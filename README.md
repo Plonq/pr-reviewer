@@ -1,22 +1,32 @@
-# lgtm
+# Gander
 
-![](./screenies/lgtm.jpeg)
+A fast, native macOS app for reviewing code — GitHub pull requests and local
+repository diffs — built in Rust with [gpui](https://www.gpui.rs/).
 
-A fast, native code-review app in Rust, built with [gpui](https://www.gpui.rs/).
+Gander is an **absorb-and-diverge fork** of
+[ellie/lgtm](https://github.com/ellie/lgtm) (MIT). The fork point is preserved
+in git history (the `Import ellie/lgtm source tree` commit); from there the
+project diverges with no upstream tracking. Everything in this repo is MIT
+licensed — see [LICENSE](./LICENSE), which carries the upstream copyright
+notice. Fork modifications are © 2026 Huon Imberger, also under MIT.
 
-Requires the [GitHub CLI](https://cli.github.com/) (`gh auth login` first), otherwise you can only review code locally.
+Changes at the fork point relative to upstream lgtm:
 
-This is 100% vibe coded. I have not read the code. 
+- renamed the app to **Gander** (binary, window title, bundle id `org.plonq.gander`),
+- stripped the Claude Code chat integration (`cmd-j` panel) and the LSP client
+  (Bifrost / rust-analyzer hover + go-to-definition),
+- the diff/review core that lgtm is kept for is intact: whole-file two-phase
+  diff rendering, tree-sitter highlighting, word-level intra-line diffs,
+  minimap, ⌘K palette, file tree, inline review comments, local repo diffs,
+  and the blob disk cache (now under `~/.cache/gander/`),
+- the palette follows the system appearance: Catppuccin Mocha in dark mode,
+  Latte in light mode,
+- builds target Apple Silicon only.
 
 ## Setup
 
-Grab [LGTM.dmg](https://github.com/ellie/lgtm/releases/download/latest/LGTM.dmg) from the latest release (built from every commit on main, Apple Silicon only), open it, and drag LGTM to Applications.
-
-The app is unsigned, so on first launch macOS will complain — right-click the app and choose Open, or:
-
-```sh
-xattr -d com.apple.quarantine /Applications/LGTM.app
-```
+Requires the [GitHub CLI](https://cli.github.com/) (`gh auth login` first) for
+PR reviews; local repo diffs work without it.
 
 Or build from source:
 
@@ -25,29 +35,27 @@ cargo run --release
 ```
 
 Note that you will need Xcode to build it from source because the metal dev
-tools are bundled with it. Otherwise the build fails with the following error:
+tools are bundled with it (and `xcodebuild -downloadComponent MetalToolchain`
+if `cargo` complains about a missing Metal toolchain).
 
-```
-cargo:rerun-if-changed=./src/platform/mac/shaders.metal
-cargo::error=metal shader compilation failed:
-xcrun: error: unable to find utility "metal", not a developer tool or in PATH
-```
+Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 
 ## Features
+
 - unified + split views
-- tree-sitter highlighting (18 languages),
-- word-level intra-line diffs, 
+- tree-sitter highlighting (18 languages)
+- word-level intra-line diffs
+- whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
 - multi-item sidebar with file tree
-- cmd-k palette with fuzzy PR picker, 
+- cmd-k palette with fuzzy PR picker
 - local repo diffs
-- minimap,
-- inline GitHub review comments (reading + posting, hover a line for +)
+- minimap
+- inline GitHub review comments (reading + posting, hover a line for `+`)
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
-
-Coming: LSP, AI inline review annotations
-
+- follows the system light/dark appearance
 
 ## Keymap
+
 | Key | Action |
 |---|---|
 | `cmd-k` | open palette (GitHub PR picker / folder) |
@@ -60,10 +68,8 @@ Coming: LSP, AI inline review annotations
 | `/` | fuzzy file filter |
 | `m` | toggle minimap |
 | `c` | toggle inline comments |
-| `cmd-j` | chat with Claude Code |
 | `r` | refresh active item |
 | `cmd-enter` | submit review (approve / request changes / comment) |
 | `home` / `end` | top / bottom |
 | `cmd-c` | copy selection |
 | `cmd-q` | quit |
-

@@ -1,0 +1,4 @@
+# Gander is Apple-Silicon-only: pin the default build target so plain
+# `cargo build`/`cargo test`/`cargo run` always produce an arm64 binary.
+[build]
+target = "aarch64-apple-darwin"

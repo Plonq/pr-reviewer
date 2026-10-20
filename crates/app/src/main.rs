@@ -1,17 +1,15 @@
-mod lsp_client;
 mod theme;
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::anyhow;
 use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
-    actions, anchored, canvas, deferred, div, fill, font, point, prelude::*, px, relative, size,
-    uniform_list, App,
-    Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
-    Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
-    SharedString, StyledText, Subscription, Task, TextRun, TitlebarOptions, UniformListScrollHandle,
-    Window, WindowBounds, WindowOptions,
+    actions, canvas, div, fill, font, point, prelude::*, px, relative, size,
+    uniform_list, App, Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla,
+    KeyBinding, Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString,
+    StyledText, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
+    WindowOptions,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -19,24 +17,14 @@ use gpui_component::{
     kbd::Kbd,
     scroll::Scrollbar,
     tag::Tag,
-    tooltip::Tooltip,
-    Disableable as _, Icon, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
+    Disableable as _, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::Duration;
-
-use lsp_client::{
-    trace as lsp_trace, DefinitionTarget, HoverResult, LspBackend, LspPosition, LspProgress,
-    LspSession,
-};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const MONO: &str = "Menlo";
 
@@ -79,7 +67,7 @@ const SPLIT_GUTTER: f32 = 44. + 28.;
 const SPLIT_DIVIDER: f32 = 6.0;
 
 actions!(
-    lgtm,
+    gander,
     [
         NextFile,
         PrevFile,
@@ -104,25 +92,21 @@ actions!(
         FocusTreeFilter,
         ToggleMinimap,
         ToggleComments,
-        ToggleChat,
         SubmitReview,
         ZoomIn,
         ZoomOut,
-        ZoomReset,
-        GoToDefinition,
-        NavBack,
-        NavForward
+        ZoomReset
     ]
 );
 
 /// Environment that makes every `git` we (or anything below us) run use the
 /// token from `gh auth login` and never block on a prompt.
 ///
-/// Per-command `-c` flags only reach the processes we spawn ourselves, but the
-/// PR worktree is a `--filter=blob:none` partial clone: any tool that walks it —
-/// bifrost, rust-analyzer, cargo — can trigger a lazy fetch of missing objects,
-/// and that runs its own `git`. Those grandchildren are invisible to us, so the
-/// config has to travel in the environment, which they inherit.
+/// Per-command `-c` flags only reach the processes we spawn ourselves, but
+/// the blob cache's git fetches — and any tool that walks a checkout of this
+/// repo — can trigger git's own credential lookups, and those run their own
+/// `git`. Those grandchildren are invisible to us, so the config has to
+/// travel in the environment, which they inherit.
 ///
 /// `GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n` is git's env spelling of `-c`. The
 /// empty helper first clears any inherited one (macOS ships `osxkeychain` in
@@ -155,15 +139,6 @@ fn main() {
         std::env::set_var("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let [mode, root] = args.as_slice() {
-        if mode == "--bifrost-lsp-server" {
-            if let Err(err) = brokk_bifrost::lsp::run_lsp_stdio_server(PathBuf::from(root)) {
-                eprintln!("lgtm: embedded Bifrost LSP failed: {err}");
-                std::process::exit(1);
-            }
-            return;
-        }
-    }
     let mut sources = Vec::new();
     let mut errors = Vec::new();
     if args.is_empty() {
@@ -192,7 +167,7 @@ fn main() {
         .with_assets(gpui_component_assets::Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
-            theme::apply_ui_theme(cx);
+            theme::apply_ui_theme(None, cx);
             cx.bind_keys([
                 KeyBinding::new("]", NextFile, Some("ReviewApp")),
                 KeyBinding::new("[", PrevFile, Some("ReviewApp")),
@@ -214,13 +189,8 @@ fn main() {
                 // palette's own escape routing wins by construction.
                 KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
                 KeyBinding::new("cmd-c", CopySelection, Some("ReviewApp")),
-                KeyBinding::new("f12", GoToDefinition, Some("ReviewApp")),
                 KeyBinding::new("ctrl-tab", NextItem, Some("ReviewApp")),
                 KeyBinding::new("ctrl-shift-tab", PrevItem, Some("ReviewApp")),
-                KeyBinding::new("cmd-left", NavBack, Some("ReviewApp")),
-                KeyBinding::new("cmd-right", NavForward, Some("ReviewApp")),
-                KeyBinding::new("alt-left", NavBack, Some("ReviewApp")),
-                KeyBinding::new("alt-right", NavForward, Some("ReviewApp")),
                 // Zoom. Bind both "cmd-=" and "cmd-+" so it fires with or
                 // without shift, the way browsers and editors behave.
                 KeyBinding::new("cmd-=", ZoomIn, None),
@@ -229,7 +199,6 @@ fn main() {
                 KeyBinding::new("cmd-0", ZoomReset, None),
                 // Global (None context): must work while the open input is focused.
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
-                KeyBinding::new("cmd-j", ToggleChat, None),
                 KeyBinding::new("cmd-t", OpenInput, None),
                 KeyBinding::new("cmd-w", CloseItem, None),
                 KeyBinding::new("cmd-k", OpenPalette, None),
@@ -258,7 +227,7 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("lgtm".into()),
+                        title: Some("Gander".into()),
                         ..TitleBar::title_bar_options()
                     }),
                     ..Default::default()
@@ -782,9 +751,6 @@ fn selection_text(sel: &Selection, rows: &[Row]) -> String {
 const MAX_HUNK_SOURCE_BYTES: usize = 100 * 1024;
 /// Individual lines longer than this stay plain even in a highlighted hunk.
 const MAX_SYNTAX_LINE_BYTES: usize = 4096;
-/// Whole files above this stay plain in the go-to-definition source view
-/// (highlighting runs synchronously when the view opens).
-const MAX_SOURCE_HIGHLIGHT_BYTES: usize = 512 * 1024;
 
 /// Patch-only highlighting: we have no full files, so highlight each hunk's
 /// text standalone, per side — old_source is context+removed lines, new_source
@@ -2348,12 +2314,6 @@ enum ItemState {
 struct ItemData {
     pr_meta: Option<gh::PrMeta>,
     diff: PrDiff,
-    /// The raw unified patch this diff was parsed from, kept for chat
-    /// context (capped at [`MAX_CHAT_PATCH_BYTES`] when sent).
-    patch: String,
-    /// Per-item chat transcript + session; survives refresh, dies with the
-    /// item.
-    chat: ChatState,
     mode: ViewMode,
     rows: Vec<Row>,
     file_rows: Vec<usize>,
@@ -2404,21 +2364,6 @@ struct ItemData {
     /// scrolls the tree when the viewport's file changes — never while the
     /// user scrolls the tree themselves.
     tree_last_file: Option<usize>,
-    lsp: Option<LspHandle>,
-    lsp_progress: Option<Arc<Mutex<LspProgress>>>,
-    lsp_loading: bool,
-    lsp_error: Option<SharedString>,
-    /// Which server backs this item's hover/goto; the "LSP" status chip toggles
-    /// it (Bifrost ↔ rust-analyzer) and restarts the session. Per-item so a
-    /// buildable Rust review can use rust-analyzer without affecting others.
-    lsp_backend: LspBackend,
-    hover: Option<HoverState>,
-    hover_gen: u64,
-    hover_cancel: Option<Arc<AtomicBool>>,
-    last_symbol_target: Option<SymbolTarget>,
-    source_view: Option<SourceViewState>,
-    nav_back: Vec<NavLocation>,
-    nav_forward: Vec<NavLocation>,
 }
 
 impl ItemData {
@@ -2502,8 +2447,6 @@ struct ReviewItem {
     /// Bumped whenever fresh data is installed; an in-flight Phase-2 upgrade
     /// only lands if the generation it captured is still current.
     upgrade_gen: u64,
-    /// Bumped whenever LSP root/session startup is restarted.
-    lsp_gen: u64,
 }
 
 impl ReviewItem {
@@ -2553,7 +2496,6 @@ impl ReviewItem {
         let Loaded {
             meta,
             diff,
-            patch,
             mut rows,
             mut file_rows,
             mut hunk_rows,
@@ -2599,7 +2541,6 @@ impl ReviewItem {
                     data.pr_meta = pr_meta;
                 }
                 data.diff = diff;
-                data.patch = patch;
                 data.set_rows((rows, file_rows, hunk_rows));
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.additions = additions;
@@ -2618,8 +2559,6 @@ impl ReviewItem {
                 let mut data = Box::new(ItemData {
                     pr_meta,
                     diff,
-                    patch,
-                    chat: ChatState::new(),
                     mode,
                     rows,
                     file_rows,
@@ -2642,18 +2581,6 @@ impl ReviewItem {
                     collapsed: HashSet::new(),
                     tree_scroll: UniformListScrollHandle::new(),
                     tree_last_file: None,
-                    lsp: None,
-                    lsp_progress: None,
-                    lsp_loading: false,
-                    lsp_error: None,
-                    lsp_backend: LspBackend::default(),
-                    hover: None,
-                    hover_gen: 0,
-                    hover_cancel: None,
-                    last_symbol_target: None,
-                    source_view: None,
-                    nav_back: Vec::new(),
-                    nav_forward: Vec::new(),
                 });
                 data.rebuild_tree();
                 self.state = ItemState::Ready(data);
@@ -2676,8 +2603,6 @@ enum LoadedMeta {
 struct Loaded {
     meta: LoadedMeta,
     diff: PrDiff,
-    /// The raw unified patch the diff was parsed from (chat context).
-    patch: String,
     rows: Vec<Row>,
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
@@ -2718,7 +2643,6 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
     Ok(Loaded {
         meta,
         diff,
-        patch,
         rows,
         file_rows,
         hunk_rows,
@@ -2771,7 +2695,7 @@ struct UpgradedFile {
 fn run_upgrade(source: &UpgradeSource, mut jobs: Vec<UpgradeJob>) -> Vec<UpgradedFile> {
     if jobs.len() > MAX_UPGRADE_FILES {
         eprintln!(
-            "lgtm: {} changed files; upgrading the first {MAX_UPGRADE_FILES} to full \
+            "gander: {} changed files; upgrading the first {MAX_UPGRADE_FILES} to full \
              contents, the rest stay patch-derived",
             jobs.len()
         );
@@ -2809,7 +2733,7 @@ fn fetch_side(source: &UpgradeSource, path: &str, old: bool) -> Option<String> {
             match gh::fetch_file_at(loc, oid, path) {
                 Ok(text) => text?,
                 Err(err) => {
-                    eprintln!("lgtm: {path}: {err:#}");
+                    eprintln!("gander: {path}: {err:#}");
                     return None;
                 }
             }
@@ -2906,7 +2830,7 @@ fn app_title(detail: Option<String>) -> gpui::AnyElement {
         .child(
             div()
                 .font_weight(gpui::FontWeight::BOLD)
-                .child(SharedString::from("lgtm")),
+                .child(SharedString::from("Gander")),
         );
     if let Some(detail) = detail {
         title = title.child(
@@ -3453,146 +3377,6 @@ struct ReviewDialog {
     _subscription: Subscription,
 }
 
-// --- Chat with Claude -------------------------------------------------------
-
-/// Width of the right-side chat panel.
-const CHAT_WIDTH: f32 = 380.0;
-/// The unified patch included in a session's first message is capped here.
-const MAX_CHAT_PATCH_BYTES: usize = 200 * 1024;
-/// Files above this size are skipped when materializing an exploration dir.
-const MAX_EXPLORE_FILE_BYTES: usize = 1024 * 1024;
-/// Reviewer persona appended to the system prompt on a session's first turn.
-const CHAT_SYSTEM_PROMPT: &str =
-    "You are reviewing this diff. Be concrete; cite file:line for claims about the code.";
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ChatRole {
-    User,
-    Assistant,
-}
-
-struct ChatMessage {
-    role: ChatRole,
-    text: String,
-    /// Total cost of the run that produced this assistant message.
-    cost: Option<f64>,
-    /// "› included selection: path:lines" marker under a user message.
-    note: Option<String>,
-    /// The run behind this assistant message failed (rendered in red).
-    error: bool,
-}
-
-/// Per-item chat state; lives on ItemData so transcripts follow the item and
-/// die with it. The InputState is created lazily (it needs a Window) the
-/// first time the panel renders for this item.
-struct ChatState {
-    messages: Vec<ChatMessage>,
-    session_id: Option<String>,
-    in_flight: bool,
-    /// Set to stop the current run; claude::chat kills the child on it.
-    /// Replaced (not reset) per send so a stale run can't clear a new one.
-    cancel: Arc<AtomicBool>,
-    input: Option<gpui::Entity<InputState>>,
-    _input_sub: Option<Subscription>,
-    scroll: ScrollHandle,
-    /// Auto-scroll to the bottom on new content, editor-style: sticky until
-    /// the user scrolls up, re-sticks when they scroll back to the bottom.
-    stick_to_bottom: bool,
-    /// Exploration dir passed to claude, fixed at session start: the repo
-    /// root for local items, a materialized scratch dir for PR items with
-    /// blob-upgraded contents, None otherwise.
-    explore_dir: Option<std::path::PathBuf>,
-}
-
-impl ChatState {
-    fn new() -> Self {
-        Self {
-            messages: Vec::new(),
-            session_id: None,
-            in_flight: false,
-            cancel: Arc::new(AtomicBool::new(false)),
-            input: None,
-            _input_sub: None,
-            scroll: ScrollHandle::new(),
-            stick_to_bottom: true,
-            explore_dir: None,
-        }
-    }
-}
-
-/// `text` truncated to at most `cap` bytes on a char boundary, plus whether
-/// anything was cut.
-fn truncate_str(text: &str, cap: usize) -> (&str, bool) {
-    if text.len() <= cap {
-        return (text, false);
-    }
-    let mut cut = cap;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    (&text[..cut], true)
-}
-
-/// First-message context header for a PR item.
-fn pr_chat_header(meta: &gh::PrMeta) -> String {
-    let body = if meta.body.trim().is_empty() {
-        "(no description)"
-    } else {
-        meta.body.trim()
-    };
-    format!(
-        "PR under review: \"{}\" — {}\nAuthor: {} · state: {} · {} ← {}\n\nPR description:\n{}",
-        meta.title,
-        meta.url,
-        meta.author.login,
-        meta.state,
-        meta.base_ref_name,
-        meta.head_ref_name,
-        body,
-    )
-}
-
-/// First-message context header for a local item.
-fn local_chat_header(src: &git::LocalSource) -> String {
-    format!(
-        "Local diff under review: repo {}, branch {} against {}.",
-        dir_name(&src.repo_root),
-        src.branch,
-        src.base_label,
-    )
-}
-
-/// The full prompt for one turn. `context` (header + raw patch) is only
-/// present on a session's first message; the patch is capped at
-/// [`MAX_CHAT_PATCH_BYTES`] with the truncation noted in the prompt.
-fn chat_prompt(
-    context: Option<(&str, &str)>,
-    selection_block: Option<&str>,
-    question: &str,
-) -> String {
-    let mut out = String::new();
-    if let Some((header, patch)) = context {
-        out.push_str(header);
-        out.push_str("\n\nThe unified diff under review:\n```diff\n");
-        let (patch, truncated) = truncate_str(patch, MAX_CHAT_PATCH_BYTES);
-        out.push_str(patch);
-        if !patch.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str("```\n");
-        if truncated {
-            out.push_str("(patch truncated at 200KB — ask about specific files if needed)\n");
-        }
-        out.push('\n');
-    }
-    if let Some(block) = selection_block {
-        out.push_str(block);
-        out.push('\n');
-    }
-    out.push_str(question);
-    out
-}
-
 fn local_review_prompt(src: &git::LocalSource, review: &LocalReview) -> String {
     let threads = local_review_threads(review)
         .iter()
@@ -3660,480 +3444,6 @@ fn local_comment_location(file: &str, side: Option<&str>, line: Option<u64>) -> 
     }
 }
 
-/// What a selection pins down for the chat: the anchor triple (path, side,
-/// line range) plus the selected text.
-#[derive(Debug, PartialEq)]
-struct SelectionInfo {
-    path: String,
-    side: &'static str,
-    lo: u32,
-    hi: u32,
-    text: String,
-}
-
-impl SelectionInfo {
-    fn block(&self) -> String {
-        format!(
-            "Selected text ({}:{}-{}, {} side):\n```\n{}\n```\n",
-            self.path, self.lo, self.hi, self.side, self.text
-        )
-    }
-
-    fn note(&self) -> String {
-        format!(
-            "› included selection: {}:{}-{}",
-            self.path, self.lo, self.hi
-        )
-    }
-}
-
-/// Resolve a selection to its anchor info, reusing the same row machinery as
-/// copy. Line numbers come from the selected side (unified rows prefer the
-/// new number); the path is the file containing the selection's start row.
-/// None when the selection has no text.
-fn selection_info(
-    sel: &Selection,
-    rows: &[Row],
-    file_rows: &[usize],
-    diff: &PrDiff,
-) -> Option<SelectionInfo> {
-    let text = selection_text(sel, rows);
-    if text.is_empty() {
-        return None;
-    }
-    let (start, end) = sel.ordered();
-    let file_ix = file_rows.iter().rposition(|&ix| ix <= start.row)?;
-    let path = diff.files.get(file_ix)?.display_path().to_string();
-    let (mut lo, mut hi) = (u32::MAX, 0);
-    for ix in start.row..=end.row.min(rows.len().saturating_sub(1)) {
-        if row_selection_range(sel, ix, &rows[ix]).is_none() {
-            continue;
-        }
-        let no = match (&rows[ix], sel.side) {
-            (Row::Line { old_no, new_no, .. }, _) => new_no.or(*old_no),
-            (Row::SplitLine { left, .. }, SelSide::Left) => left.as_ref().map(|c| c.no),
-            (Row::SplitLine { right, .. }, SelSide::Right) => right.as_ref().map(|c| c.no),
-            _ => None,
-        };
-        if let Some(no) = no {
-            lo = lo.min(no);
-            hi = hi.max(no);
-        }
-    }
-    if lo == u32::MAX {
-        return None;
-    }
-    let side = match sel.side {
-        SelSide::Unified => "unified",
-        SelSide::Left => "LEFT (old)",
-        SelSide::Right => "RIGHT (new)",
-    };
-    Some(SelectionInfo {
-        path,
-        side,
-        lo,
-        hi,
-        text,
-    })
-}
-
-/// Scratch dir for one item's materialized exploration files. Includes the
-/// pid: item ids restart at 0 every run, and stale dirs from another process
-/// must never be reused.
-fn chat_scratch_root(item_id: u64) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("lgtm-chat-{}-{item_id}", std::process::id()))
-}
-
-/// A repo-relative path mapped under `root`, preserving the layout. Rejects
-/// absolute paths and any non-normal component (`..`, `.`) so materialized
-/// files can't escape the scratch dir.
-fn scratch_path(root: &Path, rel: &str) -> Option<std::path::PathBuf> {
-    let rel = Path::new(rel);
-    if rel.as_os_str().is_empty()
-        || !rel
-            .components()
-            .all(|c| matches!(c, std::path::Component::Normal(_)))
-    {
-        return None;
-    }
-    Some(root.join(rel))
-}
-
-/// Write blob-upgraded new-side files into `root`, best-effort: oversized
-/// files, unsafe paths, and individual write failures are skipped. Returns
-/// the root when it could be created at all.
-fn materialize_files(root: &Path, files: &[(String, String)]) -> Option<std::path::PathBuf> {
-    std::fs::create_dir_all(root).ok()?;
-    for (rel, content) in files {
-        if content.len() > MAX_EXPLORE_FILE_BYTES {
-            continue;
-        }
-        let Some(path) = scratch_path(root, rel) else {
-            continue;
-        };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&path, content);
-    }
-    Some(root.to_path_buf())
-}
-
-fn lsp_root_for_source(source: &Source, pr_meta: Option<&gh::PrMeta>) -> anyhow::Result<PathBuf> {
-    match source {
-        Source::Local(src) => Ok(src.repo_root.clone()),
-        Source::Pr(loc) => {
-            let meta = pr_meta.context("PR metadata missing; cannot materialize LSP worktree")?;
-            if meta.head_ref_oid.is_empty() {
-                bail!("PR head oid missing; cannot materialize LSP worktree");
-            }
-            materialize_pr_worktree(loc, &meta.head_ref_oid)
-        }
-    }
-}
-
-fn materialize_pr_worktree(loc: &gh::PrLocator, head_oid: &str) -> anyhow::Result<PathBuf> {
-    let root = lsp_worktree_root(loc, head_oid)?;
-    let pull_ref = format!("refs/pull/{}/head", loc.number);
-    if root.join(".git").exists() {
-        git_ok(&root, &["fetch", "--depth", "1", "origin", &pull_ref]).ok();
-        git_ok(&root, &["checkout", "--detach", head_oid])?;
-        return Ok(root);
-    }
-    let parent = root
-        .parent()
-        .context("worktree root unexpectedly has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    let tmp = root.with_extension(format!("tmp-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    git_ok(
-        parent,
-        &[
-            "clone",
-            "--no-checkout",
-            "--filter=blob:none",
-            &format!("https://github.com/{}.git", loc.repo_slug()),
-            tmp.file_name()
-                .and_then(|name| name.to_str())
-                .context("temporary worktree path is not UTF-8")?,
-        ],
-    )?;
-    git_ok(&tmp, &["fetch", "--depth", "1", "origin", &pull_ref])?;
-    git_ok(&tmp, &["checkout", "--detach", head_oid])?;
-    std::fs::rename(&tmp, &root).or_else(|_| {
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::rename(&tmp, &root)
-    })?;
-    Ok(root)
-}
-
-fn lsp_worktree_root(loc: &gh::PrLocator, head_oid: &str) -> anyhow::Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    let key = format!(
-        "{}__{}__pr{}__{}",
-        sanitize_path_part(&loc.owner),
-        sanitize_path_part(&loc.repo),
-        loc.number,
-        &head_oid[..head_oid.len().min(12)]
-    );
-    Ok(PathBuf::from(home)
-        .join(".cache")
-        .join("lgtm")
-        .join("worktrees")
-        .join(key))
-}
-
-/// `~/.cache/lgtm/worktrees` — the parent of the per-PR LSP checkouts.
-fn worktrees_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".cache")
-            .join("lgtm")
-            .join("worktrees"),
-    )
-}
-
-/// A PR whose LSP worktree(s) are cached on disk, surfaced in the sidebar so a
-/// past review can be reopened or its cache cleaned up.
-#[derive(Clone)]
-struct CachedPr {
-    loc: gh::PrLocator,
-    /// Every cached worktree dir for this PR (one per reviewed head oid).
-    dirs: Vec<PathBuf>,
-}
-
-/// Scan the worktree cache for reviewable PRs, grouped by PR and most-recently
-/// used first. Blocking (a `git` call per dir) — run off the UI thread.
-fn scan_cached_prs() -> Vec<CachedPr> {
-    let Some(root) = worktrees_root() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
-    // (locator, dirs, latest mtime) — one entry per distinct PR.
-    let mut grouped: Vec<(gh::PrLocator, Vec<PathBuf>, std::time::SystemTime)> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // Skip half-written clones from an in-progress materialize.
-        if name.contains(".tmp-") {
-            continue;
-        }
-        let Some(number) = cached_pr_number(&name) else {
-            continue;
-        };
-        // The dir name sanitizes owner/repo lossily, so recover the real slug
-        // from the clone's origin remote.
-        let Some((owner, repo)) = worktree_remote(&path) else {
-            continue;
-        };
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        match grouped
-            .iter_mut()
-            .find(|(l, ..)| l.owner == owner && l.repo == repo && l.number == number)
-        {
-            Some((_, dirs, latest)) => {
-                dirs.push(path);
-                *latest = (*latest).max(mtime);
-            }
-            None => grouped.push((
-                gh::PrLocator {
-                    owner,
-                    repo,
-                    number,
-                },
-                vec![path],
-                mtime,
-            )),
-        }
-    }
-    grouped.sort_by(|a, b| b.2.cmp(&a.2));
-    grouped
-        .into_iter()
-        .map(|(loc, dirs, _)| CachedPr { loc, dirs })
-        .collect()
-}
-
-/// PR number from a `{owner}__{repo}__pr{N}__{oid}` worktree dir name.
-fn cached_pr_number(dir_name: &str) -> Option<u64> {
-    let after = dir_name.rsplit_once("__pr")?.1;
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
-}
-
-/// Owner/repo from a cached clone's `origin` remote URL.
-fn worktree_remote(dir: &Path) -> Option<(String, String)> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["config", "--get", "remote.origin.url"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8(output.stdout).ok()?;
-    parse_github_owner_repo(url.trim())
-}
-
-/// Owner/repo from a GitHub remote URL (https, ssh, or scp-style).
-fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
-    let rest = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("http://github.com/"))
-        .or_else(|| url.strip_prefix("git@github.com:"))
-        .or_else(|| url.strip_prefix("github.com/"))?;
-    let (owner, repo) = rest.strip_suffix(".git").unwrap_or(rest).split_once('/')?;
-    (!owner.is_empty() && !repo.is_empty()).then(|| (owner.to_string(), repo.to_string()))
-}
-
-fn sanitize_path_part(input: &str) -> String {
-    input
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// `git` in `dir`. Auth and prompt suppression come from the process
-/// environment (see `git_env`), which children inherit, so nothing extra is
-/// needed here — and the same settings reach git processes we never spawn
-/// ourselves.
-fn git_command(dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir);
-    cmd
-}
-
-fn git_ok(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let output = git_command(dir)
-        .args(args)
-        .output()
-        .map_err(|err| anyhow!("failed to run git: {err}"))?;
-    if !output.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// How the next chat run gets its exploration dir, decided at send time.
-enum ExplorePlan {
-    /// No tools: patch-only context.
-    None,
-    /// An existing directory (local repo root, or an already-materialized
-    /// scratch dir from an earlier turn).
-    Dir(std::path::PathBuf),
-    /// PR item, first turn with blob upgrades: write these (path, content)
-    /// pairs under `root` on the background executor, then use it.
-    Materialize {
-        root: std::path::PathBuf,
-        files: Vec<(String, String)>,
-    },
-}
-
-#[derive(Clone)]
-struct LspHandle {
-    root: PathBuf,
-    session: LspSession,
-    progress: Arc<Mutex<LspProgress>>,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct SymbolTarget {
-    position: LspPosition,
-    row: usize,
-    col: usize,
-}
-
-#[derive(Clone)]
-struct HoverState {
-    result: Option<HoverResult>,
-    loading: bool,
-    mouse: Point<Pixels>,
-}
-
-#[derive(Clone)]
-struct SourceViewState {
-    target: DefinitionTarget,
-    lines: Vec<SharedString>,
-    /// Tree-sitter spans per line (line-relative byte ranges), index-aligned
-    /// with `lines`; empty when the language is unknown or the file is too big.
-    syntax: Vec<Vec<(Range<usize>, syntax::Token)>>,
-    scroll: UniformListScrollHandle,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-enum NavLocation {
-    Diff { row: usize },
-    Source { target: DefinitionTarget },
-}
-
-fn utf16_col_for_monospace_col(text: &str, col: usize) -> u32 {
-    text.chars().take(col).map(|ch| ch.len_utf16() as u32).sum()
-}
-
-fn identifier_start_at(text: &str, col: usize) -> Option<usize> {
-    let chars = text.chars().collect::<Vec<_>>();
-    let is_identifier = |ch: char| ch == '_' || ch.is_alphanumeric();
-    let mut cursor = col.min(chars.len());
-    if chars.get(cursor).is_none_or(|ch| !is_identifier(*ch)) {
-        if chars.get(cursor).is_none_or(|ch| ch.is_whitespace()) {
-            return None;
-        }
-        cursor = cursor.checked_sub(1)?;
-        if !is_identifier(chars[cursor]) {
-            return None;
-        }
-    }
-    while cursor > 0 && is_identifier(chars[cursor - 1]) {
-        cursor -= 1;
-    }
-    Some(cursor)
-}
-
-/// Short status for a still-loading LSP. A real sub-100% percentage is genuine
-/// indexing progress and worth showing; at 100% (or once the phase count is
-/// gone) the server is usually still analyzing before hovers resolve — so show
-/// "analyzing…" rather than a stuck "100%".
-fn lsp_loading_label(percentage: Option<u32>) -> String {
-    match percentage {
-        Some(pct) if pct < 100 => format!("{pct}%"),
-        _ => "analyzing…".to_string(),
-    }
-}
-
-fn lsp_warmup_position(data: &ItemData) -> Option<LspPosition> {
-    for (row_ix, row) in data.rows.iter().enumerate() {
-        let (line, text) = match row {
-            Row::Line { new_no, text, .. } => ((*new_no)? - 1, text.as_ref()),
-            Row::SplitLine {
-                right: Some(cell), ..
-            } => (cell.no - 1, cell.text.as_ref()),
-            _ => continue,
-        };
-        let file_ix = data.file_rows.iter().rposition(|&row| row <= row_ix)?;
-        let path = data.diff.files.get(file_ix)?.new_path.as_ref()?.clone();
-        let col = first_lsp_identifier_col(text)?;
-        return Some(LspPosition {
-            path,
-            line,
-            character: col,
-        });
-    }
-    None
-}
-
-fn first_lsp_identifier_col(text: &str) -> Option<u32> {
-    let mut chars = text.char_indices().peekable();
-    while let Some((start_byte, ch)) = chars.next() {
-        if !(ch == '_' || ch.is_ascii_alphabetic()) {
-            continue;
-        }
-        let mut end_byte = start_byte + ch.len_utf8();
-        while let Some(&(next_byte, next)) = chars.peek() {
-            if next == '_' || next.is_ascii_alphanumeric() {
-                end_byte = next_byte + next.len_utf8();
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        let ident = &text[start_byte..end_byte];
-        if !RUST_LSP_WARMUP_KEYWORDS.contains(&ident) {
-            return Some(utf16_col_for_monospace_col(
-                text,
-                text[..start_byte].chars().count(),
-            ));
-        }
-    }
-    None
-}
-
-const RUST_LSP_WARMUP_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
-    "unsafe", "use", "where", "while",
-];
-
 struct ReviewApp {
     items: Vec<ReviewItem>,
     active: usize,
@@ -4155,8 +3465,6 @@ struct ReviewApp {
     drag_anchor: Option<(SelSide, RowCol)>,
     /// `m` toggles the minimap column for every item.
     minimap_visible: bool,
-    /// `cmd-j` toggles the right-side chat panel (transcripts are per-item).
-    chat_visible: bool,
     /// A minimap scrub drag is in progress (mouse went down on the minimap).
     minimap_scrub: bool,
     /// Advance width of one monospace cell at (MONO, text_size()), measured once.
@@ -4173,9 +3481,6 @@ struct ReviewApp {
     /// Bumped on every review-dialog open/close, same protocol as
     /// `composer_gen`.
     review_gen: u64,
-    /// PRs with cached LSP worktrees on disk, listed in the sidebar to reopen or
-    /// clean up. Filled by a background scan when the app starts.
-    cached_prs: Vec<CachedPr>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -4217,13 +3522,11 @@ impl ReviewApp {
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
         let _subscriptions = vec![
-            // Best-effort cleanup of every item's chat scratch dir on quit
-            // (close_item handles the per-item case).
-            cx.on_app_quit(|this: &mut Self, _cx| {
-                for item in &this.items {
-                    let _ = std::fs::remove_dir_all(chat_scratch_root(item.id));
-                }
-                async {}
+            // The system appearance can flip while we run; re-apply the
+            // palette (Mocha ↔ Latte) and repaint when it does.
+            cx.observe_window_appearance(window, |_, window, cx| {
+                theme::apply_ui_theme(Some(window), cx);
+                cx.notify();
             }),
             cx.subscribe_in(
                 &open_input,
@@ -4274,7 +3577,6 @@ impl ReviewApp {
             palette_scroll: UniformListScrollHandle::new(),
             drag_anchor: None,
             minimap_visible: true,
-            chat_visible: false,
             minimap_scrub: false,
             char_width: None,
             hover_plus: None,
@@ -4282,10 +3584,8 @@ impl ReviewApp {
             composer_gen: 0,
             review: None,
             review_gen: 0,
-            cached_prs: Vec::new(),
             _subscriptions,
         };
-        this.refresh_cached_prs(cx);
         for source in sources {
             this.open_item(source, cx);
         }
@@ -4293,50 +3593,9 @@ impl ReviewApp {
         this
     }
 
-    /// Rescan the worktree cache (off the UI thread) and repopulate the
-    /// sidebar's cached-PR list.
-    fn refresh_cached_prs(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let cached = cx.background_spawn(async move { scan_cached_prs() }).await;
-            this.update(cx, |app, cx| {
-                app.cached_prs = cached;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Open a cached PR (activating it if already open), from a sidebar click.
-    fn open_cached_pr(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(loc) = self.cached_prs.get(ix).map(|cached| cached.loc.clone()) else {
-            return;
-        };
-        if let Some(existing) = self.items.iter().position(|item| {
-            matches!(&item.source, Source::Pr(l)
-                if l.owner == loc.owner && l.repo == loc.repo && l.number == loc.number)
-        }) {
-            self.activate(existing, window, cx);
-            return;
-        }
-        self.open_item(Source::Pr(loc), cx);
-    }
-
-    /// Delete a cached PR's worktree(s) from disk and drop it from the list.
-    fn delete_cached_pr(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix >= self.cached_prs.len() {
-            return;
-        }
-        for dir in &self.cached_prs[ix].dirs {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        self.cached_prs.remove(ix);
-        cx.notify();
-    }
-
     /// Re-wrap comment bodies to the pane's current width. Called each render:
     /// the bounds come from the last paint, so a resize (or toggling the
-    /// sidebar, chat, or view mode) settles on the following frame. Rebuilding
+    /// sidebar or view mode) settles on the following frame. Rebuilding
     /// only when the column count actually changes keeps this off the hot path
     /// — a few pixels of drag usually map to the same width in columns.
     fn resync_comment_wrap(&mut self, window: &Window) {
@@ -4495,7 +3754,6 @@ impl ReviewApp {
             reloading: false,
             refresh_error: None,
             upgrade_gen: 0,
-            lsp_gen: 0,
         });
         self.active = self.items.len() - 1;
         Self::spawn_fetch(id, source, ViewMode::Split, cx);
@@ -4508,7 +3766,6 @@ impl ReviewApp {
                 .background_spawn(async move { fetch_item(&source, mode) })
                 .await;
             this.update(cx, |app, cx| {
-                let mut restart_lsp = false;
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
                     return;
                 };
@@ -4516,7 +3773,6 @@ impl ReviewApp {
                 match fetched {
                     Ok(loaded) => {
                         item.install(loaded);
-                        restart_lsp = true;
                         // Phase 2: after the instant patch-derived paint,
                         // upgrade every eligible file to full contents in the
                         // background. The bumped generation cancels any
@@ -4567,9 +3823,6 @@ impl ReviewApp {
                             _ => item.state = ItemState::Failed(msg),
                         }
                     }
-                }
-                if restart_lsp {
-                    app.restart_lsp_for_item(id, cx);
                 }
                 cx.notify();
             })
@@ -4642,124 +3895,6 @@ impl ReviewApp {
             .ok();
         })
         .detach();
-    }
-
-    /// Switch the active item's LSP backend (Bifrost ↔ rust-analyzer) and
-    /// restart its session. Driven by clicking the "LSP" status chip.
-    fn toggle_lsp_backend(&mut self, cx: &mut Context<Self>) {
-        let Some(item) = self.items.get(self.active) else {
-            return;
-        };
-        let id = item.id;
-        let Some(data) = self.active_data_mut() else {
-            return;
-        };
-        data.lsp_backend = data.lsp_backend.toggled();
-        self.restart_lsp_for_item(id, cx);
-        cx.notify();
-    }
-
-    fn restart_lsp_for_item(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
-            return;
-        };
-        let ItemState::Ready(data) = &mut item.state else {
-            return;
-        };
-        item.lsp_gen += 1;
-        let gen = item.lsp_gen;
-        let backend = data.lsp_backend;
-        data.lsp = None;
-        data.lsp_error = None;
-        data.lsp_loading = true;
-        let progress = Arc::new(Mutex::new(LspProgress {
-            title: Some("Indexing workspace".to_string()),
-            message: Some(format!("Starting {}", backend.label())),
-            percentage: Some(0),
-            done: false,
-        }));
-        data.lsp_progress = Some(Arc::clone(&progress));
-        if let Some(cancel) = data.hover_cancel.take() {
-            cancel.store(true, Ordering::Release);
-        }
-        data.hover = None;
-        data.source_view = None;
-        let source = item.source.clone();
-        let pr_meta = data.pr_meta.clone();
-        let warmup = lsp_warmup_position(data);
-        let progress_for_start = Arc::clone(&progress);
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let root = lsp_root_for_source(&source, pr_meta.as_ref())?;
-                    let session = LspSession::start(
-                        root.clone(),
-                        backend,
-                        Arc::clone(&progress_for_start),
-                        warmup,
-                    )?;
-                    Ok::<LspHandle, anyhow::Error>(LspHandle {
-                        root,
-                        session,
-                        progress: progress_for_start,
-                    })
-                })
-                .await;
-            this.update(cx, |app, cx| {
-                let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
-                    return;
-                };
-                if item.lsp_gen != gen {
-                    return;
-                }
-                let ItemState::Ready(data) = &mut item.state else {
-                    return;
-                };
-                data.lsp_loading = false;
-                match result {
-                    Ok(handle) => {
-                        data.lsp_progress = Some(Arc::clone(&handle.progress));
-                        data.lsp = Some(handle);
-                        data.lsp_error = None;
-                    }
-                    Err(err) => {
-                        data.lsp = None;
-                        data.lsp_error = Some(format!("{err:#}").into());
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(150))
-                .await;
-            let keep_going = this
-                .update(cx, |app, cx| {
-                    let Some(item) = app.items.iter().find(|item| item.id == id) else {
-                        return false;
-                    };
-                    if item.lsp_gen != gen {
-                        return false;
-                    }
-                    let ItemState::Ready(data) = &item.state else {
-                        return false;
-                    };
-                    if !data.lsp_loading {
-                        return false;
-                    }
-                    cx.notify();
-                    true
-                })
-                .unwrap_or(false);
-            if !keep_going {
-                break;
-            }
-        })
-        .detach();
-        cx.notify();
     }
 
     /// Reveal all hidden lines of one gap in an upgraded file, keeping the
@@ -5227,23 +4362,9 @@ impl ReviewApp {
         if ix >= self.items.len() {
             return;
         }
-        // Stop any in-flight chat run and drop its scratch dir (best-effort;
-        // the path is ours and never the local repo root).
-        let item = &self.items[ix];
-        if let ItemState::Ready(data) = &item.state {
-            data.chat.cancel.store(true, Ordering::Relaxed);
-        }
-        let _ = std::fs::remove_dir_all(chat_scratch_root(item.id));
-        let was_pr = matches!(item.source, Source::Pr(_));
         self.items.remove(ix);
         if self.active > ix || self.active >= self.items.len() {
             self.active = self.active.saturating_sub(1);
-        }
-        // A PR reviewed this session may have just materialized its worktree;
-        // rescan so it (re)appears in the sidebar's cached list now that it's
-        // closed, rather than only after a restart.
-        if was_pr {
-            self.refresh_cached_prs(cx);
         }
         cx.notify();
     }
@@ -5460,370 +4581,6 @@ impl ReviewApp {
         let (side, hit) = self.pane_hit(position, char_width, None)?;
         let data = self.active_data()?;
         comment_anchor(&data.rows, hit.row, side).map(|_| (hit.row, side))
-    }
-
-    fn symbol_target_at(
-        &mut self,
-        position: Point<Pixels>,
-        window: &Window,
-    ) -> Option<SymbolTarget> {
-        if self.palette.is_some() || self.composer.is_some() || self.review.is_some() {
-            return None;
-        }
-        let bounds = self.active_data()?.scroll.0.borrow().base_handle.bounds();
-        if !bounds.contains(&position) {
-            return None;
-        }
-        let (side, row, text_x) = self.pane_text_hit(position, None)?;
-        let text = match self.active_data()?.rows.get(row)? {
-            Row::Line { text, .. } if side == SelSide::Unified => text.as_ref(),
-            Row::SplitLine {
-                left: Some(cell), ..
-            } if side == SelSide::Left => cell.text.as_ref(),
-            Row::SplitLine {
-                right: Some(cell), ..
-            } if side == SelSide::Right => cell.text.as_ref(),
-            _ => return None,
-        };
-        let shaped = window.text_system().shape_line(
-            SharedString::from(text.to_string()),
-            px(text_size()),
-            &[TextRun {
-                len: text.len(),
-                font: font(MONO),
-                color: gpui::black(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            }],
-            None,
-        );
-        let byte_col = shaped.index_for_x(text_x.max(px(0.)))?;
-        let col = text.get(..byte_col)?.chars().count();
-        self.symbol_target_for_hit(side, RowCol { row, col })
-    }
-
-    fn symbol_target_for_hit(&self, side: SelSide, hit: RowCol) -> Option<SymbolTarget> {
-        let data = self.active_data()?;
-        let file_ix = data.file_rows.iter().rposition(|&row| row <= hit.row)?;
-        let file = data.diff.files.get(file_ix)?;
-        let path = file.new_path.as_ref()?.clone();
-        let (line, text) = match data.rows.get(hit.row)? {
-            Row::Line { new_no, text, .. } if side == SelSide::Unified => {
-                ((*new_no)? - 1, text.as_ref())
-            }
-            Row::SplitLine {
-                right: Some(cell), ..
-            } if side == SelSide::Right => (cell.no - 1, cell.text.as_ref()),
-            _ => return None,
-        };
-        let col = identifier_start_at(text, hit.col)?;
-        let identifier = text
-            .chars()
-            .skip(col)
-            .take_while(|ch| *ch == '_' || ch.is_alphanumeric())
-            .collect::<String>();
-        if path.ends_with(".rs") && RUST_LSP_WARMUP_KEYWORDS.contains(&identifier.as_str()) {
-            return None;
-        }
-        let character = utf16_col_for_monospace_col(text, col);
-        Some(SymbolTarget {
-            position: LspPosition {
-                path,
-                line,
-                character,
-            },
-            row: hit.row,
-            col,
-        })
-    }
-
-    fn request_hover(
-        &mut self,
-        target: SymbolTarget,
-        mouse: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(data) = self.active_data_mut() else {
-            return;
-        };
-        data.hover_gen += 1;
-        let gen = data.hover_gen;
-        lsp_trace(format_args!(
-            "ui hover gen={gen} {}:{}:{} ready={}",
-            target.position.path,
-            target.position.line + 1,
-            target.position.character + 1,
-            data.lsp.is_some()
-        ));
-        if let Some(cancel) = data.hover_cancel.take() {
-            cancel.store(true, Ordering::Release);
-        }
-        let canceled = Arc::new(AtomicBool::new(false));
-        data.hover_cancel = Some(Arc::clone(&canceled));
-        data.last_symbol_target = Some(target.clone());
-        let Some(handle) = data.lsp.clone() else {
-            if data.lsp_loading {
-                let waiting_target = target.clone();
-                data.hover = Some(HoverState {
-                    result: None,
-                    loading: true,
-                    mouse,
-                });
-                cx.notify();
-                cx.spawn(async move |this, cx| loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(150))
-                        .await;
-                    let keep_waiting = this
-                        .update(cx, |app, cx| {
-                            let Some(data) = app.active_data() else {
-                                return false;
-                            };
-                            if data.hover_gen != gen
-                                || data.last_symbol_target.as_ref() != Some(&waiting_target)
-                            {
-                                return false;
-                            }
-                            if data.lsp.is_some() {
-                                app.request_hover(waiting_target.clone(), mouse, cx);
-                                return false;
-                            }
-                            data.lsp_loading
-                        })
-                        .unwrap_or(false);
-                    if !keep_waiting {
-                        break;
-                    }
-                })
-                .detach();
-            }
-            return;
-        };
-        data.hover = None;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(250))
-                .await;
-            let should_request = this
-                .update(cx, |app, _cx| {
-                    let Some(data) = app.active_data() else {
-                        return false;
-                    };
-                    if data.hover_gen != gen || data.last_symbol_target.as_ref() != Some(&target) {
-                        lsp_trace(format_args!("ui hover debounce canceled gen={gen}"));
-                        return false;
-                    }
-                    true
-                })
-                .unwrap_or(false);
-            if !should_request {
-                return;
-            }
-            let position = target.position.clone();
-            let result = cx
-                .background_spawn(async move { handle.session.hover(position, canceled) })
-                .await;
-            this.update(cx, |app, cx| {
-                let Some(data) = app.active_data_mut() else {
-                    return;
-                };
-                if data.hover_gen != gen || data.last_symbol_target.as_ref() != Some(&target) {
-                    return;
-                }
-                match result {
-                    Ok(Some(result)) => {
-                        lsp_trace(format_args!("ui hover content gen={gen}"));
-                        data.hover = Some(HoverState {
-                            result: Some(result),
-                            loading: false,
-                            mouse,
-                        });
-                    }
-                    Ok(None) => {
-                        lsp_trace(format_args!("ui hover none gen={gen}"));
-                        data.hover = None;
-                    }
-                    Err(err) => {
-                        lsp_trace(format_args!("ui hover error gen={gen}: {err:#}"));
-                        data.hover = None;
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn go_to_last_symbol(&mut self, cx: &mut Context<Self>) {
-        let Some(target) = self
-            .active_data()
-            .and_then(|data| data.last_symbol_target.clone())
-        else {
-            return;
-        };
-        self.request_definition(target, cx);
-    }
-
-    fn request_definition(&mut self, origin: SymbolTarget, cx: &mut Context<Self>) {
-        let Some(handle) = self.active_data().and_then(|data| data.lsp.clone()) else {
-            return;
-        };
-        if let Some(data) = self.active_data_mut() {
-            data.cursor = origin.row.min(data.rows.len().saturating_sub(1));
-        }
-        cx.spawn(async move |this, cx| {
-            let position = origin.position.clone();
-            let result = cx
-                .background_spawn(async move { handle.session.definition(position) })
-                .await;
-            this.update(cx, |app, cx| {
-                let target = match result {
-                    Ok(mut targets) => targets.drain(..).next(),
-                    Err(err) => {
-                        lsp_trace(format_args!("ui definition error: {err:#}"));
-                        return;
-                    }
-                };
-                let Some(target) = target else {
-                    return;
-                };
-                app.open_source_target(target, true, cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn open_source_target(
-        &mut self,
-        target: DefinitionTarget,
-        push_history: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let (lines, syntax) = match self.read_lsp_source_lines(&target) {
-            Ok(loaded) => loaded,
-            Err(err) => {
-                lsp_trace(format_args!("ui definition source error: {err:#}"));
-                return;
-            }
-        };
-        let current = self.current_nav_location();
-        let scroll = UniformListScrollHandle::new();
-        if !lines.is_empty() {
-            scroll.scroll_to_item(
-                (target.start_line as usize).min(lines.len() - 1),
-                ScrollStrategy::Center,
-            );
-        }
-        if let Some(data) = self.active_data_mut() {
-            if push_history {
-                if let Some(current) = current {
-                    data.nav_back.push(current);
-                    data.nav_forward.clear();
-                }
-            }
-            data.source_view = Some(SourceViewState {
-                target,
-                lines,
-                syntax,
-                scroll,
-            });
-            data.hover = None;
-            cx.notify();
-        }
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn read_lsp_source_lines(
-        &self,
-        target: &DefinitionTarget,
-    ) -> anyhow::Result<(
-        Vec<SharedString>,
-        Vec<Vec<(Range<usize>, syntax::Token)>>,
-    )> {
-        let data = self.active_data().context("no active item")?;
-        let handle = data.lsp.as_ref().context("LSP is not ready")?;
-        // Targets outside the workspace (dependency / stdlib sources) carry an
-        // absolute path; in-repo ones are relative to the LSP root.
-        let target_path = Path::new(&target.path);
-        let path = if target_path.is_absolute() {
-            target_path.to_path_buf()
-        } else {
-            handle.root.join(target_path)
-        };
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let lines = text
-            .lines()
-            .map(|line| SharedString::from(line.to_string()))
-            .collect();
-        // Tree-sitter highlighting keyed off the file's extension, guarded on
-        // total size (this runs synchronously when the view opens). Line-
-        // relative spans, index-aligned with `lines`.
-        let syntax = syntax::language_for_path(&target.path)
-            .filter(|_| text.len() <= MAX_SOURCE_HIGHLIGHT_BYTES)
-            .map(|lang| syntax::highlight_lines(lang, &text))
-            .unwrap_or_default();
-        Ok((lines, syntax))
-    }
-
-    fn current_nav_location(&self) -> Option<NavLocation> {
-        let data = self.active_data()?;
-        if let Some(source) = &data.source_view {
-            Some(NavLocation::Source {
-                target: source.target.clone(),
-            })
-        } else {
-            Some(NavLocation::Diff { row: data.cursor })
-        }
-    }
-
-    fn nav_back(&mut self, cx: &mut Context<Self>) {
-        self.navigate_history(true, cx);
-    }
-
-    fn nav_forward(&mut self, cx: &mut Context<Self>) {
-        self.navigate_history(false, cx);
-    }
-
-    fn navigate_history(&mut self, backward: bool, cx: &mut Context<Self>) {
-        let Some(current) = self.current_nav_location() else {
-            return;
-        };
-        let next = {
-            let Some(data) = self.active_data_mut() else {
-                return;
-            };
-            let stack = if backward {
-                &mut data.nav_back
-            } else {
-                &mut data.nav_forward
-            };
-            let Some(next) = stack.pop() else {
-                return;
-            };
-            if backward {
-                data.nav_forward.push(current);
-            } else {
-                data.nav_back.push(current);
-            }
-            next
-        };
-        self.restore_nav_location(next, cx);
-    }
-
-    fn restore_nav_location(&mut self, location: NavLocation, cx: &mut Context<Self>) {
-        match location {
-            NavLocation::Diff { row } => {
-                if let Some(data) = self.active_data_mut() {
-                    data.source_view = None;
-                }
-                self.jump(row, cx);
-            }
-            NavLocation::Source { target } => self.open_source_target(target, false, cx),
-        }
     }
 
     fn open_composer(
@@ -6240,545 +4997,6 @@ impl ReviewApp {
             .ok();
         })
         .detach();
-    }
-
-    /// The chat state of the item with `item_id`, if it is still open and
-    /// loaded. Chat tasks address items by id so streams land on the right
-    /// transcript regardless of switching/closing.
-    fn chat_mut(&mut self, item_id: u64) -> Option<&mut ChatState> {
-        match &mut self.items.iter_mut().find(|item| item.id == item_id)?.state {
-            ItemState::Ready(data) => Some(&mut data.chat),
-            _ => None,
-        }
-    }
-
-    /// `cmd-j`: toggle the chat panel; opening focuses the active item's
-    /// chat input.
-    fn toggle_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.chat_visible = !self.chat_visible;
-        if self.chat_visible {
-            // The chat input can't take focus under the palette (same as the
-            // cmd-t open input).
-            self.palette = None;
-            self.palette_gen += 1;
-            self.ensure_chat_input(window, cx);
-            if let Some(input) = self.active_data().and_then(|data| data.chat.input.clone()) {
-                input.update(cx, |state, cx| state.focus(window, cx));
-            }
-        } else {
-            window.focus(&self.focus_handle);
-        }
-        cx.notify();
-    }
-
-    /// Create the active item's chat InputState on first use (it needs a
-    /// Window, which ItemData construction doesn't have).
-    fn ensure_chat_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.active_data() {
-            Some(data) if data.chat.input.is_none() => {}
-            _ => return,
-        }
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .auto_grow(2, 6)
-                .placeholder("ask about this diff…")
-        });
-        // cmd-enter sends — same secondary-enter pattern as the comment
-        // composer (the newline it inserts first is trimmed on send).
-        let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-            if matches!(event, InputEvent::PressEnter { secondary: true }) {
-                this.send_chat(window, cx);
-            }
-        });
-        if let Some(data) = self.active_data_mut() {
-            data.chat.input = Some(input);
-            data.chat._input_sub = Some(sub);
-        }
-    }
-
-    /// Stop the active item's streaming run, if any. Returns whether there
-    /// was one (escape falls through to other meanings when there wasn't).
-    fn cancel_chat(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(data) = self.active_data_mut() else {
-            return false;
-        };
-        if !data.chat.in_flight {
-            return false;
-        }
-        // claude::chat kills the child; the pump's finish path then clears
-        // in_flight and marks the message stopped.
-        data.chat.cancel.store(true, Ordering::Relaxed);
-        cx.notify();
-        true
-    }
-
-    /// Send the chat input's text: append the user message (with a selection
-    /// marker when one is included), stream the reply on the background
-    /// executor, and batch deltas back at ~50ms into the transcript.
-    fn send_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.items.get_mut(self.active) else {
-            return;
-        };
-        let item_id = item.id;
-        let source = item.source.clone();
-        let ItemState::Ready(data) = &mut item.state else {
-            return;
-        };
-        if data.chat.in_flight {
-            return;
-        }
-        let Some(input) = data.chat.input.clone() else {
-            return;
-        };
-        let text = input.read(cx).value().trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-
-        let first = data.chat.session_id.is_none();
-        let sel_info = data
-            .selection
-            .and_then(|sel| selection_info(&sel, &data.rows, &data.file_rows, &data.diff));
-        let sel_block = sel_info.as_ref().map(|info| info.block());
-        // The transcript shows only the typed text; the context header,
-        // patch, and selection ride along invisibly in the real prompt.
-        let header = first.then(|| match (&source, &data.pr_meta) {
-            (Source::Pr(_), Some(meta)) => pr_chat_header(meta),
-            (Source::Pr(loc), None) => {
-                format!("PR under review: {}#{}", loc.repo_slug(), loc.number)
-            }
-            (Source::Local(src), _) => local_chat_header(src),
-        });
-        let prompt = chat_prompt(
-            header.as_deref().map(|h| (h, data.patch.as_str())),
-            sel_block.as_deref(),
-            &text,
-        );
-
-        let explore = match &data.chat.explore_dir {
-            Some(dir) => ExplorePlan::Dir(dir.clone()),
-            None => match &source {
-                Source::Local(src) => ExplorePlan::Dir(src.repo_root.clone()),
-                // PR with blob-upgraded contents: materialize the new-side
-                // files once, at session start.
-                Source::Pr(_) if first && !data.upgrades.is_empty() => {
-                    let files = data
-                        .upgrades
-                        .iter()
-                        .filter_map(|(&ix, upgrade)| {
-                            let path = data.diff.files.get(ix)?.new_path.clone()?;
-                            if upgrade.new_lines.is_empty() {
-                                return None;
-                            }
-                            let mut content = upgrade
-                                .new_lines
-                                .iter()
-                                .map(|line| line.as_ref())
-                                .collect::<Vec<&str>>()
-                                .join("\n");
-                            content.push('\n');
-                            Some((path, content))
-                        })
-                        .collect();
-                    ExplorePlan::Materialize {
-                        root: chat_scratch_root(item_id),
-                        files,
-                    }
-                }
-                Source::Pr(_) => ExplorePlan::None,
-            },
-        };
-
-        let session = data.chat.session_id.clone();
-        let system_prompt = first.then(|| CHAT_SYSTEM_PROMPT.to_string());
-        let cancel = Arc::new(AtomicBool::new(false));
-        data.chat.cancel = cancel.clone();
-        data.chat.in_flight = true;
-        data.chat.stick_to_bottom = true;
-        data.chat.messages.push(ChatMessage {
-            role: ChatRole::User,
-            text,
-            cost: None,
-            note: sel_info.as_ref().map(|info| info.note()),
-            error: false,
-        });
-        data.chat.messages.push(ChatMessage {
-            role: ChatRole::Assistant,
-            text: String::new(),
-            cost: None,
-            note: None,
-            error: false,
-        });
-        data.chat.scroll.scroll_to_bottom();
-        input.update(cx, |state, cx| state.set_value("", window, cx));
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let explore_dir = match explore {
-                ExplorePlan::None => None,
-                ExplorePlan::Dir(dir) => Some(dir),
-                ExplorePlan::Materialize { root, files } => {
-                    cx.background_spawn(async move { materialize_files(&root, &files) })
-                        .await
-                }
-            };
-            if let Some(dir) = explore_dir.clone() {
-                this.update(cx, |app, _| {
-                    if let Some(chat) = app.chat_mut(item_id) {
-                        chat.explore_dir = Some(dir);
-                    }
-                })
-                .ok();
-            }
-            let opts = claude::ChatOptions {
-                session,
-                system_prompt,
-                explore_dir,
-            };
-            let (tx, rx) = std::sync::mpsc::channel();
-            let cancel_bg = cancel.clone();
-            let task = cx.background_spawn(async move {
-                claude::chat(&prompt, &opts, &cancel_bg, |event| {
-                    let _ = tx.send(event);
-                })
-            });
-            // Throttled pump: every ~50ms drain whatever streamed in and
-            // apply it as one entity update — never one update per token.
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(50))
-                    .await;
-                let mut delta = String::new();
-                let mut terminals = Vec::new();
-                let mut disconnected = false;
-                loop {
-                    match rx.try_recv() {
-                        Ok(claude::ChatEvent::TextDelta(text)) => delta.push_str(&text),
-                        Ok(event) => terminals.push(event),
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            disconnected = true;
-                            break;
-                        }
-                    }
-                }
-                if !delta.is_empty() || !terminals.is_empty() {
-                    let alive = this
-                        .update(cx, |app, cx| {
-                            app.apply_chat_events(item_id, &delta, terminals, cx)
-                        })
-                        .is_ok();
-                    if !alive {
-                        // App gone: make sure the subprocess dies too.
-                        cancel.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                }
-                if disconnected {
-                    break;
-                }
-            }
-            let result = task.await;
-            this.update(cx, |app, cx| {
-                app.finish_chat(item_id, result.err().map(|err| format!("{err:#}")), cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Fold one pump batch into the transcript: text deltas append to the
-    /// trailing assistant message, Completed installs the authoritative text
-    /// + cost + session id, Failed marks the message as an error.
-    fn apply_chat_events(
-        &mut self,
-        item_id: u64,
-        delta: &str,
-        terminals: Vec<claude::ChatEvent>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(chat) = self.chat_mut(item_id) else {
-            return;
-        };
-        if !chat.in_flight {
-            return;
-        }
-        if !delta.is_empty() {
-            if let Some(msg) = chat
-                .messages
-                .last_mut()
-                .filter(|msg| msg.role == ChatRole::Assistant)
-            {
-                msg.text.push_str(delta);
-            }
-        }
-        for event in terminals {
-            let msg = chat
-                .messages
-                .last_mut()
-                .filter(|msg| msg.role == ChatRole::Assistant);
-            match event {
-                claude::ChatEvent::Completed {
-                    session_id,
-                    cost_usd,
-                    is_error,
-                    text,
-                } => {
-                    if !session_id.is_empty() {
-                        chat.session_id = Some(session_id);
-                    }
-                    chat.in_flight = false;
-                    if let Some(msg) = msg {
-                        if !text.is_empty() {
-                            msg.text = text;
-                        }
-                        msg.cost = Some(cost_usd);
-                        msg.error = is_error;
-                    }
-                }
-                claude::ChatEvent::Failed(reason) => {
-                    chat.in_flight = false;
-                    if let Some(msg) = msg {
-                        if !msg.text.is_empty() {
-                            msg.text.push_str("\n\n");
-                        }
-                        msg.text.push_str("chat failed: ");
-                        msg.text.push_str(&reason);
-                        msg.error = true;
-                    }
-                }
-                claude::ChatEvent::TextDelta(_) => {}
-            }
-        }
-        if chat.stick_to_bottom {
-            chat.scroll.scroll_to_bottom();
-        }
-        cx.notify();
-    }
-
-    /// Close out a run that ended without a terminal event: user-cancelled,
-    /// or `claude` couldn't be spawned at all.
-    fn finish_chat(&mut self, item_id: u64, spawn_error: Option<String>, cx: &mut Context<Self>) {
-        let Some(chat) = self.chat_mut(item_id) else {
-            return;
-        };
-        if !chat.in_flight {
-            return;
-        }
-        chat.in_flight = false;
-        if let Some(msg) = chat
-            .messages
-            .last_mut()
-            .filter(|msg| msg.role == ChatRole::Assistant)
-        {
-            match spawn_error {
-                Some(err) => {
-                    msg.text = err;
-                    msg.error = true;
-                }
-                None => {
-                    if !msg.text.is_empty() {
-                        msg.text.push(' ');
-                    }
-                    msg.text.push_str("— stopped");
-                }
-            }
-        }
-        cx.notify();
-    }
-
-    /// The right-side chat panel: header (+ Stop while streaming), the
-    /// scrollable transcript, and the multi-line input. Streaming behavior
-    /// (auto-scroll, live deltas, cancel) is verified manually.
-    fn render_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        self.ensure_chat_input(window, cx);
-        let panel = div()
-            .w(px(CHAT_WIDTH))
-            .flex_shrink_0()
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(theme::mantle())
-            .border_l_1()
-            .border_color(theme::surface0())
-            .text_size(px(13.))
-            // The chat input propagates Escape when it has nothing of its
-            // own to dismiss: stop a streaming run, else return to the diff.
-            .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                if !this.cancel_chat(cx) {
-                    window.focus(&this.focus_handle);
-                }
-            }));
-        let Some(data) = self.active_data() else {
-            return panel
-                .child(centered_message(
-                    "open an item to chat about it".into(),
-                    theme::overlay0(),
-                ))
-                .into_any_element();
-        };
-        let chat = &data.chat;
-
-        let mut header = div()
-            .h(px(34.))
-            .flex_shrink_0()
-            .px_3()
-            .flex()
-            .items_center()
-            .gap_2()
-            .border_b_1()
-            .border_color(theme::surface0())
-            .child(
-                div()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(theme::text())
-                    .child(SharedString::from("chat")),
-            )
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("claude")),
-            )
-            .child(div().flex_1());
-        if chat.in_flight {
-            header = header.child(Button::new("chat-stop").label("Stop").small().on_click(
-                cx.listener(|this, _, _, cx| {
-                    this.cancel_chat(cx);
-                }),
-            ));
-        }
-
-        let mut column = div().w_full().flex().flex_col().gap_3().p_3();
-        if chat.messages.is_empty() {
-            column = column.child(
-                div()
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from(
-                    "Ask Claude about this diff. Select text in the diff to include it. ⌘⏎ sends.",
-                )),
-            );
-        }
-        let last = chat.messages.len().saturating_sub(1);
-        for (ix, msg) in chat.messages.iter().enumerate() {
-            match msg.role {
-                ChatRole::User => {
-                    let mut wrap = div().w_full().flex().flex_col().items_end().gap_1().child(
-                        div()
-                            .max_w(px(CHAT_WIDTH - 64.))
-                            .bg(theme::surface0())
-                            .rounded_md()
-                            .px_2()
-                            .py_1()
-                            .text_color(theme::text())
-                            .child(SharedString::from(msg.text.clone())),
-                    );
-                    if let Some(note) = &msg.note {
-                        wrap = wrap.child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(theme::overlay0())
-                                .truncate()
-                                .child(SharedString::from(note.clone())),
-                        );
-                    }
-                    column = column.child(wrap);
-                }
-                ChatRole::Assistant => {
-                    let mut text = msg.text.clone();
-                    if chat.in_flight && ix == last {
-                        text.push_str(" ▌");
-                    }
-                    let mut wrap = div().w_full().min_w_0().flex().flex_col().gap_1().child(
-                        div()
-                            .text_color(if msg.error {
-                                theme::red()
-                            } else {
-                                theme::text()
-                            })
-                            .child(SharedString::from(text)),
-                    );
-                    if let Some(cost) = msg.cost {
-                        wrap = wrap.child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(theme::overlay0())
-                                .child(SharedString::from(format!("${cost:.4}"))),
-                        );
-                    }
-                    column = column.child(wrap);
-                }
-            }
-        }
-        let messages = div()
-            .id("chat-messages")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&chat.scroll)
-            // Stick-to-bottom the way editors do it: scrolling up unsticks,
-            // scrolling back to (near) the bottom re-sticks.
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, _| {
-                let Some(data) = this.active_data_mut() else {
-                    return;
-                };
-                let chat = &mut data.chat;
-                let dy = f32::from(event.delta.pixel_delta(px(row_height())).y);
-                if dy > 0. {
-                    chat.stick_to_bottom = false;
-                } else {
-                    let scrolled = -f32::from(chat.scroll.offset().y);
-                    let max = f32::from(chat.scroll.max_offset().height);
-                    chat.stick_to_bottom = scrolled >= max - 8.;
-                }
-            }))
-            .child(column);
-
-        let sel_hint = data
-            .selection
-            .and_then(|sel| selection_info(&sel, &data.rows, &data.file_rows, &data.diff))
-            .map(|info| {
-                format!(
-                    "will include selection {}:{}-{}",
-                    info.path, info.lo, info.hi
-                )
-            });
-        let mut input_area = div()
-            .p_2()
-            .flex_shrink_0()
-            .border_t_1()
-            .border_color(theme::surface0())
-            .flex()
-            .flex_col()
-            .gap_1();
-        if let Some(hint) = sel_hint {
-            input_area = input_area.child(
-                div()
-                    .text_size(px(10.))
-                    .text_color(theme::blue())
-                    .truncate()
-                    .child(SharedString::from(hint)),
-            );
-        }
-        if let Some(input) = &chat.input {
-            input_area = input_area.child(Input::new(input));
-        }
-        input_area = input_area.child(
-            div()
-                .text_size(px(10.))
-                .text_color(theme::overlay0())
-                .child(SharedString::from(if chat.in_flight {
-                    "streaming… esc to stop"
-                } else {
-                    "⌘⏎ to send"
-                })),
-        );
-
-        panel
-            .child(header)
-            .child(messages)
-            .child(input_area)
-            .into_any_element()
     }
 
     /// The hover "+" affordance: a small blue box at the far left of the
@@ -7231,7 +5449,6 @@ impl ReviewApp {
         TitleBar::new()
             .text_size(px(13.))
             .child(content)
-            .when_some(self.render_lsp_status(cx), |bar, status| bar.child(status))
             .when_some(note, |bar, note| {
                 bar.child(
                     div()
@@ -7350,86 +5567,6 @@ impl ReviewApp {
                     )
                 });
             list = list.child(entry);
-        }
-
-        // --- cached PRs (past reviews with an on-disk worktree) ---
-        // Skip any that are already open above, so each PR shows once.
-        let open_pr_keys: Vec<(String, String, u64)> = self
-            .items
-            .iter()
-            .filter_map(|item| match &item.source {
-                Source::Pr(l) => Some((l.owner.clone(), l.repo.clone(), l.number)),
-                Source::Local(_) => None,
-            })
-            .collect();
-        let cached: Vec<(usize, SharedString)> = self
-            .cached_prs
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| {
-                !open_pr_keys.iter().any(|(o, r, n)| {
-                    *o == c.loc.owner && *r == c.loc.repo && *n == c.loc.number
-                })
-            })
-            .map(|(ix, c)| (ix, SharedString::from(format!("{}#{}", c.loc.repo_slug(), c.loc.number))))
-            .collect();
-        if !cached.is_empty() {
-            list = list.child(
-                div()
-                    .mx_1()
-                    .mt_2()
-                    .px_2()
-                    .pb_1()
-                    .text_size(px(10.))
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("CACHED PRS")),
-            );
-            for (ix, label) in cached {
-                let entry = div()
-                    .id(("cached-pr", ix))
-                    .group("cached-pr")
-                    .mx_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_cached_pr(ix, window, cx)
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(12.))
-                                    .text_color(theme::subtext())
-                                    .child(label),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .opacity(0.)
-                                    .group_hover("cached-pr", |style| style.opacity(1.))
-                                    .child(
-                                        Button::new(("delete-cached", ix))
-                                            .icon(IconName::Close)
-                                            .ghost()
-                                            .xsmall()
-                                            .tooltip("Delete cached worktree")
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.delete_cached_pr(ix, cx)
-                                            })),
-                                    ),
-                            ),
-                    );
-                list = list.child(entry);
-            }
         }
 
         // --- file tree for the active item ---
@@ -7848,227 +5985,6 @@ impl ReviewApp {
             .into_any_element()
     }
 
-    fn render_lsp_status(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let data = self.active_data()?;
-        let backend = data.lsp_backend;
-        // The chip always shows the active backend (so it reads as a control);
-        // a status suffix reflects loading/error, and the color tracks it.
-        let (suffix, color) = if let Some(err) = &data.lsp_error {
-            (format!(" · error: {err}"), theme::red())
-        } else if data.lsp_loading {
-            let percentage = data
-                .lsp_progress
-                .as_ref()
-                .and_then(|progress| progress.lock().ok().map(|progress| progress.clone()))
-                .and_then(|progress| progress.percentage);
-            (format!(" · {}", lsp_loading_label(percentage)), theme::blue())
-        } else {
-            (String::new(), theme::overlay0())
-        };
-        let text = SharedString::from(format!("LSP: {}{suffix}", backend.label()));
-        let other = backend.toggled().label();
-        Some(
-            div()
-                .id("lsp-backend-toggle")
-                .flex_shrink_0()
-                // Keep the chip off the window's right edge (it's the rightmost
-                // titlebar element when there's no refresh note).
-                .mr_2()
-                .flex()
-                .items_center()
-                .gap_1()
-                .pl_2()
-                .pr_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(Hsla::from(color).opacity(0.45))
-                .bg(Hsla::from(color).opacity(0.1))
-                .text_size(px(11.))
-                .text_color(color)
-                .cursor_pointer()
-                // Stronger border + fill on hover so it reads as a button.
-                .hover(|style| {
-                    style
-                        .bg(Hsla::from(color).opacity(0.2))
-                        .border_color(Hsla::from(color).opacity(0.8))
-                })
-                .tooltip(move |window, cx| {
-                    Tooltip::new(format!("Switch LSP to {other}")).build(window, cx)
-                })
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_lsp_backend(cx)))
-                .child(text)
-                // The caret signals it's a switchable control (like a dropdown);
-                // the Icon inherits the chip's text color.
-                .child(Icon::new(IconName::ChevronDown).xsmall())
-                .into_any_element(),
-        )
-    }
-
-    fn render_hover(&self) -> Option<gpui::AnyElement> {
-        let data = self.active_data()?;
-        let hover = data.hover.as_ref()?;
-        let definition_hint = if cfg!(target_os = "macos") {
-            "Cmd+click to go to definition"
-        } else {
-            "Ctrl+click to go to definition"
-        };
-        let text = if hover.loading {
-            let percentage = data
-                .lsp_progress
-                .as_ref()
-                .and_then(|progress| progress.lock().ok()?.percentage);
-            SharedString::from(format!("LSP: {}", lsp_loading_label(percentage)))
-        } else {
-            SharedString::from(hover.result.as_ref()?.text.clone())
-        };
-        // Anchor just below-right of the cursor; `anchored().snap_to_window`
-        // measures the card and slides it back from the window edges so it never
-        // spills off-screen and clips its own content. `deferred` paints it above
-        // everything and outside any ancestor's clip rect.
-        Some(
-            deferred(
-                anchored()
-                    .snap_to_window_with_margin(px(8.))
-                    .position(hover.mouse)
-                    .offset(point(px(14.), px(18.)))
-                    .child(
-                        div()
-                            .max_w(px(520.))
-                            .max_h(px(260.))
-                            .overflow_hidden()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(theme::surface0())
-                            .bg(theme::mantle())
-                            .shadow_lg()
-                            .flex()
-                            .flex_col()
-                            .font_family(MONO)
-                            .text_size(px(12.))
-                            .line_height(px(18.))
-                            .text_color(theme::text())
-                            // The body clips within the card's max height; the
-                            // hint stays pinned so it's never pushed off the
-                            // bottom by a long rust-analyzer hover.
-                            .child(div().p_3().min_h_0().overflow_hidden().child(text))
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .border_t_1()
-                                    .border_color(theme::surface0())
-                                    .px_3()
-                                    .py_1()
-                                    .text_size(px(10.))
-                                    .text_color(theme::overlay0())
-                                    .child(definition_hint),
-                            ),
-                    ),
-            )
-            .into_any_element(),
-        )
-    }
-
-    fn render_source_view(
-        &self,
-        source: &SourceViewState,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let lines = source.lines.clone();
-        let syntax = source.syntax.clone();
-        let target = source.target.clone();
-        let can_back = self
-            .active_data()
-            .is_some_and(|data| !data.nav_back.is_empty());
-        let can_forward = self
-            .active_data()
-            .is_some_and(|data| !data.nav_forward.is_empty());
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .font_family(MONO)
-            .text_size(px(text_size()))
-            .line_height(px(row_height()))
-            .child(
-                div()
-                    .h(px(30.))
-                    .flex_shrink_0()
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .bg(theme::mantle())
-                    .border_b_1()
-                    .border_color(theme::surface0())
-                    .text_color(theme::subtext())
-                    .gap_1()
-                    .child(
-                        Button::new("source-nav-back")
-                            .icon(IconName::ArrowLeft)
-                            .ghost()
-                            .xsmall()
-                            .disabled(!can_back)
-                            .tooltip_with_action("Back", &NavBack, Some("ReviewApp"))
-                            .on_click(cx.listener(|this, _, _, cx| this.nav_back(cx))),
-                    )
-                    .child(
-                        Button::new("source-nav-forward")
-                            .icon(IconName::ArrowRight)
-                            .ghost()
-                            .xsmall()
-                            .disabled(!can_forward)
-                            .tooltip_with_action("Forward", &NavForward, Some("ReviewApp"))
-                            .on_click(cx.listener(|this, _, _, cx| this.nav_forward(cx))),
-                    )
-                    .child(div().min_w_0().truncate().child(SharedString::from(format!(
-                        "{}:{}",
-                        target.path,
-                        target.start_line + 1
-                    )))),
-            )
-            .child(
-                uniform_list("source", lines.len(), move |range, _window, _cx| {
-                    range
-                        .map(|ix| {
-                            let mut row = div().h(px(row_height())).flex().items_center();
-                            if ix as u32 == target.start_line {
-                                row = row.bg(Hsla::from(theme::blue()).opacity(0.16));
-                            }
-                            row.child(
-                                div()
-                                    .w(px(64.))
-                                    .flex_shrink_0()
-                                    .pr_2()
-                                    .text_color(theme::overlay0())
-                                    .flex()
-                                    .justify_end()
-                                    .child(SharedString::from((ix + 1).to_string())),
-                            )
-                            .child(
-                                div()
-                                    .whitespace_nowrap()
-                                    .text_color(theme::text())
-                                    .child({
-                                        // Long lines stay plain, like the diff.
-                                        let spans = if lines[ix].len() > MAX_SYNTAX_LINE_BYTES {
-                                            &[][..]
-                                        } else {
-                                            syntax.get(ix).map(Vec::as_slice).unwrap_or(&[])
-                                        };
-                                        line_content(&lines[ix], spans, &[], None, None)
-                                    }),
-                            )
-                            .into_any_element()
-                        })
-                        .collect()
-                })
-                .track_scroll(source.scroll.clone())
-                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-                .flex_1()
-                .min_h_0(),
-            )
-            .into_any_element()
-    }
-
     fn render_footer(&self) -> impl IntoElement {
         let hint = |keys: &[&str], label: &'static str| {
             let mut hint = div().flex().items_center().gap_1();
@@ -8102,7 +6018,6 @@ impl ReviewApp {
             .child(hint(&["cmd-k"], "palette"))
             .child(hint(&["cmd-t"], "open"))
             .child(hint(&["cmd-b"], "sidebar"))
-            .child(hint(&["cmd-j"], "chat"))
             .child(hint(&["r"], "refresh"))
             .child(hint(&["cmd-enter"], "review"))
     }
@@ -8129,9 +6044,6 @@ impl Render for ReviewApp {
                             .child(SharedString::from(msg.clone())),
                     )
                     .into_any_element(),
-                ItemState::Ready(data) if data.source_view.is_some() => {
-                    self.render_source_view(data.source_view.as_ref().unwrap(), cx)
-                }
                 ItemState::Ready(data) => div()
                     .size_full()
                     .relative()
@@ -8150,13 +6062,6 @@ impl Render for ReviewApp {
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             if this.palette.is_some() {
                                 return;
-                            }
-                            if event.modifiers.secondary() {
-                                if let Some(target) = this.symbol_target_at(event.position, window)
-                                {
-                                    this.request_definition(target, cx);
-                                    return;
-                                }
                             }
                             window.focus(&this.focus_handle);
                             let char_width = this.char_width(window);
@@ -8254,7 +6159,6 @@ impl Render for ReviewApp {
                     // Hover "+" (add comment) overlay, absolutely positioned
                     // at the hovered row's y like the minimap viewport.
                     .children(self.render_plus(cx))
-                    .when_some(self.render_hover(), |pane, hover| pane.child(hover))
                     .into_any_element(),
             },
         };
@@ -8326,10 +6230,6 @@ impl Render for ReviewApp {
                     this.open_review(window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &ToggleChat, window, cx| this.toggle_chat(window, cx)))
-            .on_action(cx.listener(|this, _: &GoToDefinition, _, cx| this.go_to_last_symbol(cx)))
-            .on_action(cx.listener(|this, _: &NavBack, _, cx| this.nav_back(cx)))
-            .on_action(cx.listener(|this, _: &NavForward, _, cx| this.nav_forward(cx)))
             // Hover tracking for the "+" affordance lives on the root so the
             // affordance clears when the pointer leaves the diff list.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
@@ -8340,27 +6240,6 @@ impl Render for ReviewApp {
                 if this.hover_plus != hover {
                     this.hover_plus = hover;
                     cx.notify();
-                }
-                let symbol = this.symbol_target_at(event.position, window);
-                let existing = this
-                    .active_data()
-                    .and_then(|data| data.last_symbol_target.clone());
-                match (symbol, existing) {
-                    (Some(target), Some(existing)) if target == existing => {}
-                    (Some(target), _) => this.request_hover(target, event.position, cx),
-                    (None, Some(_)) => {
-                        if let Some(data) = this.active_data_mut() {
-                            data.hover_gen += 1;
-                            lsp_trace(format_args!("ui hover cleared gen={}", data.hover_gen));
-                            if let Some(cancel) = data.hover_cancel.take() {
-                                cancel.store(true, Ordering::Release);
-                            }
-                            data.last_symbol_target = None;
-                            data.hover = None;
-                            cx.notify();
-                        }
-                    }
-                    (None, None) => {}
                 }
             }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
@@ -8373,20 +6252,6 @@ impl Render for ReviewApp {
                 if this.composer.is_some() {
                     this.close_composer(window, cx);
                     return;
-                }
-                // Next in line: a streaming chat run — escape stops it.
-                if this.cancel_chat(cx) {
-                    return;
-                }
-                if let Some(data) = this.active_data_mut() {
-                    if data.hover.take().is_some() {
-                        cx.notify();
-                        return;
-                    }
-                    if data.source_view.take().is_some() {
-                        cx.notify();
-                        return;
-                    }
                 }
                 if let Some(data) = this.active_data_mut() {
                     if data.selection.take().is_some() {
@@ -8457,14 +6322,7 @@ impl Render for ReviewApp {
                             .key_context("ReviewApp")
                             .track_focus(&self.focus_handle)
                             .child(pane),
-                    )
-                    // Chat panel: a sibling of the diff pane, outside the
-                    // "ReviewApp" key context so typing in its input never
-                    // triggers diff keys — the same isolation the palette
-                    // and composer inputs rely on.
-                    .when(self.chat_visible, |main| {
-                        main.child(self.render_chat(window, cx))
-                    }),
+                    ),
             )
             .child(self.render_footer())
             // Root-level so the composer's input escapes the "ReviewApp" key
@@ -8485,39 +6343,6 @@ impl Render for ReviewApp {
 mod tests {
     use super::*;
     use diff_core::{FileDiff, Hunk};
-
-    #[test]
-    fn cached_pr_dir_names_parse() {
-        assert_eq!(
-            cached_pr_number("atuinsh__atuin__pr3592__5467566b7eb4"),
-            Some(3592)
-        );
-        assert_eq!(
-            cached_pr_number("oxidecomputer__propolis__pr966__cb6365959879"),
-            Some(966)
-        );
-        // Repos/owners with underscores don't confuse the `__pr` split.
-        assert_eq!(cached_pr_number("a_b__c_d__pr7__deadbeef"), Some(7));
-        assert_eq!(cached_pr_number("no-number-here"), None);
-    }
-
-    #[test]
-    fn github_remote_urls_parse_to_owner_repo() {
-        let expect = Some(("atuinsh".to_string(), "atuin".to_string()));
-        assert_eq!(
-            parse_github_owner_repo("https://github.com/atuinsh/atuin.git"),
-            expect
-        );
-        assert_eq!(
-            parse_github_owner_repo("git@github.com:atuinsh/atuin.git"),
-            expect
-        );
-        assert_eq!(
-            parse_github_owner_repo("https://github.com/atuinsh/atuin"),
-            expect
-        );
-        assert_eq!(parse_github_owner_repo("https://gitlab.com/a/b.git"), None);
-    }
 
     fn mention(login: &str, name: Option<&str>) -> gh::Mention {
         gh::Mention {
@@ -8559,18 +6384,6 @@ mod tests {
         // Case-insensitive, and no match returns None.
         assert_eq!(mention_rank(&octocat, "OCT"), Some(0));
         assert_eq!(mention_rank(&octocat, "zzz"), None);
-    }
-
-    #[test]
-    fn identifier_hover_hit_snaps_to_the_token_start() {
-        let text = "    if cfg.font.mono_family.is_empty() {";
-        assert_eq!(identifier_start_at(text, 7), Some(7));
-        assert_eq!(identifier_start_at(text, 9), Some(7));
-        assert_eq!(identifier_start_at(text, 10), Some(7));
-        assert_eq!(identifier_start_at(text, 11), Some(11));
-        assert_eq!(identifier_start_at(text, 14), Some(11));
-        assert_eq!(identifier_start_at(text, 15), Some(11));
-        assert_eq!(identifier_start_at(text, 6), None);
     }
 
     fn ctx(old_no: u32, new_no: u32, text: &str) -> DiffRow {
@@ -10327,87 +8140,6 @@ mod tests {
         assert_eq!(nth_noncomment_row(&plain, 999), plain.len() - 1);
     }
 
-    // --- Chat with Claude ----------------------------------------------------
-
-    #[test]
-    fn chat_prompt_first_message_carries_header_patch_and_selection() {
-        let prompt = chat_prompt(
-            Some(("HEADER", "diff --git a/x b/x\n+new line\n")),
-            Some("Selected text (x:1-1, RIGHT (new) side):\n```\nnew line\n```\n"),
-            "why?",
-        );
-        assert!(prompt.starts_with("HEADER\n\nThe unified diff under review:\n```diff\n"));
-        assert!(prompt.contains("+new line\n```\n"));
-        assert!(!prompt.contains("truncated"));
-        assert!(prompt.contains("Selected text (x:1-1"));
-        assert!(prompt.ends_with("why?"));
-        // Later turns: no context block, just selection (if any) + question.
-        let followup = chat_prompt(None, None, "and this?");
-        assert_eq!(followup, "and this?");
-    }
-
-    #[test]
-    fn chat_prompt_truncates_patch_at_cap_on_char_boundary() {
-        // 'a' then 2-byte 'é's: char boundaries sit at odd offsets, so the
-        // even cap falls mid-char and must be shaved back to a boundary.
-        let patch = format!("a{}", "é".repeat(MAX_CHAT_PATCH_BYTES));
-        let prompt = chat_prompt(Some(("H", &patch)), None, "q");
-        assert!(prompt.contains("(patch truncated at 200KB"));
-        let (cut, truncated) = truncate_str(&patch, MAX_CHAT_PATCH_BYTES);
-        assert!(truncated);
-        assert_eq!(cut.len(), MAX_CHAT_PATCH_BYTES - 1); // boundary shaved one byte
-        assert!(cut.is_char_boundary(cut.len()));
-        let (all, truncated) = truncate_str("abc", 10);
-        assert_eq!((all, truncated), ("abc", false));
-    }
-
-    #[test]
-    fn chat_headers_describe_the_item() {
-        let meta = gh::PrMeta {
-            number: 7,
-            title: "Fix the frobnicator".into(),
-            author: gh::Author {
-                login: "alice".into(),
-            },
-            state: "OPEN".into(),
-            url: "https://github.com/o/r/pull/7".into(),
-            body: "It was broken.\n".into(),
-            base_ref_name: "main".into(),
-            head_ref_name: "fix".into(),
-            base_ref_oid: String::new(),
-            head_ref_oid: String::new(),
-            additions: 1,
-            deletions: 2,
-            changed_files: 3,
-            review_decision: String::new(),
-        };
-        let header = pr_chat_header(&meta);
-        assert!(header.contains("\"Fix the frobnicator\""));
-        assert!(header.contains("https://github.com/o/r/pull/7"));
-        assert!(header.contains("alice"));
-        assert!(header.contains("OPEN"));
-        assert!(header.contains("main ← fix"));
-        assert!(header.contains("It was broken."));
-        // Empty body → explicit placeholder, so the model doesn't guess.
-        let meta = gh::PrMeta {
-            body: "  \n".into(),
-            ..meta
-        };
-        assert!(pr_chat_header(&meta).contains("(no description)"));
-
-        let src = git::LocalSource {
-            repo_root: "/tmp/myrepo".into(),
-            branch: "feature".into(),
-            base_ref: None,
-            base_label: "origin/main".into(),
-            base_oid: None,
-        };
-        let header = local_chat_header(&src);
-        assert!(header.contains("myrepo"));
-        assert!(header.contains("feature"));
-        assert!(header.contains("origin/main"));
-    }
-
     #[test]
     fn local_review_comments_index_like_review_threads() {
         let mut review = LocalReview::default();
@@ -10470,88 +8202,6 @@ mod tests {
             local_review_prompt(&src, &review),
             "Diff: upstream/main ← feature. Locations are GitHub diff-style: path:Rline for right/new, path:Lline for left/old.\n\nsrc/lib.rs:R7\nwhy remove this?\nplease explain\nReply 1 (you)\nbecause this path handles nil\n=====\nsrc/main.rs:L12\nsecond thread"
         );
-    }
-
-    #[test]
-    fn selection_info_resolves_anchor_and_text() {
-        let (rows, file_rows, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            None,
-            true,
-                COMMENT_WRAP_CHARS,
-        );
-        // rows: FileHeader, HunkHeader, ctx(1,1 "ctx"), rem(2 "old1"),
-        // rem(3 "old2"), add(2 "new1"), …
-        let unified = sel(SelSide::Unified, (2, 0), (5, 4));
-        let info = selection_info(&unified, &rows, &file_rows, &sample_diff()).unwrap();
-        assert_eq!(info.path, "a.rs");
-        assert_eq!(info.side, "unified");
-        // ctx new_no 1 .. rem old2 old_no 3 / add new1 new_no 2 → lo 1, hi 3.
-        assert_eq!((info.lo, info.hi), (1, 3));
-        assert_eq!(info.text, "ctx\nold1\nold2\nnew1");
-        assert!(info.block().contains("a.rs:1-3, unified side"));
-        assert_eq!(info.note(), "› included selection: a.rs:1-3");
-
-        // Split selection locked to the right side.
-        let (rows, file_rows, _) =
-            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
-        let right = sel(SelSide::Right, (3, 0), (4, 4));
-        let info = selection_info(&right, &rows, &file_rows, &sample_diff()).unwrap();
-        assert_eq!(info.side, "RIGHT (new)");
-        assert_eq!((info.lo, info.hi), (2, 3));
-        assert_eq!(info.text, "new1\nnew2");
-
-        // A selection with no text (headers only) yields nothing.
-        let empty = sel(SelSide::Unified, (0, 0), (0, 5));
-        assert_eq!(
-            selection_info(&empty, &rows, &file_rows, &sample_diff()),
-            None
-        );
-    }
-
-    #[test]
-    fn scratch_paths_stay_inside_the_root() {
-        let root = Path::new("/tmp/lgtm-chat-1-2");
-        assert_eq!(
-            scratch_path(root, "src/main.rs"),
-            Some(root.join("src/main.rs"))
-        );
-        assert_eq!(
-            scratch_path(root, "deep/a/b/c.txt"),
-            Some(root.join("deep/a/b/c.txt"))
-        );
-        // Escapes and non-normal components are refused.
-        assert_eq!(scratch_path(root, "../evil"), None);
-        assert_eq!(scratch_path(root, "a/../../evil"), None);
-        assert_eq!(scratch_path(root, "/abs/path"), None);
-        assert_eq!(scratch_path(root, "./x"), None);
-        assert_eq!(scratch_path(root, ""), None);
-    }
-
-    #[test]
-    fn materialize_writes_files_and_skips_oversized_and_unsafe() {
-        let root = std::env::temp_dir().join(format!(
-            "lgtm-chat-test-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let files = vec![
-            ("src/lib.rs".to_string(), "fn a() {}\n".to_string()),
-            ("../escape.rs".to_string(), "nope\n".to_string()),
-            ("big.rs".to_string(), "x".repeat(MAX_EXPLORE_FILE_BYTES + 1)),
-        ];
-        let dir = materialize_files(&root, &files).unwrap();
-        assert_eq!(dir, root);
-        assert_eq!(
-            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
-            "fn a() {}\n"
-        );
-        assert!(!root.join("big.rs").exists());
-        assert!(!root.parent().unwrap().join("escape.rs").exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

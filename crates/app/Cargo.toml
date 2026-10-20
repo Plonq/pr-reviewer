@@ -1,16 +1,14 @@
 [package]
-name = "lgtm"
+name = "gander"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "lgtm"
+name = "gander"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-brokk-bifrost = "0.8.0"
-claude = { path = "../claude" }
 diff-core = { path = "../diff-core" }
 gh = { path = "../gh" }
 git = { path = "../git" }

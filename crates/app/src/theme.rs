@@ -1,50 +1,120 @@
-//! Catppuccin Mocha, hardcoded for now. Helix-theme loading comes later.
+//! Catppuccin palette, following the system appearance: Mocha (dark) and
+//! Latte (light). The active mode is a process-global atomic set at startup
+//! and from the window's appearance-change observer, so every color helper
+//! stays a free function.
 
-use gpui::{rgb, rgba, App, FontStyle, HighlightStyle, Hsla, Rgba};
+use gpui::{rgb, rgba, App, FontStyle, HighlightStyle, Hsla, Rgba, Window};
 use gpui_component::{Theme, ThemeMode};
+use std::sync::atomic::{AtomicBool, Ordering};
 use syntax::Token;
 
-pub fn base() -> Rgba {
-    rgb(0x1e1e2e)
-}
-pub fn mantle() -> Rgba {
-    rgb(0x181825)
-}
-pub fn crust() -> Rgba {
-    rgb(0x11111b)
-}
-pub fn surface0() -> Rgba {
-    rgb(0x313244)
-}
-pub fn text() -> Rgba {
-    rgb(0xcdd6f4)
-}
-pub fn subtext() -> Rgba {
-    rgb(0xa6adc8)
-}
-pub fn overlay0() -> Rgba {
-    rgb(0x6c7086)
-}
-pub fn green() -> Rgba {
-    rgb(0xa6e3a1)
-}
-pub fn red() -> Rgba {
-    rgb(0xf38ba8)
-}
-pub fn blue() -> Rgba {
-    rgb(0x89b4fa)
-}
-pub fn mauve() -> Rgba {
-    rgb(0xcba6f7)
-}
-pub fn peach() -> Rgba {
-    rgb(0xfab387)
+/// The active appearance mode: true = Latte (light), false = Mocha (dark).
+/// Reads are cheap (relaxed atomic load), so helpers branch on it freely.
+static LIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Whether the light (Latte) palette is currently active.
+pub fn is_light() -> bool {
+    LIGHT.load(Ordering::Relaxed)
 }
 
-/// Override gpui-component's theme (dark mode, default shadcn palette) with
-/// Catppuccin Mocha. Call after `gpui_component::init`.
-pub fn apply_ui_theme(cx: &mut App) {
-    Theme::change(ThemeMode::Dark, None, cx);
+pub fn base() -> Rgba {
+    if is_light() {
+        rgb(0xeff1f5)
+    } else {
+        rgb(0x1e1e2e)
+    }
+}
+pub fn mantle() -> Rgba {
+    if is_light() {
+        rgb(0xe6e9ef)
+    } else {
+        rgb(0x181825)
+    }
+}
+pub fn crust() -> Rgba {
+    if is_light() {
+        rgb(0xdce0f8)
+    } else {
+        rgb(0x11111b)
+    }
+}
+pub fn surface0() -> Rgba {
+    if is_light() {
+        rgb(0xccd0da)
+    } else {
+        rgb(0x313244)
+    }
+}
+pub fn text() -> Rgba {
+    if is_light() {
+        rgb(0x4c4f69)
+    } else {
+        rgb(0xcdd6f4)
+    }
+}
+pub fn subtext() -> Rgba {
+    if is_light() {
+        rgb(0x6c6f85)
+    } else {
+        rgb(0xa6adc8)
+    }
+}
+pub fn overlay0() -> Rgba {
+    if is_light() {
+        rgb(0x9ca0b0)
+    } else {
+        rgb(0x6c7086)
+    }
+}
+pub fn green() -> Rgba {
+    if is_light() {
+        rgb(0x40a02b)
+    } else {
+        rgb(0xa6e3a1)
+    }
+}
+pub fn red() -> Rgba {
+    if is_light() {
+        rgb(0xd20f39)
+    } else {
+        rgb(0xf38ba8)
+    }
+}
+pub fn blue() -> Rgba {
+    if is_light() {
+        rgb(0x1e66f5)
+    } else {
+        rgb(0x89b4fa)
+    }
+}
+pub fn mauve() -> Rgba {
+    if is_light() {
+        rgb(0x8839ef)
+    } else {
+        rgb(0xcba6f7)
+    }
+}
+pub fn peach() -> Rgba {
+    if is_light() {
+        rgb(0xfe640b)
+    } else {
+        rgb(0xfab387)
+    }
+}
+
+/// Follow the system appearance: set gpui-component's `Theme` mode and swap
+/// the Catppuccin palette (Mocha ↔ Latte). Pass the window when one exists
+/// so component repaints are flushed immediately; call again from the
+/// window's appearance-change observer to track live switches. Call after
+/// `gpui_component::init`.
+pub fn apply_ui_theme(window: Option<&mut Window>, cx: &mut App) {
+    let appearance = window
+        .as_ref()
+        .map(|window| window.appearance())
+        .unwrap_or_else(|| cx.window_appearance());
+    let mode = ThemeMode::from(appearance);
+    LIGHT.store(!mode.is_dark(), Ordering::Relaxed);
+    Theme::change(mode, window, cx);
 
     let base: Hsla = base().into();
     let mantle: Hsla = mantle().into();
@@ -109,25 +179,27 @@ pub fn apply_ui_theme(cx: &mut App) {
     theme.window_border = surface0;
 }
 
-/// Catppuccin Mocha syntax palette for tree-sitter tokens. Variable and
-/// Embedded map to the plain text color (syntax spans for them are not
-/// emitted, so this is belt-and-braces).
+/// Catppuccin syntax palette for tree-sitter tokens: Latte in light mode,
+/// Mocha in dark. Variable and Embedded map to the plain text color (syntax
+/// spans for them are not emitted, so this is belt-and-braces).
 pub fn token_style(token: Token) -> HighlightStyle {
-    let (color, italic) = match token {
-        Token::Keyword => (0xcba6f7, false),                    // mauve
-        Token::Function => (0x89b4fa, false),                   // blue
-        Token::Type => (0xf9e2af, false),                       // yellow
-        Token::String => (0xa6e3a1, false),                     // green
-        Token::Number | Token::Constant => (0xfab387, false),   // peach
-        Token::Comment => (0x6c7086, true),                     // overlay0
-        Token::Property => (0xb4befe, false),                   // lavender
-        Token::Variable | Token::Embedded => (0xcdd6f4, false), // text
-        Token::Parameter => (0xeba0ac, true),                   // maroon
-        Token::Operator => (0x89dceb, false),                   // sky
-        Token::Punctuation => (0x9399b2, false),                // overlay2
-        Token::Attribute | Token::Label => (0xf9e2af, false),   // yellow
-        Token::Namespace => (0xfab387, true),                   // peach
+    // (Latte / light, Mocha / dark, italic)
+    let (light, dark, italic) = match token {
+        Token::Keyword => (0x8839ef, 0xcba6f7, false),   // mauve
+        Token::Function => (0x1e66f5, 0x89b4fa, false), // blue
+        Token::Type => (0xdf8e1d, 0xf9e2af, false),     // yellow
+        Token::String => (0x40a02b, 0xa6e3a1, false),   // green
+        Token::Number | Token::Constant => (0xfe640b, 0xfab387, false), // peach
+        Token::Comment => (0x9ca0b0, 0x6c7086, true),   // overlay0
+        Token::Property => (0x7287fd, 0xb4befe, false), // lavender
+        Token::Variable | Token::Embedded => (0x4c4f69, 0xcdd6f4, false), // text
+        Token::Parameter => (0xe64553, 0xeba0ac, true), // maroon
+        Token::Operator => (0x04a5e5, 0x89dceb, false), // sky
+        Token::Punctuation => (0x7c7f93, 0x9399b2, false), // overlay2
+        Token::Attribute | Token::Label => (0xdf8e1d, 0xf9e2af, false), // yellow
+        Token::Namespace => (0xfe640b, 0xfab387, true), // peach
     };
+    let color = if is_light() { light } else { dark };
     HighlightStyle {
         color: Some(rgb(color).into()),
         font_style: italic.then_some(FontStyle::Italic),
@@ -137,46 +209,86 @@ pub fn token_style(token: Token) -> HighlightStyle {
 
 /// Dimming layer behind the command palette.
 pub fn palette_backdrop() -> Rgba {
-    rgba(0x11111baa)
+    if is_light() {
+        rgba(0xdce0f8aa)
+    } else {
+        rgba(0x11111baa)
+    }
 }
 
-/// Split view: background for the absent side of a one-sided row — darker
-/// than any content row so it clearly reads as "nothing here".
+/// Split view: background for the absent side of a one-sided row — a fill
+/// darker than any content row so it clearly reads as "nothing here".
 pub fn void_cell_bg() -> Rgba {
-    rgba(0x11111b99)
+    if is_light() {
+        rgba(0xdce0f899)
+    } else {
+        rgba(0x11111b99)
+    }
 }
 
 /// Text selection in the diff pane — same blue.opacity(0.3) injected into the
 /// gpui-component theme as `selection` in `apply_ui_theme`.
 pub fn selection_bg() -> Rgba {
-    rgba(0x89b4fa4d)
+    if is_light() {
+        rgba(0x1e66f54d)
+    } else {
+        rgba(0x89b4fa4d)
+    }
 }
 
 /// Review comment card: a blue tint that lifts the thread off the diff without
 /// hiding it, with a stronger wash behind each comment's author line.
 pub fn comment_bg() -> Rgba {
-    rgba(0x89b4fa14)
+    if is_light() {
+        rgba(0x1e66f514)
+    } else {
+        rgba(0x89b4fa14)
+    }
 }
 pub fn comment_header_bg() -> Rgba {
-    rgba(0x89b4fa2b)
+    if is_light() {
+        rgba(0x1e66f52b)
+    } else {
+        rgba(0x89b4fa2b)
+    }
 }
 
 /// Outline drawn around a whole thread: sky at partial alpha, so it reads as a
-/// soft neon edge against the dark pane without competing with the diff.
+/// soft neon edge against the pane without competing with the diff.
 pub fn comment_outline() -> Rgba {
-    rgba(0x89dceb8c)
+    if is_light() {
+        rgba(0x04a5e58c)
+    } else {
+        rgba(0x89dceb8c)
+    }
 }
 
 /// Low-alpha tints: syntax/text must stay readable on top. Never opaque.
 pub fn added_row_bg() -> Rgba {
-    rgba(0xa6e3a120)
+    if is_light() {
+        rgba(0x40a02b20)
+    } else {
+        rgba(0xa6e3a120)
+    }
 }
 pub fn removed_row_bg() -> Rgba {
-    rgba(0xf38ba820)
+    if is_light() {
+        rgba(0xd20f3920)
+    } else {
+        rgba(0xf38ba820)
+    }
 }
 pub fn added_word_bg() -> Rgba {
-    rgba(0xa6e3a148)
+    if is_light() {
+        rgba(0x40a02b48)
+    } else {
+        rgba(0xa6e3a148)
+    }
 }
 pub fn removed_word_bg() -> Rgba {
-    rgba(0xf38ba848)
+    if is_light() {
+        rgba(0xd20f3948)
+    } else {
+        rgba(0xf38ba848)
+    }
 }

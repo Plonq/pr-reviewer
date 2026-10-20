@@ -27,22 +27,24 @@ jobs:
 
       - name: Create app bundle
         run: |
-          APP=dist/LGTM.app
+          APP=dist/Gander.app
           mkdir -p "$APP/Contents/MacOS"
-          cp target/release/lgtm "$APP/Contents/MacOS/lgtm"
+          # The explicit aarch64-apple-darwin build target (see .cargo/config.toml)
+          # puts artifacts under target/<triple>/release/.
+          cp target/aarch64-apple-darwin/release/gander "$APP/Contents/MacOS/gander"
           cat > "$APP/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
             <key>CFBundleName</key>
-            <string>LGTM</string>
+            <string>Gander</string>
             <key>CFBundleDisplayName</key>
-            <string>LGTM</string>
+            <string>Gander</string>
             <key>CFBundleIdentifier</key>
-            <string>com.elliehuxtable.lgtm</string>
+            <string>org.plonq.gander</string>
             <key>CFBundleExecutable</key>
-            <string>lgtm</string>
+            <string>gander</string>
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
@@ -61,7 +63,7 @@ jobs:
       - name: Create DMG
         run: |
           ln -s /Applications dist/Applications
-          hdiutil create -volname LGTM -srcfolder dist -ov -format UDZO LGTM.dmg
+          hdiutil create -volname Gander -srcfolder dist -ov -format UDZO Gander.dmg
 
       - name: Upload to latest release
         env:
@@ -71,4 +73,4 @@ jobs:
           gh release view latest >/dev/null 2>&1 || \
             gh release create latest --prerelease --title "Latest build" --notes ""
           gh release edit latest --notes "Automated build from \`${GITHUB_SHA::7}\`"
-          gh release upload latest LGTM.dmg --clobber
+          gh release upload latest Gander.dmg --clobber

@@ -94,8 +94,7 @@ pub struct PrMeta {
     pub author: Author,
     pub state: String,
     pub url: String,
-    /// PR description (markdown); empty when the PR has none. Used as chat
-    /// context, not rendered in the UI.
+    /// PR description (markdown); empty when the PR has none.
     #[serde(default)]
     pub body: String,
     pub base_ref_name: String,
@@ -381,7 +380,7 @@ const MAX_BLOB_BYTES: usize = 1024 * 1024;
 /// `Ok(None)` means "leave this file un-upgraded": absent on that side (404),
 /// non-UTF-8 (binary), or larger than [`MAX_BLOB_BYTES`]. A path at a commit
 /// is immutable, so results — including negative ones — are cached on disk in
-/// `~/.cache/lgtm/blobs/` (sha256 of `repo\0oid\0path`, with an `.absent`
+/// `~/.cache/gander/blobs/` (sha256 of `repo\0oid\0path`, with an `.absent`
 /// sidecar marking negative entries).
 pub fn fetch_file_at(loc: &PrLocator, commit_oid: &str, path: &str) -> Result<Option<String>> {
     let cache = cache_path(&loc.repo_slug(), commit_oid, path);
@@ -438,12 +437,12 @@ fn mark_absent(cache: Option<PathBuf>) {
     }
 }
 
-/// `~/.cache/lgtm/blobs/<key>`, creating the directory; None when HOME is
+/// `~/.cache/gander/blobs/<key>`, creating the directory; None when HOME is
 /// unset or the directory can't be created (cache disabled, fetch still works).
 fn cache_path(repo: &str, oid: &str, path: &str) -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("HOME")?)
         .join(".cache")
-        .join("lgtm")
+        .join("gander")
         .join("blobs");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join(cache_key(repo, oid, path)))
