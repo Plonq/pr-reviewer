@@ -12,6 +12,7 @@ use gpui::{
     WindowOptions,
 };
 use gpui_component::{
+    avatar::Avatar,
     button::{Button, ButtonVariants as _},
     input::{CompletionProvider, Escape as InputEscape, Input, InputEvent, InputState},
     kbd::Kbd,
@@ -25,6 +26,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 const MONO: &str = "Menlo";
 
@@ -233,7 +235,9 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let view = cx.new(|cx| ReviewApp::new(sources, errors, window, cx));
+                    let view = cx.new(|cx| {
+                        ReviewApp::new(sources, errors, github_client(), window, cx)
+                    });
                     window.focus(&view.read(cx).focus_handle);
                     cx.new(|cx| Root::new(view, window, cx))
                 },
@@ -3444,6 +3448,23 @@ fn local_comment_location(file: &str, side: Option<&str>, line: Option<u64>) -> 
     }
 }
 
+/// The GitHub backend the app runs on. v0.1 shells out to the `gh` CLI;
+/// a v0.2 REST/GraphQL backend replaces this one constructor and nothing
+/// else in the app — every caller goes through the facade trait.
+fn github_client() -> Arc<dyn github::GitHubClient> {
+    Arc::new(github::gh_cli::GhCliClient::new())
+}
+
+/// Where the account check stands. The signed-out case keeps the facade's
+/// [`github::ClientError`]: its `Display` is the user-facing message, and it
+/// already names the `gh auth login` fix.
+enum AccountStatus {
+    /// Check still running on a background thread; renders nothing yet.
+    Checking,
+    SignedIn(github::Viewer),
+    SignedOut(github::ClientError),
+}
+
 struct ReviewApp {
     items: Vec<ReviewItem>,
     active: usize,
@@ -3481,6 +3502,13 @@ struct ReviewApp {
     /// Bumped on every review-dialog open/close, same protocol as
     /// `composer_gen`.
     review_gen: u64,
+    /// The GitHub facade every GitHub operation goes through.
+    github: Arc<dyn github::GitHubClient>,
+    /// The account check surfaced in the title bar (see `render_account`).
+    account: AccountStatus,
+    /// Bumped on every account re-check; an in-flight result only lands if
+    /// the generation it captured is still current.
+    account_gen: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -3513,6 +3541,7 @@ impl ReviewApp {
     fn new(
         sources: Vec<Source>,
         errors: Vec<String>,
+        github: Arc<dyn github::GitHubClient>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -3584,13 +3613,42 @@ impl ReviewApp {
             composer_gen: 0,
             review: None,
             review_gen: 0,
+            github,
+            account: AccountStatus::Checking,
+            account_gen: 0,
             _subscriptions,
         };
         for source in sources {
             this.open_item(source, cx);
         }
         this.active = 0;
+        this.spawn_account_check(cx);
         this
+    }
+
+    /// Ask the facade who we're signed in as — a `gh` subprocess in v0.1, so
+    /// it runs on a background thread — and surface the result in the title
+    /// bar. The generation guard keeps a stale check from overwriting a newer
+    /// one after a re-check (`r`).
+    fn spawn_account_check(&mut self, cx: &mut Context<Self>) {
+        self.account_gen += 1;
+        let gen = self.account_gen;
+        let client = self.github.clone();
+        cx.spawn(async move |this, cx| {
+            let viewer = cx.background_spawn(async move { client.viewer() }).await;
+            this.update(cx, |app, cx| {
+                if app.account_gen != gen {
+                    return;
+                }
+                app.account = match viewer {
+                    Ok(viewer) => AccountStatus::SignedIn(viewer),
+                    Err(err) => AccountStatus::SignedOut(err),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Re-wrap comment bodies to the pane's current width. Called each render:
@@ -4378,6 +4436,10 @@ impl ReviewApp {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        // `r` also re-checks the account: run `gh auth login` in a terminal,
+        // press `r` here, and the title bar picks the sign-in up without a
+        // relaunch.
+        self.spawn_account_check(cx);
         let Some(item) = self.items.get_mut(self.active) else {
             return;
         };
@@ -5446,19 +5508,55 @@ impl ReviewApp {
                     .map(|err| SharedString::from(format!("refresh failed: {err}")))
             }
         });
+        // The title bar spreads its children edge to edge; one right group
+        // keeps the item note beside the account chip instead of stranded
+        // mid-bar.
+        let mut right = div().flex().items_center().flex_shrink_0().h_full().gap_2();
+        if let Some(note) = note {
+            right = right.child(
+                div()
+                    .max_w(px(280.))
+                    .truncate()
+                    .text_color(theme::overlay0())
+                    .child(note),
+            );
+        }
+        right = right.child(self.render_account());
         TitleBar::new()
             .text_size(px(13.))
             .child(content)
-            .when_some(note, |bar, note| {
-                bar.child(
+            .child(right)
+    }
+
+    /// The account chip at the title bar's right edge: avatar + login when
+    /// GitHub knows who we are; the fix in one line when it doesn't — the
+    /// empty pane spells the failure out in full. While the check is still
+    /// running, nothing: the chip appears rather than flickers.
+    fn render_account(&self) -> gpui::AnyElement {
+        match &self.account {
+            AccountStatus::Checking => div().into_any_element(),
+            AccountStatus::SignedIn(viewer) => div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .pr_3()
+                .child(Avatar::new().src(viewer.avatar_url.clone()).xsmall())
+                .child(
                     div()
-                        .max_w(px(280.))
-                        .truncate()
-                        .text_color(theme::overlay0())
-                        .pr_3()
-                        .child(note),
+                        .text_size(px(12.))
+                        .text_color(theme::subtext())
+                        .child(SharedString::from(viewer.login.clone())),
                 )
-            })
+                .into_any_element(),
+            AccountStatus::SignedOut(err) => div()
+                .pr_3()
+                .max_w(px(360.))
+                .truncate()
+                .text_size(px(12.))
+                .text_color(theme::peach())
+                .child(SharedString::from(err.to_string()))
+                .into_any_element(),
+        }
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5985,6 +6083,40 @@ impl ReviewApp {
             .into_any_element()
     }
 
+    /// The pane with nothing open: the ⌘T hint — plus, when GitHub isn't
+    /// usable, the facade's sign-in message above it, so a fresh launch
+    /// without `gh auth login` explains itself instead of showing a near-
+    /// blank screen. With something open, local diffs included, only the
+    /// title-bar chip carries the message.
+    fn render_empty_pane(&self) -> gpui::AnyElement {
+        match &self.account {
+            AccountStatus::SignedOut(err) => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_4()
+                .p_8()
+                .child(
+                    div()
+                        .max_w(px(560.))
+                        .text_center()
+                        .text_size(px(14.))
+                        .text_color(theme::peach())
+                        .child(SharedString::from(err.to_string())),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(theme::overlay0())
+                        .child(SharedString::from("⌘T to open a PR or path")),
+                )
+                .into_any_element(),
+            _ => centered_message("⌘T to open a PR or path".into(), theme::overlay0()),
+        }
+    }
+
     fn render_footer(&self) -> impl IntoElement {
         let hint = |keys: &[&str], label: &'static str| {
             let mut hint = div().flex().items_center().gap_1();
@@ -6028,7 +6160,7 @@ impl Render for ReviewApp {
         let entity = cx.entity();
         self.resync_comment_wrap(window);
         let pane: gpui::AnyElement = match self.active_item() {
-            None => centered_message("⌘T to open a PR or path".into(), theme::overlay0()),
+            None => self.render_empty_pane(),
             Some(item) => match &item.state {
                 ItemState::Loading => centered_message("loading…".into(), theme::overlay0()),
                 ItemState::Failed(msg) => div()

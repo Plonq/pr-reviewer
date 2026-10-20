@@ -12,6 +12,7 @@ anyhow = { workspace = true }
 diff-core = { path = "../diff-core" }
 gh = { path = "../gh" }
 git = { path = "../git" }
+github = { path = "../github" }
 syntax = { path = "../syntax" }
 gpui = "0.2"
 gpui-component = "0.5"

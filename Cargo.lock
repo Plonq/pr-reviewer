@@ -2047,6 +2047,7 @@ dependencies = [
  "fuzzy-matcher",
  "gh",
  "git",
+ "github",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
@@ -2142,6 +2143,14 @@ dependencies = [
  "anyhow",
  "diff-core",
  "tempfile",
+]
+
+[[package]]
+name = "github"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

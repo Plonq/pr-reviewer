@@ -1,0 +1,2 @@
+error connecting to api.github.com.invalid
+check your internet connection or https://githubstatus.com
