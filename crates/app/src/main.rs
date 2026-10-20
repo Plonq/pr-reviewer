@@ -5,12 +5,12 @@ use anyhow::anyhow;
 use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
-    actions, canvas, div, fill, font, point, prelude::*, px, relative, size,
-    uniform_list, App, Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla,
-    KeyBinding, Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString,
-    StyledText, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
-    WindowOptions,
+    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
+    Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla,
+    KeyBinding, Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Rgba, ScrollStrategy,
+    SharedString, StyledText, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions,
 };
 use gpui_component::{
     avatar::Avatar,
@@ -19,8 +19,9 @@ use gpui_component::{
     kbd::Kbd,
     scroll::Scrollbar,
     tag::Tag,
-    Disableable as _, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
+    Disableable as _, Icon, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
 };
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -131,6 +132,41 @@ fn git_env() -> [(&'static str, &'static str); 6] {
     ]
 }
 
+/// The app's own assets, layered over gpui-component's icon bundle. Today
+/// that's the speech bubble the queue's comment count rides on — an
+/// Octicon (comment-16, © GitHub, MIT: https://github.com/primer/octicons),
+/// which gpui renders as a monochrome mask so it tints with the palette.
+/// The app's icons live under `icons/gander/` so they can never shadow an
+/// upstream name.
+struct AppAssets;
+
+/// (asset path, embedded bytes) — served exactly as an `AssetSource`
+/// expects, so the icon renders like any bundled one.
+const OWNED_ASSETS: &[(&str, &[u8])] = &[(
+    "icons/gander/comment-16.svg",
+    include_bytes!("assets/icons/gander/comment-16.svg"),
+)];
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        if let Some((_, bytes)) = OWNED_ASSETS.iter().find(|(known, _)| *known == path) {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
+        gpui_component_assets::Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        let mut all = gpui_component_assets::Assets.list(path)?;
+        all.extend(
+            OWNED_ASSETS
+                .iter()
+                .filter(|(known, _)| known.starts_with(path))
+                .map(|(known, _)| SharedString::from(*known)),
+        );
+        Ok(all)
+    }
+}
+
 fn main() {
     // Before any thread or child exists: set_var is process-global and not
     // thread-safe, and every subprocess needs to inherit this.
@@ -165,7 +201,7 @@ fn main() {
         }
     }
     Application::new()
-        .with_assets(gpui_component_assets::Assets)
+        .with_assets(AppAssets)
         // gpui ships a NullHttpClient: without a real one, every remote
         // `img()` (the account avatar, later PR media) silently fails.
         .with_http_client(http::http_client())
@@ -245,9 +281,8 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let view = cx.new(|cx| {
-                        ReviewApp::new(sources, errors, github_client(), window, cx)
-                    });
+                    let view =
+                        cx.new(|cx| ReviewApp::new(sources, errors, github_client(), window, cx));
                     window.focus(&view.read(cx).focus_handle);
                     cx.new(|cx| Root::new(view, window, cx))
                 },
@@ -965,8 +1000,26 @@ fn push_gap_rows(
                 }),
             },
         });
-        push_thread_rows(rows, anchors, path, CommentSide::Left, Some(old_no), now, ViewMode::Split, wrap);
-        push_thread_rows(rows, anchors, path, CommentSide::Right, Some(new_no), now, ViewMode::Split, wrap);
+        push_thread_rows(
+            rows,
+            anchors,
+            path,
+            CommentSide::Left,
+            Some(old_no),
+            now,
+            ViewMode::Split,
+            wrap,
+        );
+        push_thread_rows(
+            rows,
+            anchors,
+            path,
+            CommentSide::Right,
+            Some(new_no),
+            now,
+            ViewMode::Split,
+            wrap,
+        );
     }
 }
 
@@ -1103,8 +1156,26 @@ fn build_rows(
                                 syntax,
                             },
                         });
-                        push_thread_rows(&mut rows, anchors, path, CommentSide::Left, old_no, now, ViewMode::Unified, wrap);
-                        push_thread_rows(&mut rows, anchors, path, CommentSide::Right, new_no, now, ViewMode::Unified, wrap);
+                        push_thread_rows(
+                            &mut rows,
+                            anchors,
+                            path,
+                            CommentSide::Left,
+                            old_no,
+                            now,
+                            ViewMode::Unified,
+                            wrap,
+                        );
+                        push_thread_rows(
+                            &mut rows,
+                            anchors,
+                            path,
+                            CommentSide::Right,
+                            new_no,
+                            now,
+                            ViewMode::Unified,
+                            wrap,
+                        );
                     }
                 }
                 ViewMode::Split => {
@@ -1146,7 +1217,8 @@ fn build_rows(
                                     CommentSide::Left,
                                     Some(*old_no),
                                     now,
-                                    ViewMode::Split, wrap,
+                                    ViewMode::Split,
+                                    wrap,
                                 );
                                 push_thread_rows(
                                     &mut rows,
@@ -1155,7 +1227,8 @@ fn build_rows(
                                     CommentSide::Right,
                                     Some(*new_no),
                                     now,
-                                    ViewMode::Split, wrap,
+                                    ViewMode::Split,
+                                    wrap,
                                 );
                                 i += 1;
                             }
@@ -1182,7 +1255,8 @@ fn build_rows(
                                     CommentSide::Right,
                                     Some(*new_no),
                                     now,
-                                    ViewMode::Split, wrap,
+                                    ViewMode::Split,
+                                    wrap,
                                 );
                                 i += 1;
                             }
@@ -1237,7 +1311,8 @@ fn build_rows(
                                         CommentSide::Left,
                                         left_no,
                                         now,
-                                        ViewMode::Split, wrap,
+                                        ViewMode::Split,
+                                        wrap,
                                     );
                                     push_thread_rows(
                                         &mut rows,
@@ -1246,7 +1321,8 @@ fn build_rows(
                                         CommentSide::Right,
                                         right_no,
                                         now,
-                                        ViewMode::Split, wrap,
+                                        ViewMode::Split,
+                                        wrap,
                                     );
                                 }
                             }
@@ -1513,7 +1589,11 @@ fn render_row(
                     .into_any_element(),
                 *half,
                 true,
-                if *top { CardEdge::Top } else { CardEdge::Middle },
+                if *top {
+                    CardEdge::Top
+                } else {
+                    CardEdge::Middle
+                },
             )
         }
         Row::CommentBody { line, half } => comment_row(
@@ -2564,8 +2644,8 @@ impl ReviewItem {
             }
             _ => {
                 let minimap = minimap_rows(&rows);
-                let local_review = matches!(&self.source, Source::Local(_))
-                    .then(LocalReview::default);
+                let local_review =
+                    matches!(&self.source, Source::Local(_)).then(LocalReview::default);
                 let comments = match &local_review {
                     Some(local) => Some(local.index()),
                     None => comments,
@@ -2652,8 +2732,14 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
         }
     };
     let diff = diff_core::parse_patch(&patch);
-    let (rows, file_rows, hunk_rows) =
-        build_rows(&diff, mode, &HashMap::new(), comments.as_ref(), true, COMMENT_WRAP_CHARS);
+    let (rows, file_rows, hunk_rows) = build_rows(
+        &diff,
+        mode,
+        &HashMap::new(),
+        comments.as_ref(),
+        true,
+        COMMENT_WRAP_CHARS,
+    );
     Ok(Loaded {
         meta,
         diff,
@@ -3012,7 +3098,10 @@ fn local_titlebar_content(
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_local_base_palette(item_id, repo_root.clone(), window, cx);
                         }))
-                        .child(SharedString::from(format!("{} ← {}", src.base_label, src.branch))),
+                        .child(SharedString::from(format!(
+                            "{} ← {}",
+                            src.base_label, src.branch
+                        ))),
                 )
                 .child(
                     div()
@@ -3082,9 +3171,10 @@ const PALETTE_SOURCES: [&str; 2] = ["Open GitHub pull request", "Open local fold
 const SOURCE_PR: usize = 0;
 const SOURCE_FOLDER: usize = 1;
 const PALETTE_ROW_HEIGHT: f32 = 30.0;
-/// Queue rows are one line, a touch taller than the palette's: title,
-/// author, repo, and age side by side.
-const QUEUE_ROW_HEIGHT: f32 = 32.0;
+/// Queue rows stay one line but a dense one — avatar, title, badges, size,
+/// counts, chips — so they sit a little taller than the palette's, with
+/// the uniform list keeping scroll math simple and rows virtualized.
+const QUEUE_ROW_HEIGHT: f32 = 36.0;
 
 /// Step-1 options matching the query (case-insensitive substring), as indices
 /// into PALETTE_SOURCES. Empty query keeps both.
@@ -3207,8 +3297,190 @@ fn palette_pr_row(
         .into_any_element()
 }
 
-/// One review-queue row: title, author, repository, and when it last saw
-/// activity — enough to recognize a PR without opening it. Clicking selects
+/// The CI dot's paint, per verdict: green opens without fear, red means
+/// expect breakage, yellow means checks still running, gray means no
+/// signal — no checks configured, or the enrichment couldn't see them.
+fn ci_dot_color(ci: github::CiState) -> Rgba {
+    match ci {
+        github::CiState::Pass => theme::green(),
+        github::CiState::Fail => theme::red(),
+        github::CiState::Pending => theme::yellow(),
+        github::CiState::NoChecks => theme::overlay0(),
+    }
+}
+
+/// The review-state bit of a queue row: a green ✓ or red ✕ for the decided
+/// states, plain muted text for the queue's default "awaiting" posture —
+/// so the row never keeps quiet about where a PR stands.
+fn review_state_view(state: github::ReviewState) -> gpui::AnyElement {
+    let (icon, label, color) = match state {
+        github::ReviewState::Approved => (Some(IconName::CircleCheck), "approved", theme::green()),
+        github::ReviewState::ChangesRequested => {
+            (Some(IconName::CircleX), "changes requested", theme::red())
+        }
+        github::ReviewState::Awaiting => (None, "awaiting review", theme::subtext()),
+    };
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_1()
+        .when_some(icon, |state, icon| {
+            state.child(Icon::new(icon).xsmall().text_color(color))
+        })
+        .child(div().text_size(px(12.)).text_color(color).child(label))
+        .into_any_element()
+}
+
+/// The diff size at a glance — `+151 −30`, additions in green, deletions
+/// in red, the "big vs small" triage signal. `None` until the enrichment
+/// has seen the diff, and rendered not at all rather than as a fake zero.
+fn size_view(additions: Option<u64>, deletions: Option<u64>) -> Option<gpui::AnyElement> {
+    let (additions, deletions) = (additions?, deletions?);
+    Some(
+        div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_size(px(12.))
+            .child(
+                div()
+                    .text_color(theme::green())
+                    .child(SharedString::from(format!("+{additions}"))),
+            )
+            .child(
+                div()
+                    .text_color(theme::red())
+                    .child(SharedString::from(format!("−{deletions}"))),
+            )
+            .into_any_element(),
+    )
+}
+
+/// The conversation count: a muted speech bubble beside the number, so
+/// "has discussion happened here?" reads at a glance.
+fn comment_count_view(comments: u64) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            Icon::default()
+                .path("icons/gander/comment-16.svg")
+                .xsmall()
+                .text_color(theme::overlay0()),
+        )
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme::subtext())
+                .child(SharedString::from(comments.to_string())),
+        )
+}
+
+/// GitHub's label colors are six hex digits without `#` (`"1D76DB"`).
+/// Anything else degrades to `None` and the chip falls back to neutral
+/// colors — a malformed color never breaks a row.
+fn label_color(color: &str) -> Option<Hsla> {
+    let channel = |text: &str| u8::from_str_radix(text, 16).ok();
+    let bytes = color.as_bytes();
+    if bytes.len() != 6 {
+        return None;
+    }
+    let (r, g, b) = (
+        channel(std::str::from_utf8(&bytes[0..2]).ok()?)?,
+        channel(std::str::from_utf8(&bytes[2..4]).ok()?)?,
+        channel(std::str::from_utf8(&bytes[4..6]).ok()?)?,
+    );
+    Some(Hsla::from(Rgba {
+        r: r as f32 / 255.0,
+        g: g as f32 / 255.0,
+        b: b as f32 / 255.0,
+        a: 1.0,
+    }))
+}
+
+/// Mix `a` toward `b` by `t` (0 = `a`, 1 = `b`). Hue takes the short way
+/// around the wheel; alpha lerps like the rest.
+fn mix_hsla(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    let mut hue = b.h - a.h;
+    if hue > 0.5 {
+        hue -= 1.0;
+    } else if hue < -0.5 {
+        hue += 1.0;
+    }
+    Hsla {
+        h: (a.h + hue * t).rem_euclid(1.0),
+        s: a.s + (b.s - a.s) * t,
+        l: a.l + (b.l - a.l) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
+/// A label chip's `(background, text, border)` from GitHub's label color,
+/// tuned for the palette: a tinted fill with the color itself as text —
+/// lifted toward white in dark mode, deepened toward black in light, so
+/// GitHub's darker label colors stay readable on both. A missing color
+/// degrades to neutral grays, never breaks the row.
+fn label_chip_colors(color: Option<Hsla>, light: bool) -> (Hsla, Hsla, Hsla) {
+    let Some(color) = color else {
+        let bg = Hsla::from(theme::surface0()).opacity(0.4);
+        let text = Hsla::from(theme::subtext());
+        return (bg, text, Hsla::from(theme::surface0()));
+    };
+    let (text, toward) = if light {
+        (
+            mix_hsla(
+                color,
+                Hsla {
+                    h: 0.0,
+                    s: 0.0,
+                    l: 0.0,
+                    a: 1.0,
+                },
+                0.2,
+            ),
+            0.18,
+        )
+    } else {
+        (
+            mix_hsla(
+                color,
+                Hsla {
+                    h: 0.0,
+                    s: 0.0,
+                    l: 1.0,
+                    a: 1.0,
+                },
+                0.4,
+            ),
+            0.12,
+        )
+    };
+    (
+        color.opacity(toward),
+        text,
+        color.opacity(if light { 0.6 } else { 0.5 }),
+    )
+}
+
+/// How many label chips a row shows before the rest collapse into a
+/// muted `+n` — enough to recognize, not enough to crowd the row.
+const QUEUE_LABELS_SHOWN: usize = 3;
+
+/// The chips to paint plus how many more labels exist: the budget the row
+/// gives labels before size and state start competing for space.
+fn label_budget(labels: &[github::QueueLabel]) -> (&[github::QueueLabel], usize) {
+    let shown = labels.len().min(QUEUE_LABELS_SHOWN);
+    (&labels[..shown], labels.len() - shown)
+}
+
+/// One review-queue row, carrying everything needed to triage without
+/// opening anything: CI verdict as a colored dot, author avatar, `#number`
+/// and title (drafts badged and muted), review state, diff size,
+/// conversation count, label chips, repository, and age. Clicking selects
 /// the row (opening from the queue arrives with the PR screen).
 fn queue_row(
     pr: &github::QueueItem,
@@ -3217,6 +3489,7 @@ fn queue_row(
     now: i64,
     entity: gpui::Entity<ReviewApp>,
 ) -> gpui::AnyElement {
+    let (labels, overflow) = label_budget(&pr.labels);
     div()
         .id(("queue-row", pos))
         .mx_1()
@@ -3234,6 +3507,30 @@ fn queue_row(
         .on_click(move |_, window, cx| {
             entity.update(cx, |this, cx| this.queue_select(pos, window, cx));
         })
+        // The CI verdict sits at the very edge: green rows open without
+        // fear, red ones expect breakage — the first thing to catch the eye.
+        .child(
+            div()
+                .flex_shrink_0()
+                .size(px(8.))
+                .rounded_full()
+                .bg(ci_dot_color(pr.ci))
+                .when(pr.ci == github::CiState::Pending, |dot| {
+                    dot.border_1()
+                        .border_color(theme::yellow())
+                        .bg(Hsla::from(theme::yellow()).opacity(0.35))
+                }),
+        )
+        .child(
+            // `name` covers the slot the enrichment couldn't fill: the
+            // author's initials on a tinted circle instead of a face.
+            match &pr.author_avatar_url {
+                Some(url) => Avatar::new().src(url.clone()),
+                None => Avatar::new(),
+            }
+            .name(pr.author.clone())
+            .xsmall(),
+        )
         .child(
             div()
                 .flex_shrink_0()
@@ -3245,15 +3542,62 @@ fn queue_row(
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_color(theme::text())
+                // Drafts read muted with a badge beside them — visibly
+                // not-ready while still fully triageable.
+                .text_color(if pr.is_draft {
+                    theme::subtext()
+                } else {
+                    theme::text()
+                })
                 .child(SharedString::from(pr.title.clone())),
         )
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_color(theme::subtext())
-                .child(SharedString::from(pr.author.clone())),
-        )
+        .when(pr.is_draft, |row| {
+            row.child(
+                div()
+                    .flex_shrink_0()
+                    .px_1p5()
+                    .text_size(px(10.))
+                    .rounded_sm()
+                    .bg(Hsla::from(theme::overlay0()).opacity(0.2))
+                    .border_1()
+                    .border_color(Hsla::from(theme::overlay0()).opacity(0.5))
+                    .text_color(theme::subtext())
+                    .child("Draft"),
+            )
+        })
+        .child(review_state_view(pr.review_state))
+        .when_some(size_view(pr.additions, pr.deletions), |row, size| {
+            row.child(size)
+        })
+        .child(comment_count_view(pr.comments))
+        .when(!labels.is_empty(), |row| {
+            row.child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .max_w(px(360.))
+                    .overflow_hidden()
+                    .children(labels.iter().map(|label| {
+                        let (bg, text, border) =
+                            label_chip_colors(label_color(&label.color), theme::is_light());
+                        Tag::custom(bg, text, border)
+                            .xsmall()
+                            .max_w(px(120.))
+                            .truncate()
+                            .child(SharedString::from(label.name.clone()))
+                    }))
+                    .when(overflow > 0, |chips| {
+                        chips.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme::overlay0())
+                                .child(SharedString::from(format!("+{overflow}"))),
+                        )
+                    }),
+            )
+        })
         .child(
             div()
                 .flex_shrink_0()
@@ -3816,8 +4160,7 @@ impl ReviewApp {
                     Ok(prs) => {
                         // Keep the selection where it was, clamped into the
                         // fresh rows.
-                        app.queue.selected =
-                            move_selection(app.queue.selected, prs.len(), 0);
+                        app.queue.selected = move_selection(app.queue.selected, prs.len(), 0);
                         app.queue.prs = prs;
                         app.queue.error = None;
                     }
@@ -3836,8 +4179,7 @@ impl ReviewApp {
         if !self.show_queue || self.queue.prs.is_empty() {
             return;
         }
-        self.queue.selected =
-            move_selection(self.queue.selected, self.queue.prs.len(), delta);
+        self.queue.selected = move_selection(self.queue.selected, self.queue.prs.len(), delta);
         self.queue
             .scroll
             .scroll_to_item(self.queue.selected, ScrollStrategy::Top);
@@ -4200,9 +4542,10 @@ impl ReviewApp {
             // offset.y is negative when scrolled down.
             let top_row = (f32::from(-offset.y) / row_height()).floor() as usize;
             if gap_row < top_row {
-                scroll
-                    .base_handle
-                    .set_offset(point(offset.x, offset.y - px(inserted as f32 * row_height())));
+                scroll.base_handle.set_offset(point(
+                    offset.x,
+                    offset.y - px(inserted as f32 * row_height()),
+                ));
             }
         }
         cx.notify();
@@ -4306,7 +4649,10 @@ impl ReviewApp {
                 }
             }
             Some(PaletteStep::LocalBaseList {
-                bases: BaseListState::Loaded { filtered, selected, .. },
+                bases:
+                    BaseListState::Loaded {
+                        filtered, selected, ..
+                    },
                 ..
             }) => {
                 if !filtered.is_empty() {
@@ -4343,7 +4689,12 @@ impl ReviewApp {
                 self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
             Some(PaletteStep::LocalBaseList {
-                bases: BaseListState::Loaded { all, filtered, selected },
+                bases:
+                    BaseListState::Loaded {
+                        all,
+                        filtered,
+                        selected,
+                    },
                 ..
             }) => {
                 *filtered = filter_base_refs(all, &query);
@@ -4916,7 +5267,8 @@ impl ReviewApp {
                 let mentions = data.mentions.clone();
                 seed_mentions(&mentions, data);
                 input.update(cx, |state, _| {
-                    state.lsp.completion_provider = Some(Rc::new(MentionProvider { users: mentions }));
+                    state.lsp.completion_provider =
+                        Some(Rc::new(MentionProvider { users: mentions }));
                 });
             }
             self.ensure_mentions(item_id, loc, cx);
@@ -6190,7 +6542,12 @@ impl ReviewApp {
                                 let this = entity.read(cx);
                                 let Some(PaletteStep::LocalBaseList {
                                     current,
-                                    bases: BaseListState::Loaded { all, filtered, selected },
+                                    bases:
+                                        BaseListState::Loaded {
+                                            all,
+                                            filtered,
+                                            selected,
+                                        },
                                     ..
                                 }) = &this.palette
                                 else {
@@ -6215,7 +6572,9 @@ impl ReviewApp {
                                             .when(pos == *selected, |row| row.bg(theme::surface0()))
                                             .when(pos != *selected, |row| {
                                                 row.hover(|style| {
-                                                    style.bg(Hsla::from(theme::surface0()).opacity(0.5))
+                                                    style
+                                                        .bg(Hsla::from(theme::surface0())
+                                                            .opacity(0.5))
                                                 })
                                             })
                                             .on_click({
@@ -6401,15 +6760,7 @@ impl ReviewApp {
                     let this = entity.read(cx);
                     range
                         .filter_map(|pos| this.queue.prs.get(pos).map(|pr| (pos, pr)))
-                        .map(|(pos, pr)| {
-                            queue_row(
-                                pr,
-                                pos,
-                                pos == selected,
-                                now,
-                                entity.clone(),
-                            )
-                        })
+                        .map(|(pos, pr)| queue_row(pr, pos, pos == selected, now, entity.clone()))
                         .collect()
                 })
                 .track_scroll(queue.scroll.clone())
@@ -6879,7 +7230,10 @@ mod tests {
         // Empty query matches everything at the top rank.
         assert_eq!(mention_rank(&octocat, ""), Some(0));
         // Name-word prefix beats a login substring.
-        assert_eq!(mention_rank(&mention("xyz", Some("Bob Jones")), "bob"), Some(1));
+        assert_eq!(
+            mention_rank(&mention("xyz", Some("Bob Jones")), "bob"),
+            Some(1)
+        );
         assert_eq!(mention_rank(&mention("abobc", None), "bob"), Some(2));
         // Case-insensitive, and no match returns None.
         assert_eq!(mention_rank(&octocat, "OCT"), Some(0));
@@ -6977,7 +7331,14 @@ mod tests {
 
     #[test]
     fn split_context_fills_both_cells() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         // rows[0] = FileHeader, rows[1] = HunkHeader, rows[2] = first context.
         match &rows[2] {
             Row::SplitLine { left, right } => {
@@ -6990,7 +7351,14 @@ mod tests {
 
     #[test]
     fn split_pairs_equal_runs_positionally() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         match &rows[3] {
             Row::SplitLine { left, right } => {
                 assert_eq!(cell(left), (2, LineKind::Removed, "old1", &[0..3][..]));
@@ -7017,8 +7385,14 @@ mod tests {
 
     #[test]
     fn split_unequal_and_lone_runs_are_one_sided() {
-        let (rows, _, hunk_rows) =
-            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let (rows, _, hunk_rows) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         let h2 = hunk_rows[1];
         // 2 removed / 1 added: first row paired, second left-only.
         match &rows[h2 + 1] {
@@ -7109,7 +7483,8 @@ mod tests {
     fn upgraded_file_gets_gap_rows_and_marked_headers() {
         let (diff, upgrades) = upgraded_diff();
         for mode in [ViewMode::Unified, ViewMode::Split] {
-            let (rows, _, hunk_rows) = build_rows(&diff, mode, &upgrades, None, true, COMMENT_WRAP_CHARS);
+            let (rows, _, hunk_rows) =
+                build_rows(&diff, mode, &upgrades, None, true, COMMENT_WRAP_CHARS);
             // FileHeader, Gap(6), HunkHeader, 7 hunk rows, Gap(7).
             match &rows[1] {
                 Row::Gap {
@@ -7132,7 +7507,14 @@ mod tests {
             assert!(row_side_text(&rows[1], SelSide::Left).is_none());
         }
         // Un-upgraded build of the same diff has no gap rows.
-        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let (rows, _, _) = build_rows(
+            &diff,
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
         assert!(matches!(
             rows[1],
@@ -7148,7 +7530,14 @@ mod tests {
         let (diff, mut upgrades) = upgraded_diff();
         upgrades.get_mut(&0).unwrap().expanded.insert(0);
 
-        let (rows, _, hunk_rows) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true, COMMENT_WRAP_CHARS);
+        let (rows, _, hunk_rows) = build_rows(
+            &diff,
+            ViewMode::Unified,
+            &upgrades,
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         // Leading gap expanded into 6 context rows before the hunk header.
         assert_eq!(hunk_rows, vec![7]); // FileHeader + 6 context rows
         for (j, row) in rows[1..7].iter().enumerate() {
@@ -7172,7 +7561,14 @@ mod tests {
         assert!(matches!(rows.last(), Some(Row::Gap { gap_ix: 1, .. })));
 
         // Split mode: same expansion as two-cell context rows.
-        let (rows, _, _) = build_rows(&diff, ViewMode::Split, &upgrades, None, true, COMMENT_WRAP_CHARS);
+        let (rows, _, _) = build_rows(
+            &diff,
+            ViewMode::Split,
+            &upgrades,
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         match &rows[1] {
             Row::SplitLine { left, right } => {
                 let (l, r) = (left.as_ref().unwrap(), right.as_ref().unwrap());
@@ -7186,7 +7582,14 @@ mod tests {
 
         // Expanding the trailing gap too: numbering continues past the hunk.
         upgrades.get_mut(&0).unwrap().expanded.insert(1);
-        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true, COMMENT_WRAP_CHARS);
+        let (rows, _, _) = build_rows(
+            &diff,
+            ViewMode::Unified,
+            &upgrades,
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
         match rows.last().unwrap() {
             Row::Line {
@@ -7372,6 +7775,122 @@ mod tests {
         assert_eq!(move_selection(5, 3, 0), 2);
     }
 
+    /// A queue row's label colors: GitHub's six-hex form parses, and only
+    /// that form — anything else degrades the chip to neutral, never
+    /// breaks the row.
+    #[test]
+    fn queue_label_colors_parse_githubs_hex() {
+        assert_eq!(
+            label_color("1D76DB"),
+            Some(Hsla::from(Rgba {
+                r: 0x1d as f32 / 255.0,
+                g: 0x76 as f32 / 255.0,
+                b: 0xdb as f32 / 255.0,
+                a: 1.0,
+            }))
+        );
+        for malformed in ["", "1D76D", "1D76DBB", "#1D76DB", "GHIJKL", "1D 6DB"] {
+            assert_eq!(
+                label_color(malformed),
+                None,
+                "{malformed:?} isn't a label color"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_label_chips_stay_readable_in_both_palettes() {
+        // A GitHub label color, mid-tone blue.
+        let blue = label_color("1D76DB").unwrap();
+        // Dark mode: text lifts toward white, fill stays tinted.
+        let (bg, text, border) = label_chip_colors(Some(blue), false);
+        assert!(
+            text.l > blue.l,
+            "dark-mode text must be lighter than the base"
+        );
+        assert_eq!(bg.a, 0.12);
+        assert!(border.a > 0.0);
+        // Light mode: text deepens toward black instead.
+        let (_, text, _) = label_chip_colors(Some(blue), true);
+        assert!(
+            text.l < blue.l,
+            "light-mode text must be darker than the base"
+        );
+        // No color at all: neutral grays, so the chip still reads.
+        let (bg, text, _) = label_chip_colors(None, false);
+        assert_eq!(bg, Hsla::from(theme::surface0()).opacity(0.4));
+        assert_eq!(text, Hsla::from(theme::subtext()));
+    }
+
+    #[test]
+    fn queue_label_mixing_takes_the_short_way_round() {
+        let red = Hsla {
+            h: 0.95,
+            s: 1.0,
+            l: 0.5,
+            a: 1.0,
+        };
+        let yellow = Hsla {
+            h: 0.05,
+            s: 1.0,
+            l: 0.5,
+            a: 1.0,
+        };
+        // Near-equality: hues wrap through rem_euclid, so endpoints land a
+        // float's whisker off the originals — visible to ==, not to eyes.
+        let close = |a: Hsla, b: Hsla| {
+            (a.h - b.h).abs() < 1e-6
+                && (a.s - b.s).abs() < 1e-6
+                && (a.l - b.l).abs() < 1e-6
+                && (a.a - b.a).abs() < 1e-6
+        };
+        // Endpoints are (near enough to) exact.
+        assert!(close(mix_hsla(red, yellow, 0.0), red));
+        assert!(close(mix_hsla(red, yellow, 1.0), yellow));
+        // Halfway wraps through 1.0 → 0.0 (red → yellow the short way),
+        // not the long way through green.
+        assert_eq!(mix_hsla(red, yellow, 0.5).h, 0.0);
+        // Alpha lerps with the rest.
+        assert_eq!(mix_hsla(red, Hsla { a: 0.0, ..yellow }, 0.5).a, 0.5);
+    }
+
+    /// The label budget: three chips, then a count — the row keeps its
+    /// room for size and state no matter how many labels a PR carries.
+    #[test]
+    fn queue_rows_show_capped_labels_with_an_overflow_count() {
+        let label = |name: &str| github::QueueLabel {
+            name: name.to_string(),
+            color: String::new(),
+        };
+        let few = vec![label("api"), label("frontend")];
+        assert_eq!(label_budget(&few).0.len(), 2);
+        assert_eq!(label_budget(&few).1, 0);
+        let many: Vec<_> = (0..5).map(|_| label("x")).collect();
+        let (shown, overflow) = label_budget(&many);
+        assert_eq!(shown.len(), QUEUE_LABELS_SHOWN);
+        assert_eq!(overflow, 2);
+    }
+
+    /// The CI dot's palette wiring: each verdict paints its own color —
+    /// the acceptance "green vs red" rides on exactly these mappings.
+    #[test]
+    fn queue_ci_dots_paint_their_verdicts() {
+        assert_eq!(ci_dot_color(github::CiState::Pass), theme::green());
+        assert_eq!(ci_dot_color(github::CiState::Fail), theme::red());
+        assert_eq!(ci_dot_color(github::CiState::Pending), theme::yellow());
+        assert_eq!(ci_dot_color(github::CiState::NoChecks), theme::overlay0());
+    }
+
+    /// Size stays absent until the enrichment has seen both halves — a
+    /// half-known PR shows nothing rather than a misleading number.
+    #[test]
+    fn queue_size_waits_for_the_whole_diff() {
+        assert!(size_view(None, None).is_none());
+        assert!(size_view(Some(151), None).is_none());
+        assert!(size_view(None, Some(30)).is_none());
+        assert!(size_view(Some(151), Some(30)).is_some());
+    }
+
     /// (depth, display name, Some(file_ix) for files / None for dirs).
     fn flat(entries: &[TreeEntry]) -> Vec<(usize, &str, Option<usize>)> {
         entries
@@ -7531,7 +8050,8 @@ mod tests {
     fn header_indices_are_correct_in_both_modes() {
         let diff = sample_diff();
         for mode in [ViewMode::Unified, ViewMode::Split] {
-            let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+            let (rows, file_rows, hunk_rows) =
+                build_rows(&diff, mode, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
             assert_eq!(file_rows.len(), 2);
             assert_eq!(hunk_rows.len(), 2);
             for &ix in &file_rows {
@@ -7544,8 +8064,22 @@ mod tests {
             assert!(matches!(rows[file_rows[1] + 1], Row::Binary));
         }
         // Unified emits one row per diff row; split collapses the equal run.
-        let (unified, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
-        let (split, _, _) = build_rows(&diff, ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let (unified, _, _) = build_rows(
+            &diff,
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
+        let (split, _, _) = build_rows(
+            &diff,
+            ViewMode::Split,
+            &HashMap::new(),
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         let unified_lines = unified
             .iter()
             .filter(|r| matches!(r, Row::Line { .. }))
@@ -7736,7 +8270,7 @@ mod tests {
             &HashMap::new(),
             None,
             true,
-                COMMENT_WRAP_CHARS,
+            COMMENT_WRAP_CHARS,
         );
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
@@ -7754,7 +8288,14 @@ mod tests {
 
     #[test]
     fn minimap_rows_split_pairs_and_gaps() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
         // Context pair: both halves, no change flags.
@@ -8199,7 +8740,7 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             true,
-                COMMENT_WRAP_CHARS,
+            COMMENT_WRAP_CHARS,
         );
         // rows: FileHeader, HunkHeader, ctx, rem old1 (old_no 2) + LEFT
         // thread, rem old2, add new1 (new_no 2) + RIGHT thread, …
@@ -8280,7 +8821,7 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             true,
-                COMMENT_WRAP_CHARS,
+            COMMENT_WRAP_CHARS,
         );
         // rows[3] pairs old1/new1 (both line 2): LEFT thread then RIGHT
         // thread directly beneath it.
@@ -8322,12 +8863,11 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             true,
-                COMMENT_WRAP_CHARS,
+            COMMENT_WRAP_CHARS,
         );
         // rows[4..7] are carol's LEFT thread, rows[7..12] the RIGHT one; each
         // row of a thread carries the side it was anchored to.
-        let halves: Vec<Option<Option<CommentSide>>> =
-            rows[4..12].iter().map(row_half).collect();
+        let halves: Vec<Option<Option<CommentSide>>> = rows[4..12].iter().map(row_half).collect();
         assert_eq!(
             halves,
             vec![
@@ -8439,7 +8979,10 @@ mod tests {
         let chrome = COMMENT_CARD_CHROME;
         // Unified uses the whole width; split only its half, so the same pane
         // yields roughly half the columns.
-        assert_eq!(comment_wrap_cols(chrome + 40. * cw, ViewMode::Unified, cw), 40);
+        assert_eq!(
+            comment_wrap_cols(chrome + 40. * cw, ViewMode::Unified, cw),
+            40
+        );
         let split_pane = 2. * (chrome + 40. * cw) + SPLIT_DIVIDER;
         assert_eq!(comment_wrap_cols(split_pane, ViewMode::Split, cw), 40);
         // A roomy pane stops widening at the readability cap...
@@ -8463,7 +9006,11 @@ mod tests {
     fn comment_bodies_wrap_to_the_requested_column_width() {
         // One long prose line plus an unbreakable token (a URL), the two ways a
         // body runs past the card.
-        let body = format!("{} https://example.com/{}", "word ".repeat(60), "x".repeat(200));
+        let body = format!(
+            "{} https://example.com/{}",
+            "word ".repeat(60),
+            "x".repeat(200)
+        );
         let index = group_comments(vec![rc(
             1,
             "a.rs",
@@ -8478,8 +9025,14 @@ mod tests {
             ("unified", ViewMode::Unified, COMMENT_WRAP_CHARS),
             ("split", ViewMode::Split, 40),
         ] {
-            let (rows, _, _) =
-                build_rows(&sample_diff(), mode, &HashMap::new(), Some(&index), true, cap);
+            let (rows, _, _) = build_rows(
+                &sample_diff(),
+                mode,
+                &HashMap::new(),
+                Some(&index),
+                true,
+                cap,
+            );
             let bodies: Vec<&SharedString> = rows
                 .iter()
                 .filter_map(|row| match row {
@@ -8507,7 +9060,7 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             true,
-                COMMENT_WRAP_CHARS,
+            COMMENT_WRAP_CHARS,
         );
         // Unified has one column, so no comment row is confined to a half.
         assert!(rows.iter().filter_map(row_half).all(|half| half.is_none()));
@@ -8524,7 +9077,7 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             false,
-                COMMENT_WRAP_CHARS,
+            COMMENT_WRAP_CHARS,
         );
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
@@ -8542,7 +9095,7 @@ mod tests {
             &HashMap::new(),
             None,
             true,
-                COMMENT_WRAP_CHARS,
+            COMMENT_WRAP_CHARS,
         );
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
@@ -8569,11 +9122,25 @@ mod tests {
             "2026-01-01T00:00:00Z",
             None,
         )]);
-        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true, COMMENT_WRAP_CHARS);
+        let (rows, _, _) = build_rows(
+            &diff,
+            ViewMode::Unified,
+            &upgrades,
+            Some(&index),
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         // Collapsed gap: the thread has no anchor row and stays hidden.
         assert!(!rows.iter().any(is_comment_row));
         upgrades.get_mut(&0).unwrap().expanded.insert(0);
-        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true, COMMENT_WRAP_CHARS);
+        let (rows, _, _) = build_rows(
+            &diff,
+            ViewMode::Unified,
+            &upgrades,
+            Some(&index),
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         // FileHeader, ctx 1, ctx 2, ctx 3, then the thread.
         assert_eq!(row_name(&rows[3]), "Line");
         assert_eq!(row_name(&rows[4]), "CommentHeader");
@@ -8590,7 +9157,7 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             true,
-                COMMENT_WRAP_CHARS,
+            COMMENT_WRAP_CHARS,
         );
         // Headers and comment rows anchor nothing.
         assert_eq!(comment_anchor(&rows, 0, SelSide::Unified), None);
@@ -8609,8 +9176,14 @@ mod tests {
             Some((CommentSide::Right, 2))
         );
         // Split: the half under the pointer decides; absent cells refuse.
-        let (rows, _, hunk_rows) =
-            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let (rows, _, hunk_rows) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
         assert_eq!(
             comment_anchor(&rows, 3, SelSide::Left),
             Some((CommentSide::Left, 2))
@@ -8637,7 +9210,7 @@ mod tests {
             &HashMap::new(),
             None,
             true,
-                COMMENT_WRAP_CHARS,
+            COMMENT_WRAP_CHARS,
         );
         let (with, _, _) = build_rows(
             &sample_diff(),
@@ -8645,7 +9218,7 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             true,
-                COMMENT_WRAP_CHARS,
+            COMMENT_WRAP_CHARS,
         );
         // Every plain row maps to the same row content with comments shown.
         for (n, row) in plain.iter().enumerate() {

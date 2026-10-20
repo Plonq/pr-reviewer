@@ -101,6 +101,13 @@ pub fn peach() -> Rgba {
         rgb(0xfab387)
     }
 }
+pub fn yellow() -> Rgba {
+    if is_light() {
+        rgb(0xdf8e1d)
+    } else {
+        rgb(0xf9e2af)
+    }
+}
 
 /// Follow the system appearance: set gpui-component's `Theme` mode and swap
 /// the Catppuccin palette (Mocha ↔ Latte). Pass the window when one exists
@@ -185,12 +192,12 @@ pub fn apply_ui_theme(window: Option<&mut Window>, cx: &mut App) {
 pub fn token_style(token: Token) -> HighlightStyle {
     // (Latte / light, Mocha / dark, italic)
     let (light, dark, italic) = match token {
-        Token::Keyword => (0x8839ef, 0xcba6f7, false),   // mauve
+        Token::Keyword => (0x8839ef, 0xcba6f7, false), // mauve
         Token::Function => (0x1e66f5, 0x89b4fa, false), // blue
-        Token::Type => (0xdf8e1d, 0xf9e2af, false),     // yellow
-        Token::String => (0x40a02b, 0xa6e3a1, false),   // green
+        Token::Type => (0xdf8e1d, 0xf9e2af, false),    // yellow
+        Token::String => (0x40a02b, 0xa6e3a1, false),  // green
         Token::Number | Token::Constant => (0xfe640b, 0xfab387, false), // peach
-        Token::Comment => (0x9ca0b0, 0x6c7086, true),   // overlay0
+        Token::Comment => (0x9ca0b0, 0x6c7086, true),  // overlay0
         Token::Property => (0x7287fd, 0xb4befe, false), // lavender
         Token::Variable | Token::Embedded => (0x4c4f69, 0xcdd6f4, false), // text
         Token::Parameter => (0xe64553, 0xeba0ac, true), // maroon

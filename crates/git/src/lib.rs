@@ -442,13 +442,27 @@ mod tests {
         let fork = tmp.path().join("fork");
         run(
             tmp.path(),
-            &["git", "clone", upstream.to_str().unwrap(), fork.to_str().unwrap()],
+            &[
+                "git",
+                "clone",
+                upstream.to_str().unwrap(),
+                fork.to_str().unwrap(),
+            ],
         );
         run(&fork, &["git", "remote", "rename", "origin", "upstream"]);
         let empty_origin = tmp.path().join("origin");
         fs::create_dir(&empty_origin).unwrap();
         init_repo(&empty_origin);
-        run(&fork, &["git", "remote", "add", "origin", empty_origin.to_str().unwrap()]);
+        run(
+            &fork,
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                empty_origin.to_str().unwrap(),
+            ],
+        );
         run(&fork, &["git", "config", "user.email", "test@example.com"]);
         run(&fork, &["git", "config", "user.name", "Test"]);
         run(&fork, &["git", "config", "commit.gpgsign", "false"]);
