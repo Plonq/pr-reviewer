@@ -24,6 +24,81 @@ pub struct Viewer {
     pub avatar_url: String,
 }
 
+/// One PR in the review queue: the summary a queue row is drawn from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueItem {
+    pub number: u64,
+    pub title: String,
+    /// The author's `@handle`.
+    pub author: String,
+    /// `owner/name` of the repository the PR belongs to.
+    pub repository: String,
+    /// Draft PRs wait in the queue like any other, unready to merge.
+    pub is_draft: bool,
+    /// When the PR last saw activity, ISO 8601 (GitHub's format).
+    pub updated_at: String,
+}
+
+/// Which set of PRs a queue search asks GitHub for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuePreset {
+    /// Every open PR where the viewer's review is requested — directly or
+    /// via a team she belongs to; the one search qualifier covers both.
+    ReviewRequested,
+}
+
+/// How a queue search orders its results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueSort {
+    /// Most recently updated first — the default, so fresh activity
+    /// surfaces first.
+    RecentlyUpdated,
+    /// Oldest first, for clearing backlog.
+    OldestUpdated,
+}
+
+/// A queue search — the reviewer-facing query the review queue runs.
+/// Compiles to exact GitHub search syntax ([`Self::query`]) plus the search
+/// API's sort spec ([`Self::sort`]); backends never see a preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueSearch {
+    preset: QueuePreset,
+    sort: QueueSort,
+}
+
+impl QueueSearch {
+    /// The default queue: every open PR where the viewer's review is
+    /// requested, most recently updated first.
+    pub fn review_requested() -> Self {
+        Self {
+            preset: QueuePreset::ReviewRequested,
+            sort: QueueSort::RecentlyUpdated,
+        }
+    }
+
+    /// The same search, ordered differently.
+    pub fn sorted_by(self, sort: QueueSort) -> Self {
+        Self { sort, ..self }
+    }
+
+    /// The exact GitHub search string for this search. `@me` resolves to
+    /// the signed-in viewer, and the `review-requested` qualifier includes
+    /// both direct requests and ones via her teams.
+    pub fn query(&self) -> &'static str {
+        match self.preset {
+            QueuePreset::ReviewRequested => "is:pr is:open review-requested:@me",
+        }
+    }
+
+    /// The search API sort spec: `(field, order)`.
+    pub fn sort(&self) -> (&'static str, &'static str) {
+        match self.sort {
+            QueueSort::RecentlyUpdated => ("updated", "desc"),
+            QueueSort::OldestUpdated => ("updated", "asc"),
+        }
+    }
+}
+
 /// Why a client operation failed, in domain terms — never subprocess or
 /// transport mechanics, which stay inside a backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +144,10 @@ pub trait GitHubClient: Send + Sync {
     /// `Ok` says GitHub is usable as her, `Err` says why it isn't, in words
     /// that name the fix.
     fn viewer(&self) -> Result<Viewer, ClientError>;
+
+    /// PRs matching `search`, in the search's order — the review queue's
+    /// data.
+    fn search_prs(&self, search: &QueueSearch) -> Result<Vec<QueueItem>, ClientError>;
 }
 
 #[cfg(test)]
@@ -90,5 +169,24 @@ mod tests {
                 "{err:?} doesn't name the fix: {message}"
             );
         }
+    }
+
+    /// Golden string: the review-requested preset must compile to exactly
+    /// this search — open PRs, review requested of the viewer (teams
+    /// included by the qualifier) — sorted recently-updated. Every backend
+    /// runs this verbatim, so the queue's contents are pinned here.
+    #[test]
+    fn review_requested_compiles_to_the_exact_queue_search() {
+        let search = QueueSearch::review_requested();
+        assert_eq!(search.query(), "is:pr is:open review-requested:@me");
+        assert_eq!(search.sort(), ("updated", "desc"));
+    }
+
+    /// Re-sorting changes the sort spec, never the set of PRs.
+    #[test]
+    fn sorting_flips_the_order_not_the_search() {
+        let search = QueueSearch::review_requested().sorted_by(QueueSort::OldestUpdated);
+        assert_eq!(search.query(), "is:pr is:open review-requested:@me");
+        assert_eq!(search.sort(), ("updated", "asc"));
     }
 }

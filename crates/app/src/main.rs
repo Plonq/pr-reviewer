@@ -86,6 +86,8 @@ actions!(
         NextItem,
         PrevItem,
         Refresh,
+        QueueUp,
+        QueueDown,
         OpenPalette,
         PaletteUp,
         PaletteDown,
@@ -144,28 +146,24 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut sources = Vec::new();
     let mut errors = Vec::new();
-    if args.is_empty() {
-        // No args: review the repo we're standing in, or open empty.
-        if let Ok(src) = git::resolve_local(Path::new(".")) {
-            sources.push(Source::Local(src));
-        }
-    } else {
-        for arg in &args {
-            let parsed = if Path::new(arg).is_dir() {
-                git::resolve_local(Path::new(arg)).map(Source::Local)
-            } else {
-                gh::resolve_pr_arg(arg).map(Source::Pr)
-            };
-            match parsed {
-                Ok(source) => sources.push(source),
-                Err(err) => {
-                    eprintln!("error: {arg}: {err:#}");
-                    errors.push(format!("{arg}: {err:#}"));
-                }
+    // Bare launch lands on the review queue — the home screen. The repo we
+    // stand in stays one explicit act away (`.` as an argument, or the
+    // palette's "open local folder"), so local review keeps working
+    // without hijacking the launch.
+    for arg in &args {
+        let parsed = if Path::new(arg).is_dir() {
+            git::resolve_local(Path::new(arg)).map(Source::Local)
+        } else {
+            gh::resolve_pr_arg(arg).map(Source::Pr)
+        };
+        match parsed {
+            Ok(source) => sources.push(source),
+            Err(err) => {
+                eprintln!("error: {arg}: {err:#}");
+                errors.push(format!("{arg}: {err:#}"));
             }
         }
     }
-
     Application::new()
         .with_assets(gpui_component_assets::Assets)
         // gpui ships a NullHttpClient: without a real one, every remote
@@ -185,6 +183,14 @@ fn main() {
                 KeyBinding::new("m", ToggleMinimap, Some("ReviewApp")),
                 KeyBinding::new("c", ToggleComments, Some("ReviewApp")),
                 KeyBinding::new("r", Refresh, Some("ReviewApp")),
+                // The queue screen's keys, in its own context: j/k drive the
+                // selection, r refreshes, and the diff's single-key bindings
+                // stay quiet while the queue is up.
+                KeyBinding::new("j", QueueDown, Some("Queue")),
+                KeyBinding::new("k", QueueUp, Some("Queue")),
+                KeyBinding::new("r", Refresh, Some("Queue")),
+                // ⌘R refreshes from anywhere, whatever has focus.
+                KeyBinding::new("cmd-r", Refresh, None),
                 // Finish the review: approve / request changes / comment.
                 KeyBinding::new("cmd-enter", SubmitReview, Some("ReviewApp")),
                 // Only while the diff pane has focus; typing `/` in any input
@@ -3076,6 +3082,9 @@ const PALETTE_SOURCES: [&str; 2] = ["Open GitHub pull request", "Open local fold
 const SOURCE_PR: usize = 0;
 const SOURCE_FOLDER: usize = 1;
 const PALETTE_ROW_HEIGHT: f32 = 30.0;
+/// Queue rows are one line, a touch taller than the palette's: title,
+/// author, repo, and age side by side.
+const QUEUE_ROW_HEIGHT: f32 = 32.0;
 
 /// Step-1 options matching the query (case-insensitive substring), as indices
 /// into PALETTE_SOURCES. Empty query keeps both.
@@ -3194,6 +3203,70 @@ fn palette_pr_row(
                 .truncate()
                 .text_color(theme::overlay0())
                 .child(SharedString::from(pr.head_ref_name.clone())),
+        )
+        .into_any_element()
+}
+
+/// One review-queue row: title, author, repository, and when it last saw
+/// activity — enough to recognize a PR without opening it. Clicking selects
+/// the row (opening from the queue arrives with the PR screen).
+fn queue_row(
+    pr: &github::QueueItem,
+    pos: usize,
+    selected: bool,
+    now: i64,
+    entity: gpui::Entity<ReviewApp>,
+) -> gpui::AnyElement {
+    div()
+        .id(("queue-row", pos))
+        .mx_1()
+        .px_3()
+        .h(px(QUEUE_ROW_HEIGHT))
+        .rounded_md()
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .when(selected, |row| row.bg(theme::surface0()))
+        .when(!selected, |row| {
+            row.hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+        })
+        .on_click(move |_, window, cx| {
+            entity.update(cx, |this, cx| this.queue_select(pos, window, cx));
+        })
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(theme::subtext())
+                .child(SharedString::from(format!("#{}", pr.number))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(theme::text())
+                .child(SharedString::from(pr.title.clone())),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(theme::subtext())
+                .child(SharedString::from(pr.author.clone())),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .max_w(px(220.))
+                .truncate()
+                .text_color(theme::blue())
+                .child(SharedString::from(pr.repository.clone())),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(theme::overlay0())
+                .child(SharedString::from(short_age(&pr.updated_at, now))),
         )
         .into_any_element()
 }
@@ -3469,6 +3542,53 @@ enum AccountStatus {
     SignedOut(github::ClientError),
 }
 
+/// The review queue screen: every open PR where the viewer's review is
+/// requested (directly or via a team — the search qualifier covers both),
+/// most recently updated first.
+struct QueueState {
+    /// The compiled search the queue runs. v1 always the review-requested
+    /// preset, recently-updated first.
+    search: github::QueueSearch,
+    /// Queue rows in the search's order. Kept (stale) across refresh
+    /// failures, so the screen stays useful offline.
+    prs: Vec<github::QueueItem>,
+    /// A fetch is in flight — the initial load or a refresh.
+    loading: bool,
+    /// The last fetch failure; kept while stale rows remain visible,
+    /// cleared by the next success.
+    error: Option<String>,
+    /// The row the keyboard selection sits on, kept by position across
+    /// refreshes.
+    selected: usize,
+    scroll: UniformListScrollHandle,
+}
+
+impl QueueState {
+    /// The queue as it stands before any fetch: the default search, empty,
+    /// waiting on the app-open refresh.
+    fn new() -> Self {
+        Self {
+            search: github::QueueSearch::review_requested(),
+            prs: Vec::new(),
+            loading: false,
+            error: None,
+            selected: 0,
+            scroll: UniformListScrollHandle::new(),
+        }
+    }
+}
+
+/// The selection after moving `delta` rows in a list of `len`: clamped at
+/// both ends — j/k can never fall off the list — and an empty list has
+/// nothing to select. `delta` 0 re-clamps in place (how a refresh keeps the
+/// selection position when the queue shrinks).
+fn move_selection(selected: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (selected as isize + delta).clamp(0, len as isize - 1) as usize
+}
+
 struct ReviewApp {
     items: Vec<ReviewItem>,
     active: usize,
@@ -3513,6 +3633,15 @@ struct ReviewApp {
     /// Bumped on every account re-check; an in-flight result only lands if
     /// the generation it captured is still current.
     account_gen: u64,
+    /// The review queue — the screen the app opens on.
+    queue: QueueState,
+    /// Bumped on every queue fetch; an in-flight result only lands if the
+    /// generation it captured is still current.
+    queue_gen: u64,
+    /// Whether the main pane shows the review queue (the home screen) or
+    /// the open items. Launching bare shows the queue; launching with PRs
+    /// or paths on the CLI shows those instead.
+    show_queue: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -3598,7 +3727,11 @@ impl ReviewApp {
         let mut this = Self {
             items: Vec::new(),
             active: 0,
-            sidebar_visible: !errors.is_empty() || sources.len() != 1,
+            // The queue is the home screen now: with nothing opened the
+            // sidebar starts hidden (⌘T/⌘K carry the open affordances, and
+            // both open it); several sources or CLI errors still start it
+            // open, the way they always did.
+            sidebar_visible: !errors.is_empty() || sources.len() > 1,
             open_input,
             open_error: errors.first().cloned().map(SharedString::from),
             tree_filter_input,
@@ -3620,6 +3753,9 @@ impl ReviewApp {
             github,
             account: AccountStatus::Checking,
             account_gen: 0,
+            queue: QueueState::new(),
+            queue_gen: 0,
+            show_queue: sources.is_empty(),
             _subscriptions,
         };
         for source in sources {
@@ -3627,6 +3763,8 @@ impl ReviewApp {
         }
         this.active = 0;
         this.spawn_account_check(cx);
+        // The queue fetches on open: the home screen fills itself in.
+        this.spawn_queue_refresh(cx);
         this
     }
 
@@ -3653,6 +3791,68 @@ impl ReviewApp {
             .ok();
         })
         .detach();
+    }
+
+    /// Run the queue search in the background and hot-swap the rows in.
+    /// Failures are non-destructive: stale rows stay visible with the error
+    /// surfaced beside them (see `render_queue`), and the next success
+    /// clears it. The generation guard keeps a stale fetch from landing
+    /// after a newer refresh started.
+    fn spawn_queue_refresh(&mut self, cx: &mut Context<Self>) {
+        self.queue.loading = true;
+        self.queue_gen += 1;
+        let gen = self.queue_gen;
+        let (client, search) = (self.github.clone(), self.queue.search);
+        cx.spawn(async move |this, cx| {
+            let fetched = cx
+                .background_spawn(async move { client.search_prs(&search) })
+                .await;
+            this.update(cx, |app, cx| {
+                if app.queue_gen != gen {
+                    return;
+                }
+                app.queue.loading = false;
+                match fetched {
+                    Ok(prs) => {
+                        // Keep the selection where it was, clamped into the
+                        // fresh rows.
+                        app.queue.selected =
+                            move_selection(app.queue.selected, prs.len(), 0);
+                        app.queue.prs = prs;
+                        app.queue.error = None;
+                    }
+                    Err(err) => app.queue.error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// `j`/`k`: move the queue selection by `delta` rows and keep the
+    /// selected row visible. No-op outside the queue screen.
+    fn queue_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if !self.show_queue || self.queue.prs.is_empty() {
+            return;
+        }
+        self.queue.selected =
+            move_selection(self.queue.selected, self.queue.prs.len(), delta);
+        self.queue
+            .scroll
+            .scroll_to_item(self.queue.selected, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Click a queue row: the selection follows the mouse too, and focus
+    /// lands on the pane so the keyboard keeps working.
+    fn queue_select(&mut self, pos: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_queue || pos >= self.queue.prs.len() {
+            return;
+        }
+        self.queue.selected = pos;
+        window.focus(&self.focus_handle);
+        cx.notify();
     }
 
     /// Re-wrap comment bodies to the pane's current width. Called each render:
@@ -3818,6 +4018,8 @@ impl ReviewApp {
             upgrade_gen: 0,
         });
         self.active = self.items.len() - 1;
+        // Opening something leaves the home screen for the item's pane.
+        self.show_queue = false;
         Self::spawn_fetch(id, source, ViewMode::Split, cx);
         cx.notify();
     }
@@ -4415,6 +4617,7 @@ impl ReviewApp {
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.items.len() {
             self.active = ix;
+            self.show_queue = false;
             window.focus(&self.focus_handle);
             cx.notify();
         }
@@ -4428,6 +4631,11 @@ impl ReviewApp {
         if self.active > ix || self.active >= self.items.len() {
             self.active = self.active.saturating_sub(1);
         }
+        // Closing the last item comes home to the queue.
+        if self.items.is_empty() {
+            self.active = 0;
+            self.show_queue = true;
+        }
         cx.notify();
     }
 
@@ -4435,15 +4643,22 @@ impl ReviewApp {
         let len = self.items.len() as isize;
         if len > 0 {
             self.active = (self.active as isize + delta).rem_euclid(len) as usize;
+            self.show_queue = false;
             cx.notify();
         }
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        // `r` also re-checks the account: run `gh auth login` in a terminal,
-        // press `r` here, and the title bar picks the sign-in up without a
+        // `r`/⌘R re-check the account and re-run the queue search (the home
+        // screen), alongside the visible item: run `gh auth login` in a
+        // terminal, press `r` here, and both pick the sign-in up without a
         // relaunch.
         self.spawn_account_check(cx);
+        self.spawn_queue_refresh(cx);
+        if self.show_queue {
+            cx.notify();
+            return;
+        }
         let Some(item) = self.items.get_mut(self.active) else {
             return;
         };
@@ -5489,29 +5704,51 @@ impl ReviewApp {
     }
 
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let content: gpui::AnyElement = match self.active_item() {
-            None => app_title(None),
-            Some(item) => match &item.state {
-                ItemState::Ready(data) => match &item.source {
-                    Source::Pr(_) => match &data.pr_meta {
-                        Some(meta) => pr_titlebar_content(meta, cx),
-                        None => app_title(None),
+        let content: gpui::AnyElement = if self.show_queue {
+            app_title(None)
+        } else {
+            match self.active_item() {
+                None => app_title(None),
+                Some(item) => match &item.state {
+                    ItemState::Ready(data) => match &item.source {
+                        Source::Pr(_) => match &data.pr_meta {
+                            Some(meta) => pr_titlebar_content(meta, cx),
+                            None => app_title(None),
+                        },
+                        Source::Local(src) => local_titlebar_content(item.id, src, data, cx),
                     },
-                    Source::Local(src) => local_titlebar_content(item.id, src, data, cx),
+                    ItemState::Loading => app_title(Some(format!("loading {}…", item.primary()))),
+                    ItemState::Failed(_) => app_title(Some(format!("{} — failed", item.primary()))),
                 },
-                ItemState::Loading => app_title(Some(format!("loading {}…", item.primary()))),
-                ItemState::Failed(_) => app_title(Some(format!("{} — failed", item.primary()))),
-            },
-        };
-        let note: Option<SharedString> = self.active_item().and_then(|item| {
-            if item.reloading {
-                Some("reloading…".into())
-            } else {
-                item.refresh_error
-                    .as_ref()
-                    .map(|err| SharedString::from(format!("refresh failed: {err}")))
             }
-        });
+        };
+        // On the queue screen the pane itself spells out the empty and
+        // first-failure cases; with rows up, the title bar carries the
+        // refresh status beside the account chip, like an item's.
+        let note: Option<SharedString> = if self.show_queue {
+            if !self.queue.prs.is_empty() {
+                if self.queue.loading {
+                    Some("refreshing queue…".into())
+                } else {
+                    self.queue
+                        .error
+                        .as_ref()
+                        .map(|err| SharedString::from(format!("queue refresh failed: {err}")))
+                }
+            } else {
+                None
+            }
+        } else {
+            self.active_item().and_then(|item| {
+                if item.reloading {
+                    Some("reloading…".into())
+                } else {
+                    item.refresh_error
+                        .as_ref()
+                        .map(|err| SharedString::from(format!("refresh failed: {err}")))
+                }
+            })
+        };
         // The title bar spreads its children edge to edge; one right group
         // keeps the item note beside the account chip instead of stranded
         // mid-bar.
@@ -6087,6 +6324,101 @@ impl ReviewApp {
             .into_any_element()
     }
 
+    /// The review queue screen — what a bare launch opens on. Rows are the
+    /// facade's queue items in the search's order (recently updated first);
+    /// `j`/`k` walk them with a visible selection. Failures are
+    /// non-destructive: the last rows stay up with the error beside them,
+    /// and a first-fetch failure explains itself where the rows would be,
+    /// naming the fix. An empty queue says so instead of a blank pane.
+    fn render_queue(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let queue = &self.queue;
+        if queue.prs.is_empty() && queue.loading {
+            return centered_message("loading review queue…".into(), theme::overlay0());
+        }
+        if queue.prs.is_empty() {
+            if let Some(err) = &queue.error {
+                return div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .p_8()
+                    .child(
+                        div()
+                            .max_w(px(560.))
+                            .text_center()
+                            .text_size(px(14.))
+                            .text_color(theme::peach())
+                            .child(SharedString::from(err.clone())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme::overlay0())
+                            .child(SharedString::from("⌘R to retry")),
+                    )
+                    .into_any_element();
+            }
+            return centered_message("no PRs awaiting your review".into(), theme::overlay0());
+        }
+        let entity = cx.entity();
+        let now = now_unix();
+        let count = queue.prs.len();
+        let selected = queue.selected;
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .text_size(px(13.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .flex_shrink_0()
+                    .h(px(34.))
+                    .border_b_1()
+                    .border_color(theme::surface0())
+                    .child(div().text_color(theme::text()).child("Review queue"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_right()
+                            .text_size(px(12.))
+                            .text_color(theme::subtext())
+                            .child(SharedString::from(format!(
+                                "{count} {}",
+                                if count == 1 { "PR" } else { "PRs" }
+                            ))),
+                    ),
+            )
+            .child(
+                uniform_list("queue", count, move |range, _window, cx| {
+                    let this = entity.read(cx);
+                    range
+                        .filter_map(|pos| this.queue.prs.get(pos).map(|pr| (pos, pr)))
+                        .map(|(pos, pr)| {
+                            queue_row(
+                                pr,
+                                pos,
+                                pos == selected,
+                                now,
+                                entity.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .track_scroll(queue.scroll.clone())
+                .flex_1()
+                .min_h_0(),
+            )
+            .into_any_element()
+    }
+
     /// The pane with nothing open: the ⌘T hint — plus, when GitHub isn't
     /// usable, the facade's sign-in message above it, so a fresh launch
     /// without `gh auth login` explains itself instead of showing a near-
@@ -6133,7 +6465,7 @@ impl ReviewApp {
                     .child(SharedString::from(label)),
             )
         };
-        div()
+        let mut footer = div()
             .h(px(28.))
             .flex_shrink_0()
             .flex()
@@ -6143,27 +6475,39 @@ impl ReviewApp {
             .bg(theme::mantle())
             .border_t_1()
             .border_color(theme::surface0())
-            .text_size(px(12.))
-            .child(hint(&["]", "["], "files"))
-            .child(hint(&["n", "p"], "hunks"))
-            .child(hint(&["v"], "unified/split"))
-            .child(hint(&["m"], "minimap"))
-            .child(hint(&["c"], "comments"))
-            .child(hint(&["/"], "filter files"))
-            .child(hint(&["home", "end"], "top/bottom"))
-            .child(hint(&["cmd-k"], "palette"))
-            .child(hint(&["cmd-t"], "open"))
-            .child(hint(&["cmd-b"], "sidebar"))
-            .child(hint(&["r"], "refresh"))
-            .child(hint(&["cmd-enter"], "review"))
+            .text_size(px(12.));
+        // The queue screen's hints differ from the diff's: j/k drive the
+        // rows, and nothing about hunks or files applies yet.
+        if self.show_queue {
+            footer = footer
+                .child(hint(&["j", "k"], "rows"))
+                .child(hint(&["r"], "refresh"))
+                .child(hint(&["cmd-t"], "open"))
+                .child(hint(&["cmd-k"], "palette"))
+                .child(hint(&["cmd-b"], "sidebar"));
+        } else {
+            footer = footer
+                .child(hint(&["]", "["], "files"))
+                .child(hint(&["n", "p"], "hunks"))
+                .child(hint(&["v"], "unified/split"))
+                .child(hint(&["m"], "minimap"))
+                .child(hint(&["c"], "comments"))
+                .child(hint(&["/"], "filter files"))
+                .child(hint(&["home", "end"], "top/bottom"))
+                .child(hint(&["cmd-k"], "palette"))
+                .child(hint(&["cmd-t"], "open"))
+                .child(hint(&["cmd-b"], "sidebar"))
+                .child(hint(&["r"], "refresh"))
+                .child(hint(&["cmd-enter"], "review"));
+        }
+        footer
     }
-}
-
-impl Render for ReviewApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The pane for an open item — loading, failure message, or the
+    /// diff itself — everything the main pane shows when the queue
+    /// screen isn't up.
+    fn render_item_pane(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entity = cx.entity();
-        self.resync_comment_wrap(window);
-        let pane: gpui::AnyElement = match self.active_item() {
+        match self.active_item() {
             None => self.render_empty_pane(),
             Some(item) => match &item.state {
                 ItemState::Loading => centered_message("loading…".into(), theme::overlay0()),
@@ -6297,6 +6641,17 @@ impl Render for ReviewApp {
                     .children(self.render_plus(cx))
                     .into_any_element(),
             },
+        }
+    }
+}
+
+impl Render for ReviewApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.resync_comment_wrap(window);
+        let pane: gpui::AnyElement = if self.show_queue {
+            self.render_queue(cx)
+        } else {
+            self.render_item_pane(cx)
         };
         div()
             .size_full()
@@ -6379,6 +6734,8 @@ impl Render for ReviewApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
+            .on_action(cx.listener(|this, _: &QueueUp, _, cx| this.queue_move(-1, cx)))
+            .on_action(cx.listener(|this, _: &QueueDown, _, cx| this.queue_move(1, cx)))
             // Bound in the "ReviewApp" context: these only fire while the
             // diff pane has focus. With the palette open, focus sits in the
             // palette input, so its escape routing (PaletteBack) wins.
@@ -6455,7 +6812,14 @@ impl Render for ReviewApp {
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
-                            .key_context("ReviewApp")
+                            // The queue screen is its own key context: while
+                            // it's up, the diff's single-key bindings stay
+                            // quiet and the queue's (j/k, r) fire instead.
+                            .key_context(if self.show_queue {
+                                "Queue"
+                            } else {
+                                "ReviewApp"
+                            })
                             .track_focus(&self.focus_handle)
                             .child(pane),
                     ),
@@ -6990,6 +7354,22 @@ mod tests {
         assert_eq!(filter_prs(&all, "bob"), vec![1]);
         assert_eq!(filter_prs(&all, "crash"), vec![0]);
         assert!(filter_prs(&all, "zzzqqq").is_empty());
+    }
+
+    #[test]
+    fn queue_selection_moves_and_clamps() {
+        // Movement in bounds, both directions, from a middle position.
+        assert_eq!(move_selection(1, 3, 1), 2);
+        assert_eq!(move_selection(1, 3, -1), 0);
+        // Clamped at both ends — j/k can never fall off the list.
+        assert_eq!(move_selection(0, 3, -1), 0);
+        assert_eq!(move_selection(2, 3, 1), 2);
+        // An empty list has nothing to select, however far you move.
+        assert_eq!(move_selection(0, 0, 1), 0);
+        assert_eq!(move_selection(2, 0, -1), 0);
+        // Delta 0 re-clamps in place: how a refresh keeps the selection
+        // position when the queue shrinks.
+        assert_eq!(move_selection(5, 3, 0), 2);
     }
 
     /// (depth, display name, Some(file_ix) for files / None for dirs).
@@ -8028,7 +8408,7 @@ mod tests {
     fn zoom_keybindings_parse() {
         // These strings are only parsed when the app boots, so a typo would be
         // a runtime panic rather than a compile error.
-        for keys in ["cmd-=", "cmd-+", "cmd--", "cmd-0"] {
+        for keys in ["cmd-=", "cmd-+", "cmd--", "cmd-0", "cmd-r", "j", "k"] {
             assert!(
                 Keystroke::parse(keys).is_ok(),
                 "{keys:?} should be a valid keystroke"
