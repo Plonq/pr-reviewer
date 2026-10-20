@@ -1,0 +1,11 @@
+[package]
+name = "git"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+
+[dev-dependencies]
+diff-core = { path = "../diff-core" }
+tempfile = "3"

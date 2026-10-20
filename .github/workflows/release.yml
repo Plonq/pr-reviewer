@@ -1,0 +1,74 @@
+name: Release DMG
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-dmg
+  cancel-in-progress: true
+
+jobs:
+  dmg:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Create app bundle
+        run: |
+          APP=dist/LGTM.app
+          mkdir -p "$APP/Contents/MacOS"
+          cp target/release/lgtm "$APP/Contents/MacOS/lgtm"
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>LGTM</string>
+            <key>CFBundleDisplayName</key>
+            <string>LGTM</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.elliehuxtable.lgtm</string>
+            <key>CFBundleExecutable</key>
+            <string>lgtm</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.1.0</string>
+            <key>CFBundleVersion</key>
+            <string>${GITHUB_SHA::7}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>12.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --deep --sign - "$APP"
+
+      - name: Create DMG
+        run: |
+          ln -s /Applications dist/Applications
+          hdiutil create -volname LGTM -srcfolder dist -ov -format UDZO LGTM.dmg
+
+      - name: Upload to latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push --force origin "HEAD:refs/tags/latest"
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest --prerelease --title "Latest build" --notes ""
+          gh release edit latest --notes "Automated build from \`${GITHUB_SHA::7}\`"
+          gh release upload latest LGTM.dmg --clobber
