@@ -1,3 +1,4 @@
+mod http;
 mod theme;
 
 use anyhow::anyhow;
@@ -167,6 +168,9 @@ fn main() {
 
     Application::new()
         .with_assets(gpui_component_assets::Assets)
+        // gpui ships a NullHttpClient: without a real one, every remote
+        // `img()` (the account avatar, later PR media) silently fails.
+        .with_http_client(http::http_client())
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
             theme::apply_ui_theme(None, cx);

@@ -20,5 +20,8 @@ gpui-component-assets = "0.5"
 # Must match gpui-component's lsp-types so its CompletionProvider signatures line up.
 lsp-types = "0.97"
 fuzzy-matcher = "0.3"
+http_client = { version = "0.2", package = "gpui_http_client" }
+futures = "0.3"
+ureq = "2"
 serde_json = { workspace = true }
 libc = "0.2"
