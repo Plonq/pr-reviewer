@@ -26,7 +26,7 @@ pub struct Viewer {
 
 /// A GitHub label as the queue shows it: its name and the six-hex-digit
 /// color GitHub's own UI paints it (`"1D76DB"`, no `#`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueueLabel {
     pub name: String,
     pub color: String,
@@ -36,7 +36,7 @@ pub struct QueueLabel {
 /// (policy unmet) and a null decision (no policy) both fold into
 /// [`Self::Awaiting`]: the queue row's question is "has anyone already
 /// approved or blocked this?", and both answers are "no".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReviewState {
     /// No approving or blocking review recorded — the queue's default
     /// posture.
@@ -61,7 +61,7 @@ impl ReviewState {
 
 /// The summarized verdict of a PR's checks — the queue's CI dot. The whole
 /// check rollup reduced to one look, so the queue stays fast.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CiState {
     /// Every check green — CI won't get in the way of this review.
     Pass,
@@ -95,7 +95,7 @@ impl CiState {
 /// batched enrichment pass, and a PR the enrichment missed keeps honest
 /// defaults — gray CI, no sizes, initials instead of an avatar — rather
 /// than fabricated values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueueItem {
     pub number: u64,
     pub title: String,
@@ -172,7 +172,7 @@ impl QueueFilterKind {
 /// logins can't contain spaces or colons, so no quoting is needed and none
 /// is invented; the queue derives chips from well-formed queue rows, so
 /// verbatim is honest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum QueueFilter {
     /// Every PR under one organization: `org:<owner>`.
     Org(String),
@@ -245,6 +245,25 @@ impl QueueSearch {
             sort: QueueSort::RecentlyUpdated,
             filters: Vec::new(),
         }
+    }
+
+    /// A search rebuilt from the parts it is made of: the filters that
+    /// were active and the order they ran in.
+    ///
+    /// This is how a search survives a restart: the app remembers the
+    /// chips and the sort, not the compiled string, so a rebuilt search is
+    /// the same search — the preset is the only one there is, and the
+    /// filters land in kind order however they were restored.
+    pub fn from_parts(filters: Vec<QueueFilter>, sort: QueueSort) -> Self {
+        let mut search = Self {
+            preset: QueuePreset::ReviewRequested,
+            sort,
+            filters: Vec::new(),
+        };
+        for filter in filters {
+            search = search.filtered_by(filter);
+        }
+        search
     }
 
     /// The same search, ordered differently.
@@ -518,6 +537,31 @@ mod tests {
             "repo:acme/widgets"
         );
         assert_eq!(QueueFilter::author("octocat").qualifier(), "author:octocat");
+    }
+
+    /// A search rebuilt from its parts is the same search: the chips come
+    /// back in kind order however they were restored, and the sort with
+    /// them. This is what lets a search survive a restart — the parts are
+    /// remembered, not the compiled string.
+    #[test]
+    fn a_search_rebuilt_from_its_parts_is_the_same_search() {
+        let search = QueueSearch::from_parts(
+            vec![
+                QueueFilter::author("octocat"),
+                QueueFilter::org("acme"),
+                QueueFilter::repo("acme/widgets"),
+            ],
+            QueueSort::OldestUpdated,
+        );
+        assert_eq!(
+            search.query(),
+            "is:pr is:open review-requested:@me org:acme repo:acme/widgets author:octocat"
+        );
+        assert_eq!(search.sort(), ("updated", "asc"));
+        // No parts, no chips: the default queue.
+        let empty = QueueSearch::from_parts(Vec::new(), QueueSort::RecentlyUpdated);
+        assert_eq!(empty.query(), "is:pr is:open review-requested:@me");
+        assert!(empty.filters().is_empty());
     }
 
     /// GitHub's reviewDecision vocabulary, exhaustively: the two decided

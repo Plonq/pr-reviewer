@@ -1,4 +1,5 @@
 mod http;
+mod local_store;
 mod theme;
 
 use anyhow::anyhow;
@@ -69,6 +70,54 @@ fn row_height() -> f32 {
 const UNIFIED_GUTTER: f32 = 44. + 44. + 28.;
 const SPLIT_GUTTER: f32 = 44. + 28.;
 const SPLIT_DIVIDER: f32 = 6.0;
+
+/// How often the queue refreshes itself while the window is frontmost.
+///
+/// GitHub's search costs a couple of GraphQL points, so a poll every few
+/// minutes is cheap; the reviewer never has to think about it. The poll
+/// stops when the window is backgrounded and the focus refresh covers the
+/// moment the user comes back.
+const BACKGROUND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The settings key the queue's search (its chips and its sort) is
+/// remembered under.
+const QUEUE_SEARCH_SETTING: &str = "queue_search";
+
+/// The queue's search as it was last remembered: the chips and the sort,
+/// rebuilt into a search.
+///
+/// A setting this build doesn't understand (or a corrupt one) reads as
+/// the default queue — the app must never fail to start over a
+/// preference.
+fn restore_queue_search(value: Option<serde_json::Value>) -> github::QueueSearch {
+    let Some(value) = value else {
+        return github::QueueSearch::review_requested();
+    };
+    let filters = value
+        .get("filters")
+        .and_then(|filters| filters.as_array())
+        .map(|filters| {
+            filters
+                .iter()
+                .filter_map(|filter| {
+                    let kind = filter.get("kind")?.as_str()?;
+                    let value = filter.get("value")?.as_str()?;
+                    Some(match kind {
+                        "org" => github::QueueFilter::org(value),
+                        "repo" => github::QueueFilter::repo(value),
+                        "author" => github::QueueFilter::author(value),
+                        _ => return None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let sort = match value.get("sort").and_then(|sort| sort.as_str()) {
+        Some("oldest") => github::QueueSort::OldestUpdated,
+        _ => github::QueueSort::RecentlyUpdated,
+    };
+    github::QueueSearch::from_parts(filters, sort)
+}
 
 actions!(
     gander,
@@ -276,6 +325,11 @@ fn main() {
             .detach();
 
             let bounds = Bounds::centered(None, size(px(1280.), px(860.)), cx);
+            // The local store opens before the window: the queue paints
+            // from it before anything else happens, so the store's own
+            // cost (a few milliseconds for a SQLite open) is on the cold
+            // start's critical path.
+            let (store, store_error) = local_store::LocalStore::open_default();
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -286,8 +340,17 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let view =
-                        cx.new(|cx| ReviewApp::new(sources, errors, github_client(), window, cx));
+                    let view = cx.new(|cx| {
+                        ReviewApp::new(
+                            sources,
+                            errors,
+                            github_client(),
+                            store,
+                            store_error,
+                            window,
+                            cx,
+                        )
+                    });
                     window.focus(&view.read(cx).focus_handle);
                     cx.new(|cx| Root::new(view, window, cx))
                 },
@@ -2573,6 +2636,87 @@ impl ReviewItem {
         }
     }
 
+    /// Open a PR from the local store, for the case the network isn't
+    /// there: the app has a snapshot of the PR from the last time it
+    /// fetched it, and shows that instead of an error.
+    ///
+    /// The diff itself needs the network (the patch comes from GitHub),
+    /// so what's shown is the PR's metadata — its title, its body, its
+    /// author — and an empty diff pane. It is a readable PR, not a
+    /// complete one: the reviewer can read the conversation offline and
+    /// see the code again when the network is back.
+    ///
+    /// Returns false when the store has no snapshot of this PR: there's
+    /// nothing to show, and the caller falls back to the error.
+    fn install_offline_snapshot(&mut self, store: &local_store::LocalStore) -> bool {
+        let Source::Pr(loc) = &self.source else {
+            return false;
+        };
+        let Some(snapshot) = store.snapshot(&loc.repo_slug(), loc.number) else {
+            return false;
+        };
+        let meta = gh::PrMeta {
+            number: snapshot.number,
+            title: snapshot.title.clone(),
+            author: gh::Author {
+                login: snapshot.author.clone(),
+            },
+            state: "OPEN".to_string(),
+            url: format!(
+                "https://github.com/{}/pull/{}",
+                snapshot.repository, snapshot.number
+            ),
+            body: snapshot.body.clone(),
+            base_ref_name: snapshot.base_ref.clone(),
+            head_ref_name: snapshot.head_ref.clone(),
+            base_ref_oid: String::new(),
+            head_ref_oid: snapshot.head_sha.clone(),
+            additions: 0,
+            deletions: 0,
+            changed_files: 0,
+            review_decision: String::new(),
+        };
+        let diff = diff_core::PrDiff::default();
+        let (rows, file_rows, hunk_rows) = build_rows(
+            &diff,
+            ViewMode::Split,
+            &HashMap::new(),
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+        );
+        let minimap = minimap_rows(&rows);
+        let mut data = Box::new(ItemData {
+            pr_meta: Some(meta),
+            diff,
+            mode: ViewMode::Split,
+            rows,
+            file_rows,
+            hunk_rows,
+            minimap,
+            minimap_cache: RefCell::new(None),
+            cursor: 0,
+            scroll: UniformListScrollHandle::new(),
+            additions: 0,
+            deletions: 0,
+            selection: None,
+            upgrades: HashMap::new(),
+            comments: None,
+            local_review: None,
+            comments_visible: true,
+            comment_wrap: COMMENT_WRAP_CHARS,
+            mentions: Rc::new(RefCell::new(Vec::new())),
+            mentions_fetched: false,
+            tree: Vec::new(),
+            collapsed: HashSet::new(),
+            tree_scroll: UniformListScrollHandle::new(),
+            tree_last_file: None,
+        });
+        data.rebuild_tree();
+        self.state = ItemState::Ready(data);
+        true
+    }
+
     fn dot_color(&self) -> gpui::Rgba {
         match &self.source {
             Source::Local(_) => theme::blue(),
@@ -2591,7 +2735,11 @@ impl ReviewItem {
 
     /// Swap fetched data in. On refresh (already Ready) scroll position,
     /// cursor, and view mode are preserved.
-    fn install(&mut self, loaded: Loaded) {
+    ///
+    /// Returns the PR's snapshot, when the fetch was a PR's: the caller
+    /// keeps it in the local store, so the next launch knows what the app
+    /// last saw of this PR.
+    fn install(&mut self, loaded: Loaded) -> Option<local_store::StoredPrSnapshot> {
         let Loaded {
             meta,
             diff,
@@ -2600,6 +2748,7 @@ impl ReviewItem {
             mut hunk_rows,
             mode,
             comments,
+            snapshot,
         } = loaded;
         let (additions, deletions) = diff
             .files
@@ -2685,6 +2834,7 @@ impl ReviewItem {
                 self.state = ItemState::Ready(data);
             }
         }
+        snapshot
     }
 }
 
@@ -2708,13 +2858,21 @@ struct Loaded {
     mode: ViewMode,
     /// Some (possibly empty) for PR items, None for local ones.
     comments: Option<CommentIndex>,
+    /// The snapshot of a PR's fetch, for the local store: what the app
+    /// saw of the PR, and when. None for local items.
+    snapshot: Option<local_store::StoredPrSnapshot>,
 }
 
 /// Blocking fetch + parse + row building for one item; runs on the background
 /// executor, so subprocess waits and tree-sitter work stay off the main thread.
 /// PR items fetch meta, patch, and review comments concurrently.
+///
+/// A PR's fetch also produces the snapshot the local store keeps: what the
+/// app saw of the PR (its head SHA, its threads), so the next launch knows
+/// what "since I last looked" means, and an offline launch can still read
+/// the PR.
 fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
-    let (meta, patch, comments) = match source {
+    let (meta, patch, comments, snapshot) = match source {
         Source::Pr(loc) => {
             let meta_loc = loc.clone();
             let meta_thread = std::thread::spawn(move || gh::fetch_meta(&meta_loc));
@@ -2728,12 +2886,18 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
             let comments = comments_thread
                 .join()
                 .map_err(|_| anyhow!("gh comments fetch panicked"))??;
-            (LoadedMeta::Pr(meta), patch, Some(group_comments(comments)))
+            let snapshot = pr_snapshot(loc, &meta, &comments);
+            (
+                LoadedMeta::Pr(meta),
+                patch,
+                Some(group_comments(comments)),
+                Some(snapshot),
+            )
         }
         Source::Local(src) => {
             let src = git::resolve_local_with_base(&src.repo_root, src.base_ref.as_deref())?;
             let patch = git::diff_patch(&src)?;
-            (LoadedMeta::Local(src), patch, None)
+            (LoadedMeta::Local(src), patch, None, None)
         }
     };
     let diff = diff_core::parse_patch(&patch);
@@ -2753,7 +2917,69 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
         hunk_rows,
         mode,
         comments,
+        snapshot,
     })
+}
+
+/// The snapshot of a PR, as the local store keeps it: what the app saw
+/// (its head SHA, its review threads) and when it saw it.
+fn pr_snapshot(
+    loc: &gh::PrLocator,
+    meta: &gh::PrMeta,
+    comments: &[gh::ReviewComment],
+) -> local_store::StoredPrSnapshot {
+    // A thread is a root comment plus its replies: the root's id is the
+    // thread's id, and the thread's timestamp is its last comment's.
+    let mut threads: Vec<local_store::StoredThreadSeen> = Vec::new();
+    let mut replies: HashMap<u64, u64> = HashMap::new();
+    for comment in comments {
+        if let Some(parent) = comment.in_reply_to_id {
+            replies.insert(comment.id, parent);
+        }
+    }
+    for comment in comments {
+        if comment.in_reply_to_id.is_some() {
+            continue; // a reply, not a thread root
+        }
+        // The thread's last comment: the newest reply under this root, or
+        // the root itself.
+        let mut updated_at = comment.created_at.clone();
+        for other in comments {
+            let mut root = other.in_reply_to_id;
+            let mut guard = 0;
+            while let Some(parent) = root {
+                if parent == comment.id {
+                    if other.created_at > updated_at {
+                        updated_at = other.created_at.clone();
+                    }
+                    break;
+                }
+                root = replies.get(&parent).copied();
+                guard += 1;
+                if guard > 32 {
+                    break; // a reply cycle can't happen, but don't spin
+                }
+            }
+        }
+        threads.push(local_store::StoredThreadSeen {
+            id: comment.id.to_string(),
+            updated_at,
+            resolved: false,
+        });
+    }
+    local_store::StoredPrSnapshot {
+        repository: loc.repo_slug(),
+        number: meta.number,
+        title: meta.title.clone(),
+        body: meta.body.clone(),
+        author: meta.author.login.clone(),
+        head_sha: meta.head_ref_oid.clone(),
+        base_ref: meta.base_ref_name.clone(),
+        head_ref: meta.head_ref_name.clone(),
+        threads,
+        is_draft: false,
+        fetched_at_ms: local_store::now_ms(),
+    }
 }
 
 // --- Phase-2 full-content upgrade ---------------------------------------
@@ -3990,6 +4216,11 @@ enum AccountStatus {
 /// The review queue screen: every open PR where the viewer's review is
 /// requested (directly or via a team — the search qualifier covers both),
 /// most recently updated first.
+///
+/// The queue is **cache-first**: the rows it paints come from the local
+/// store when the app opens, and the network's answer hot-swaps in when
+/// it lands. The rows on screen therefore carry their origin — cached or
+/// fresh — which is what the status line says.
 struct QueueState {
     /// The compiled search the queue runs. v1 always the review-requested
     /// preset, recently-updated first.
@@ -3997,6 +4228,10 @@ struct QueueState {
     /// Queue rows in the search's order. Kept (stale) across refresh
     /// failures, so the screen stays useful offline.
     prs: Vec<github::QueueItem>,
+    /// Where the rows on screen came from: the local cache (painted the
+    /// instant the app opened) or the network (hot-swapped in when the
+    /// fetch landed).
+    origin: QueueOrigin,
     /// A fetch is in flight — the initial load or a refresh.
     loading: bool,
     /// The last fetch failure; kept while stale rows remain visible,
@@ -4008,6 +4243,19 @@ struct QueueState {
     scroll: UniformListScrollHandle,
 }
 
+/// Where the rows on screen came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueOrigin {
+    /// Nothing has been painted yet: the app is opening, or the cache was
+    /// empty.
+    None,
+    /// The rows came from the local cache — the app's first paint, and
+    /// what stays on screen when the network is unreachable.
+    Cached,
+    /// The rows came from the network.
+    Fresh,
+}
+
 impl QueueState {
     /// The queue as it stands before any fetch: the default search, empty,
     /// waiting on the app-open refresh.
@@ -4015,6 +4263,7 @@ impl QueueState {
         Self {
             search: github::QueueSearch::review_requested(),
             prs: Vec::new(),
+            origin: QueueOrigin::None,
             loading: false,
             error: None,
             selected: 0,
@@ -4087,6 +4336,18 @@ struct ReviewApp {
     /// the open items. Launching bare shows the queue; launching with PRs
     /// or paths on the CLI shows those instead.
     show_queue: bool,
+    /// The local store: the queue cache the app paints from on open, and
+    /// the place fetched queues are written to.
+    store: local_store::LocalStore,
+    /// Why the store couldn't be opened, when it couldn't — the app says
+    /// so rather than pretending the cache is there.
+    store_error: Option<String>,
+    /// Whether the window is frontmost. The background poll only runs
+    /// while it is; a backgrounded app doesn't spend the user's data.
+    frontmost: bool,
+    /// Bumped on every background poll; an older poll stops when it sees
+    /// a newer generation, so there is never more than one running.
+    poll_gen: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -4120,6 +4381,8 @@ impl ReviewApp {
         sources: Vec<Source>,
         errors: Vec<String>,
         github: Arc<dyn github::GitHubClient>,
+        store: local_store::LocalStore,
+        store_error: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -4134,6 +4397,12 @@ impl ReviewApp {
             cx.observe_window_appearance(window, |_, window, cx| {
                 theme::apply_ui_theme(Some(window), cx);
                 cx.notify();
+            }),
+            // The window's key status: the app refreshes when it comes
+            // back to the front, and the background poll only runs while
+            // it is frontmost.
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.set_frontmost(window.is_window_active(), cx);
             }),
             cx.subscribe_in(
                 &open_input,
@@ -4201,16 +4470,115 @@ impl ReviewApp {
             queue: QueueState::new(),
             queue_gen: 0,
             show_queue: sources.is_empty(),
+            store,
+            store_error,
+            frontmost: true,
+            poll_gen: 0,
             _subscriptions,
         };
         for source in sources {
             this.open_item(source, cx);
         }
         this.active = 0;
+        // The queue's search comes back from the last run before the
+        // cache is read: the cached rows belong to a search, and the app
+        // must know which one before it paints them.
+        this.queue.search = this.restore_queue_search();
         this.spawn_account_check(cx);
-        // The queue fetches on open: the home screen fills itself in.
+        // The queue paints from the cache before the network is asked at
+        // all: the first frame already shows the last queue, and the
+        // fetch that follows hot-swaps the fresh one in.
+        this.paint_queue_from_cache();
         this.spawn_queue_refresh(cx);
+        this.spawn_background_poll(cx);
         this
+    }
+
+    /// The window's key status changed: the app is frontmost, or it isn't
+    /// any more.
+    ///
+    /// Coming back to the front is the moment the queue is most likely to
+    /// have moved on, so the queue refreshes and the background poll
+    /// starts again. Going away stops the poll: a backgrounded app
+    /// doesn't spend the user's data.
+    fn set_frontmost(&mut self, frontmost: bool, cx: &mut Context<Self>) {
+        if frontmost == self.frontmost {
+            return;
+        }
+        self.frontmost = frontmost;
+        if frontmost {
+            // Coming back to the front is the moment the queue is most
+            // likely to have moved on: refresh it, and let the poll run
+            // again (the new poll ends the old one).
+            self.spawn_queue_refresh(cx);
+            self.spawn_background_poll(cx);
+        }
+        cx.notify();
+    }
+
+    /// The gentle background poll.
+    ///
+    /// While the window is frontmost, the queue refreshes every
+    /// [`BACKGROUND_POLL_INTERVAL`] — GitHub's search costs a couple of
+    /// points, so a poll every few minutes is cheap and keeps the queue
+    /// fresh without the reviewer thinking about it. The poll stops the
+    /// moment the window loses the key: a backgrounded app doesn't spend
+    /// the user's data, and the focus refresh covers the moment they come
+    /// back.
+    ///
+    /// The generation guard ends the previous poll when a new one starts,
+    /// so a window that comes back to the front has exactly one poll
+    /// running — never two, never none.
+    fn spawn_background_poll(&mut self, cx: &mut Context<Self>) {
+        self.poll_gen += 1;
+        let gen = self.poll_gen;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(BACKGROUND_POLL_INTERVAL)
+                    .await;
+                // A newer poll took over, or the window went to the
+                // background: this poll is done.
+                let keep_going = this
+                    .read_with(cx, |app, _| app.poll_gen == gen && app.frontmost)
+                    .unwrap_or(false);
+                if !keep_going {
+                    return;
+                }
+                this.update(cx, |app, cx| app.spawn_queue_refresh(cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Paint the queue from the local cache.
+    ///
+    /// This is the app's first paint: the rows on screen are the ones the
+    /// last run saw, so the queue is there before the network is asked.
+    /// The fetch that runs alongside it hot-swaps the fresh rows in when
+    /// it lands.
+    ///
+    /// A cache from a *different* search isn't painted as this search's
+    /// queue: those rows are another queue, and showing them under this
+    /// search's chips would be a lie. The app paints what it has and
+    /// says so.
+    fn paint_queue_from_cache(&mut self) {
+        let cached = self.store.cached_queue();
+        if cached.prs.is_empty() {
+            return;
+        }
+        let (sort, order) = self.queue.search.sort();
+        let matches = cached.matches(&self.queue.search.query(), sort, order);
+        self.queue.prs = self.store.cached_queue_items();
+        // The origin stays `None` for a cache that belongs to another
+        // search: the status line must not claim "cached" for a queue it
+        // doesn't match.
+        self.queue.origin = if matches {
+            QueueOrigin::Cached
+        } else {
+            QueueOrigin::None
+        };
+        self.queue.selected = move_selection(self.queue.selected, self.queue.prs.len(), 0);
     }
 
     /// Ask the facade who we're signed in as — a `gh` subprocess in v0.1, so
@@ -4243,6 +4611,9 @@ impl ReviewApp {
     /// surfaced beside them (see `render_queue`), and the next success
     /// clears it. The generation guard keeps a stale fetch from landing
     /// after a newer refresh started.
+    ///
+    /// A successful fetch also lands in the local store, so the *next*
+    /// launch paints this queue before the network is asked at all.
     fn spawn_queue_refresh(&mut self, cx: &mut Context<Self>) {
         self.queue.loading = true;
         self.queue_gen += 1;
@@ -4263,7 +4634,19 @@ impl ReviewApp {
                         // fresh rows.
                         app.queue.selected = move_selection(app.queue.selected, prs.len(), 0);
                         app.queue.prs = prs;
+                        app.queue.origin = QueueOrigin::Fresh;
                         app.queue.error = None;
+                        // The fresh queue becomes the cache: the next
+                        // launch paints it before the network answers. The
+                        // write goes to the background executor — a disk
+                        // write must never sit on the UI thread.
+                        let store = app.store.clone();
+                        let search = app.queue.search.clone();
+                        let prs = app.queue.prs.clone();
+                        cx.background_spawn(async move {
+                            store.cache_queue(&search, &prs);
+                        })
+                        .detach();
                     }
                     Err(err) => app.queue.error = Some(err.to_string()),
                 }
@@ -4312,6 +4695,7 @@ impl ReviewApp {
             github::QueueSort::OldestUpdated => github::QueueSort::RecentlyUpdated,
         };
         self.queue.search = self.queue.search.clone().sorted_by(flipped);
+        self.persist_queue_search();
         self.queue_run_search(cx);
     }
 
@@ -4327,6 +4711,7 @@ impl ReviewApp {
         } else {
             self.queue.search.clone().filtered_by(filter)
         };
+        self.persist_queue_search();
         self.queue_run_search(cx);
     }
 
@@ -4337,7 +4722,44 @@ impl ReviewApp {
             return;
         }
         self.queue.search = self.queue.search.clone().unfiltered();
+        self.persist_queue_search();
         self.queue_run_search(cx);
+    }
+
+    /// Remember the queue's search — the chips and the sort — so the next
+    /// launch opens the same queue the last one did.
+    ///
+    /// The parts are stored, not the compiled string: a rebuilt search is
+    /// the same search, and the parts survive a change in how the query
+    /// compiles.
+    fn persist_queue_search(&self) {
+        let filters: Vec<serde_json::Value> = self
+            .queue
+            .search
+            .filters()
+            .iter()
+            .map(|filter| {
+                serde_json::json!({
+                    "kind": filter.kind().prefix(),
+                    "value": filter.value(),
+                })
+            })
+            .collect();
+        let sort = match self.queue.search.ordering() {
+            github::QueueSort::RecentlyUpdated => "recent",
+            github::QueueSort::OldestUpdated => "oldest",
+        };
+        self.store.set_setting(
+            QUEUE_SEARCH_SETTING,
+            serde_json::json!({ "filters": filters, "sort": sort }),
+        );
+    }
+
+    /// The queue's search as it was last remembered: the chips and the
+    /// sort, rebuilt into a search. A setting this build doesn't
+    /// understand (or a corrupt one) reads as the default queue.
+    fn restore_queue_search(&self) -> github::QueueSearch {
+        restore_queue_search(self.store.setting(QUEUE_SEARCH_SETTING))
     }
 
     /// Run the queue's (already-changed) search from the top: the rows
@@ -4532,7 +4954,14 @@ impl ReviewApp {
                 item.reloading = false;
                 match fetched {
                     Ok(loaded) => {
-                        item.install(loaded);
+                        let snapshot = item.install(loaded);
+                        // The PR's snapshot lands in the local store: the
+                        // next launch knows what the app last saw of it
+                        // (its head SHA, its threads), and an offline
+                        // launch can still read it.
+                        if let Some(snapshot) = snapshot {
+                            app.store.save_snapshot(&snapshot);
+                        }
                         // Phase 2: after the instant patch-derived paint,
                         // upgrade every eligible file to full contents in the
                         // background. The bumped generation cancels any
@@ -4580,7 +5009,19 @@ impl ReviewApp {
                         match &item.state {
                             // Refresh failure: keep the stale-but-useful data.
                             ItemState::Ready(_) => item.refresh_error = Some(msg.into()),
-                            _ => item.state = ItemState::Failed(msg),
+                            _ => {
+                                // A PR that can't be fetched may still be
+                                // readable from the local store: the app
+                                // opens it from the snapshot it kept, and
+                                // says the data is a cached one.
+                                let offline = item.install_offline_snapshot(&app.store);
+                                if offline {
+                                    item.refresh_error =
+                                        Some("offline — showing the last saved copy".into());
+                                } else {
+                                    item.state = ItemState::Failed(msg);
+                                }
+                            }
                         }
                     }
                 }
@@ -6876,10 +7317,9 @@ impl ReviewApp {
                             .child(SharedString::from("⌘R to retry")),
                     )
                     .into_any_element();
-            }
-            // A filter that matched everything away — the rows it was
-            // derived from went with them, so the way back out is the
-            // message itself: one click (or escape) clears and re-runs.
+            } // A filter that matched everything away — the rows it was
+              // derived from went with them, so the way back out is the
+              // message itself: one click (or escape) clears and re-runs.
             if !queue.search.filters().is_empty() {
                 let entity = cx.entity();
                 return div()
@@ -7137,26 +7577,55 @@ impl ReviewApp {
         // The fetch status, right-aligned where the chips are: the refresh
         // a click just kicked off, or the failure that left the stale
         // rows up — surfaced in the pane, not only in the title bar.
-        let status: Option<(&str, gpui::Hsla)> = if self.queue.loading {
-            Some(("refreshing queue…", gpui::Hsla::from(theme::overlay0())))
-        } else {
-            self.queue
-                .error
-                .as_deref()
-                .map(|err| (err, gpui::Hsla::from(theme::peach())))
-        };
+        //
+        // A queue painted from the local cache says so, and says how old
+        // it is: the rows on screen are the last ones the app saw, not
+        // live data, and the reviewer deserves to know which they're
+        // looking at.
+        let mut status: Vec<(String, gpui::Hsla)> = Vec::new();
+        if self.queue.loading {
+            status.push((
+                match self.queue.origin {
+                    QueueOrigin::Cached => "refreshing queue… (showing cached rows)".to_string(),
+                    _ => "refreshing queue…".to_string(),
+                },
+                gpui::Hsla::from(theme::overlay0()),
+            ));
+        } else if let Some(err) = self.queue.error.as_deref() {
+            status.push((err.to_string(), gpui::Hsla::from(theme::peach())));
+        } else if self.queue.origin == QueueOrigin::Cached {
+            let age = self.store.cached_queue().age_seconds(local_store::now_ms());
+            status.push((
+                format!("cached · {age}s ago"),
+                gpui::Hsla::from(theme::overlay0()),
+            ));
+        }
+        // A store that couldn't be opened is worth saying out loud: the
+        // queue still works, but nothing is cached, so the next launch
+        // starts from the network again. The path it *would* have used
+        // is part of the message — it's what the user might have to fix.
+        if let Some(err) = &self.store_error {
+            let where_ = match self.store.path() {
+                Some(path) => format!(" ({})", path.display()),
+                None => String::new(),
+            };
+            status.push((
+                format!("cache unavailable{where_}: {err}"),
+                gpui::Hsla::from(theme::peach()),
+            ));
+        }
         row = row
             .child(div().flex_1().min_w_0())
-            .when_some(status, |row, (text, color)| {
-                row.child(
+            .when(!status.is_empty(), |row| {
+                row.children(status.into_iter().map(|(text, color)| {
                     div()
                         .min_w_0()
                         .max_w(px(480.))
                         .truncate()
                         .text_size(px(12.))
                         .text_color(color)
-                        .child(SharedString::from(text.to_string())),
-                )
+                        .child(SharedString::from(text))
+                }))
             });
         row.into_any_element()
     }
@@ -8555,6 +9024,16 @@ mod tests {
         cx: &mut gpui::TestAppContext,
         client: Arc<dyn github::GitHubClient>,
     ) -> (gpui::AnyWindowHandle, gpui::Entity<ReviewApp>) {
+        queue_window_with_store(cx, client, local_store::LocalStore::in_memory())
+    }
+
+    /// The same window, over a store the test controls — so a test can
+    /// seed a cache before the app opens and watch it paint from it.
+    fn queue_window_with_store(
+        cx: &mut gpui::TestAppContext,
+        client: Arc<dyn github::GitHubClient>,
+        store: local_store::LocalStore,
+    ) -> (gpui::AnyWindowHandle, gpui::Entity<ReviewApp>) {
         cx.update(|cx| {
             gpui_component::init(cx);
             theme::apply_ui_theme(None, cx);
@@ -8562,8 +9041,17 @@ mod tests {
         let stash = std::rc::Rc::new(std::cell::RefCell::new(None::<gpui::Entity<ReviewApp>>));
         let stash2 = stash.clone();
         let window = cx.add_window(move |window, cx| {
-            let view =
-                cx.new(|cx| ReviewApp::new(Vec::new(), Vec::new(), client.clone(), window, cx));
+            let view = cx.new(|cx| {
+                ReviewApp::new(
+                    Vec::new(),
+                    Vec::new(),
+                    client.clone(),
+                    store,
+                    None,
+                    window,
+                    cx,
+                )
+            });
             window.focus(&view.read(cx).focus_handle);
             *stash2.borrow_mut() = Some(view.clone());
             Root::new(view, window, cx)
@@ -8649,6 +9137,370 @@ mod tests {
                 "is:pr is:open review-requested:@me".to_string(),
                 ("updated", "asc")
             )
+        );
+    }
+
+    /// A queue that never answers — the offline case: the facade fails
+    /// every search, and the app must not fall over, must not clear the
+    /// rows it has, and must say what went wrong.
+    struct OfflineQueue {
+        asked: std::sync::Mutex<usize>,
+    }
+
+    impl github::GitHubClient for OfflineQueue {
+        fn viewer(&self) -> Result<github::Viewer, github::ClientError> {
+            Err(github::ClientError::Failed("offline".into()))
+        }
+
+        fn search_prs(
+            &self,
+            _search: &github::QueueSearch,
+        ) -> Result<Vec<github::QueueItem>, github::ClientError> {
+            *self.asked.lock().unwrap() += 1;
+            Err(github::ClientError::Failed(
+                "error connecting to api.github.com".into(),
+            ))
+        }
+    }
+
+    /// The cache-first paint: with a warm cache, the app paints the
+    /// cached rows the instant it opens — before the network has answered
+    /// — and the fresh rows hot-swap in when the fetch lands.
+    ///
+    /// The two halves are checked separately: the cache paint is what
+    /// makes the app open instantly, and the hot swap is what keeps it
+    /// honest.
+    #[gpui::test]
+    fn a_warm_cache_paints_the_queue_before_the_network_answers(cx: &mut gpui::TestAppContext) {
+        let store = local_store::LocalStore::in_memory();
+        // Seed the cache with the rows the last run saw.
+        store.cache_queue(
+            &github::QueueSearch::review_requested(),
+            &[
+                queued(1, "acme/widgets", "alice"),
+                queued(2, "acme/widgets", "bob"),
+            ],
+        );
+        // A facade that never answers: the cache paint is the only thing
+        // that can put rows on screen.
+        let fake = Arc::new(OfflineQueue {
+            asked: std::sync::Mutex::new(0),
+        });
+        let (_window, app) = queue_window_with_store(cx, fake.clone(), store);
+
+        cx.update(|cx| {
+            let app = app.read(cx);
+            assert_eq!(app.queue.prs.len(), 2, "the cached rows must paint");
+            assert_eq!(app.queue.origin, QueueOrigin::Cached);
+            // The network was asked, and failed: the cached rows stay.
+            assert!(app.queue.error.is_some(), "the failure must be surfaced");
+        });
+        assert!(
+            *fake.asked.lock().unwrap() >= 1,
+            "the app must still ask the network"
+        );
+    }
+
+    /// The hot swap: the fresh rows replace the cached ones when the
+    /// fetch lands, and the queue says it is fresh.
+    #[gpui::test]
+    fn the_fresh_queue_hot_swaps_in_over_the_cached_one(cx: &mut gpui::TestAppContext) {
+        let store = local_store::LocalStore::in_memory();
+        store.cache_queue(
+            &github::QueueSearch::review_requested(),
+            &[queued(1, "acme/widgets", "alice")],
+        );
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (_window, app) = queue_window_with_store(cx, fake.clone(), store);
+
+        cx.update(|cx| {
+            let app = app.read(cx);
+            assert_eq!(
+                app.queue.prs.len(),
+                2,
+                "the fresh queue replaced the cached one"
+            );
+            assert_eq!(app.queue.origin, QueueOrigin::Fresh);
+            assert!(app.queue.error.is_none());
+        });
+    }
+
+    /// The fetched queue lands in the cache: the next launch paints it
+    /// before the network is asked. Without this the cache would stay
+    /// empty forever and the app would never be instant.
+    #[gpui::test]
+    fn the_fetched_queue_lands_in_the_cache(cx: &mut gpui::TestAppContext) {
+        let store = local_store::LocalStore::in_memory();
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (_window, _app) = queue_window_with_store(cx, fake.clone(), store.clone());
+
+        let cached = store.cached_queue();
+        assert_eq!(cached.prs.len(), 2, "the fetched queue must be cached");
+        assert_eq!(cached.search, "is:pr is:open review-requested:@me");
+        assert_eq!(cached.sort, "updated");
+        assert_eq!(cached.order, "desc");
+        assert!(
+            cached.fetched_at_ms > 0,
+            "the cache must know when it was written"
+        );
+    }
+
+    /// The offline launch: a warm cache, a network that never answers.
+    /// The app opens, shows the cached queue, and reports the failure
+    /// without losing the rows.
+    #[gpui::test]
+    fn an_offline_launch_shows_the_cached_queue(cx: &mut gpui::TestAppContext) {
+        let store = local_store::LocalStore::in_memory();
+        store.cache_queue(
+            &github::QueueSearch::review_requested(),
+            &[
+                queued(1, "acme/widgets", "alice"),
+                queued(2, "acme/widgets", "bob"),
+            ],
+        );
+        let fake = Arc::new(OfflineQueue {
+            asked: std::sync::Mutex::new(0),
+        });
+        let (_window, app) = queue_window_with_store(cx, fake.clone(), store);
+
+        cx.update(|cx| {
+            let app = app.read(cx);
+            assert_eq!(
+                app.queue.prs.len(),
+                2,
+                "the cached queue must survive an offline launch"
+            );
+            assert!(app.queue.error.is_some());
+            // The rows are usable: the selection can still move.
+            assert_eq!(app.queue.selected, 0);
+        });
+    }
+
+    /// The queue's search comes back from the last run: the chips and
+    /// the sort, rebuilt into the same search — so the app opens the
+    /// queue the reviewer left, and the cache it paints belongs to that
+    /// search.
+    #[test]
+    fn the_queue_search_survives_a_restart() {
+        let store = local_store::LocalStore::in_memory();
+        let search = github::QueueSearch::review_requested()
+            .filtered_by(github::QueueFilter::author("bob"))
+            .sorted_by(github::QueueSort::OldestUpdated);
+        store.set_setting(
+            "queue_search",
+            serde_json::json!({
+                "filters": [{"kind": "author", "value": "bob"}],
+                "sort": "oldest",
+            }),
+        );
+        let app_search = restore_queue_search(store.setting("queue_search"));
+        assert_eq!(app_search.query(), search.query());
+        assert_eq!(app_search.ordering(), search.ordering());
+        assert_eq!(app_search.filters(), search.filters());
+    }
+
+    /// A setting the app doesn't understand reads as the default queue:
+    /// a corrupt preference must never keep the app from starting.
+    #[test]
+    fn an_unreadable_queue_search_setting_reads_as_the_default_queue() {
+        let default = restore_queue_search(None);
+        assert_eq!(default.query(), "is:pr is:open review-requested:@me");
+        assert_eq!(default.ordering(), github::QueueSort::RecentlyUpdated);
+        // A blob of the wrong shape.
+        let drifted = restore_queue_search(Some(serde_json::json!("nonsense")));
+        assert_eq!(drifted.query(), "is:pr is:open review-requested:@me");
+        // A filter kind this build doesn't know is dropped, the rest kept.
+        let mixed = restore_queue_search(Some(serde_json::json!({
+            "filters": [
+                {"kind": "author", "value": "bob"},
+                {"kind": "colour", "value": "blue"},
+            ],
+            "sort": "oldest",
+        })));
+        assert_eq!(
+            mixed.query(),
+            "is:pr is:open review-requested:@me author:bob"
+        );
+        assert_eq!(mixed.ordering(), github::QueueSort::OldestUpdated);
+    }
+
+    /// The freshness bookkeeping: a fetched PR's snapshot lands in the
+    /// store with its head SHA and its threads, so the next fetch can be
+    /// compared against it — "what changed since I last looked".
+    #[test]
+    fn a_fetched_pr_leaves_its_freshness_bookkeeping() {
+        let store = local_store::LocalStore::in_memory();
+        let snapshot = local_store::StoredPrSnapshot {
+            repository: "acme/widgets".into(),
+            number: 7,
+            title: "Add deactivation filters".into(),
+            body: String::new(),
+            author: "alice".into(),
+            head_sha: "abc123".into(),
+            base_ref: "main".into(),
+            head_ref: "feature/deactivation".into(),
+            threads: vec![local_store::StoredThreadSeen {
+                id: "T_1".into(),
+                updated_at: "2026-10-20T08:07:08Z".into(),
+                resolved: false,
+            }],
+            is_draft: false,
+            fetched_at_ms: 1_700_000_000_000,
+        };
+        store.save_snapshot(&snapshot);
+
+        // The head SHA is its own column, so "has the head moved?" is a
+        // cheap comparison.
+        assert_eq!(store.head_sha("acme/widgets", 7).as_deref(), Some("abc123"));
+        // The snapshot knows when it was taken.
+        assert_eq!(
+            store.snapshot_fetched_at_ms("acme/widgets", 7),
+            Some(1_700_000_000_000)
+        );
+        // The threads the app saw are remembered, one by one.
+        let threads = store.threads_seen("acme/widgets", 7);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, "T_1");
+        assert_eq!(threads[0].updated_at, "2026-10-20T08:07:08Z");
+        // Another PR's bookkeeping is another PR's.
+        assert!(store.threads_seen("acme/widgets", 8).is_empty());
+    }
+
+    /// A PR the app has a snapshot of can be opened without the network:
+    /// the local store's copy stands in for the fetch that failed, so an
+    /// offline reviewer can still read the PR.
+    #[test]
+    fn a_pr_opens_from_the_store_when_the_fetch_fails() {
+        let store = local_store::LocalStore::in_memory();
+        store.save_snapshot(&local_store::StoredPrSnapshot {
+            repository: "acme/widgets".into(),
+            number: 7,
+            title: "Add deactivation filters".into(),
+            body: "Some **markdown**.".into(),
+            author: "alice".into(),
+            head_sha: "abc123".into(),
+            base_ref: "main".into(),
+            head_ref: "feature/deactivation".into(),
+            threads: Vec::new(),
+            is_draft: false,
+            fetched_at_ms: 1_700_000_000_000,
+        });
+
+        let mut item = ReviewItem {
+            id: 1,
+            source: Source::Pr(gh::PrLocator {
+                owner: "acme".into(),
+                repo: "widgets".into(),
+                number: 7,
+            }),
+            state: ItemState::Loading,
+            reloading: false,
+            refresh_error: None,
+            upgrade_gen: 0,
+        };
+        assert!(
+            item.install_offline_snapshot(&store),
+            "the stored snapshot must stand in for the failed fetch"
+        );
+        let ItemState::Ready(data) = &item.state else {
+            panic!("the PR must be readable from the store");
+        };
+        let meta = data
+            .pr_meta
+            .as_ref()
+            .expect("the PR's metadata must be there");
+        assert_eq!(meta.title, "Add deactivation filters");
+        assert_eq!(meta.body, "Some **markdown**.");
+        assert_eq!(meta.author.login, "alice");
+        assert_eq!(meta.head_ref_oid, "abc123");
+
+        // A PR the store has never seen has nothing to stand in: the
+        // caller falls back to the error.
+        let mut unknown = ReviewItem {
+            id: 2,
+            source: Source::Pr(gh::PrLocator {
+                owner: "acme".into(),
+                repo: "widgets".into(),
+                number: 8,
+            }),
+            state: ItemState::Loading,
+            reloading: false,
+            refresh_error: None,
+            upgrade_gen: 0,
+        };
+        assert!(!unknown.install_offline_snapshot(&store));
+        assert!(matches!(unknown.state, ItemState::Loading));
+    }
+
+    /// The focus refresh: the window coming back to the front re-runs the
+    /// queue search. The reviewer comes back from the mail app and the
+    /// queue is current again — without them thinking about it.
+    #[gpui::test]
+    fn the_window_focusing_refreshes_the_queue(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        let asked_after_open = fake.asked.lock().unwrap().len();
+        assert_eq!(asked_after_open, 1, "the app-open fetch runs once");
+
+        // The window leaves the foreground and comes back: the app
+        // refreshes on the way back. The activation observer is what
+        // fires, so the test drives the window's active state directly.
+        cx.update(|cx| app.update(cx, |this, cx| this.set_frontmost(false, cx)));
+        cx.run_until_parked();
+        cx.update(|cx| app.update(cx, |this, cx| this.set_frontmost(true, cx)));
+        cx.run_until_parked();
+        assert!(
+            fake.asked.lock().unwrap().len() > asked_after_open,
+            "the focus must trigger a refresh"
+        );
+        // The rows are still there — a refresh never clears the queue.
+        cx.update(|cx| assert_eq!(app.read(cx).queue.prs.len(), 2));
+        let _ = window;
+    }
+
+    /// The background poll: while the window is frontmost, the queue
+    /// refreshes on its own every few minutes, and stops the moment the
+    /// window goes to the background.
+    #[gpui::test]
+    fn the_background_poll_refreshes_while_frontmost(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (_window, app) = queue_window(cx, fake.clone());
+        let asked_after_open = fake.asked.lock().unwrap().len();
+        assert_eq!(asked_after_open, 1, "the app-open fetch runs once");
+
+        // The window goes to the background: the poll must not run.
+        cx.update(|cx| app.update(cx, |this, cx| this.set_frontmost(false, cx)));
+        cx.run_until_parked();
+        cx.executor().advance_clock(BACKGROUND_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            fake.asked.lock().unwrap().len(),
+            asked_after_open,
+            "a backgrounded app must not poll"
+        );
+
+        // The window comes back: the poll runs again, and the queue
+        // refreshes on its own.
+        cx.update(|cx| app.update(cx, |this, cx| this.set_frontmost(true, cx)));
+        cx.run_until_parked();
+        let asked_after_focus = fake.asked.lock().unwrap().len();
+        assert!(
+            asked_after_focus > asked_after_open,
+            "the focus must trigger a refresh"
+        );
+        cx.executor().advance_clock(BACKGROUND_POLL_INTERVAL);
+        cx.run_until_parked();
+        assert!(
+            fake.asked.lock().unwrap().len() > asked_after_focus,
+            "the poll must refresh the queue while frontmost"
         );
     }
 

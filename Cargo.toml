@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/diff-core", "crates/gh", "crates/git", "crates/github", "crates/syntax", "crates/app"]
+members = ["crates/diff-core", "crates/gh", "crates/git", "crates/github", "crates/store", "crates/syntax", "crates/app"]
 
 [workspace.dependencies]
 anyhow = "1"
@@ -8,6 +8,7 @@ imara-diff = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.dev]
 # gpui is slow to run unoptimized; keep our own crates debuggable but opt deps.

@@ -42,6 +42,8 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 
 ## Features
 
+- opens straight into the review queue, painted from a local cache and hot-swapped
+  when the network answers (works offline, too)
 - unified + split views
 - tree-sitter highlighting (18 languages)
 - word-level intra-line diffs
@@ -53,6 +55,20 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - inline GitHub review comments (reading + posting, hover a line for `+`)
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
 - follows the system light/dark appearance
+
+## Where its state lives
+
+The app keeps its own memory in one SQLite database (WAL mode) at
+`~/Library/Application Support/Gander/store.db`:
+
+- the **queue cache** — the last review queue, so the app opens instantly and
+  still works with no network,
+- **per-PR bookkeeping** — the head SHA and the review-thread timestamps the
+  app last saw, for "what changed since I looked",
+- **settings** — the queue's chips and sort, so the app opens the queue you left.
+
+The store is a cache, never a source of truth: deleting the directory costs a
+re-fetch, nothing more.
 
 ## Keymap
 
@@ -73,3 +89,6 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 | `home` / `end` | top / bottom |
 | `cmd-c` | copy selection |
 | `cmd-q` | quit |
+
+The queue refreshes on its own: on open, when the window comes back to the
+front, every few minutes while the window is frontmost, and on `cmd-r`.
