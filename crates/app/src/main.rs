@@ -235,21 +235,30 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut sources = Vec::new();
     let mut errors = Vec::new();
+    // One backend for the whole process: CLI arguments resolve through the
+    // same facade the app runs on, so launch errors speak the app's one
+    // GitHub vocabulary.
+    let github = github_client();
     // Bare launch lands on the review queue — the home screen. The repo we
     // stand in stays one explicit act away (`.` as an argument, or the
     // palette's "open local folder"), so local review keeps working
     // without hijacking the launch.
     for arg in &args {
         let parsed = if Path::new(arg).is_dir() {
-            git::resolve_local(Path::new(arg)).map(Source::Local)
+            git::resolve_local(Path::new(arg))
+                .map(Source::Local)
+                .map_err(|err| format!("{err:#}"))
         } else {
-            gh::resolve_pr_arg(arg).map(Source::Pr)
+            github
+                .resolve_pr(arg)
+                .map(Source::Pr)
+                .map_err(|err| err.to_string())
         };
         match parsed {
             Ok(source) => sources.push(source),
-            Err(err) => {
-                eprintln!("error: {arg}: {err:#}");
-                errors.push(format!("{arg}: {err:#}"));
+            Err(message) => {
+                eprintln!("error: {arg}: {message}");
+                errors.push(format!("{arg}: {message}"));
             }
         }
     }
@@ -351,15 +360,7 @@ fn main() {
                 },
                 |window, cx| {
                     let view = cx.new(|cx| {
-                        ReviewApp::new(
-                            sources,
-                            errors,
-                            github_client(),
-                            store,
-                            store_error,
-                            window,
-                            cx,
-                        )
+                        ReviewApp::new(sources, errors, github, store, store_error, window, cx)
                     });
                     window.focus(&view.read(cx).focus_handle);
                     cx.new(|cx| Root::new(view, window, cx))
@@ -507,8 +508,8 @@ impl CommentSide {
 /// created_at order.
 #[derive(Debug)]
 struct CommentThread {
-    root: gh::ReviewComment,
-    replies: Vec<gh::ReviewComment>,
+    root: github::ReviewComment,
+    replies: Vec<github::ReviewComment>,
 }
 
 /// One file's threads, keyed by anchor.
@@ -526,7 +527,7 @@ struct CommentIndex {
 /// Group flat REST comments into anchored threads: replies attach to their
 /// thread via `in_reply_to_id` (orphans are dropped), threads whose root has
 /// no current line are only counted as outdated.
-fn group_comments(mut comments: Vec<gh::ReviewComment>) -> CommentIndex {
+fn group_comments(mut comments: Vec<github::ReviewComment>) -> CommentIndex {
     // ISO-8601 UTC strings sort lexicographically = chronologically, so this
     // orders roots before their replies and threads by root creation.
     comments.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
@@ -579,7 +580,7 @@ fn group_comments(mut comments: Vec<gh::ReviewComment>) -> CommentIndex {
 
 #[derive(Debug, Default)]
 struct LocalReview {
-    comments: Vec<gh::ReviewComment>,
+    comments: Vec<github::ReviewComment>,
     next_id: u64,
 }
 
@@ -597,14 +598,14 @@ impl LocalReview {
         body: String,
     ) {
         self.next_id += 1;
-        self.comments.push(gh::ReviewComment {
+        self.comments.push(github::ReviewComment {
             id: self.next_id,
             path,
             line: Some(line),
             side: Some(side.api_str().to_string()),
             start_line: None,
             body,
-            user: gh::Author {
+            user: github::Author {
                 login: "you".to_string(),
             },
             created_at: "draft".to_string(),
@@ -2488,7 +2489,7 @@ fn render_tree_row(
 /// Where a review item's diff comes from.
 #[derive(Clone)]
 enum Source {
-    Pr(gh::PrLocator),
+    Pr(github::PrLocator),
     Local(git::LocalSource),
 }
 
@@ -2517,7 +2518,7 @@ enum ItemState {
 /// Everything the diff pane needs for one loaded item. Each item owns its
 /// scroll handle so per-item scroll position survives switching.
 struct ItemData {
-    pr_meta: Option<gh::PrMeta>,
+    pr_meta: Option<github::PrMeta>,
     diff: PrDiff,
     mode: ViewMode,
     rows: Vec<Row>,
@@ -2554,7 +2555,7 @@ struct ItemData {
     /// Users offered by the composer's `@`-mention autocomplete. Shared live
     /// with any open `MentionProvider`; seeded from PR participants, then
     /// filled from the repo's mentionable set (see `mentions_fetched`).
-    mentions: Rc<RefCell<Vec<gh::Mention>>>,
+    mentions: Rc<RefCell<Vec<github::Mention>>>,
     /// The one-time background mentionable-user fetch has been kicked off.
     mentions_fetched: bool,
     /// Sidebar file tree, rebuilt whenever the diff itself changes (load,
@@ -2698,10 +2699,10 @@ impl ReviewItem {
         let Some(snapshot) = store.snapshot(&loc.repo_slug(), loc.number) else {
             return false;
         };
-        let meta = gh::PrMeta {
+        let meta = github::PrMeta {
             number: snapshot.number,
             title: snapshot.title.clone(),
-            author: gh::Author {
+            author: github::Author {
                 login: snapshot.author.clone(),
             },
             state: "OPEN".to_string(),
@@ -2888,7 +2889,7 @@ fn dir_name(path: &Path) -> String {
 }
 
 enum LoadedMeta {
-    Pr(gh::PrMeta),
+    Pr(github::PrMeta),
     Local(git::LocalSource),
 }
 
@@ -2908,27 +2909,34 @@ struct Loaded {
 
 /// Blocking fetch + parse + row building for one item; runs on the background
 /// executor, so subprocess waits and tree-sitter work stay off the main thread.
-/// PR items fetch meta, patch, and review comments concurrently.
+/// PR items fetch meta, patch, and review comments concurrently — three
+/// facade calls, one error vocabulary.
 ///
 /// A PR's fetch also produces the snapshot the local store keeps: what the
 /// app saw of the PR (its head SHA, its threads), so the next launch knows
 /// what "since I last looked" means, and an offline launch can still read
 /// the PR.
-fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
+fn fetch_item(
+    github: Arc<dyn github::GitHubClient>,
+    source: &Source,
+    mode: ViewMode,
+) -> anyhow::Result<Loaded> {
     let (meta, patch, comments, snapshot) = match source {
         Source::Pr(loc) => {
+            let meta_client = github.clone();
             let meta_loc = loc.clone();
-            let meta_thread = std::thread::spawn(move || gh::fetch_meta(&meta_loc));
+            let meta_thread = std::thread::spawn(move || meta_client.pr_meta(&meta_loc));
+            let comments_client = github.clone();
             let comments_loc = loc.clone();
             let comments_thread =
-                std::thread::spawn(move || gh::fetch_review_comments(&comments_loc));
-            let patch = gh::fetch_patch(loc)?;
+                std::thread::spawn(move || comments_client.review_comments(&comments_loc));
+            let patch = github.pr_patch(loc)?;
             let meta = meta_thread
                 .join()
-                .map_err(|_| anyhow!("gh metadata fetch panicked"))??;
+                .map_err(|_| anyhow!("GitHub metadata fetch panicked"))??;
             let comments = comments_thread
                 .join()
-                .map_err(|_| anyhow!("gh comments fetch panicked"))??;
+                .map_err(|_| anyhow!("GitHub comments fetch panicked"))??;
             let snapshot = pr_snapshot(loc, &meta, &comments);
             (
                 LoadedMeta::Pr(meta),
@@ -2967,9 +2975,9 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
 /// The snapshot of a PR, as the local store keeps it: what the app saw
 /// (its head SHA, its review threads) and when it saw it.
 fn pr_snapshot(
-    loc: &gh::PrLocator,
-    meta: &gh::PrMeta,
-    comments: &[gh::ReviewComment],
+    loc: &github::PrLocator,
+    meta: &github::PrMeta,
+    comments: &[github::ReviewComment],
 ) -> local_store::StoredPrSnapshot {
     // A thread is a root comment plus its replies: the root's id is the
     // thread's id, and the thread's timestamp is its last comment's.
@@ -3030,7 +3038,8 @@ fn pr_snapshot(
 /// Never upgrade more than this many files per item; the rest stay on the
 /// perfectly serviceable patch-derived view.
 const MAX_UPGRADE_FILES: usize = 400;
-/// Per-side blob cap; gh::fetch_file_at enforces the same limit for PRs.
+/// Per-side blob cap; the facade's `file_at` enforces the same limit for
+/// PRs, so this guards only the local working-tree read.
 const MAX_UPGRADE_BLOB_BYTES: usize = 1024 * 1024;
 /// gh/git are one subprocess per call, so a small worker pool is plenty.
 const UPGRADE_WORKERS: usize = 4;
@@ -3038,7 +3047,7 @@ const UPGRADE_WORKERS: usize = 4;
 /// Where to fetch full file contents from, snapshotted when an item loads.
 enum UpgradeSource {
     Pr {
-        loc: gh::PrLocator,
+        loc: github::PrLocator,
         base_oid: String,
         head_oid: String,
     },
@@ -3066,7 +3075,11 @@ struct UpgradedFile {
 /// Blocking fetch + re-diff + whole-file highlight for every eligible file;
 /// runs on the background executor. Files that fail on either side are simply
 /// missing from the result and keep their patch-derived view.
-fn run_upgrade(source: &UpgradeSource, mut jobs: Vec<UpgradeJob>) -> Vec<UpgradedFile> {
+fn run_upgrade(
+    github: &dyn github::GitHubClient,
+    source: &UpgradeSource,
+    mut jobs: Vec<UpgradeJob>,
+) -> Vec<UpgradedFile> {
     if jobs.len() > MAX_UPGRADE_FILES {
         eprintln!(
             "gander: {} changed files; upgrading the first {MAX_UPGRADE_FILES} to full \
@@ -3083,7 +3096,7 @@ fn run_upgrade(source: &UpgradeSource, mut jobs: Vec<UpgradeJob>) -> Vec<Upgrade
                 let Some(job) = queue.lock().unwrap().next() else {
                     break;
                 };
-                if let Some(result) = upgrade_file(source, &job) {
+                if let Some(result) = upgrade_file(github, source, &job) {
                     done.lock().unwrap().push(result);
                 }
             });
@@ -3096,7 +3109,12 @@ fn run_upgrade(source: &UpgradeSource, mut jobs: Vec<UpgradeJob>) -> Vec<Upgrade
 
 /// One side's full contents, or None to leave the file un-upgraded: absent,
 /// binary/non-UTF-8, over the size cap, or a fetch failure.
-fn fetch_side(source: &UpgradeSource, path: &str, old: bool) -> Option<String> {
+fn fetch_side(
+    github: &dyn github::GitHubClient,
+    source: &UpgradeSource,
+    path: &str,
+    old: bool,
+) -> Option<String> {
     let text = match source {
         UpgradeSource::Pr {
             loc,
@@ -3104,10 +3122,10 @@ fn fetch_side(source: &UpgradeSource, path: &str, old: bool) -> Option<String> {
             head_oid,
         } => {
             let oid = if old { base_oid } else { head_oid };
-            match gh::fetch_file_at(loc, oid, path) {
+            match github.file_at(loc, oid, path) {
                 Ok(text) => text?,
                 Err(err) => {
-                    eprintln!("gander: {path}: {err:#}");
+                    eprintln!("gander: {path}: {err}");
                     return None;
                 }
             }
@@ -3123,18 +3141,22 @@ fn fetch_side(source: &UpgradeSource, path: &str, old: bool) -> Option<String> {
     (text.len() <= MAX_UPGRADE_BLOB_BYTES).then_some(text)
 }
 
-fn upgrade_file(source: &UpgradeSource, job: &UpgradeJob) -> Option<UpgradedFile> {
+fn upgrade_file(
+    github: &dyn github::GitHubClient,
+    source: &UpgradeSource,
+    job: &UpgradeJob,
+) -> Option<UpgradedFile> {
     // Presence must match the patch's story: Added has no old side, Deleted no
     // new side, everything else needs both. A wanted-but-missing side (404,
     // binary, huge) keeps the whole file patch-derived.
     let old_text = match (job.status, &job.old_path) {
         (FileStatus::Added, _) => String::new(),
-        (_, Some(path)) => fetch_side(source, path, true)?,
+        (_, Some(path)) => fetch_side(github, source, path, true)?,
         (_, None) => return None,
     };
     let new_text = match (job.status, &job.new_path) {
         (FileStatus::Deleted, _) => String::new(),
-        (_, Some(path)) => fetch_side(source, path, false)?,
+        (_, Some(path)) => fetch_side(github, source, path, false)?,
         (_, None) => return None,
     };
     // Normalize CRLF→LF up front: hunks, span tables, and gap rows must all
@@ -3217,7 +3239,7 @@ fn app_title(detail: Option<String>) -> gpui::AnyElement {
     title.into_any_element()
 }
 
-fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
+fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
     let (state_color, state_label) = match meta.state.as_str() {
         "OPEN" => (theme::green(), "open"),
         "MERGED" => (theme::mauve(), "merged"),
@@ -3420,7 +3442,7 @@ enum PaletteStep {
 enum PrListState {
     Loading,
     Loaded {
-        all: Vec<gh::PrSummary>,
+        all: Vec<github::PrSummary>,
         /// Indices into `all`, fuzzy-filtered by the query, best match first.
         filtered: Vec<usize>,
         /// Index into `filtered`.
@@ -3464,7 +3486,7 @@ fn filtered_sources(query: &str) -> Vec<usize> {
 
 /// Fuzzy-filter PRs against `#number title author branch`, best score first;
 /// an empty query keeps gh's original (most recently updated) order.
-fn filter_prs(all: &[gh::PrSummary], query: &str) -> Vec<usize> {
+fn filter_prs(all: &[github::PrSummary], query: &str) -> Vec<usize> {
     let query = query.trim();
     if query.is_empty() {
         return (0..all.len()).collect();
@@ -3505,7 +3527,7 @@ fn filter_base_refs(all: &[String], query: &str) -> Vec<usize> {
 /// One row of the palette's PR list: state dot, #number, title, author, head
 /// branch. Clicking opens the PR just like enter does.
 fn palette_pr_row(
-    pr: &gh::PrSummary,
+    pr: &github::PrSummary,
     pos: usize,
     selected: bool,
     entity: gpui::Entity<ReviewApp>,
@@ -4008,7 +4030,7 @@ const MENTION_LIMIT: usize = 50;
 /// participants, then filled from the repo's mentionable set in the
 /// background). Reads the pool fresh on every keystroke.
 struct MentionProvider {
-    users: Rc<RefCell<Vec<gh::Mention>>>,
+    users: Rc<RefCell<Vec<github::Mention>>>,
 }
 
 /// If the cursor sits inside an `@mention` token, return the byte offset of the
@@ -4039,7 +4061,7 @@ fn mention_prefix(text: &Rope, offset: usize) -> Option<(usize, String)> {
 
 /// Rank of `user` against `query` (matched case-insensitively), lower = better;
 /// None = no match. Login prefix beats name prefix beats substring matches.
-fn mention_rank(user: &gh::Mention, query: &str) -> Option<u8> {
+fn mention_rank(user: &github::Mention, query: &str) -> Option<u8> {
     if query.is_empty() {
         return Some(0);
     }
@@ -4081,7 +4103,7 @@ impl CompletionProvider for MentionProvider {
             end: text.offset_to_position(offset),
         };
         let users = self.users.borrow();
-        let mut ranked: Vec<(u8, &gh::Mention)> = users
+        let mut ranked: Vec<(u8, &github::Mention)> = users
             .iter()
             .filter_map(|u| mention_rank(u, &prefix).map(|r| (r, u)))
             .collect();
@@ -4118,11 +4140,11 @@ impl CompletionProvider for MentionProvider {
 /// Seed `cell` with everyone already visible on the PR — the author and every
 /// comment author — so autocomplete has relevant names before the full
 /// mentionable-user fetch returns. Additive: never drops fetched entries.
-fn seed_mentions(cell: &Rc<RefCell<Vec<gh::Mention>>>, data: &ItemData) {
+fn seed_mentions(cell: &Rc<RefCell<Vec<github::Mention>>>, data: &ItemData) {
     let mut pool = cell.borrow_mut();
     let mut add = |login: &str| {
         if !login.is_empty() && !pool.iter().any(|m| m.login.eq_ignore_ascii_case(login)) {
-            pool.push(gh::Mention {
+            pool.push(github::Mention {
                 login: login.to_string(),
                 name: None,
             });
@@ -4170,7 +4192,7 @@ struct Composer {
 /// comment) plus an optional body, targeting the item it was opened on.
 struct ReviewDialog {
     item_id: u64,
-    verdict: gh::ReviewVerdict,
+    verdict: github::ReviewVerdict,
     input: gpui::Entity<InputState>,
     error: Option<SharedString>,
     in_flight: bool,
@@ -4722,9 +4744,9 @@ impl ReviewApp {
     /// the row carries everything the PR-open path needs. A row without a
     /// well-formed repository degrades to nothing — Enter on it is a no-op,
     /// the same honesty the chip derivation shows a malformed slug.
-    fn queue_item_locator(pr: &github::QueueItem) -> Option<gh::PrLocator> {
+    fn queue_item_locator(pr: &github::QueueItem) -> Option<github::PrLocator> {
         let (owner, repo) = pr.repository.split_once('/')?;
-        Some(gh::PrLocator {
+        Some(github::PrLocator {
             owner: owner.to_string(),
             repo: repo.to_string(),
             number: pr.number,
@@ -5040,14 +5062,15 @@ impl ReviewApp {
         self.active = self.items.len() - 1;
         // Opening something leaves the home screen for the item's pane.
         self.show_queue = false;
-        Self::spawn_fetch(id, source, ViewMode::Split, cx);
+        self.spawn_fetch(id, source, ViewMode::Split, cx);
         cx.notify();
     }
 
-    fn spawn_fetch(id: u64, source: Source, mode: ViewMode, cx: &mut Context<Self>) {
+    fn spawn_fetch(&self, id: u64, source: Source, mode: ViewMode, cx: &mut Context<Self>) {
+        let github = self.github.clone();
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { fetch_item(&source, mode) })
+                .background_spawn(async move { fetch_item(github, &source, mode) })
                 .await;
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
@@ -5102,7 +5125,7 @@ impl ReviewApp {
                                 Source::Local(src) => Some(UpgradeSource::Local(src.clone())),
                             };
                             if let (Some(source), false) = (source, jobs.is_empty()) {
-                                Self::spawn_upgrade(id, gen, source, jobs, cx);
+                                app.spawn_upgrade(id, gen, source, jobs, cx);
                             }
                         }
                     }
@@ -5140,15 +5163,17 @@ impl ReviewApp {
     /// reproduces the patch's hunks, so drift is small); the selection is
     /// cleared because row indices shift.
     fn spawn_upgrade(
+        &self,
         id: u64,
         gen: u64,
         source: UpgradeSource,
         jobs: Vec<UpgradeJob>,
         cx: &mut Context<Self>,
     ) {
+        let github = self.github.clone();
         cx.spawn(async move |this, cx| {
             let upgraded = cx
-                .background_spawn(async move { run_upgrade(&source, jobs) })
+                .background_spawn(async move { run_upgrade(github.as_ref(), &source, jobs) })
                 .await;
             if upgraded.is_empty() {
                 return;
@@ -5254,9 +5279,14 @@ impl ReviewApp {
             return;
         }
         let parsed = if Path::new(&value).is_dir() {
-            git::resolve_local(Path::new(&value)).map(Source::Local)
+            git::resolve_local(Path::new(&value))
+                .map(Source::Local)
+                .map_err(|err| format!("{err:#}"))
         } else {
-            gh::resolve_pr_arg(&value).map(Source::Pr)
+            self.github
+                .resolve_pr(&value)
+                .map(Source::Pr)
+                .map_err(|err| err.to_string())
         };
         match parsed {
             Ok(source) => {
@@ -5266,7 +5296,7 @@ impl ReviewApp {
                 self.open_item(source, cx);
                 window.focus(&self.focus_handle);
             }
-            Err(err) => self.open_error = Some(format!("{err:#}").into()),
+            Err(message) => self.open_error = Some(message.into()),
         }
         cx.notify();
     }
@@ -5474,9 +5504,10 @@ impl ReviewApp {
         });
         self.set_palette_input("", "search pull requests…", window, cx);
         cx.notify();
+        let github = self.github.clone();
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { gh::list_prs(&owner, &repo) })
+                .background_spawn(async move { github.list_prs(&owner, &repo) })
                 .await;
             this.update(cx, |app, cx| {
                 if app.palette_gen != gen {
@@ -5495,7 +5526,7 @@ impl ReviewApp {
                             selected: 0,
                         }
                     }
-                    Err(err) => PrListState::Failed(format!("{err:#}")),
+                    Err(err) => PrListState::Failed(err.to_string()),
                 };
                 app.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 cx.notify();
@@ -5577,7 +5608,7 @@ impl ReviewApp {
         let Some((owner, repo)) = repo.split_once('/') else {
             return;
         };
-        let source = Source::Pr(gh::PrLocator {
+        let source = Source::Pr(github::PrLocator {
             owner: owner.to_string(),
             repo: repo.to_string(),
             number: all[ix].number,
@@ -5626,7 +5657,7 @@ impl ReviewApp {
             ItemState::Loading => {}
             ItemState::Ready(_) => item.reloading = true,
         }
-        Self::spawn_fetch(item_id, source, mode, cx);
+        self.spawn_fetch(item_id, source, mode, cx);
         cx.notify();
     }
 
@@ -5723,7 +5754,7 @@ impl ReviewApp {
         }
         item.refresh_error = None;
         let (id, source) = (item.id, item.source.clone());
-        Self::spawn_fetch(id, source, mode, cx);
+        self.spawn_fetch(id, source, mode, cx);
         cx.notify();
     }
 
@@ -5989,7 +6020,7 @@ impl ReviewApp {
     /// Fetch the repo's mentionable users once per item, merging them into the
     /// item's shared mention pool (which an open composer's completion provider
     /// reads live). Best-effort: on failure the seeded participants remain.
-    fn ensure_mentions(&mut self, item_id: u64, loc: gh::PrLocator, cx: &mut Context<Self>) {
+    fn ensure_mentions(&mut self, item_id: u64, loc: github::PrLocator, cx: &mut Context<Self>) {
         let Some(data) = self.active_data_mut() else {
             return;
         };
@@ -5997,9 +6028,10 @@ impl ReviewApp {
             return;
         }
         data.mentions_fetched = true;
+        let github = self.github.clone();
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { gh::fetch_mentionable_users(&loc) })
+                .background_spawn(async move { github.mentionable_users(&loc) })
                 .await;
             let Ok(users) = fetched else {
                 return;
@@ -6081,13 +6113,14 @@ impl ReviewApp {
             return;
         };
         cx.notify();
+        let github = self.github.clone();
         cx.spawn_in(window, async move |this, cx| {
             let post_loc = loc.clone();
             let result = cx
                 .background_spawn(async move {
                     match reply_to {
-                        Some(root_id) => gh::post_reply(&post_loc, root_id, &body),
-                        None => gh::post_review_comment(
+                        Some(root_id) => github.post_reply(&post_loc, root_id, &body),
+                        None => github.post_review_comment(
                             &post_loc,
                             &commit_id,
                             &path,
@@ -6110,7 +6143,7 @@ impl ReviewApp {
                     Err(err) => {
                         if let Some(composer) = &mut app.composer {
                             composer.in_flight = false;
-                            composer.error = Some(format!("{err:#}").into());
+                            composer.error = Some(err.to_string().into());
                         }
                     }
                 }
@@ -6165,10 +6198,11 @@ impl ReviewApp {
     /// Refetch only the review comments (not meta/patch), regroup, and
     /// rebuild the rows with the viewport anchored — the counterpart of a
     /// full refresh for the post-comment path.
-    fn refetch_comments(&mut self, item_id: u64, loc: gh::PrLocator, cx: &mut Context<Self>) {
+    fn refetch_comments(&mut self, item_id: u64, loc: github::PrLocator, cx: &mut Context<Self>) {
+        let github = self.github.clone();
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { gh::fetch_review_comments(&loc) })
+                .background_spawn(async move { github.review_comments(&loc) })
                 .await;
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) else {
@@ -6183,8 +6217,7 @@ impl ReviewApp {
                         data.rebuild_rows_anchored();
                     }
                     Err(err) => {
-                        item.refresh_error =
-                            Some(format!("comment refresh failed: {err:#}").into());
+                        item.refresh_error = Some(format!("comment refresh failed: {err}").into());
                     }
                 }
                 cx.notify();
@@ -6221,7 +6254,7 @@ impl ReviewApp {
         input.update(cx, |state, cx| state.focus(window, cx));
         self.review = Some(ReviewDialog {
             item_id,
-            verdict: gh::ReviewVerdict::Approve,
+            verdict: github::ReviewVerdict::Approve,
             input,
             error: None,
             in_flight: false,
@@ -6252,7 +6285,7 @@ impl ReviewApp {
         let verdict = review.verdict;
         // GitHub rejects bodyless request-changes/comment reviews; fail
         // locally with a clearer message.
-        if body.is_empty() && verdict != gh::ReviewVerdict::Approve {
+        if body.is_empty() && verdict != github::ReviewVerdict::Approve {
             if let Some(review) = &mut self.review {
                 review.error = Some("this review type needs a comment".into());
             }
@@ -6273,10 +6306,11 @@ impl ReviewApp {
             review.error = None;
         }
         cx.notify();
+        let github = self.github.clone();
         cx.spawn_in(window, async move |this, cx| {
             let submit_loc = loc.clone();
             let result = cx
-                .background_spawn(async move { gh::submit_review(&submit_loc, verdict, &body) })
+                .background_spawn(async move { github.submit_review(&submit_loc, verdict, &body) })
                 .await;
             this.update_in(cx, |app, window, cx| {
                 if app.review_gen != gen {
@@ -6290,7 +6324,7 @@ impl ReviewApp {
                     Err(err) => {
                         if let Some(review) = &mut app.review {
                             review.in_flight = false;
-                            review.error = Some(format!("{err:#}").into());
+                            review.error = Some(err.to_string().into());
                         }
                     }
                 }
@@ -6304,10 +6338,11 @@ impl ReviewApp {
     /// Refetch only the PR meta — the post-review counterpart of
     /// `refetch_comments`, so the titlebar reflects the new review decision
     /// without reloading the whole diff.
-    fn refetch_meta(&mut self, item_id: u64, loc: gh::PrLocator, cx: &mut Context<Self>) {
+    fn refetch_meta(&mut self, item_id: u64, loc: github::PrLocator, cx: &mut Context<Self>) {
+        let github = self.github.clone();
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { gh::fetch_meta(&loc) })
+                .background_spawn(async move { github.pr_meta(&loc) })
                 .await;
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) else {
@@ -6319,7 +6354,7 @@ impl ReviewApp {
                 match fetched {
                     Ok(meta) => data.pr_meta = Some(meta),
                     Err(err) => {
-                        item.refresh_error = Some(format!("meta refresh failed: {err:#}").into());
+                        item.refresh_error = Some(format!("meta refresh failed: {err}").into());
                     }
                 }
                 cx.notify();
@@ -6522,7 +6557,7 @@ impl ReviewApp {
         }
         let selected = review.verdict;
         let verdict_option =
-            |label: &'static str, verdict: gh::ReviewVerdict, color: gpui::Rgba| {
+            |label: &'static str, verdict: github::ReviewVerdict, color: gpui::Rgba| {
                 let tint: Hsla = color.into();
                 div()
                     .id(label)
@@ -6551,9 +6586,9 @@ impl ReviewApp {
                     .child(SharedString::from(label))
             };
         let submit_label = match selected {
-            gh::ReviewVerdict::Approve => "Approve",
-            gh::ReviewVerdict::RequestChanges => "Request changes",
-            gh::ReviewVerdict::Comment => "Comment",
+            github::ReviewVerdict::Approve => "Approve",
+            github::ReviewVerdict::RequestChanges => "Request changes",
+            github::ReviewVerdict::Comment => "Comment",
         };
         div()
             .absolute()
@@ -6602,17 +6637,17 @@ impl ReviewApp {
                             .gap_2()
                             .child(verdict_option(
                                 "approve",
-                                gh::ReviewVerdict::Approve,
+                                github::ReviewVerdict::Approve,
                                 theme::green(),
                             ))
                             .child(verdict_option(
                                 "request changes",
-                                gh::ReviewVerdict::RequestChanges,
+                                github::ReviewVerdict::RequestChanges,
                                 theme::red(),
                             ))
                             .child(verdict_option(
                                 "comment",
-                                gh::ReviewVerdict::Comment,
+                                github::ReviewVerdict::Comment,
                                 theme::blue(),
                             )),
                     )
@@ -8173,8 +8208,8 @@ mod tests {
     use super::*;
     use diff_core::{FileDiff, Hunk};
 
-    fn mention(login: &str, name: Option<&str>) -> gh::Mention {
-        gh::Mention {
+    fn mention(login: &str, name: Option<&str>) -> github::Mention {
+        github::Mention {
             login: login.to_string(),
             name: name.map(str::to_string),
         }
@@ -8700,11 +8735,11 @@ mod tests {
         assert!(spans[1].is_empty());
     }
 
-    fn pr(number: u64, title: &str, author: &str, branch: &str) -> gh::PrSummary {
-        gh::PrSummary {
+    fn pr(number: u64, title: &str, author: &str, branch: &str) -> github::PrSummary {
+        github::PrSummary {
             number,
             title: title.to_string(),
-            author: gh::Author {
+            author: github::Author {
                 login: author.to_string(),
             },
             state: "OPEN".to_string(),
@@ -9124,6 +9159,90 @@ mod tests {
                 .push((search.query(), search.sort()));
             Ok(self.rows(&search.query()))
         }
+
+        // The queue screen's tests never open a PR's contents: Enter
+        // opens the row's item (asserted in its Loading state before any
+        // fetch lands), and the three fetch calls fail cleanly rather
+        // than inventing data. The rest of the contract is out of scope
+        // — each stub says so loudly.
+        fn resolve_pr(&self, _arg: &str) -> Result<github::PrLocator, github::ClientError> {
+            unimplemented!("queue tests never resolve a PR")
+        }
+
+        fn pr_meta(&self, _loc: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
+            Err(github::ClientError::Failed(
+                "queue tests never read PR meta".into(),
+            ))
+        }
+
+        fn list_prs(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<Vec<github::PrSummary>, github::ClientError> {
+            unimplemented!("queue tests never list PRs")
+        }
+
+        fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
+            Err(github::ClientError::Failed(
+                "queue tests never fetch a patch".into(),
+            ))
+        }
+
+        fn review_comments(
+            &self,
+            _loc: &github::PrLocator,
+        ) -> Result<Vec<github::ReviewComment>, github::ClientError> {
+            Err(github::ClientError::Failed(
+                "queue tests never read comments".into(),
+            ))
+        }
+
+        fn mentionable_users(
+            &self,
+            _loc: &github::PrLocator,
+        ) -> Result<Vec<github::Mention>, github::ClientError> {
+            unimplemented!("queue tests never fetch mentionable users")
+        }
+
+        fn file_at(
+            &self,
+            _loc: &github::PrLocator,
+            _commit_oid: &str,
+            _path: &str,
+        ) -> Result<Option<String>, github::ClientError> {
+            unimplemented!("queue tests never fetch file contents")
+        }
+
+        fn post_review_comment(
+            &self,
+            _loc: &github::PrLocator,
+            _commit_id: &str,
+            _path: &str,
+            _side: &str,
+            _line: u64,
+            _body: &str,
+        ) -> Result<(), github::ClientError> {
+            unimplemented!("queue tests never post comments")
+        }
+
+        fn post_reply(
+            &self,
+            _loc: &github::PrLocator,
+            _comment_id: u64,
+            _body: &str,
+        ) -> Result<(), github::ClientError> {
+            unimplemented!("queue tests never post replies")
+        }
+
+        fn submit_review(
+            &self,
+            _loc: &github::PrLocator,
+            _verdict: github::ReviewVerdict,
+            _body: &str,
+        ) -> Result<(), github::ClientError> {
+            unimplemented!("queue tests never submit reviews")
+        }
     }
 
     /// A window running the real app over the scripted queue, parked
@@ -9269,6 +9388,82 @@ mod tests {
                 "error connecting to api.github.com".into(),
             ))
         }
+
+        // The queue screen never opens a PR in these tests, so the rest of
+        // the contract is out of scope — each stub says so loudly rather
+        // than inventing data.
+        fn resolve_pr(&self, _arg: &str) -> Result<github::PrLocator, github::ClientError> {
+            unimplemented!("queue tests never resolve a PR")
+        }
+
+        fn pr_meta(&self, _loc: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
+            unimplemented!("queue tests never read PR meta")
+        }
+
+        fn list_prs(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<Vec<github::PrSummary>, github::ClientError> {
+            unimplemented!("queue tests never list PRs")
+        }
+
+        fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
+            unimplemented!("queue tests never fetch a patch")
+        }
+
+        fn review_comments(
+            &self,
+            _loc: &github::PrLocator,
+        ) -> Result<Vec<github::ReviewComment>, github::ClientError> {
+            unimplemented!("queue tests never read comments")
+        }
+
+        fn mentionable_users(
+            &self,
+            _loc: &github::PrLocator,
+        ) -> Result<Vec<github::Mention>, github::ClientError> {
+            unimplemented!("queue tests never fetch mentionable users")
+        }
+
+        fn file_at(
+            &self,
+            _loc: &github::PrLocator,
+            _commit_oid: &str,
+            _path: &str,
+        ) -> Result<Option<String>, github::ClientError> {
+            unimplemented!("queue tests never fetch file contents")
+        }
+
+        fn post_review_comment(
+            &self,
+            _loc: &github::PrLocator,
+            _commit_id: &str,
+            _path: &str,
+            _side: &str,
+            _line: u64,
+            _body: &str,
+        ) -> Result<(), github::ClientError> {
+            unimplemented!("queue tests never post comments")
+        }
+
+        fn post_reply(
+            &self,
+            _loc: &github::PrLocator,
+            _comment_id: u64,
+            _body: &str,
+        ) -> Result<(), github::ClientError> {
+            unimplemented!("queue tests never post replies")
+        }
+
+        fn submit_review(
+            &self,
+            _loc: &github::PrLocator,
+            _verdict: github::ReviewVerdict,
+            _body: &str,
+        ) -> Result<(), github::ClientError> {
+            unimplemented!("queue tests never submit reviews")
+        }
     }
 
     /// The cache-first paint: with a warm cache, the app paints the
@@ -9394,7 +9589,7 @@ mod tests {
     #[test]
     fn sources_match_on_identity_not_labels() {
         let pr = |owner: &str, number: u64| {
-            Source::Pr(gh::PrLocator {
+            Source::Pr(github::PrLocator {
                 owner: owner.into(),
                 repo: "widgets".into(),
                 number,
@@ -9497,7 +9692,7 @@ mod tests {
                 this.items = vec![
                     ReviewItem {
                         id: 0,
-                        source: Source::Pr(gh::PrLocator {
+                        source: Source::Pr(github::PrLocator {
                             owner: "acme".into(),
                             repo: "widgets".into(),
                             number: 1,
@@ -9509,7 +9704,7 @@ mod tests {
                     },
                     ReviewItem {
                         id: 1,
-                        source: Source::Pr(gh::PrLocator {
+                        source: Source::Pr(github::PrLocator {
                             owner: "acme".into(),
                             repo: "widgets".into(),
                             number: 2,
@@ -9657,7 +9852,7 @@ mod tests {
 
         let mut item = ReviewItem {
             id: 1,
-            source: Source::Pr(gh::PrLocator {
+            source: Source::Pr(github::PrLocator {
                 owner: "acme".into(),
                 repo: "widgets".into(),
                 number: 7,
@@ -9687,7 +9882,7 @@ mod tests {
         // caller falls back to the error.
         let mut unknown = ReviewItem {
             id: 2,
-            source: Source::Pr(gh::PrLocator {
+            source: Source::Pr(github::PrLocator {
                 owner: "acme".into(),
                 repo: "widgets".into(),
                 number: 8,
@@ -10488,15 +10683,15 @@ mod tests {
         author: &str,
         created_at: &str,
         reply_to: Option<u64>,
-    ) -> gh::ReviewComment {
-        gh::ReviewComment {
+    ) -> github::ReviewComment {
+        github::ReviewComment {
             id,
             path: path.to_string(),
             line,
             side: side.map(str::to_string),
             start_line: None,
             body: body.to_string(),
-            user: gh::Author {
+            user: github::Author {
                 login: author.to_string(),
             },
             created_at: created_at.to_string(),

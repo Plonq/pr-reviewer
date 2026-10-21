@@ -6,3 +6,8 @@ edition = "2021"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# file_at's disk cache test redirects $HOME into a throwaway directory.
+tempfile = "3"

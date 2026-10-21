@@ -2082,7 +2082,6 @@ dependencies = [
  "diff-core",
  "futures",
  "fuzzy-matcher",
- "gh",
  "git",
  "github",
  "gpui",
@@ -2157,16 +2156,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gh"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "gif"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2210,6 +2199,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]

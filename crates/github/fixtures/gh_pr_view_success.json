@@ -1,0 +1,21 @@
+{
+  "additions": 151,
+  "author": {
+    "id": "MDQ6VXNlcjU4MzIzMQ==",
+    "is_bot": false,
+    "login": "octocat",
+    "name": "The Octocat"
+  },
+  "baseRefName": "main",
+  "baseRefOid": "f16ea0a8cfd0fbb0328b8348972356d532b921d0",
+  "body": "Adds the filters discussed in #4778.",
+  "changedFiles": 3,
+  "deletions": 30,
+  "headRefName": "deactivation-filters",
+  "headRefOid": "a66406e5daa6e8b7c15b05f3b8b1c9d2f04d0e11",
+  "number": 4781,
+  "reviewDecision": "CHANGES_REQUESTED",
+  "state": "OPEN",
+  "title": "Add deactivation filters to the users manage list",
+  "url": "https://github.com/octocat/Hello-World/pull/4781"
+}

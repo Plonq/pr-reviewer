@@ -1,17 +1,18 @@
 //! The GitHub client facade: the domain-shaped interface every GitHub
 //! operation in the app goes through, independent of how it's backed.
 //!
-//! Callers hold a [`GitHubClient`] (usually `Arc<dyn GitHubClient>`) and work
-//! in domain terms — [`Viewer`], [`ClientError`] — never subprocesses, exit
-//! codes, or HTTP. v0.1's backend ([`gh_cli::GhCliClient`]) shells out to the
-//! `gh` CLI, JSON crossing the process boundary; a v0.2 backend doing direct
-//! REST/GraphQL with a PAT implements the same trait and slots in without
-//! touching a single caller.
+//! Callers hold a [`GitHubClient`] (usually `Arc<dyn GitHubClient>`) and
+//! work in domain terms — [`Viewer`], [`PrLocator`], [`PrMeta`],
+//! [`ClientError`] — never subprocesses, exit codes, or HTTP. Every GitHub
+//! operation the app runs goes through this one trait: the queue's viewer
+//! and search, and the review's resolve/fetch/comment/post. v0.1's backend
+//! ([`gh_cli::GhCliClient`]) shells out to the `gh` CLI, JSON crossing the
+//! process boundary; a v0.2 backend doing direct REST/GraphQL with a PAT
+//! implements the same trait and slots in without touching a single caller.
 //!
 //! Error kinds are stable vocabulary for callers to match on; the `Display`
 //! text is the user-facing message and moves with the backend (it carries
 //! v0.1's `gh`-CLI wording today, including the `gh auth login` fix).
-
 pub mod gh_cli;
 
 /// The signed-in GitHub user, as far as the app needs to know her: who she
@@ -334,6 +335,119 @@ impl QueueSearch {
     }
 }
 
+// --- PR review -------------------------------------------------------------
+
+/// A pull request's coordinates: which repository it lives in and which
+/// number it is — everything the review operations need to address one PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrLocator {
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+}
+
+impl PrLocator {
+    /// `owner/repo` — how the CLI and API address the repository.
+    pub fn repo_slug(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+}
+
+/// The verdict of a top-level PR review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewVerdict {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+/// A GitHub account as PR metadata names one: just the handle the UI shows.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct Author {
+    pub login: String,
+}
+
+/// One PR's metadata: the titlebar's content, the review's anchor oids, and
+/// the stats the header shows — fetched whole by one call
+/// ([`GitHubClient::pr_meta`]).
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrMeta {
+    pub number: u64,
+    pub title: String,
+    pub author: Author,
+    /// "OPEN", "MERGED", or "CLOSED".
+    pub state: String,
+    pub url: String,
+    /// PR description (markdown); empty when the PR has none.
+    #[serde(default)]
+    pub body: String,
+    pub base_ref_name: String,
+    pub head_ref_name: String,
+    /// The commit the PR's base side sits at — where whole-file upgrades
+    /// fetch old sides from. Older `gh` builds may not report it.
+    #[serde(default)]
+    pub base_ref_oid: String,
+    /// The commit the PR's head side sits at — also the `commit_id` new
+    /// review comments anchor against.
+    #[serde(default)]
+    pub head_ref_oid: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+    /// "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED", or "" (no
+    /// required reviews and none given).
+    #[serde(default)]
+    pub review_decision: String,
+}
+
+/// One open PR as the PR picker lists it.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrSummary {
+    pub number: u64,
+    pub title: String,
+    pub author: Author,
+    pub state: String,
+    pub is_draft: bool,
+    pub head_ref_name: String,
+    /// When the PR last saw activity, ISO 8601 (GitHub's format).
+    pub updated_at: String,
+}
+
+/// One PR review comment, flat — the app groups them into threads by
+/// `in_reply_to_id` and anchors them by (path, side, line). Field names
+/// follow the pulls comments API's snake_case; every backend must hand
+/// back this shape.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct ReviewComment {
+    pub id: u64,
+    pub path: String,
+    /// Anchor line on `side` against the *current* diff; None = outdated
+    /// (the code the comment was written against has since changed).
+    pub line: Option<u64>,
+    /// "RIGHT" (new side) or "LEFT" (old side).
+    pub side: Option<String>,
+    /// Multi-line comments start here and anchor at `line` (the end), like
+    /// GitHub's own UI.
+    pub start_line: Option<u64>,
+    pub body: String,
+    pub user: Author,
+    /// When the comment was posted, ISO 8601 (GitHub's format).
+    pub created_at: String,
+    pub in_reply_to_id: Option<u64>,
+}
+
+/// A user who can be @-mentioned on a repository, for the comment
+/// composer's autocomplete.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct Mention {
+    pub login: String,
+    /// The user's display name, if set (shown as a hint beside the login).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// Why a client operation failed, in domain terms — never subprocess or
 /// transport mechanics, which stay inside a backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,6 +459,11 @@ pub enum ClientError {
     /// A credential source exists, but no usable sign-in: v0.1's `gh` is
     /// signed out or its token was rejected. The fix is `gh auth login`.
     Unauthenticated,
+    /// The request itself names no PR it could name — an argument the
+    /// resolver can't turn into a [`PrLocator`]. Nothing was asked of
+    /// GitHub, so the message names the expected form, not the sign-in
+    /// fix: the problem is in the input, not the credential.
+    Invalid(String),
     /// The operation failed for any other reason — network, API, or a
     /// response we couldn't digest. The string is a short human cause.
     Failed(String),
@@ -364,6 +483,7 @@ impl std::fmt::Display for ClientError {
                     "You're not signed in to GitHub. Run `gh auth login` to sign in."
                 )
             }
+            Self::Invalid(cause) => write!(f, "{cause}"),
             Self::Failed(cause) => write!(
                 f,
                 "Couldn't reach GitHub: {cause}. Run `gh auth login` if you haven't signed in."
@@ -390,6 +510,72 @@ pub trait GitHubClient: Send + Sync {
     /// one call, but never one per PR. A PR the enrichment misses keeps
     /// honest defaults rather than fabricated values (see [`QueueItem`]).
     fn search_prs(&self, search: &QueueSearch) -> Result<Vec<QueueItem>, ClientError>;
+
+    /// Turn a user-typed PR argument into a locator. Accepts
+    /// `owner/repo#123`, `#123`, `123`, or a GitHub PR URL; a bare number
+    /// resolves the repository from the current directory. A malformed
+    /// argument is [`ClientError::Invalid`] — the message names the
+    /// expected form, not the sign-in fix.
+    fn resolve_pr(&self, arg: &str) -> Result<PrLocator, ClientError>;
+
+    /// One PR's metadata (see [`PrMeta`]).
+    fn pr_meta(&self, loc: &PrLocator) -> Result<PrMeta, ClientError>;
+
+    /// A repository's open PRs, most recently updated first, for the PR
+    /// picker.
+    fn list_prs(&self, owner: &str, repo: &str) -> Result<Vec<PrSummary>, ClientError>;
+
+    /// The PR's unified diff patch, for the diff engine to parse.
+    fn pr_patch(&self, loc: &PrLocator) -> Result<String, ClientError>;
+
+    /// Every review comment on the PR, flat; the app groups them into
+    /// threads. Pagination (gh ≥ 2.66's `--paginate --slurp`) is the
+    /// backend's concern, not the caller's.
+    fn review_comments(&self, loc: &PrLocator) -> Result<Vec<ReviewComment>, ClientError>;
+
+    /// Users who can be @-mentioned on the PR's repository, for comment
+    /// autocomplete. Capped by the backend — the autocomplete only needs
+    /// a workable pool of the most relevant, not every account.
+    fn mentionable_users(&self, loc: &PrLocator) -> Result<Vec<Mention>, ClientError>;
+
+    /// Full contents of `path` at `commit_oid`, for whole-file upgrades.
+    /// `Ok(None)` means "leave this file un-upgraded": absent at that
+    /// commit, binary, or over the backend's size cap. Backends may cache
+    /// — a path at a commit is immutable, including negative answers.
+    fn file_at(
+        &self,
+        loc: &PrLocator,
+        commit_oid: &str,
+        path: &str,
+    ) -> Result<Option<String>, ClientError>;
+
+    /// Post a new top-level review comment anchored at (path, side, line)
+    /// against `commit_id` (the PR's head oid). `side` is GitHub's
+    /// LEFT/RIGHT vocabulary; `line` a JSON integer on the wire — the
+    /// backend sees to that.
+    fn post_review_comment(
+        &self,
+        loc: &PrLocator,
+        commit_id: &str,
+        path: &str,
+        side: &str,
+        line: u64,
+        body: &str,
+    ) -> Result<(), ClientError>;
+
+    /// Reply to the review thread rooted at `comment_id`.
+    fn post_reply(&self, loc: &PrLocator, comment_id: u64, body: &str) -> Result<(), ClientError>;
+
+    /// Submit a top-level review with `verdict`. GitHub requires a
+    /// non-empty body for request-changes and comment reviews — the
+    /// caller enforces this so the error surfaces before a round trip;
+    /// approvals may be bodyless.
+    fn submit_review(
+        &self,
+        loc: &PrLocator,
+        verdict: ReviewVerdict,
+        body: &str,
+    ) -> Result<(), ClientError>;
 }
 
 #[cfg(test)]
@@ -398,8 +584,10 @@ mod tests {
 
     /// The contract every failure message must meet, whatever the backend:
     /// the app shows it as the fix, so it has to name `gh auth login`.
+    /// [`ClientError::Invalid`] is the one exception by design — nothing
+    /// was asked of GitHub, so its message names the expected input instead.
     #[test]
-    fn every_error_message_names_the_gh_auth_login_fix() {
+    fn every_github_failure_message_names_the_gh_auth_login_fix() {
         for err in [
             ClientError::NoCredentialSource,
             ClientError::Unauthenticated,
@@ -411,6 +599,18 @@ mod tests {
                 "{err:?} doesn't name the fix: {message}"
             );
         }
+    }
+
+    /// A malformed request reports its own cause — the expected form — and
+    /// never claims GitHub is unreachable or the user unsigned in.
+    #[test]
+    fn an_invalid_request_names_the_expected_form_not_the_sign_in_fix() {
+        let err = ClientError::Invalid(
+            "could not parse \"nope\"; expected owner/repo#123, a PR URL, or a PR number".into(),
+        );
+        let message = err.to_string();
+        assert!(message.contains("expected owner/repo#123"));
+        assert!(!message.contains("gh auth login"), "{message}");
     }
 
     /// Golden string: the review-requested preset must compile to exactly

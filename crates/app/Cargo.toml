@@ -10,7 +10,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 diff-core = { path = "../diff-core" }
-gh = { path = "../gh" }
 git = { path = "../git" }
 github = { path = "../github" }
 store = { path = "../store" }
