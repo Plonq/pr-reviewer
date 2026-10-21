@@ -138,6 +138,8 @@ actions!(
         Refresh,
         QueueUp,
         QueueDown,
+        QueueOpen,
+        BackToQueue,
         QueueSortToggle,
         QueueClearFilters,
         OpenPalette,
@@ -276,9 +278,17 @@ fn main() {
                 // while the queue is up.
                 KeyBinding::new("j", QueueDown, Some("Queue")),
                 KeyBinding::new("k", QueueUp, Some("Queue")),
+                // Enter completes j/k: the selected row opens into the
+                // changes view.
+                KeyBinding::new("enter", QueueOpen, Some("Queue")),
                 KeyBinding::new("r", Refresh, Some("Queue")),
                 KeyBinding::new("s", QueueSortToggle, Some("Queue")),
                 KeyBinding::new("escape", QueueClearFilters, Some("Queue")),
+                // `u` leaves the changes view for the queue again; the open
+                // item stays open behind the scenes (⌘K / ctrl-tab reach
+                // it). Bound in the diff's context so typing in the queue
+                // or any input never triggers it.
+                KeyBinding::new("u", BackToQueue, Some("ReviewApp")),
                 // ⌘R refreshes from anywhere, whatever has focus.
                 KeyBinding::new("cmd-r", Refresh, None),
                 // Finish the review: approve / request changes / comment.
@@ -2424,14 +2434,24 @@ fn render_tree_row(
                 }
                 TreeEntryKind::File { file_ix } => {
                     let file = &data.diff.files[*file_ix];
+                    let (status_label, status_color) = status_style(file.status);
+                    let status: Hsla = status_color.into();
                     base.child(div().w(px(12.)).flex_shrink_0()) // aligns with dir chevrons
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_color(status_style(file.status).1)
+                                .text_color(status_color)
                                 .child(entry.name.clone()),
+                        )
+                        // The status tag mirrors the file header's — the
+                        // tree answers "what happened to this file" at a
+                        // glance, without reading colors alone.
+                        .child(
+                            Tag::custom(status.opacity(0.15), status, status.opacity(0.4))
+                                .xsmall()
+                                .child(SharedString::from(status_label)),
                         )
                         .child(stats(file))
                         .into_any_element()
@@ -2440,6 +2460,8 @@ fn render_tree_row(
         }
         TreeListRow::FilteredFile(file_ix) => {
             let file = &data.diff.files[file_ix];
+            let (status_label, status_color) = status_style(file.status);
+            let status: Hsla = status_color.into();
             base.pl_2()
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| this.jump_to_file(file_ix, window, cx));
@@ -2449,8 +2471,13 @@ fn render_tree_row(
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_color(status_style(file.status).1)
+                        .text_color(status_color)
                         .child(SharedString::from(file.display_path().to_string())),
+                )
+                .child(
+                    Tag::custom(status.opacity(0.15), status, status.opacity(0.4))
+                        .xsmall()
+                        .child(SharedString::from(status_label)),
                 )
                 .child(stats(file))
                 .into_any_element()
@@ -2463,6 +2490,22 @@ fn render_tree_row(
 enum Source {
     Pr(gh::PrLocator),
     Local(git::LocalSource),
+}
+
+/// Whether two sources describe the same thing to review: a PR by
+/// owner/repo/number, a local diff by its working tree and base. The
+/// session opens one item per source — [`ReviewApp::open_item`] brings an
+/// existing item forward instead of duplicating it.
+fn sources_match(a: &Source, b: &Source) -> bool {
+    match (a, b) {
+        (Source::Pr(x), Source::Pr(y)) => {
+            x.owner == y.owner && x.repo == y.repo && x.number == y.number
+        }
+        (Source::Local(x), Source::Local(y)) => {
+            x.repo_root == y.repo_root && x.base_ref == y.base_ref
+        }
+        _ => false,
+    }
 }
 
 enum ItemState {
@@ -3832,7 +3875,12 @@ fn queue_row(
             row.hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
         })
         .on_click(move |_, window, cx| {
-            entity.update(cx, |this, cx| this.queue_select(pos, window, cx));
+            entity.update(cx, |this, cx| {
+                // Focus lands on the pane so the keyboard keeps working —
+                // j/k from a click still move the (new) selection.
+                window.focus(&this.focus_handle);
+                this.queue_open(pos, cx);
+            });
         })
         // The CI verdict sits at the very edge: green rows open without
         // fear, red ones expect breakage — the first thing to catch the eye.
@@ -4670,14 +4718,52 @@ impl ReviewApp {
         cx.notify();
     }
 
-    /// Click a queue row: the selection follows the mouse too, and focus
-    /// lands on the pane so the keyboard keeps working.
-    fn queue_select(&mut self, pos: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.show_queue || pos >= self.queue.prs.len() {
+    /// The locator a queue row opens: its repository is `owner/name`, so
+    /// the row carries everything the PR-open path needs. A row without a
+    /// well-formed repository degrades to nothing — Enter on it is a no-op,
+    /// the same honesty the chip derivation shows a malformed slug.
+    fn queue_item_locator(pr: &github::QueueItem) -> Option<gh::PrLocator> {
+        let (owner, repo) = pr.repository.split_once('/')?;
+        Some(gh::PrLocator {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number: pr.number,
+        })
+    }
+
+    /// Enter (or a click) on a queue row: that PR opens into the changes
+    /// view — its own tab, fresh (fetch + phase-2 upgrade) or straight
+    /// from the snapshot when offline — with the sidebar's file tree
+    /// showing. A PR that's already open behind the scenes just comes
+    /// forward ([`ReviewApp::open_item`]'s one-item-per-source rule), so
+    /// re-opening never loses your place in the first copy.
+    fn queue_open(&mut self, pos: usize, cx: &mut Context<Self>) {
+        if !self.show_queue {
             return;
         }
+        let Some(pr) = self.queue.prs.get(pos) else {
+            return;
+        };
+        let Some(loc) = Self::queue_item_locator(pr) else {
+            return;
+        };
         self.queue.selected = pos;
-        window.focus(&self.focus_handle);
+        self.open_item(Source::Pr(loc), cx);
+        // The changes view's navigation lives in the sidebar: the file
+        // tree (and the open items above it) must be there when the PR
+        // lands, even though the queue starts with the sidebar hidden.
+        self.sidebar_visible = true;
+        cx.notify();
+    }
+
+    /// `u`: back to the queue. The open item stays open — ⌘K and
+    /// ctrl-tab come right back to it — and the queue keeps the
+    /// selection and scroll exactly where they were left.
+    fn back_to_queue(&mut self, cx: &mut Context<Self>) {
+        if self.show_queue {
+            return;
+        }
+        self.show_queue = true;
         cx.notify();
     }
 
@@ -4925,6 +5011,22 @@ impl ReviewApp {
     }
 
     fn open_item(&mut self, source: Source, cx: &mut Context<Self>) {
+        // The session keeps one item per source: opening something it
+        // already has brings that item forward — scroll, cursor, view mode
+        // and comments exactly where they were left — instead of a second
+        // copy that would be a way to lose your place in the first. Every
+        // open path (queue Enter, palette, ⌘T, the CLI) shares this.
+        if let Some(ix) = self
+            .items
+            .iter()
+            .position(|item| sources_match(&item.source, &source))
+        {
+            self.active = ix;
+            // Opening something leaves the home screen for the item's pane.
+            self.show_queue = false;
+            cx.notify();
+            return;
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.items.push(ReviewItem {
@@ -7692,6 +7794,7 @@ impl ReviewApp {
         if self.show_queue {
             footer = footer
                 .child(hint(&["j", "k"], "rows"))
+                .child(hint(&["enter"], "open PR"))
                 .child(hint(&["s"], "sort"))
                 .child(hint(&["r"], "refresh"))
                 // Escape only clears once there's something to clear, so
@@ -7706,6 +7809,7 @@ impl ReviewApp {
             footer = footer
                 .child(hint(&["]", "["], "files"))
                 .child(hint(&["n", "p"], "hunks"))
+                .child(hint(&["u"], "queue"))
                 .child(hint(&["v"], "unified/split"))
                 .child(hint(&["m"], "minimap"))
                 .child(hint(&["c"], "comments"))
@@ -7953,6 +8057,10 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &QueueUp, _, cx| this.queue_move(-1, cx)))
             .on_action(cx.listener(|this, _: &QueueDown, _, cx| this.queue_move(1, cx)))
+            .on_action(
+                cx.listener(|this, _: &QueueOpen, _, cx| this.queue_open(this.queue.selected, cx)),
+            )
+            .on_action(cx.listener(|this, _: &BackToQueue, _, cx| this.back_to_queue(cx)))
             .on_action(cx.listener(|this, _: &QueueSortToggle, _, cx| this.queue_toggle_sort(cx)))
             .on_action(
                 cx.listener(|this, _: &QueueClearFilters, _, cx| this.queue_clear_filters(cx)),
@@ -9277,6 +9385,163 @@ mod tests {
             assert!(app.queue.error.is_some());
             // The rows are usable: the selection can still move.
             assert_eq!(app.queue.selected, 0);
+        });
+    }
+
+    /// One item per source: a PR is its owner/repo/number, a local diff
+    /// is its working tree and base — anything else is a different thing
+    /// to review and opens its own item.
+    #[test]
+    fn sources_match_on_identity_not_labels() {
+        let pr = |owner: &str, number: u64| {
+            Source::Pr(gh::PrLocator {
+                owner: owner.into(),
+                repo: "widgets".into(),
+                number,
+            })
+        };
+        let local = |base: Option<&str>| {
+            Source::Local(git::LocalSource {
+                branch: "main".into(),
+                base_ref: base.map(str::to_string),
+                base_label: base.unwrap_or("…").into(),
+                base_oid: None,
+                repo_root: "/tmp/repo".into(),
+            })
+        };
+        // Same PR, same local tree+base: the same thing.
+        assert!(sources_match(&pr("acme", 1), &pr("acme", 1)));
+        assert!(sources_match(&local(Some("main")), &local(Some("main"))));
+        // Different number, different owner, different base: not the same.
+        assert!(!sources_match(&pr("acme", 1), &pr("acme", 2)));
+        assert!(!sources_match(&pr("acme", 1), &pr("beta", 1)));
+        assert!(!sources_match(&local(Some("main")), &local(Some("dev"))));
+        assert!(!sources_match(&local(Some("main")), &local(None)));
+        // And never across kinds.
+        assert!(!sources_match(&pr("acme", 1), &local(None)));
+    }
+
+    /// The locator a row opens: the repository's `owner/name` plus the
+    /// number — everything ⌘T's open input parses into, derived from
+    /// what the row already carries. A malformed repository degrades
+    /// honestly: no locator, so Enter on it does nothing.
+    #[test]
+    fn queue_rows_carry_the_locator_they_open() {
+        let pr = queued(7, "acme/widgets", "alice");
+        let loc = ReviewApp::queue_item_locator(&pr).expect("owner/name parses");
+        assert_eq!(
+            (loc.owner.as_str(), loc.repo.as_str(), loc.number),
+            ("acme", "widgets", 7)
+        );
+        assert!(ReviewApp::queue_item_locator(&queued(7, "widgets", "alice")).is_none());
+        assert!(ReviewApp::queue_item_locator(&queued(7, "", "alice")).is_none());
+    }
+
+    /// The tracer bullet's first half: Enter on a queue row opens that
+    /// PR into the changes view — its own item, the pane leaves the
+    /// queue screen, and the sidebar (whose file tree is the item's
+    /// navigation) is showing. `u` then comes home without closing
+    /// anything, and the queue remembers exactly where it was left.
+    #[gpui::test]
+    fn enter_opens_the_selected_pr_and_u_comes_home(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (_window, app) = queue_window(cx, fake);
+
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                // j to the second row (bob, acme/widgets#2), Enter to open.
+                this.queue_move(1, cx);
+                this.queue_open(this.queue.selected, cx);
+                // The PR opened as its own item, and the pane is showing it.
+                assert!(!this.show_queue, "the changes view must be up");
+                assert_eq!(this.items.len(), 1);
+                assert_eq!(this.active, 0);
+                assert!(matches!(this.items[0].state, ItemState::Loading));
+                let Source::Pr(loc) = &this.items[0].source else {
+                    panic!("a queue row must open a PR");
+                };
+                assert_eq!(
+                    (loc.owner.as_str(), loc.repo.as_str(), loc.number),
+                    ("acme", "widgets", 2)
+                );
+                // The sidebar carries the file tree: it must be showing.
+                assert!(this.sidebar_visible);
+                // `u`: back to the queue — the item stays open behind the
+                // scenes (⌘K / ctrl-tab reach it) and the queue keeps the
+                // selection where it was left.
+                this.back_to_queue(cx);
+                assert!(this.show_queue, "u must come home");
+                assert_eq!(this.items.len(), 1, "the PR must stay open");
+                assert_eq!(this.queue.selected, 1, "the queue keeps its place");
+            });
+        });
+    }
+
+    /// The other side of the same glue: opening a PR the session already
+    /// has brings its tab forward — a duplicate would be a way to lose
+    /// your place in the first copy — and a row without a well-formed
+    /// repository opens nothing at all.
+    #[gpui::test]
+    fn an_already_open_pr_comes_forward_instead_of_duplicating(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (_window, app) = queue_window(cx, fake);
+
+        // Two PRs already open (as the session would have them after two
+        // Enters), the second one in front.
+        cx.update(|cx| {
+            app.update(cx, |this, _cx| {
+                this.items = vec![
+                    ReviewItem {
+                        id: 0,
+                        source: Source::Pr(gh::PrLocator {
+                            owner: "acme".into(),
+                            repo: "widgets".into(),
+                            number: 1,
+                        }),
+                        state: ItemState::Failed("stale".into()),
+                        reloading: false,
+                        refresh_error: None,
+                        upgrade_gen: 0,
+                    },
+                    ReviewItem {
+                        id: 1,
+                        source: Source::Pr(gh::PrLocator {
+                            owner: "acme".into(),
+                            repo: "widgets".into(),
+                            number: 2,
+                        }),
+                        state: ItemState::Failed("stale".into()),
+                        reloading: false,
+                        refresh_error: None,
+                        upgrade_gen: 0,
+                    },
+                ];
+                this.active = 1;
+                this.next_id = 2;
+            });
+        });
+
+        // Enter on the first row (alice, acme/widgets#1): its tab comes
+        // forward — no fetch, no third item.
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.queue_open(0, cx);
+                assert_eq!(this.items.len(), 2, "no duplicate may open");
+                assert_eq!(this.active, 0, "the open tab comes forward");
+                assert!(!this.show_queue);
+                assert!(this.sidebar_visible);
+
+                // A row whose repository isn't owner/name opens nothing.
+                this.back_to_queue(cx);
+                this.queue.prs[0].repository = "not-a-slug".into();
+                this.queue_open(0, cx);
+                assert!(this.show_queue, "a malformed row is a no-op");
+                assert_eq!(this.items.len(), 2);
+            });
         });
     }
 

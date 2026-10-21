@@ -44,6 +44,8 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 
 - opens straight into the review queue, painted from a local cache and hot-swapped
   when the network answers (works offline, too)
+- enter (or click) opens a queue row straight into its changes view; `u` comes
+  back to the queue with open PRs kept open behind the scenes
 - unified + split views
 - tree-sitter highlighting (18 languages)
 - word-level intra-line diffs
@@ -77,6 +79,8 @@ re-fetch, nothing more.
 | `cmd-k` | open palette (GitHub PR picker / folder) |
 | `cmd-t` / `cmd-w` / `cmd-b` | quick-open input / close item / toggle sidebar |
 | `ctrl-tab` | cycle open items |
+| `j` / `k` + `enter` | queue: move the selection, open the selected PR |
+| `u` | back to the queue (open PRs stay open) |
 | `cmd-+` / `cmd--` / `cmd-0` | diff font size: bigger / smaller / reset |
 | `]` / `[` | next / previous file |
 | `n` / `p` | next / previous hunk |
