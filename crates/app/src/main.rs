@@ -89,6 +89,8 @@ actions!(
         Refresh,
         QueueUp,
         QueueDown,
+        QueueSortToggle,
+        QueueClearFilters,
         OpenPalette,
         PaletteUp,
         PaletteDown,
@@ -220,11 +222,14 @@ fn main() {
                 KeyBinding::new("c", ToggleComments, Some("ReviewApp")),
                 KeyBinding::new("r", Refresh, Some("ReviewApp")),
                 // The queue screen's keys, in its own context: j/k drive the
-                // selection, r refreshes, and the diff's single-key bindings
-                // stay quiet while the queue is up.
+                // selection, r refreshes, s flips the sort, escape lifts
+                // every chip — and the diff's single-key bindings stay quiet
+                // while the queue is up.
                 KeyBinding::new("j", QueueDown, Some("Queue")),
                 KeyBinding::new("k", QueueUp, Some("Queue")),
                 KeyBinding::new("r", Refresh, Some("Queue")),
+                KeyBinding::new("s", QueueSortToggle, Some("Queue")),
+                KeyBinding::new("escape", QueueClearFilters, Some("Queue")),
                 // ⌘R refreshes from anywhere, whatever has focus.
                 KeyBinding::new("cmd-r", Refresh, None),
                 // Finish the review: approve / request changes / comment.
@@ -3477,6 +3482,102 @@ fn label_budget(labels: &[github::QueueLabel]) -> (&[github::QueueLabel], usize)
     (&labels[..shown], labels.len() - shown)
 }
 
+/// How many chips one filter dimension shows before its `+n` overflow: the
+/// chip bar stays a bounded strip over the queue however wide the day's
+/// contexts spread, the way a row's label budget keeps room for size and
+/// state. The active chip is pinned to the front of its group, so it can
+/// never fall off the capped end.
+const QUEUE_CHIPS_SHOWN: usize = 8;
+
+/// One quick-filter chip over the queue: the filter clicking it applies,
+/// how many rows it covers, and whether it's its dimension's active value.
+/// The chip paints the qualifier it compiles to — the bar doubles as a
+/// readout of the search the next refresh runs.
+struct QueueChip {
+    filter: github::QueueFilter,
+    count: usize,
+    active: bool,
+}
+
+/// One filter dimension's chips: the values present in the queue, ordered
+/// for triage — the active value first, then the heaviest, then
+/// alphabetically — capped with a count of the rest. A dimension with a
+/// single value and nothing active stays off the bar entirely: there's
+/// nothing to narrow, and an inert chip would only look broken.
+struct QueueChipGroup {
+    kind: github::QueueFilterKind,
+    chips: Vec<QueueChip>,
+    hidden: usize,
+}
+
+/// The chip groups for the queue as it stands: one per dimension — org,
+/// repo, author — its values derived from the rows the queue is currently
+/// showing, each carrying the rows it covers and whether it's active.
+/// Deriving from the current rows is what keeps the bar honest: a filtered
+/// queue offers the values it still contains — the active chip included,
+/// so it stays visible and clearable — and an unfiltered one offers
+/// everything. Two rules keep every chip meaningful: a dimension appears
+/// only once it can narrow (two or more values, or one while it's the
+/// active filter — its chip is the one-glance readout), and a malformed
+/// repository row degrades honestly, its whole string standing in as the
+/// org rather than panicking or vanishing.
+fn queue_chips(prs: &[github::QueueItem], search: &github::QueueSearch) -> Vec<QueueChipGroup> {
+    use github::QueueFilterKind::{Author, Org, Repo};
+    [Org, Repo, Author]
+        .into_iter()
+        .filter_map(|kind| {
+            let mut counts: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for pr in prs {
+                let value = match kind {
+                    Org => pr
+                        .repository
+                        .split_once('/')
+                        .map(|(owner, _)| owner)
+                        .unwrap_or(pr.repository.as_str()),
+                    Repo => pr.repository.as_str(),
+                    Author => pr.author.as_str(),
+                };
+                *counts.entry(value).or_insert(0) += 1;
+            }
+            let active = search.filters().iter().find(|f| f.kind() == kind);
+            // One value and nothing active: the chip couldn't narrow
+            // anything, so it stays off the bar.
+            if counts.len() < 2 && active.is_none() {
+                return None;
+            }
+            let mut values: Vec<(&str, usize)> = counts.into_iter().collect();
+            values.sort_by(|(a_value, a_count), (b_value, b_count)| {
+                // The active value always leads its group — the chip must
+                // stay visible, whatever its weight.
+                let a_active = active.is_some_and(|f| f.value() == *a_value);
+                let b_active = active.is_some_and(|f| f.value() == *b_value);
+                b_active
+                    .cmp(&a_active)
+                    .then(b_count.cmp(a_count))
+                    .then(a_value.cmp(b_value))
+            });
+            let (shown, hidden) = values.split_at(values.len().min(QUEUE_CHIPS_SHOWN));
+            Some(QueueChipGroup {
+                kind,
+                chips: shown
+                    .iter()
+                    .map(|(value, count)| QueueChip {
+                        filter: match kind {
+                            Org => github::QueueFilter::org(*value),
+                            Repo => github::QueueFilter::repo(*value),
+                            Author => github::QueueFilter::author(*value),
+                        },
+                        count: *count,
+                        active: active.is_some_and(|f| f.value() == *value),
+                    })
+                    .collect(),
+                hidden: hidden.len(),
+            })
+        })
+        .collect()
+}
+
 /// One review-queue row, carrying everything needed to triage without
 /// opening anything: CI verdict as a colored dot, author avatar, `#number`
 /// and title (drafts badged and muted), review state, diff size,
@@ -4146,7 +4247,7 @@ impl ReviewApp {
         self.queue.loading = true;
         self.queue_gen += 1;
         let gen = self.queue_gen;
-        let (client, search) = (self.github.clone(), self.queue.search);
+        let (client, search) = (self.github.clone(), self.queue.search.clone());
         cx.spawn(async move |this, cx| {
             let fetched = cx
                 .background_spawn(async move { client.search_prs(&search) })
@@ -4194,6 +4295,59 @@ impl ReviewApp {
         }
         self.queue.selected = pos;
         window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    /// `s` and the sort toggle: flip the queue between recently-updated
+    /// and oldest-first. The order runs server-side — the compiled search
+    /// carries it — so the rows hot-swap on the next fetch, and the
+    /// selection starts over: a position in one order means nothing in the
+    /// other.
+    fn queue_toggle_sort(&mut self, cx: &mut Context<Self>) {
+        if !self.show_queue {
+            return;
+        }
+        let flipped = match self.queue.search.ordering() {
+            github::QueueSort::RecentlyUpdated => github::QueueSort::OldestUpdated,
+            github::QueueSort::OldestUpdated => github::QueueSort::RecentlyUpdated,
+        };
+        self.queue.search = self.queue.search.clone().sorted_by(flipped);
+        self.queue_run_search(cx);
+    }
+
+    /// A chip click: selecting a value narrows the queue to it; selecting
+    /// the active chip lifts that dimension again — the one-glance rule
+    /// runs both ways, and clearing is never more than one click.
+    fn queue_toggle_filter(&mut self, filter: github::QueueFilter, cx: &mut Context<Self>) {
+        if !self.show_queue {
+            return;
+        }
+        self.queue.search = if self.queue.search.filters().contains(&filter) {
+            self.queue.search.clone().without_filter(filter.kind())
+        } else {
+            self.queue.search.clone().filtered_by(filter)
+        };
+        self.queue_run_search(cx);
+    }
+
+    /// `escape` and the clear chip: lift every chip at once — the preset
+    /// queue again, in whatever order it was in.
+    fn queue_clear_filters(&mut self, cx: &mut Context<Self>) {
+        if !self.show_queue || self.queue.search.filters().is_empty() {
+            return;
+        }
+        self.queue.search = self.queue.search.clone().unfiltered();
+        self.queue_run_search(cx);
+    }
+
+    /// Run the queue's (already-changed) search from the top: the rows
+    /// that come back belong to a different result set, so the selection
+    /// restarts at the first row and the fetch hot-swaps in as ever — the
+    /// stale rows stay visible until it lands.
+    fn queue_run_search(&mut self, cx: &mut Context<Self>) {
+        self.queue.selected = 0;
+        self.queue.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.spawn_queue_refresh(cx);
         cx.notify();
     }
 
@@ -6684,11 +6838,14 @@ impl ReviewApp {
     }
 
     /// The review queue screen — what a bare launch opens on. Rows are the
-    /// facade's queue items in the search's order (recently updated first);
-    /// `j`/`k` walk them with a visible selection. Failures are
-    /// non-destructive: the last rows stay up with the error beside them,
-    /// and a first-fetch failure explains itself where the rows would be,
-    /// naming the fix. An empty queue says so instead of a blank pane.
+    /// facade's queue items in the search's order (recently updated first,
+    /// oldest-first at a toggle); `j`/`k` walk them with a visible
+    /// selection, the control row sorts and filters (see
+    /// [`Self::queue_controls`]). Failures are non-destructive: the last
+    /// rows stay up with the error beside them, and a first-fetch failure
+    /// explains itself where the rows would be, naming the fix. An empty
+    /// queue says so instead of a blank pane — an empty *filtered* one
+    /// offers the way back out.
     fn render_queue(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let queue = &self.queue;
         if queue.prs.is_empty() && queue.loading {
@@ -6717,6 +6874,49 @@ impl ReviewApp {
                             .text_size(px(13.))
                             .text_color(theme::overlay0())
                             .child(SharedString::from("⌘R to retry")),
+                    )
+                    .into_any_element();
+            }
+            // A filter that matched everything away — the rows it was
+            // derived from went with them, so the way back out is the
+            // message itself: one click (or escape) clears and re-runs.
+            if !queue.search.filters().is_empty() {
+                let entity = cx.entity();
+                return div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .p_8()
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .text_color(theme::overlay0())
+                            .child("no PRs match the current filters"),
+                    )
+                    .child(
+                        div()
+                            .id("queue-clear-empty")
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .px_2()
+                            .h(px(24.))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme::surface0())
+                            .text_size(px(13.))
+                            .text_color(theme::subtext())
+                            .hover(|style| style.bg(theme::surface0()))
+                            .child("clear filters (escape)")
+                            .on_click(move |_, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    window.focus(&this.focus_handle);
+                                    this.queue_clear_filters(cx);
+                                })
+                            }),
                     )
                     .into_any_element();
             }
@@ -6755,6 +6955,7 @@ impl ReviewApp {
                             ))),
                     ),
             )
+            .child(self.queue_controls(entity.clone()))
             .child(
                 uniform_list("queue", count, move |range, _window, cx| {
                     let this = entity.read(cx);
@@ -6768,6 +6969,196 @@ impl ReviewApp {
                 .min_h_0(),
             )
             .into_any_element()
+    }
+
+    /// The queue's control row, under the title: the sort toggle, then the
+    /// filter chips derived from the rows below — each showing the exact
+    /// qualifier it compiles to, the rows it covers, and its active state —
+    /// and, while any chip is active, the one-click clear-all. The row's
+    /// right edge carries the fetch status: the refresh in flight, or the
+    /// failure that kept the rows stale — beside the chips that caused
+    /// it, where the eye already is. The chips are click-driven for now;
+    /// the keyboard drives the sort (`s`) and the clear (`escape`).
+    fn queue_controls(&self, entity: gpui::Entity<Self>) -> gpui::AnyElement {
+        let search = &self.queue.search;
+        let oldest = search.ordering() == github::QueueSort::OldestUpdated;
+        // The sort toggle: its label is the order the next refresh runs in
+        // — newest first by default, oldest first for backlog clearing.
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py_1()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme::surface0())
+            .child(
+                div()
+                    .id("queue-sort-toggle")
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .h(px(22.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme::surface0())
+                    .text_size(px(12.))
+                    .text_color(theme::subtext())
+                    .hover(|style| style.bg(theme::surface0()))
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, window, cx| {
+                            entity.update(cx, |this, cx| {
+                                window.focus(&this.focus_handle);
+                                this.queue_toggle_sort(cx);
+                            })
+                        }
+                    })
+                    .child(
+                        div()
+                            .text_color(theme::overlay0())
+                            .child(SharedString::from("sort:")),
+                    )
+                    .child(SharedString::from(if oldest {
+                        "oldest first ↑"
+                    } else {
+                        "recently updated ↓"
+                    })),
+            );
+        // Chip ids run across the whole row: groups re-enumerated would
+        // collide ("org"'s first chip and "repo"'s are both
+        // ("queue-chip", 0)).
+        let mut chip_ix = 0usize;
+        for group in queue_chips(&self.queue.prs, search) {
+            for chip in group.chips {
+                let ix = chip_ix;
+                chip_ix += 1;
+                // The active chip reads like a selected filter — blue-tinted
+                // like GitHub's own label chips — and the inactive ones sit
+                // quiet until hovered.
+                let (bg, fg, border) = if chip.active {
+                    label_chip_colors(Some(Hsla::from(theme::blue())), theme::is_light())
+                } else {
+                    label_chip_colors(None, theme::is_light())
+                };
+                row = row.child(
+                    div()
+                        .id(("queue-chip", ix))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_0p5()
+                        .px_1p5()
+                        .h(px(22.))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(bg)
+                        .text_size(px(12.))
+                        .when(chip.active, |chip| {
+                            chip.hover(|style| style.bg(Hsla::from(theme::blue()).opacity(0.2)))
+                        })
+                        .when(!chip.active, |chip| {
+                            chip.hover(|style| style.bg(theme::surface0()))
+                        })
+                        .on_click({
+                            let entity = entity.clone();
+                            let filter = chip.filter.clone();
+                            move |_, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    window.focus(&this.focus_handle);
+                                    this.queue_toggle_filter(filter.clone(), cx);
+                                })
+                            }
+                        })
+                        .child(
+                            div()
+                                .text_color(theme::overlay0())
+                                .child(SharedString::from(format!("{}:", group.kind.prefix()))),
+                        )
+                        .child(
+                            div()
+                                .max_w(px(220.))
+                                .truncate()
+                                .text_color(fg)
+                                .child(SharedString::from(chip.filter.value().to_string())),
+                        )
+                        .child(
+                            div()
+                                .text_color(if chip.active {
+                                    fg
+                                } else {
+                                    Hsla::from(theme::overlay0())
+                                })
+                                .child(SharedString::from(format!("· {}", chip.count))),
+                        ),
+                );
+            }
+            if group.hidden > 0 {
+                row = row.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::overlay0())
+                        .child(SharedString::from(format!("+{} more", group.hidden))),
+                );
+            }
+        }
+        if !search.filters().is_empty() {
+            row = row.child(
+                div()
+                    .id("queue-clear-filters")
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .px_1p5()
+                    .h(px(22.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme::surface0())
+                    .text_size(px(12.))
+                    .text_color(theme::overlay0())
+                    .hover(|style| style.text_color(theme::red()).border_color(theme::red()))
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, window, cx| {
+                            entity.update(cx, |this, cx| {
+                                window.focus(&this.focus_handle);
+                                this.queue_clear_filters(cx);
+                            })
+                        }
+                    })
+                    .child(SharedString::from("✕ clear")),
+            );
+        }
+        // The fetch status, right-aligned where the chips are: the refresh
+        // a click just kicked off, or the failure that left the stale
+        // rows up — surfaced in the pane, not only in the title bar.
+        let status: Option<(&str, gpui::Hsla)> = if self.queue.loading {
+            Some(("refreshing queue…", gpui::Hsla::from(theme::overlay0())))
+        } else {
+            self.queue
+                .error
+                .as_deref()
+                .map(|err| (err, gpui::Hsla::from(theme::peach())))
+        };
+        row = row
+            .child(div().flex_1().min_w_0())
+            .when_some(status, |row, (text, color)| {
+                row.child(
+                    div()
+                        .min_w_0()
+                        .max_w(px(480.))
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(color)
+                        .child(SharedString::from(text.to_string())),
+                )
+            });
+        row.into_any_element()
     }
 
     /// The pane with nothing open: the ⌘T hint — plus, when GitHub isn't
@@ -6832,7 +7223,13 @@ impl ReviewApp {
         if self.show_queue {
             footer = footer
                 .child(hint(&["j", "k"], "rows"))
+                .child(hint(&["s"], "sort"))
                 .child(hint(&["r"], "refresh"))
+                // Escape only clears once there's something to clear, so
+                // its hint appears with it.
+                .when(!self.queue.search.filters().is_empty(), |footer| {
+                    footer.child(hint(&["escape"], "clear filters"))
+                })
                 .child(hint(&["cmd-t"], "open"))
                 .child(hint(&["cmd-k"], "palette"))
                 .child(hint(&["cmd-b"], "sidebar"));
@@ -7087,6 +7484,10 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &QueueUp, _, cx| this.queue_move(-1, cx)))
             .on_action(cx.listener(|this, _: &QueueDown, _, cx| this.queue_move(1, cx)))
+            .on_action(cx.listener(|this, _: &QueueSortToggle, _, cx| this.queue_toggle_sort(cx)))
+            .on_action(
+                cx.listener(|this, _: &QueueClearFilters, _, cx| this.queue_clear_filters(cx)),
+            )
             // Bound in the "ReviewApp" context: these only fire while the
             // diff pane has focus. With the palette open, focus sits in the
             // palette input, so its escape routing (PaletteBack) wins.
@@ -7889,6 +8290,458 @@ mod tests {
         assert!(size_view(Some(151), None).is_none());
         assert!(size_view(None, Some(30)).is_none());
         assert!(size_view(Some(151), Some(30)).is_some());
+    }
+
+    /// A queue row for the chip tests: a fully-formed [`QueueItem`] with
+    /// only the fields the chips derive from filled in.
+    fn queued(number: u64, repository: &str, author: &str) -> github::QueueItem {
+        github::QueueItem {
+            number,
+            title: format!("pr {number}"),
+            author: author.to_string(),
+            author_avatar_url: None,
+            repository: repository.to_string(),
+            is_draft: false,
+            review_state: github::ReviewState::Awaiting,
+            ci: github::CiState::NoChecks,
+            additions: None,
+            deletions: None,
+            comments: 0,
+            labels: Vec::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// The `kind` group from a derivation — the bar skips dimensions with
+    /// nothing to offer, so positions in the vec aren't stable.
+    fn group(groups: &[QueueChipGroup], kind: github::QueueFilterKind) -> &QueueChipGroup {
+        groups
+            .iter()
+            .find(|group| group.kind == kind)
+            .expect("the kind must be on the bar")
+    }
+
+    /// Chips derive from the rows the queue is showing: one group per
+    /// dimension that can narrow, each value with the rows it covers,
+    /// heaviest first with alphabetical ties.
+    #[test]
+    fn queue_chips_derive_from_the_current_rows() {
+        let prs = vec![
+            queued(1, "acme/widgets", "alice"),
+            queued(2, "acme/widgets", "bob"),
+            queued(3, "acme/gadgets", "alice"),
+            queued(4, "globex/thing", "bob"),
+        ];
+        let groups = queue_chips(&prs, &github::QueueSearch::review_requested());
+        // Orgs in kind order first, then repos, then authors — every
+        // dimension here has two or more values.
+        assert_eq!(
+            groups.iter().map(|group| group.kind).collect::<Vec<_>>(),
+            vec![
+                github::QueueFilterKind::Org,
+                github::QueueFilterKind::Repo,
+                github::QueueFilterKind::Author,
+            ]
+        );
+        // Heaviest first, whatever the alphabetical order would say.
+        let org = group(&groups, github::QueueFilterKind::Org);
+        assert_eq!(org.chips[0].filter, github::QueueFilter::org("acme"));
+        assert_eq!(org.chips[0].count, 3);
+        assert!(!org.chips[0].active);
+        assert_eq!(org.chips[1].filter, github::QueueFilter::org("globex"));
+        let repo = group(&groups, github::QueueFilterKind::Repo);
+        assert_eq!(
+            repo.chips[0].filter,
+            github::QueueFilter::repo("acme/widgets")
+        );
+        assert_eq!(repo.chips[0].count, 2);
+        assert_eq!(
+            repo.chips[1].filter,
+            github::QueueFilter::repo("acme/gadgets")
+        );
+        assert_eq!(
+            repo.chips[2].filter,
+            github::QueueFilter::repo("globex/thing")
+        );
+        // alice and bob both cover 2 rows: the tie breaks alphabetically.
+        let authors = group(&groups, github::QueueFilterKind::Author);
+        assert_eq!(
+            authors.chips[0].filter,
+            github::QueueFilter::author("alice")
+        );
+        assert_eq!(authors.chips[1].filter, github::QueueFilter::author("bob"));
+        assert_eq!(groups.iter().map(|group| group.hidden).sum::<usize>(), 0);
+    }
+
+    /// A dimension with a single value has nothing to narrow: it stays
+    /// off the bar instead of offering a chip that couldn't visibly change
+    /// anything — but while it's the active filter its chip returns, as
+    /// the one-glance readout of what's filtering the queue.
+    #[test]
+    fn queue_chips_stay_off_the_bar_until_they_can_narrow() {
+        let prs = vec![
+            queued(1, "acme/widgets", "alice"),
+            queued(2, "acme/widgets", "bob"),
+        ];
+        // One org, one repo, two authors: only the authors offer a choice.
+        let groups = queue_chips(&prs, &github::QueueSearch::review_requested());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, github::QueueFilterKind::Author);
+        assert_eq!(groups[0].chips.len(), 2);
+        // Active brings a single-value dimension back — marked, and the
+        // only chip in its group.
+        let search =
+            github::QueueSearch::review_requested().filtered_by(github::QueueFilter::org("acme"));
+        let groups = queue_chips(&prs, &search);
+        let org = group(&groups, github::QueueFilterKind::Org);
+        assert_eq!(org.chips.len(), 1);
+        assert!(org.chips[0].active);
+        assert_eq!(org.chips[0].filter, github::QueueFilter::org("acme"));
+        assert_eq!(org.hidden, 0);
+    }
+
+    /// The active chip pins to the front of its group — even when it's the
+    /// lightest value there — and reads back marked, so the one-glance
+    /// rule holds under the cap too.
+    #[test]
+    fn queue_chips_pin_the_active_value_first() {
+        let prs = vec![
+            queued(1, "acme/widgets", "alice"),
+            queued(2, "acme/widgets", "alice"),
+            queued(3, "acme/gadgets", "bob"),
+        ];
+        let search =
+            github::QueueSearch::review_requested().filtered_by(github::QueueFilter::author("bob"));
+        let groups = queue_chips(&prs, &search);
+        let authors = group(&groups, github::QueueFilterKind::Author);
+        assert_eq!(authors.chips[0].filter, github::QueueFilter::author("bob"));
+        assert_eq!(authors.chips[0].count, 1);
+        assert!(authors.chips[0].active);
+        assert_eq!(
+            authors.chips[1].filter,
+            github::QueueFilter::author("alice")
+        );
+        assert!(!authors.chips[1].active);
+    }
+
+    /// What the queue holds after narrowing to one repo: the bar offers
+    /// only that repo — the active chip, visible and marked. The org and
+    /// author dimensions now hold a single value each with nothing
+    /// active, so they leave the bar: nothing left to narrow.
+    #[test]
+    fn queue_chips_derive_from_the_filtered_queue() {
+        let prs = vec![queued(3, "acme/gadgets", "alice")];
+        let search = github::QueueSearch::review_requested()
+            .filtered_by(github::QueueFilter::repo("acme/gadgets"));
+        let groups = queue_chips(&prs, &search);
+        assert_eq!(groups.len(), 1, "only the active repo's dimension remains");
+        let repo = group(&groups, github::QueueFilterKind::Repo);
+        assert_eq!(
+            repo.chips[0].filter,
+            github::QueueFilter::repo("acme/gadgets")
+        );
+        assert!(repo.chips[0].active);
+        // With the repo chip lifted too, a single row can't offer
+        // anything to narrow: the bar empties.
+        let groups = queue_chips(
+            &prs,
+            &search.clone().without_filter(github::QueueFilterKind::Repo),
+        );
+        assert!(
+            groups.is_empty(),
+            "a single row can't offer anything to narrow"
+        );
+    }
+
+    /// Ten authors: the bar shows the cap and reports the rest — bounded
+    /// strip, honest count. All counts equal here, so alphabetical order
+    /// decides what shows.
+    #[test]
+    fn queue_chips_cap_each_group_with_an_overflow_count() {
+        let prs: Vec<_> = (0..10)
+            .map(|n| queued(n, "acme/widgets", &format!("user{n:02}")))
+            .collect();
+        let groups = queue_chips(&prs, &github::QueueSearch::review_requested());
+        let authors = group(&groups, github::QueueFilterKind::Author);
+        assert_eq!(authors.chips.len(), QUEUE_CHIPS_SHOWN);
+        assert_eq!(authors.hidden, 10 - QUEUE_CHIPS_SHOWN);
+        assert_eq!(
+            authors.chips[0].filter,
+            github::QueueFilter::author("user00")
+        );
+        assert_eq!(
+            authors.chips[QUEUE_CHIPS_SHOWN - 1].filter,
+            github::QueueFilter::author("user07")
+        );
+    }
+
+    /// A malformed repository row degrades honestly: the whole string
+    /// stands in as the org rather than panicking or vanishing — and it
+    /// counts as its own value, so a queue mixing malformed and normal
+    /// rows still offers both.
+    #[test]
+    fn queue_chips_degrade_a_malformed_repository() {
+        let prs = vec![
+            queued(1, "not-a-slug", "alice"),
+            queued(2, "acme/widgets", "alice"),
+        ];
+        let groups = queue_chips(&prs, &github::QueueSearch::review_requested());
+        let org = group(&groups, github::QueueFilterKind::Org);
+        assert_eq!(org.chips.len(), 2);
+        assert_eq!(org.chips[0].filter, github::QueueFilter::org("acme"));
+        assert_eq!(org.chips[1].filter, github::QueueFilter::org("not-a-slug"));
+        let repo = group(&groups, github::QueueFilterKind::Repo);
+        assert_eq!(
+            repo.chips[0].filter,
+            github::QueueFilter::repo("acme/widgets")
+        );
+        assert_eq!(
+            repo.chips[1].filter,
+            github::QueueFilter::repo("not-a-slug")
+        );
+    }
+
+    /// A queue-shaped facade for the app-level tests: scripted search
+    /// results keyed by what the app asks for, recording every query it
+    /// compiled — the observer for the exact chain a chip click runs.
+    /// The scripted rows are deliberately one-org/one-repo — the shape a
+    /// real queue often has — so the tests also pin that narrowing by
+    /// author works even when org and repo can't narrow anything.
+    struct FakeQueue {
+        asked: std::sync::Mutex<Vec<(String, (&'static str, &'static str))>>,
+    }
+
+    impl FakeQueue {
+        fn rows(&self, query: &str) -> Vec<github::QueueItem> {
+            for author in ["alice", "bob"] {
+                if query.contains(&format!("author:{author}")) {
+                    return vec![queued(
+                        if author == "alice" { 1 } else { 2 },
+                        "acme/widgets",
+                        author,
+                    )];
+                }
+            }
+            vec![
+                queued(1, "acme/widgets", "alice"),
+                queued(2, "acme/widgets", "bob"),
+            ]
+        }
+    }
+
+    impl github::GitHubClient for FakeQueue {
+        fn viewer(&self) -> Result<github::Viewer, github::ClientError> {
+            Ok(github::Viewer {
+                login: "tester".into(),
+                avatar_url: String::new(),
+            })
+        }
+
+        fn search_prs(
+            &self,
+            search: &github::QueueSearch,
+        ) -> Result<Vec<github::QueueItem>, github::ClientError> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((search.query(), search.sort()));
+            Ok(self.rows(&search.query()))
+        }
+    }
+
+    /// A window running the real app over the scripted queue, parked
+    /// after the app-open fetch: `(window, app)` ready to drive.
+    fn queue_window(
+        cx: &mut gpui::TestAppContext,
+        client: Arc<dyn github::GitHubClient>,
+    ) -> (gpui::AnyWindowHandle, gpui::Entity<ReviewApp>) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::apply_ui_theme(None, cx);
+        });
+        let stash = std::rc::Rc::new(std::cell::RefCell::new(None::<gpui::Entity<ReviewApp>>));
+        let stash2 = stash.clone();
+        let window = cx.add_window(move |window, cx| {
+            let view =
+                cx.new(|cx| ReviewApp::new(Vec::new(), Vec::new(), client.clone(), window, cx));
+            window.focus(&view.read(cx).focus_handle);
+            *stash2.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = stash.borrow().clone().unwrap();
+        cx.run_until_parked();
+        (window.into(), app)
+    }
+
+    /// The whole chain a chip click runs — handler → search update →
+    /// background fetch → landing → row swap — through the real app in a
+    /// test window. A broken link anywhere shows up as rows that never
+    /// narrow, exactly what the queue must never do. (The mouse and the
+    /// real `gh` subprocess have their own tests.)
+    #[gpui::test]
+    fn a_chip_click_narrows_the_queue(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (_window, app) = queue_window(cx, fake.clone());
+
+        // The app-open fetch landed: the default queue, both authors, in
+        // the default order.
+        cx.update(|cx| assert_eq!(app.read(cx).queue.prs.len(), 2));
+        assert_eq!(
+            fake.asked.lock().unwrap().as_slice(),
+            &[(
+                "is:pr is:open review-requested:@me".to_string(),
+                ("updated", "desc")
+            )]
+        );
+
+        // Click the bob chip: the search narrows, the fetch that lands is
+        // the one the chip asked for, and the rows swap to just bob's.
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.queue_toggle_filter(github::QueueFilter::author("bob"), cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                app.read(cx).queue.search.filters(),
+                &[github::QueueFilter::author("bob")]
+            );
+            assert_eq!(app.read(cx).queue.prs.len(), 1, "the queue must narrow");
+            assert_eq!(app.read(cx).queue.prs[0].author, "bob");
+        });
+        assert_eq!(
+            fake.asked.lock().unwrap().last().unwrap(),
+            &(
+                "is:pr is:open review-requested:@me author:bob".to_string(),
+                ("updated", "desc")
+            )
+        );
+
+        // Click the active chip again: the dimension lifts, and the rows
+        // come back.
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.queue_toggle_filter(github::QueueFilter::author("bob"), cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(app.read(cx).queue.search.filters().is_empty());
+            assert_eq!(app.read(cx).queue.prs.len(), 2);
+        });
+
+        // `s` flips the sort: the next fetch carries the flipped spec —
+        // the same re-run-a-different-search machinery, order side.
+        cx.update(|cx| app.update(cx, |this, cx| this.queue_toggle_sort(cx)));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                app.read(cx).queue.search.ordering(),
+                github::QueueSort::OldestUpdated
+            )
+        });
+        assert_eq!(
+            fake.asked.lock().unwrap().last().unwrap(),
+            &(
+                "is:pr is:open review-requested:@me".to_string(),
+                ("updated", "asc")
+            )
+        );
+    }
+
+    /// The mouse path itself: a real down-up click on a chip must narrow
+    /// the queue — hitbox, element state, pending mouse-down, click
+    /// listeners — everything between the platform mouse event and the
+    /// handler the previous test drives directly. Headless tests can't
+    /// read element bounds, so this one probes: first down the window's
+    /// left edge until the sort chip answers (it's the control row's
+    /// first element), then rightward along that row until an author chip
+    /// does.
+    #[gpui::test]
+    fn the_mouse_click_path_narrows_the_queue(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        // Paint the element tree the mouse events hit-test against.
+        vcx.update(|window, cx| {
+            window.draw(cx);
+        });
+
+        let click = |vcx: &mut gpui::VisualTestContext, x: f32, y: f32| {
+            let at = gpui::point(gpui::px(x), gpui::px(y));
+            vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+            vcx.simulate_mouse_down(at, gpui::MouseButton::Left, gpui::Modifiers::default());
+            vcx.simulate_mouse_up(at, gpui::MouseButton::Left, gpui::Modifiers::default());
+            vcx.run_until_parked();
+        };
+        let ordering = |vcx: &gpui::VisualTestContext| {
+            vcx.cx.update(|cx| app.read(cx).queue.search.ordering())
+        };
+
+        // Find the control row: the sort chip is its first element, and a
+        // click on it flips the order — probe down until one does.
+        let mut band = None;
+        for y in (40..170).step_by(2) {
+            click(&mut vcx, 20., y as f32);
+            if ordering(&vcx) == github::QueueSort::OldestUpdated {
+                band = Some(y as f32);
+                break;
+            }
+        }
+        let band = band.expect("no click ever reached the sort chip");
+        // Restore the default order for the sweep.
+        click(&mut vcx, 20., band);
+        assert_eq!(
+            ordering(&vcx),
+            github::QueueSort::RecentlyUpdated,
+            "the sort chip must flip back on a second click"
+        );
+
+        // Sweep rightward until an author chip answers. The sweep may
+        // cross the sort chip again — restore it when it does, so the
+        // state stays known.
+        let mut clicked: Option<github::QueueFilter> = None;
+        let mut x = 24.;
+        while x < 640. {
+            click(&mut vcx, x, band);
+            if ordering(&vcx) == github::QueueSort::OldestUpdated {
+                click(&mut vcx, 20., band);
+            }
+            let filters = vcx
+                .cx
+                .update(|cx| app.read(cx).queue.search.filters().to_vec());
+            if let Some(filter) = filters
+                .iter()
+                .find(|filter| filter.kind() == github::QueueFilterKind::Author)
+                .cloned()
+            {
+                clicked = Some(filter);
+                break;
+            }
+            x += 3.;
+        }
+        let filter = clicked.expect("no click ever reached an author chip");
+
+        // The click narrowed the queue — the mouse path works end to end.
+        vcx.cx.update(|cx| {
+            let app = app.read(cx);
+            assert_eq!(app.queue.prs.len(), 1, "the click must narrow the queue");
+            assert_eq!(app.queue.prs[0].author, filter.value());
+            assert_eq!(app.queue.search.filters(), std::slice::from_ref(&filter));
+        });
+        assert!(fake
+            .asked
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .0
+            .contains("author:"));
     }
 
     /// (depth, display name, Some(file_ix) for files / None for dirs).

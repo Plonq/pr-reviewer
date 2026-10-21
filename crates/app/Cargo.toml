@@ -25,3 +25,8 @@ futures = "0.3"
 ureq = "2"
 serde_json = { workspace = true }
 libc = "0.2"
+
+[dev-dependencies]
+# TestAppContext + the #[gpui::test] harness — app-level behavior tests
+# drive the real window/handler chain against a fake facade.
+gpui = { version = "0.2", features = ["test-support"] }

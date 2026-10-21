@@ -96,7 +96,8 @@ impl<P: GhProcess> GhCliClient<P> {
     /// usable, and check data can catch up on the next refresh.
     fn search_queue(&self, search: &QueueSearch) -> Result<Vec<QueueItem>, ClientError> {
         let args = search_prs_args(search);
-        let out = self.process.run(&args).map_err(spawn_failure)?;
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.process.run(&argv).map_err(spawn_failure)?;
         if out.code != Some(0) {
             return Err(classify_failure(&out));
         }
@@ -338,21 +339,26 @@ fn apply_enrichment(items: &mut [QueueItem], plan: &EnrichPlan, stdout: &str) {
 
 /// The exact `gh` invocation a queue search compiles to. The search string
 /// becomes one argument *per qualifier* — a single quoted string is
-/// keyword-searched, not qualifier-parsed — followed by the sort spec.
-fn search_prs_args(search: &QueueSearch) -> Vec<&'static str> {
+/// keyword-searched, not qualifier-parsed — chip qualifiers included,
+/// followed by the sort spec. The query is owned (chips compile into it),
+/// so the arguments are too.
+fn search_prs_args(search: &QueueSearch) -> Vec<String> {
     let (sort, order) = search.sort();
-    let mut args = vec!["search", "prs"];
-    args.extend(search.query().split_whitespace());
-    args.extend_from_slice(&[
-        "--sort",
-        sort,
-        "--order",
-        order,
-        "--limit",
-        SEARCH_LIMIT,
-        "--json",
-        QUEUE_JSON_FIELDS,
-    ]);
+    let mut args: Vec<String> = vec!["search".into(), "prs".into()];
+    args.extend(search.query().split_whitespace().map(str::to_string));
+    args.extend(
+        [
+            "--sort",
+            sort,
+            "--order",
+            order,
+            "--limit",
+            SEARCH_LIMIT,
+            "--json",
+            QUEUE_JSON_FIELDS,
+        ]
+        .map(str::to_string),
+    );
     args
 }
 
@@ -500,6 +506,7 @@ fn parse_queue(stdout: &str) -> Result<Vec<QueueItem>, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{QueueFilter, QueueSort};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -798,6 +805,33 @@ mod tests {
     }
 
     #[test]
+    fn filtered_searches_invoke_the_compiled_chips_and_sort_verbatim() {
+        // The golden invocation with chips and a flipped sort — the whole
+        // pipeline from a chip click to gh argv: each chip's qualifier is
+        // its own argument after the preset's, in kind order, and the
+        // sort spec follows. Filtering never adds a round trip.
+        let fake = FakeGh::one(ok(Some(0), QUEUE_EMPTY, ""));
+        let calls = fake.calls_handle();
+        GhCliClient::with_process(fake)
+            .search_prs(
+                &QueueSearch::review_requested()
+                    .filtered_by(QueueFilter::org("acme"))
+                    .filtered_by(QueueFilter::repo("acme/widgets"))
+                    .filtered_by(QueueFilter::author("octocat"))
+                    .sorted_by(QueueSort::OldestUpdated),
+            )
+            .expect("the recorded empty queue must parse");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "chips and sort never add a round trip");
+        assert_eq!(
+            calls[0].join(" "),
+            "search prs is:pr is:open review-requested:@me org:acme repo:acme/widgets \
+             author:octocat --sort updated --order asc --limit 1000 \
+             --json number,title,author,repository,isDraft,updatedAt,commentsCount,labels"
+        );
+    }
+
+    #[test]
     fn enrichment_lands_check_data_on_the_right_rows() {
         let (client, _) = rich_client(
             ok(Some(0), QUEUE_SUCCESS, ""),
@@ -1048,6 +1082,34 @@ mod tests {
                 queue.iter().any(|pr| pr.additions.is_some()),
                 "with PRs queued, at least one must carry its diff size"
             );
+        }
+    }
+
+    /// Live smoke check that chips narrow on real data — not part of the
+    /// recorded set. Run explicitly with `cargo test -p github --
+    /// --ignored` whenever the search contract is in question.
+    #[test]
+    #[ignore = "needs gh installed, authenticated, and network"]
+    fn the_real_backend_narrows_by_author() {
+        let client = GhCliClient::new();
+        let full = client
+            .search_prs(&QueueSearch::review_requested())
+            .expect("gh on this machine is installed and signed in");
+        if full.len() < 2 {
+            return; // nothing to narrow on this account today
+        }
+        let author = full[0].author.clone();
+        let narrowed = client
+            .search_prs(
+                &QueueSearch::review_requested().filtered_by(QueueFilter::author(author.clone())),
+            )
+            .expect("the narrowed search must succeed like the full one");
+        assert!(narrowed.iter().all(|pr| pr.author == author));
+        assert!(!narrowed.is_empty());
+        // Narrowing means fewer rows whenever the author isn't the whole
+        // queue.
+        if full.iter().any(|pr| pr.author != author) {
+            assert!(narrowed.len() < full.len());
         }
     }
 }
