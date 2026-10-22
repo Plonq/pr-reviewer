@@ -6,12 +6,13 @@ mod selection;
 mod theme;
 mod threads;
 mod tree;
+mod upgrade;
 
 #[cfg(test)]
 mod test_util;
 
 use anyhow::anyhow;
-use diff_core::{diff_texts, DiffRow, FileStatus, Hunk, PrDiff};
+use diff_core::{DiffRow, FileStatus, Hunk, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
     actions, canvas, div, fill, font, point, prelude::*, px, relative, rems, size, uniform_list,
@@ -53,6 +54,7 @@ use tree::{
     build_tree, fuzzy_file_matches, render_tree_row, status_style, visible_entries, TreeEntry,
     TreeEntryKind, TreeListRow,
 };
+use upgrade::{run_upgrade, UpgradeJob, UpgradeSource};
 
 const MONO: &str = "Menlo";
 
@@ -715,7 +717,7 @@ fn hunk_syntax(
 /// spans and fill in the context around the hunks. Lives in
 /// `ItemData.upgrades`, so a view-mode toggle preserves it and a
 /// refresh (which rebuilds ItemData contents) resets it.
-struct FileUpgrade {
+pub(crate) struct FileUpgrade {
     /// The complete new-side file, line-ending-normalized, split into lines.
     new_lines: Vec<SharedString>,
     old_spans: Vec<Vec<(Range<usize>, syntax::Token)>>,
@@ -2336,177 +2338,6 @@ fn pr_snapshot(
         is_draft: false,
         fetched_at_ms: local_store::now_ms(),
     }
-}
-
-// --- Phase-2 full-content upgrade ---------------------------------------
-
-/// Never upgrade more than this many files per item; the rest stay on the
-/// perfectly serviceable patch-derived view.
-const MAX_UPGRADE_FILES: usize = 400;
-/// Per-side blob cap; the facade's `file_at` enforces the same limit for
-/// PRs, so this guards only the local working-tree read.
-const MAX_UPGRADE_BLOB_BYTES: usize = 1024 * 1024;
-/// gh/git are one subprocess per call, so a small worker pool is plenty.
-const UPGRADE_WORKERS: usize = 4;
-
-/// Where to fetch full file contents from, snapshotted when an item loads.
-enum UpgradeSource {
-    Pr {
-        loc: github::PrLocator,
-        base_oid: String,
-        head_oid: String,
-    },
-    Local(git::LocalSource),
-}
-
-/// One file's fetch inputs, snapshotted from the parsed patch (paths and
-/// statuses are already known — no extra API call needed).
-struct UpgradeJob {
-    file_ix: usize,
-    old_path: Option<String>,
-    new_path: Option<String>,
-    status: FileStatus,
-}
-
-/// One file's completed upgrade: authoritative hunks plus the render state.
-struct UpgradedFile {
-    file_ix: usize,
-    hunks: Vec<Hunk>,
-    additions: u32,
-    deletions: u32,
-    upgrade: FileUpgrade,
-}
-
-/// Blocking fetch + re-diff + whole-file highlight for every eligible file;
-/// runs on the background executor. Files that fail on either side are simply
-/// missing from the result and keep their patch-derived view.
-fn run_upgrade(
-    github: &dyn github::GitHubClient,
-    source: &UpgradeSource,
-    mut jobs: Vec<UpgradeJob>,
-) -> Vec<UpgradedFile> {
-    if jobs.len() > MAX_UPGRADE_FILES {
-        eprintln!(
-            "gander: {} changed files; upgrading the first {MAX_UPGRADE_FILES} to full \
-             contents, the rest stay patch-derived",
-            jobs.len()
-        );
-        jobs.truncate(MAX_UPGRADE_FILES);
-    }
-    let queue = std::sync::Mutex::new(jobs.into_iter());
-    let done = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|scope| {
-        for _ in 0..UPGRADE_WORKERS {
-            scope.spawn(|| loop {
-                let Some(job) = queue.lock().unwrap().next() else {
-                    break;
-                };
-                if let Some(result) = upgrade_file(github, source, &job) {
-                    done.lock().unwrap().push(result);
-                }
-            });
-        }
-    });
-    let mut done = done.into_inner().unwrap();
-    done.sort_by_key(|file| file.file_ix);
-    done
-}
-
-/// One side's full contents, or None to leave the file un-upgraded: absent,
-/// binary/non-UTF-8, over the size cap, or a fetch failure.
-fn fetch_side(
-    github: &dyn github::GitHubClient,
-    source: &UpgradeSource,
-    path: &str,
-    old: bool,
-) -> Option<String> {
-    let text = match source {
-        UpgradeSource::Pr {
-            loc,
-            base_oid,
-            head_oid,
-        } => {
-            let oid = if old { base_oid } else { head_oid };
-            match github.file_at(loc, oid, path) {
-                Ok(text) => text?,
-                Err(err) => {
-                    eprintln!("gander: {path}: {err}");
-                    return None;
-                }
-            }
-        }
-        UpgradeSource::Local(src) => {
-            if old {
-                git::file_at_base(src, path)?
-            } else {
-                String::from_utf8(std::fs::read(src.repo_root.join(path)).ok()?).ok()?
-            }
-        }
-    };
-    (text.len() <= MAX_UPGRADE_BLOB_BYTES).then_some(text)
-}
-
-fn upgrade_file(
-    github: &dyn github::GitHubClient,
-    source: &UpgradeSource,
-    job: &UpgradeJob,
-) -> Option<UpgradedFile> {
-    // Presence must match the patch's story: Added has no old side, Deleted no
-    // new side, everything else needs both. A wanted-but-missing side (404,
-    // binary, huge) keeps the whole file patch-derived.
-    let old_text = match (job.status, &job.old_path) {
-        (FileStatus::Added, _) => String::new(),
-        (_, Some(path)) => fetch_side(github, source, path, true)?,
-        (_, None) => return None,
-    };
-    let new_text = match (job.status, &job.new_path) {
-        (FileStatus::Deleted, _) => String::new(),
-        (_, Some(path)) => fetch_side(github, source, path, false)?,
-        (_, None) => return None,
-    };
-    // Normalize CRLF→LF up front: hunks, span tables, and gap rows must all
-    // index the same line/byte space (diff_texts itself is ending-agnostic).
-    let normalize = |text: String| {
-        if text.contains('\r') {
-            text.replace("\r\n", "\n")
-        } else {
-            text
-        }
-    };
-    let old_text = normalize(old_text);
-    let new_text = normalize(new_text);
-
-    let hunks = diff_texts(&old_text, &new_text, 3);
-    let (additions, deletions) =
-        hunks
-            .iter()
-            .flat_map(|hunk| &hunk.rows)
-            .fold((0, 0), |(a, d), row| match row {
-                DiffRow::Added { .. } => (a + 1, d),
-                DiffRow::Removed { .. } => (a, d + 1),
-                DiffRow::Context { .. } => (a, d),
-            });
-
-    let path = job.new_path.as_deref().or(job.old_path.as_deref())?;
-    let lang = syntax::language_for_path(path);
-    let spans = |text: &str| match lang {
-        Some(lang) if !text.is_empty() => syntax::highlight_lines(lang, text),
-        _ => Vec::new(),
-    };
-    Some(UpgradedFile {
-        file_ix: job.file_ix,
-        hunks,
-        additions,
-        deletions,
-        upgrade: FileUpgrade {
-            old_spans: spans(&old_text),
-            new_spans: spans(&new_text),
-            new_lines: new_text
-                .lines()
-                .map(|line| SharedString::from(line.to_string()))
-                .collect(),
-        },
-    })
 }
 
 fn centered_message(text: SharedString, color: gpui::Rgba) -> gpui::AnyElement {
@@ -7728,7 +7559,7 @@ mod tests {
     use crate::minimap::MinimapKind;
     use crate::selection::row_side_text;
     use crate::test_util::{add, ctx, hunk, mrow, rc, rem, sample_diff};
-    use diff_core::{FileDiff, Hunk};
+    use diff_core::{diff_texts, FileDiff, Hunk};
 
     fn mention(login: &str, name: Option<&str>) -> github::Mention {
         github::Mention {
