@@ -1,7 +1,7 @@
 //! Review-comment threads: grouping REST comments into anchored threads,
 //! comment-body wrapping, and comment age formatting.
 
-use crate::{ViewMode, SPLIT_DIVIDER};
+use crate::{rows::ViewMode, SPLIT_DIVIDER};
 use std::collections::HashMap;
 use std::ops::Range;
 

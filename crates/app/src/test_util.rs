@@ -1,7 +1,11 @@
 //! Shared test fixtures used by more than one module's tests.
 
 use crate::minimap::{MinimapKind, MinimapRow};
-use diff_core::{DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
+use crate::rows::{FileUpgrade, Row};
+use crate::threads::{group_comments, CommentIndex};
+use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
+use gpui::SharedString;
+use std::collections::HashMap;
 use std::ops::Range;
 
 pub(crate) fn ctx(old_no: u32, new_no: u32, text: &str) -> DiffRow {
@@ -149,4 +153,113 @@ pub(crate) fn queued(number: u64, repository: &str, author: &str) -> github::Que
         labels: Vec::new(),
         updated_at: String::new(),
     }
+}
+
+/// A 20-line file with line 10 changed, re-diffed with context 3: one
+/// hunk covering lines 7..=13, hidden gaps of 6 lines above and 7 below.
+pub(crate) fn upgraded_diff() -> (PrDiff, HashMap<usize, FileUpgrade>) {
+    let old: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    let new = old.replace("line 10\n", "line ten\n");
+    let hunks = diff_texts(&old, &new, 3);
+    let new_lines: Vec<SharedString> = new.lines().map(|l| l.to_string().into()).collect();
+    let n = new_lines.len();
+    let file = FileDiff {
+        old_path: Some("a.txt".into()),
+        new_path: Some("a.txt".into()),
+        status: FileStatus::Modified,
+        hunks,
+        additions: 1,
+        deletions: 1,
+    };
+    let upgrade = FileUpgrade {
+        new_lines,
+        old_spans: vec![Vec::new(); 20],
+        new_spans: vec![Vec::new(); n],
+    };
+    (PrDiff { files: vec![file] }, HashMap::from([(0, upgrade)]))
+}
+
+pub(crate) fn row_name(row: &Row) -> &'static str {
+    match row {
+        Row::FileHeader { .. } => "FileHeader",
+        Row::Binary => "Binary",
+        Row::Line { .. } => "Line",
+        Row::SplitLine { .. } => "SplitLine",
+        Row::CommentHeader { .. } => "CommentHeader",
+        Row::CommentBody { .. } => "CommentBody",
+        Row::CommentActions { .. } => "CommentActions",
+    }
+}
+
+/// Two text files — a.rs with two hunks, b.rs with one — the smallest
+/// change set that exercises navigation across a file boundary.
+pub(crate) fn two_file_diff() -> PrDiff {
+    let file = |path: &str, hunks: Vec<Hunk>| FileDiff {
+        old_path: Some(path.into()),
+        new_path: Some(path.into()),
+        status: FileStatus::Modified,
+        hunks,
+        additions: 1,
+        deletions: 1,
+    };
+    PrDiff {
+        files: vec![
+            file(
+                "a.rs",
+                vec![
+                    hunk(1, 1, vec![add(1, "one", Vec::new())]),
+                    hunk(10, 10, vec![add(10, "two", Vec::new())]),
+                ],
+            ),
+            file("b.rs", vec![hunk(1, 1, vec![rem(1, "three", Vec::new())])]),
+        ],
+    }
+}
+
+/// Comments for sample_diff's a.rs: a RIGHT thread (with one reply) on
+/// added line 2 ("new1"), a LEFT thread on removed line 2 ("old1"), and
+/// one outdated comment.
+pub(crate) fn sample_comments() -> CommentIndex {
+    group_comments(vec![
+        rc(
+            1,
+            "a.rs",
+            Some("RIGHT"),
+            Some(2),
+            "on new1",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        ),
+        rc(
+            2,
+            "a.rs",
+            Some("RIGHT"),
+            Some(2),
+            "reply",
+            "bob",
+            "2026-01-02T00:00:00Z",
+            Some(1),
+        ),
+        rc(
+            3,
+            "a.rs",
+            Some("LEFT"),
+            Some(2),
+            "on old1",
+            "carol",
+            "2026-01-03T00:00:00Z",
+            None,
+        ),
+        rc(
+            4,
+            "a.rs",
+            None,
+            None,
+            "outdated",
+            "dave",
+            "2026-01-04T00:00:00Z",
+            None,
+        ),
+    ])
 }

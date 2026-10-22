@@ -1,8 +1,9 @@
 //! Review targets: where an item's diff comes from (PR or local tree)
 //! and the blocking fetch that loads one.
 
+use crate::local_store;
+use crate::rows::{build_rows, Row, ViewMode};
 use crate::threads::{group_comments, CommentIndex, COMMENT_WRAP_CHARS};
-use crate::{build_rows, local_store, Row, ViewMode};
 use anyhow::anyhow;
 use diff_core::PrDiff;
 use std::collections::HashMap;

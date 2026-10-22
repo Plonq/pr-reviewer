@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use crate::Row;
+use crate::rows::Row;
 
 /// Which text stream a selection runs through. Split selections are locked to
 /// the side where the drag started, like GitHub; the other side paints nothing.
@@ -110,7 +110,7 @@ pub(crate) fn selection_text(sel: &Selection, rows: &[Row]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Cell, LineKind, Row};
+    use crate::rows::{Cell, LineKind, Row};
 
     fn line(text: &str) -> Row {
         Row::Line {

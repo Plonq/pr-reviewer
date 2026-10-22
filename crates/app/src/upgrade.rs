@@ -1,6 +1,6 @@
 //! Phase-2 full-content upgrade: background refetch and re-diff of whole files.
 
-use crate::FileUpgrade;
+use crate::rows::FileUpgrade;
 use diff_core::{diff_texts, DiffRow, FileStatus, Hunk};
 use gpui::SharedString;
 

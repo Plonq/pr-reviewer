@@ -1,6 +1,6 @@
 //! The diff-pane minimap: display rows reduced to bars, downsampled into coalesced paint runs.
 
-use crate::{Cell, LineKind, Row};
+use crate::rows::{Cell, LineKind, Row};
 
 /// Width of the minimap column on the right edge of the diff pane.
 pub(crate) const MINIMAP_WIDTH: f32 = 100.0;
@@ -255,8 +255,9 @@ pub(crate) fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rows::{build_rows, ViewMode};
     use crate::test_util::{mrow, sample_diff};
-    use crate::{build_rows, threads::COMMENT_WRAP_CHARS, ViewMode};
+    use crate::threads::COMMENT_WRAP_CHARS;
     use std::collections::HashMap;
 
     #[test]
