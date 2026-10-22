@@ -116,3 +116,37 @@ pub(crate) fn rc(
         in_reply_to_id: reply_to,
     }
 }
+
+pub(crate) fn pr(number: u64, title: &str, author: &str, branch: &str) -> github::PrSummary {
+    github::PrSummary {
+        number,
+        title: title.to_string(),
+        author: github::Author {
+            login: author.to_string(),
+        },
+        state: "OPEN".to_string(),
+        is_draft: false,
+        head_ref_name: branch.to_string(),
+        updated_at: "2026-07-01T00:00:00Z".to_string(),
+    }
+}
+
+/// A queue row for the chip tests: a fully-formed [`QueueItem`] with
+/// only the fields the chips derive from filled in.
+pub(crate) fn queued(number: u64, repository: &str, author: &str) -> github::QueueItem {
+    github::QueueItem {
+        number,
+        title: format!("pr {number}"),
+        author: author.to_string(),
+        author_avatar_url: None,
+        repository: repository.to_string(),
+        is_draft: false,
+        review_state: github::ReviewState::Awaiting,
+        ci: github::CiState::NoChecks,
+        additions: None,
+        deletions: None,
+        comments: 0,
+        labels: Vec::new(),
+        updated_at: String::new(),
+    }
+}
