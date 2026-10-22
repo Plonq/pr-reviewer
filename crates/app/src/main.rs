@@ -4486,6 +4486,20 @@ fn cursor_anchor(rows: &[Row], row_ix: usize) -> Option<(CommentSide, u64)> {
     comment_anchor(rows, row_ix, side)
 }
 
+/// The comment composer card's x, window-absolute: in split view the card
+/// sits under the half its anchor is on (a right-side card starts at the
+/// right half's edge), otherwise near the pane's left — and always clamped
+/// so the 520px card fits inside the pane.
+fn composer_x(pane_left: f32, pane_width: f32, mode: ViewMode, side: CommentSide) -> f32 {
+    let half = (pane_width - SPLIT_DIVIDER) / 2.;
+    let x = match (mode, side) {
+        (ViewMode::Split, CommentSide::Right) => pane_left + half + SPLIT_DIVIDER,
+        _ => pane_left + 72.,
+    };
+    let pane_right = pane_left + pane_width;
+    x.min((pane_right - 528.).max(8.))
+}
+
 impl ReviewApp {
     fn new(
         sources: Vec<Source>,
@@ -6512,7 +6526,12 @@ impl ReviewApp {
         let pane_h = f32::from(bounds.size.height);
         let row_y = composer.row_ix as f32 * row_height() + f32::from(offset.y);
         let y = f32::from(bounds.top()) + (row_y + row_height()).clamp(8., (pane_h - 250.).max(8.));
-        let x = (f32::from(bounds.left()) + 72.).min((f32::from(bounds.right()) - 528.).max(8.));
+        let x = composer_x(
+            f32::from(bounds.left()),
+            f32::from(bounds.size.width),
+            data.mode,
+            composer.side,
+        );
         let action = if composer.reply_to.is_some() {
             "Reply"
         } else {
@@ -12087,6 +12106,37 @@ mod tests {
         );
         assert_eq!(cursor_anchor(&rows, 2), Some((CommentSide::Left, 2)));
         assert_eq!(cursor_anchor(&rows, 7), Some((CommentSide::Right, 2)));
+    }
+
+    /// The composer card sits under the half its anchor is on in split view
+    /// (regression: it always used to sit on the left), stays left in
+    /// unified view, and clamps inside panes too narrow for the 520px card.
+    #[test]
+    fn composer_x_follows_the_anchored_half_in_split_view() {
+        let (left, width) = (100., 1200.);
+        // Split: a right-side card starts at the right half's edge; a
+        // left-side one stays near the pane's left.
+        let half = (width - SPLIT_DIVIDER) / 2.;
+        assert_eq!(
+            composer_x(left, width, ViewMode::Split, CommentSide::Right),
+            left + half + SPLIT_DIVIDER
+        );
+        assert_eq!(
+            composer_x(left, width, ViewMode::Split, CommentSide::Left),
+            left + 72.
+        );
+        // Unified is a single column: the card is always on the left.
+        assert_eq!(
+            composer_x(left, width, ViewMode::Unified, CommentSide::Right),
+            left + 72.
+        );
+        // A pane too narrow to hold the card: both sides clamp the same way
+        // so the card never starts past the pane's right edge.
+        assert_eq!(
+            composer_x(0., 480., ViewMode::Split, CommentSide::Right),
+            8.
+        );
+        assert_eq!(composer_x(0., 480., ViewMode::Split, CommentSide::Left), 8.);
     }
 
     /// File mode rides the threads along: the displayed file's threads
