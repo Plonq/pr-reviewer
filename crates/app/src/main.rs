@@ -1,3 +1,4 @@
+mod conversation;
 mod http;
 mod local_store;
 mod theme;
@@ -6,12 +7,12 @@ use anyhow::anyhow;
 use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
-    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
-    Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla,
-    KeyBinding, Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Rgba, ScrollStrategy,
-    SharedString, StyledText, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window,
-    WindowBounds, WindowOptions,
+    actions, canvas, div, fill, font, point, prelude::*, px, relative, rems, size, uniform_list,
+    App, Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle,
+    Hsla, KeyBinding, Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Rgba, ScrollHandle,
+    ScrollStrategy, SharedString, StyledText, Subscription, Task, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     avatar::Avatar,
@@ -20,7 +21,9 @@ use gpui_component::{
     kbd::Kbd,
     scroll::Scrollbar,
     tag::Tag,
-    Disableable as _, Icon, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
+    text::{TextView, TextViewStyle},
+    ActiveTheme, Disableable as _, Icon, IconName, Root, Rope, RopeExt as _, Sizable as _,
+    TitleBar,
 };
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -157,7 +160,9 @@ actions!(
         SubmitReview,
         ZoomIn,
         ZoomOut,
-        ZoomReset
+        ZoomReset,
+        ShowConversation,
+        ShowChanges
     ]
 );
 
@@ -309,6 +314,14 @@ fn main() {
                 // it). Bound in the diff's context so typing in the queue
                 // or any input never triggers it.
                 KeyBinding::new("u", BackToQueue, Some("ReviewApp")),
+                // ⇧⌘←/→ flips the open item between the conversation and
+                // the changes, conversation on the left of that axis (the
+                // GitHub tab strip's order). PRs open onto changes; this is
+                // the one-keystroke hop. Inputs deeper in the tree bind
+                // shift-cmd-left/right themselves for text selection, so
+                // typing in the filter or the composer is unaffected.
+                KeyBinding::new("shift-cmd-left", ShowConversation, Some("ReviewApp")),
+                KeyBinding::new("shift-cmd-right", ShowChanges, Some("ReviewApp")),
                 // ⌘R refreshes from anywhere, whatever has focus.
                 KeyBinding::new("cmd-r", Refresh, None),
                 // Finish the review: approve / request changes / comment.
@@ -2492,6 +2505,10 @@ struct ItemData {
     minimap_cache: RefCell<Option<(f32, Rc<MinimapLayout>)>>,
     cursor: usize,
     scroll: UniformListScrollHandle,
+    /// The conversation pane's scroll position. A pane-level container (not
+    /// the TextView's own), so the wheel scrolls from anywhere over the pane
+    /// and the scrollbar paints at the pane's edge — like the diff pane's.
+    conv_scroll: ScrollHandle,
     additions: u32,
     deletions: u32,
     /// Mouse text selection, in display-row space. Per item (survives item
@@ -2558,6 +2575,7 @@ impl ItemData {
             minimap_cache: RefCell::new(None),
             cursor: 0,
             scroll: UniformListScrollHandle::new(),
+            conv_scroll: ScrollHandle::new(),
             additions: 0,
             deletions: 0,
             selection: None,
@@ -2726,6 +2744,16 @@ impl ItemData {
     }
 }
 
+/// Which pane an open item shows: the diff (changes), or the conversation
+/// — the PR description, rendered as GFM. Items open onto changes; ⇧⌘←/→
+/// flips between them. Per item, so ctrl-tab's other item keeps its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ItemPane {
+    #[default]
+    Changes,
+    Conversation,
+}
+
 struct ReviewItem {
     id: u64,
     source: Source,
@@ -2736,6 +2764,9 @@ struct ReviewItem {
     /// Bumped whenever fresh data is installed; an in-flight Phase-2 upgrade
     /// only lands if the generation it captured is still current.
     upgrade_gen: u64,
+    /// Which pane the item shows; lives here — not in `ItemData` — so a
+    /// refresh (which swaps the data in) never flips the reviewer's view.
+    pane: ItemPane,
 }
 
 impl ReviewItem {
@@ -5144,6 +5175,10 @@ impl ReviewApp {
             reloading: false,
             refresh_error: None,
             upgrade_gen: 0,
+            // PRs still open onto changes — the tracer decision; whether
+            // the default flips to conversation-first is a one-line change
+            // revisited at dogfood (task 28).
+            pane: ItemPane::default(),
         });
         self.active = self.items.len() - 1;
         // Opening something leaves the home screen for the item's pane.
@@ -5792,6 +5827,19 @@ impl ReviewApp {
             self.active = (self.active as isize + delta).rem_euclid(len) as usize;
             self.show_queue = false;
             cx.notify();
+        }
+    }
+
+    /// Flip the open item to `pane` (⇧⌘←/→): the PR's conversation — its
+    /// description, rendered as GFM — sits one keystroke off the changes,
+    /// and ⇧⌘→ is the way back. Already-on-target flips are no-ops, so the
+    /// keys stay useful as "go there" rather than "toggle".
+    fn flip_pane(&mut self, pane: ItemPane, cx: &mut Context<Self>) {
+        if let Some(item) = self.items.get_mut(self.active) {
+            if item.pane != pane {
+                item.pane = pane;
+                cx.notify();
+            }
         }
     }
 
@@ -7966,10 +8014,25 @@ impl ReviewApp {
                 .child(hint(&["cmd-t"], "open"))
                 .child(hint(&["cmd-k"], "palette"))
                 .child(hint(&["cmd-b"], "sidebar"));
+        } else if self
+            .active_item()
+            .is_some_and(|item| item.pane == ItemPane::Conversation)
+        {
+            // The conversation pane's hints: the way back to the changes
+            // comes first, and the diff's file/hunk hints don't apply there.
+            footer = footer
+                .child(hint(&["shift-cmd-right"], "changes"))
+                .child(hint(&["u"], "queue"))
+                .child(hint(&["r"], "refresh"))
+                .child(hint(&["cmd-k"], "palette"))
+                .child(hint(&["cmd-t"], "open"))
+                .child(hint(&["cmd-b"], "sidebar"));
         } else {
             footer = footer
                 .child(hint(&["]", "["], "files"))
                 .child(hint(&["n", "p"], "hunks"))
+                // The conversation pane is one keystroke off the changes.
+                .child(hint(&["shift-cmd-left"], "conversation"))
                 .child(hint(&["u"], "queue"))
                 .child(hint(&["v"], "unified/split"))
                 .child(hint(&["m"], "minimap"))
@@ -7985,10 +8048,10 @@ impl ReviewApp {
         }
         footer
     }
-    /// The pane for an open item — loading, failure message, or the
-    /// diff itself — everything the main pane shows when the queue
-    /// screen isn't up.
-    fn render_item_pane(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The pane for an open item — loading, failure message, the
+    /// conversation, or the diff itself — everything the main pane shows
+    /// when the queue screen isn't up.
+    fn render_item_pane(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entity = cx.entity();
         match self.active_item() {
             None => self.render_empty_pane(),
@@ -8007,6 +8070,9 @@ impl ReviewApp {
                             .child(SharedString::from(msg.clone())),
                     )
                     .into_any_element(),
+                ItemState::Ready(data) if item.pane == ItemPane::Conversation => {
+                    self.render_conversation(item, data, window, cx)
+                }
                 ItemState::Ready(data) => div()
                     .size_full()
                     .relative()
@@ -8145,6 +8211,97 @@ impl ReviewApp {
             },
         }
     }
+
+    /// The conversation pane: the PR's description, rendered as full GFM
+    /// — tables, task lists, highlighted code blocks, links — through the
+    /// Kit TextView's markdown setup, after the conversation pipe expands
+    /// GitHub's `:shortcodes:`, `@mentions`, and `#refs` into characters
+    /// and links. The description arrived with the detail fetch (or from
+    /// the store snapshot, offline), so it paints instantly, no fetching.
+    fn render_conversation(
+        &self,
+        item: &ReviewItem,
+        data: &ItemData,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // Only a PR has a conversation to read; the titlebar keeps the PR's
+        // identity, so the pane can be just the description.
+        let (Some(meta), Source::Pr(loc)) = (&data.pr_meta, &item.source) else {
+            return centered_message("A local diff has no conversation".into(), theme::overlay0());
+        };
+        // The pipe runs on every paint; bodies are small, the output is
+        // what the TextView's keyed state diffs against (same text → no
+        // re-parse), and keeping it out of ItemData means a refresh swaps
+        // the description without any cache to invalidate.
+        let body = conversation::preprocess(&meta.body, &loc.repo_slug());
+        let content = if body.trim().is_empty() {
+            // GitHub's own empty state, verbatim.
+            div()
+                .text_color(theme::overlay0())
+                .child(SharedString::from("No description provided."))
+                .into_any_element()
+        } else {
+            TextView::markdown(
+                ("conversation", item.id),
+                SharedString::from(body),
+                window,
+                cx,
+            )
+            // Plain, not scrollable: the pane is the scroll container (see
+            // below). Selectable, for copying the description's text.
+            .selectable(true)
+            .style(TextViewStyle {
+                // The pane's font size follows the app's zoom (⌘±/⌘0);
+                // headings scale from it, and code blocks pick up the
+                // theme's highlight palette.
+                heading_base_font_size: px(text_size()),
+                paragraph_gap: rems(0.75),
+                highlight_theme: cx.theme().highlight_theme.clone(),
+                is_dark: !theme::is_light(),
+                ..Default::default()
+            })
+            .into_any_element()
+        };
+        // The pane itself is the scroll container — like the diff pane, not
+        // like the TextView's own scrollable mode — so the wheel scrolls
+        // from anywhere over the pane (the centered column's gutters
+        // included). The tradeoff: the TextView renders the whole
+        // description rather than virtualizing, which descriptions (unlike
+        // diffs) are short enough for.
+        //
+        // Two layers, like the diff pane's: the scroller below, and the
+        // Scrollbar overlay outside it, in a non-scrolling relative parent —
+        // an absolutely-positioned child *of* the scroller would position
+        // against the scrolled content and ride below it, not the viewport.
+        div()
+            .size_full()
+            .relative()
+            .text_size(px(text_size()))
+            .child(
+                div()
+                    .id("conversation")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&data.conv_scroll)
+                    .child(
+                        // A reading column, centered like GitHub's: prose at
+                        // line length, not stretched across a diff-width
+                        // window. mx_auto (not justify-center) so a
+                        // taller-than-pane column keeps its top reachable.
+                        div()
+                            .max_w(px(760.))
+                            .min_w_0()
+                            .w_full()
+                            .mx_auto()
+                            .px_8()
+                            .py_6()
+                            .child(content),
+                    ),
+            )
+            .child(Scrollbar::vertical(&data.conv_scroll))
+            .into_any_element()
+    }
 }
 
 impl Render for ReviewApp {
@@ -8153,7 +8310,7 @@ impl Render for ReviewApp {
         let pane: gpui::AnyElement = if self.show_queue {
             self.render_queue(cx)
         } else {
-            self.render_item_pane(cx)
+            self.render_item_pane(window, cx)
         };
         div()
             .size_full()
@@ -8287,6 +8444,12 @@ impl Render for ReviewApp {
             }))
             .on_action(cx.listener(|this, _: &NextItem, _, cx| this.cycle_items(1, cx)))
             .on_action(cx.listener(|this, _: &PrevItem, _, cx| this.cycle_items(-1, cx)))
+            .on_action(cx.listener(|this, _: &ShowConversation, _, cx| {
+                this.flip_pane(ItemPane::Conversation, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ShowChanges, _, cx| this.flip_pane(ItemPane::Changes, cx)),
+            )
             // The open input propagates Escape when it has nothing of its own
             // to dismiss: hand focus back to the diff.
             .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
@@ -10100,6 +10263,7 @@ mod tests {
                         reloading: false,
                         refresh_error: None,
                         upgrade_gen: 0,
+                        pane: ItemPane::default(),
                     },
                     ReviewItem {
                         id: 1,
@@ -10112,6 +10276,7 @@ mod tests {
                         reloading: false,
                         refresh_error: None,
                         upgrade_gen: 0,
+                        pane: ItemPane::default(),
                     },
                 ];
                 this.active = 1;
@@ -10260,6 +10425,7 @@ mod tests {
             reloading: false,
             refresh_error: None,
             upgrade_gen: 0,
+            pane: ItemPane::default(),
         };
         assert!(
             item.install_offline_snapshot(&store),
@@ -10290,9 +10456,179 @@ mod tests {
             reloading: false,
             refresh_error: None,
             upgrade_gen: 0,
+            pane: ItemPane::default(),
         };
         assert!(!unknown.install_offline_snapshot(&store));
         assert!(matches!(unknown.state, ItemState::Loading));
+    }
+
+    /// ⇧⌘←/→ flip the open item between its changes and its conversation
+    /// (user stories 22, 11). The flip is per item, PRs open onto changes,
+    /// re-opening an item keeps it where it was, and the conversation —
+    /// whose text comes from the store snapshot here — paints through the
+    /// real render (the Kit TextView's markdown setup plus the
+    /// conversation pipe) without fetching anything.
+    #[gpui::test]
+    fn the_flip_swaps_changes_and_conversation(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let store = local_store::LocalStore::in_memory();
+        store.save_snapshot(&local_store::StoredPrSnapshot {
+            repository: "acme/widgets".into(),
+            number: 7,
+            title: "Add deactivation filters".into(),
+            body: "## Summary\n\n| area | state |\n|---|---|\n| api | done |\n\n- [x] table\n- [ ] task list\n\nThanks @octocat for :tada: — closes #12.\n\n```rust\nlet x = 1; // highlighted, and :not_emoji: stays\n```".into(),
+            author: "alice".into(),
+            head_sha: "abc123".into(),
+            base_ref: "main".into(),
+            head_ref: "feature/deactivation".into(),
+            threads: Vec::new(),
+            is_draft: false,
+            fetched_at_ms: 1_700_000_000_000,
+        });
+        let (window, app) = queue_window_with_store(cx, fake, store.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+
+        // The offline stand-in: the snapshot makes the PR readable without
+        // the network, description and all.
+        let loc = github::PrLocator {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 7,
+        };
+        let mut item = ReviewItem {
+            id: 1,
+            source: Source::Pr(loc.clone()),
+            state: ItemState::Loading,
+            reloading: false,
+            refresh_error: None,
+            upgrade_gen: 0,
+            pane: ItemPane::default(),
+        };
+        assert!(item.install_offline_snapshot(&store));
+        install_item(&app, item, cx);
+
+        // PRs open onto changes — the tracer decision — and ⇧⌘← lands on
+        // the conversation, ⇧⌘→ back on the changes, through the real
+        // action handlers the keys dispatch.
+        let pane = |cx: &gpui::TestAppContext| cx.update(|cx| app.read(cx).items[0].pane);
+        assert_eq!(pane(cx), ItemPane::Changes);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        vcx.dispatch_action(ShowConversation);
+        assert_eq!(pane(cx), ItemPane::Conversation);
+
+        // The pane paints from the snapshot's body — full GFM plus the
+        // expanded @mention, :shortcode:, and #ref — with no fetch in
+        // flight (the fake would have recorded one).
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        vcx.dispatch_action(ShowChanges);
+        assert_eq!(pane(cx), ItemPane::Changes);
+
+        // Re-opening the item the session already has brings it forward
+        // with its pane intact — flipping isn't something `u`/⌘K resets.
+        vcx.dispatch_action(ShowConversation);
+        cx.update(|cx| {
+            app.update(cx, |this, cx| this.open_item(Source::Pr(loc), cx));
+        });
+        assert_eq!(pane(cx), ItemPane::Conversation);
+        assert_eq!(
+            cx.update(|cx| app.read(cx).items.len()),
+            1,
+            "re-opening forwards the item, never a duplicate"
+        );
+    }
+
+    /// The conversation pane scrolls from anywhere the cursor is — the
+    /// pane is the scroll container, not the 760px reading column inside
+    /// it, so the gutters wheel-scroll too (and the scrollbar rides the
+    /// pane's edge, not the column's). A regression here is the classic
+    /// failure: the TextView's own `scrollable` mode puts the scroller
+    /// inside the column, and only the column scrolls.
+    #[gpui::test]
+    fn the_conversation_scrolls_from_anywhere_over_the_pane(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        // A description much taller than the 1920×1080 test window, so
+        // the pane has scroll range to move.
+        let body = "A tall description.\n\n".repeat(200);
+        let store = local_store::LocalStore::in_memory();
+        store.save_snapshot(&local_store::StoredPrSnapshot {
+            repository: "acme/widgets".into(),
+            number: 7,
+            title: "Tall".into(),
+            body,
+            author: "alice".into(),
+            head_sha: "abc123".into(),
+            base_ref: "main".into(),
+            head_ref: "feature".into(),
+            threads: Vec::new(),
+            is_draft: false,
+            fetched_at_ms: 1_700_000_000_000,
+        });
+        let (window, app) = queue_window_with_store(cx, fake, store.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let loc = github::PrLocator {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 7,
+        };
+        let mut item = ReviewItem {
+            id: 1,
+            source: Source::Pr(loc),
+            state: ItemState::Loading,
+            reloading: false,
+            refresh_error: None,
+            upgrade_gen: 0,
+            pane: ItemPane::default(),
+        };
+        assert!(item.install_offline_snapshot(&store));
+        install_item(&app, item, cx);
+        vcx.dispatch_action(ShowConversation);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let conv_offset = |cx: &gpui::TestAppContext| {
+            cx.update(|cx| match &app.read(cx).items[0].state {
+                ItemState::Ready(data) => data.conv_scroll.offset(),
+                _ => panic!("item not ready"),
+            })
+        };
+        assert_eq!(conv_offset(cx).y, px(0.), "starts at the top");
+
+        // The left gutter: inside the conversation pane, outside the
+        // centered 760px column (which starts around x≈710 in the
+        // 1920-wide test window). A wheel there must scroll — the whole
+        // point of the pane-level scroller.
+        vcx.simulate_event(gpui::ScrollWheelEvent {
+            position: point(px(400.), px(500.)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            ..Default::default()
+        });
+        assert_eq!(
+            conv_offset(cx).y,
+            px(-120.),
+            "the wheel scrolls from the gutter, outside the column"
+        );
+
+        // And over the column itself, where it always worked.
+        vcx.simulate_event(gpui::ScrollWheelEvent {
+            position: point(px(1100.), px(500.)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            ..Default::default()
+        });
+        assert_eq!(
+            conv_offset(cx).y,
+            px(-240.),
+            "the wheel scrolls over the column too"
+        );
     }
 
     /// The focus refresh: the window coming back to the front re-runs the
@@ -10380,7 +10716,7 @@ mod tests {
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
         // Paint the element tree the mouse events hit-test against.
         vcx.update(|window, cx| {
-            window.draw(cx);
+            let _ = window.draw(cx);
         });
 
         let click = |vcx: &mut gpui::VisualTestContext, x: f32, y: f32| {
@@ -11950,6 +12286,7 @@ mod tests {
             reloading: false,
             refresh_error: None,
             upgrade_gen: 0,
+            pane: ItemPane::default(),
         }
     }
 
