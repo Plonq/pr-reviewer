@@ -128,6 +128,8 @@ actions!(
         PrevHunk,
         GoToTop,
         GoToBottom,
+        ScrollLeft,
+        ScrollRight,
         ToggleView,
         Quit,
         ToggleSidebar,
@@ -278,6 +280,11 @@ fn main() {
                 KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
+                // Sideways through long lines in the unified diff. Inputs
+                // deeper in the tree (a focused palette/filter input) keep
+                // their own left/right for caret movement.
+                KeyBinding::new("left", ScrollLeft, Some("ReviewApp")),
+                KeyBinding::new("right", ScrollRight, Some("ReviewApp")),
                 KeyBinding::new("v", ToggleView, Some("ReviewApp")),
                 KeyBinding::new("m", ToggleMinimap, Some("ReviewApp")),
                 KeyBinding::new("c", ToggleComments, Some("ReviewApp")),
@@ -457,6 +464,25 @@ fn is_comment_row(row: &Row) -> bool {
         row,
         Row::CommentHeader { .. } | Row::CommentBody { .. } | Row::CommentActions { .. }
     )
+}
+
+/// Index of the row with the widest min-content: the longest no-wrap text
+/// (diff lines, comment bodies, file-header paths). `uniform_list` measures
+/// exactly one item to derive its horizontal scroll range, so the list must
+/// be pointed at this row — its default, row 0 (the file header), is always
+/// narrower than the viewport, which pins `offset.x` to zero. See
+/// `UniformList::with_width_from_item` where the diff list is built.
+fn widest_row_ix(rows: &[Row]) -> usize {
+    rows.iter()
+        .enumerate()
+        .max_by_key(|(_, row)| match row {
+            Row::Line { text, .. } => text.chars().count(),
+            Row::CommentBody { line, .. } => line.chars().count(),
+            Row::FileHeader { path, .. } => path.chars().count(),
+            _ => 0,
+        })
+        .map(|(ix, _)| ix)
+        .unwrap_or(0)
 }
 
 /// Index of the `n`-th non-comment row (0-based), clamped to the last row.
@@ -2455,6 +2481,10 @@ struct ItemData {
     rows: Vec<Row>,
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
+    /// The row `uniform_list` measures for its horizontal scroll range
+    /// (gpui measures a single item; row 0 is always the file header,
+    /// which would leave that range at zero). Recomputed in `set_rows`.
+    wide_row: usize,
     /// Minimap model, index-aligned with `rows`; rebuilt with them.
     minimap: Vec<MinimapRow>,
     /// Coalesced minimap quad runs for one pane height, computed lazily on
@@ -2523,6 +2553,7 @@ impl ItemData {
             rows: Vec::new(),
             file_rows: Vec::new(),
             hunk_rows: Vec::new(),
+            wide_row: 0,
             minimap: Vec::new(),
             minimap_cache: RefCell::new(None),
             cursor: 0,
@@ -2555,6 +2586,7 @@ impl ItemData {
     fn set_rows(&mut self, (rows, file_rows, hunk_rows): (Vec<Row>, Vec<usize>, Vec<usize>)) {
         self.minimap = minimap_rows(&rows);
         self.minimap_cache.replace(None);
+        self.wide_row = widest_row_ix(&rows);
         self.rows = rows;
         self.file_rows = file_rows;
         self.hunk_rows = hunk_rows;
@@ -5822,6 +5854,35 @@ impl ReviewApp {
         cx.notify();
     }
 
+    /// `left`/`right`: nudge the diff's horizontal scroll by ten columns.
+    /// Split mode never scrolls horizontally (FitList sizes the list to the
+    /// viewport and each cell clips its own overflow), so the nudge only
+    /// applies to the unified list; the paint-time clamp pins x to
+    /// [-max_offset, 0], so overshooting the ends is harmless.
+    fn scroll_horizontal(&mut self, direction: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let step = f32::from(self.char_width(window)) * 10.;
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        if data.mode != ViewMode::Unified {
+            return;
+        }
+        let (offset, max_x) = {
+            let state = data.scroll.0.borrow();
+            (
+                state.base_handle.offset(),
+                state.base_handle.max_offset().width,
+            )
+        };
+        let x = (f32::from(offset.x) + direction as f32 * step).clamp(-f32::from(max_x), 0.);
+        data.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(x), offset.y));
+        cx.notify();
+    }
+
     /// `n`/`p`: step to the next/previous hunk, wrapping past the ends —
     /// into the next/previous file that has hunks, switching the display.
     fn step_hunk(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -8055,6 +8116,17 @@ impl ReviewApp {
                             ViewMode::Unified => ListHorizontalSizingBehavior::Unconstrained,
                             ViewMode::Split => ListHorizontalSizingBehavior::FitList,
                         })
+                        // Unconstrained sizing turns on horizontal overflow,
+                        // but gpui sizes the scroll range from one measured
+                        // item — row 0, the file header, which never exceeds
+                        // the viewport, so `offset.x` was clamped to zero and
+                        // long lines were unreachable. Measure the widest
+                        // row instead. Split mode sizes to the list and clips
+                        // per cell, so it keeps the default measurement.
+                        .with_width_from_item(match data.mode {
+                            ViewMode::Unified => Some(data.wide_row),
+                            ViewMode::Split => None,
+                        })
                         .h_full()
                         .flex_1()
                         .min_w_0(),
@@ -8106,6 +8178,12 @@ impl Render for ReviewApp {
                 if let Some(last) = this.active_data().map(|d| d.rows.len().saturating_sub(1)) {
                     this.jump(last, cx)
                 }
+            }))
+            .on_action(cx.listener(|this, _: &ScrollLeft, window, cx| {
+                this.scroll_horizontal(-1, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollRight, window, cx| {
+                this.scroll_horizontal(1, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleView, _, cx| this.toggle_view(cx)))
             .on_action(cx.listener(|this, _: &ToggleMinimap, _, cx| {
@@ -8304,6 +8382,35 @@ mod tests {
         // Case-insensitive, and no match returns None.
         assert_eq!(mention_rank(&octocat, "OCT"), Some(0));
         assert_eq!(mention_rank(&octocat, "zzz"), None);
+    }
+
+    #[test]
+    fn widest_row_ix_points_at_the_longest_nowrap_row() {
+        let line = |text: &str| Row::Line {
+            old_no: Some(1),
+            new_no: Some(1),
+            kind: LineKind::Context,
+            text: text.to_string().into(),
+            intra: Vec::new(),
+            syntax: Vec::new(),
+        };
+        let rows = vec![
+            Row::FileHeader {
+                path: "src/a/very/long/path.rs".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 1,
+                comments: 0,
+                outdated: 0,
+            },
+            line("short"),
+            line("a much longer line that forces the scroll range wide"),
+            Row::Binary,
+        ];
+        assert_eq!(widest_row_ix(&rows), 2);
+        // Empty rows must not panic — callers fall back to row 0.
+        assert_eq!(widest_row_ix(&[]), 0);
     }
 
     fn ctx(old_no: u32, new_no: u32, text: &str) -> DiffRow {
