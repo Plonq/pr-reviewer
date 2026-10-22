@@ -91,3 +91,28 @@ pub(crate) fn sample_diff() -> PrDiff {
 pub(crate) fn mrow(kind: MinimapKind, len_frac: f32) -> MinimapRow {
     MinimapRow { kind, len_frac }
 }
+
+pub(crate) fn rc(
+    id: u64,
+    path: &str,
+    side: Option<&str>,
+    line: Option<u64>,
+    body: &str,
+    author: &str,
+    created_at: &str,
+    reply_to: Option<u64>,
+) -> github::ReviewComment {
+    github::ReviewComment {
+        id,
+        path: path.to_string(),
+        line,
+        side: side.map(str::to_string),
+        start_line: None,
+        body: body.to_string(),
+        user: github::Author {
+            login: author.to_string(),
+        },
+        created_at: created_at.to_string(),
+        in_reply_to_id: reply_to,
+    }
+}

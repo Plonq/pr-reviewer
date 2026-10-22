@@ -256,7 +256,7 @@ pub(crate) fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
 mod tests {
     use super::*;
     use crate::test_util::{mrow, sample_diff};
-    use crate::{build_rows, ViewMode, COMMENT_WRAP_CHARS};
+    use crate::{build_rows, threads::COMMENT_WRAP_CHARS, ViewMode};
     use std::collections::HashMap;
 
     #[test]
