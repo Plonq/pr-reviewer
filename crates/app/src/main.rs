@@ -151,6 +151,7 @@ actions!(
         FocusTreeFilter,
         ToggleMinimap,
         ToggleComments,
+        NewComment,
         SubmitReview,
         ZoomIn,
         ZoomOut,
@@ -280,6 +281,9 @@ fn main() {
                 KeyBinding::new("v", ToggleView, Some("ReviewApp")),
                 KeyBinding::new("m", ToggleMinimap, Some("ReviewApp")),
                 KeyBinding::new("c", ToggleComments, Some("ReviewApp")),
+                // `C` (shift-c) opens the inline composer on the selected
+                // line — the keyboard twin of the hover `+`.
+                KeyBinding::new("shift-c", NewComment, Some("ReviewApp")),
                 KeyBinding::new("r", Refresh, Some("ReviewApp")),
                 // The queue screen's keys, in its own context: j/k drive the
                 // selection, r refreshes, s flips the sort, escape lifts
@@ -4468,6 +4472,20 @@ fn comment_anchor(rows: &[Row], row_ix: usize, side: SelSide) -> Option<(Comment
     }
 }
 
+/// The anchor `C` resolves when the *keyboard* picks the line (there is no
+/// pointer half to take): like the hover `+`, but with the split side chosen
+/// by row shape — the right cell when the row has one (a context pair or an
+/// added line), the left when the row is a removal with no right cell. The
+/// side is irrelevant for unified rows; `comment_anchor` derives theirs from
+/// the row kind.
+fn cursor_anchor(rows: &[Row], row_ix: usize) -> Option<(CommentSide, u64)> {
+    let side = match rows.get(row_ix) {
+        Some(Row::SplitLine { right, .. }) if right.is_none() => SelSide::Left,
+        _ => SelSide::Right,
+    };
+    comment_anchor(rows, row_ix, side)
+}
+
 impl ReviewApp {
     fn new(
         sources: Vec<Source>,
@@ -5950,6 +5968,40 @@ impl ReviewApp {
         comment_anchor(&data.rows, hit.row, side).map(|_| (hit.row, side))
     }
 
+    /// `C`: open the composer on the selected line. The selected line is
+    /// the text selection's top row when a drag left one (the side it runs
+    /// through decides the anchor half), else the keyboard cursor's row —
+    /// which every way of moving (n/p, jump, a plain click) keeps on the
+    /// line the reviewer is looking at. Only a real line comments: the
+    /// anchor goes through `comment_anchor`/`cursor_anchor`, so headers,
+    /// comment rows, and binary rows are no-ops.
+    fn open_composer_on_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_queue || self.composer.is_some() || self.review.is_some() {
+            return;
+        }
+        let Some(item) = self.active_item() else {
+            return;
+        };
+        let ItemState::Ready(data) = &item.state else {
+            return;
+        };
+        let (row_ix, anchor) = match data.selection {
+            // A mouse selection names its line and side: anchor under it.
+            Some(sel) => {
+                let row = sel.ordered().0.row;
+                (row, comment_anchor(&data.rows, row, sel.side))
+            }
+            // No selection: the keyboard cursor names the line; a split
+            // row's side falls out of its shape.
+            None => (data.cursor, cursor_anchor(&data.rows, data.cursor)),
+        };
+        let Some((anchor_side, line)) = anchor else {
+            return;
+        };
+        let path = data.diff.files[data.file_ix].display_path().to_string();
+        self.open_composer(None, path, anchor_side, line, row_ix, window, cx);
+    }
+
     fn open_composer(
         &mut self,
         reply_to: Option<u64>,
@@ -6464,7 +6516,9 @@ impl ReviewApp {
         let action = if composer.reply_to.is_some() {
             "Reply"
         } else {
-            "Comment"
+            // GitHub's own label for the posts-now mode — the counterpart
+            // ("start a review", batched) arrives with pending reviews.
+            "Add single comment"
         };
         let target = format!(
             "{}{}:{} ({})",
@@ -7840,6 +7894,7 @@ impl ReviewApp {
                 .child(hint(&["v"], "unified/split"))
                 .child(hint(&["m"], "minimap"))
                 .child(hint(&["c"], "comments"))
+                .child(hint(&["C"], "comment"))
                 .child(hint(&["/"], "filter files"))
                 .child(hint(&["home", "end"], "top/bottom"))
                 .child(hint(&["cmd-k"], "palette"))
@@ -7894,6 +7949,14 @@ impl ReviewApp {
                             window.focus(&this.focus_handle);
                             let char_width = this.char_width(window);
                             this.drag_anchor = this.pane_hit(event.position, char_width, None);
+                            // A plain click also moves the keyboard cursor:
+                            // `C` and `n`/`p` follow the line the reviewer
+                            // last touched, mouse or keyboard alike.
+                            if let Some((_, hit)) = this.drag_anchor {
+                                if let Some(data) = this.active_data_mut() {
+                                    data.cursor = hit.row;
+                                }
+                            }
                             // A plain click clears; a selection only appears
                             // once the drag covers ≥ 1 char.
                             if let Some(data) = this.active_data_mut() {
@@ -8031,6 +8094,9 @@ impl Render for ReviewApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleComments, _, cx| this.toggle_comments(cx)))
+            .on_action(cx.listener(|this, _: &NewComment, window, cx| {
+                this.open_composer_on_selection(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &SubmitReview, window, cx| {
                 // Backstop: with the dialog open, focus sits in its input,
                 // whose own secondary-enter handles submission.
@@ -11693,5 +11759,678 @@ mod tests {
                 (4..6, sel_style(None)),
             ]
         );
+    }
+
+    // --- The review loop: comment, reply, submit (user stories 40, 42, 46, 47)
+
+    /// The meta of the fake PR every loop test runs against: open, head
+    /// `dead10cc` — the commit new comments anchor against.
+    fn loop_pr_meta() -> github::PrMeta {
+        github::PrMeta {
+            number: 7,
+            title: "Add the thing".into(),
+            author: github::Author {
+                login: "alice".into(),
+            },
+            state: "OPEN".into(),
+            url: "https://github.com/acme/widgets/pull/7".into(),
+            body: String::new(),
+            base_ref_name: "main".into(),
+            head_ref_name: "feature".into(),
+            base_ref_oid: "ba5ec0de".into(),
+            head_ref_oid: "dead10cc".into(),
+            additions: 1,
+            deletions: 1,
+            changed_files: 2,
+            review_decision: String::new(),
+        }
+    }
+
+    fn loop_loc() -> github::PrLocator {
+        github::PrLocator {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 7,
+        }
+    }
+
+    /// A ready PR item over two_file_diff — the state a finished open
+    /// leaves behind: file mode on a.rs, cursor revealed at its first
+    /// change (the added line 1), carrying `comments` on the diff.
+    fn loop_pr_item(comments: Vec<github::ReviewComment>) -> ReviewItem {
+        let diff = two_file_diff();
+        let index = group_comments(comments);
+        let rows = build_rows(
+            &diff,
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+            COMMENT_WRAP_CHARS,
+            0,
+        );
+        ReviewItem {
+            id: 0,
+            source: Source::Pr(loop_loc()),
+            state: ItemState::Ready(Box::new(ItemData::new(
+                Some(loop_pr_meta()),
+                diff,
+                ViewMode::Unified,
+                0,
+                rows,
+                Some(index),
+                None,
+            ))),
+            reloading: false,
+            refresh_error: None,
+            upgrade_gen: 0,
+        }
+    }
+
+    /// Every GitHub mutation the loop makes, as the recording fake saw it
+    /// (in order — the tests pin that nothing posts twice or out of turn).
+    #[derive(Debug, Clone, PartialEq)]
+    enum Post {
+        Comment {
+            commit_id: String,
+            path: String,
+            side: String,
+            line: u64,
+            body: String,
+        },
+        Reply {
+            comment_id: u64,
+            body: String,
+        },
+        Review {
+            verdict: github::ReviewVerdict,
+            body: String,
+        },
+    }
+
+    /// A PR-shaped facade for the loop tests: scripted threads on the PR,
+    /// recording every mutation the app posts. Like GitHub, a successful
+    /// post also lands in the threads the next `review_comments` returns —
+    /// the tests watch the refetch show what was posted.
+    #[derive(Default)]
+    struct FakePr {
+        comments: std::sync::Mutex<Vec<github::ReviewComment>>,
+        posted: std::sync::Mutex<Vec<Post>>,
+        /// While set, posting a new comment fails — the inline-error path.
+        fail: std::sync::atomic::AtomicBool,
+        /// The id the next posted comment gets.
+        next_id: std::sync::atomic::AtomicU64,
+    }
+
+    impl FakePr {
+        fn with_threads(comments: Vec<github::ReviewComment>) -> Arc<Self> {
+            Arc::new(Self {
+                comments: std::sync::Mutex::new(comments),
+                ..Self::default()
+            })
+        }
+
+        fn posts(&self) -> Vec<Post> {
+            self.posted.lock().unwrap().clone()
+        }
+    }
+
+    impl github::GitHubClient for FakePr {
+        fn viewer(&self) -> Result<github::Viewer, github::ClientError> {
+            Ok(github::Viewer {
+                login: "tester".into(),
+                avatar_url: String::new(),
+            })
+        }
+
+        fn search_prs(
+            &self,
+            _search: &github::QueueSearch,
+        ) -> Result<Vec<github::QueueItem>, github::ClientError> {
+            Ok(Vec::new())
+        }
+
+        fn resolve_pr(&self, _arg: &str) -> Result<github::PrLocator, github::ClientError> {
+            unimplemented!("loop tests never resolve a PR argument")
+        }
+
+        fn pr_meta(&self, _loc: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
+            Ok(loop_pr_meta())
+        }
+
+        fn list_prs(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<Vec<github::PrSummary>, github::ClientError> {
+            unimplemented!("loop tests never list PRs")
+        }
+
+        fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
+            unimplemented!("loop tests install ready items; no patch is fetched")
+        }
+
+        fn review_comments(
+            &self,
+            _loc: &github::PrLocator,
+        ) -> Result<Vec<github::ReviewComment>, github::ClientError> {
+            Ok(self.comments.lock().unwrap().clone())
+        }
+
+        fn mentionable_users(
+            &self,
+            _loc: &github::PrLocator,
+        ) -> Result<Vec<github::Mention>, github::ClientError> {
+            Ok(Vec::new())
+        }
+
+        fn file_at(
+            &self,
+            _loc: &github::PrLocator,
+            _commit_oid: &str,
+            _path: &str,
+        ) -> Result<Option<String>, github::ClientError> {
+            unimplemented!("loop tests never fetch file contents")
+        }
+
+        fn post_review_comment(
+            &self,
+            _loc: &github::PrLocator,
+            commit_id: &str,
+            path: &str,
+            side: &str,
+            line: u64,
+            body: &str,
+        ) -> Result<(), github::ClientError> {
+            self.posted.lock().unwrap().push(Post::Comment {
+                commit_id: commit_id.to_string(),
+                path: path.to_string(),
+                side: side.to_string(),
+                line,
+                body: body.to_string(),
+            });
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(github::ClientError::Failed("gh: the server said no".into()));
+            }
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 100;
+            self.comments.lock().unwrap().push(rc(
+                id,
+                path,
+                Some(side),
+                Some(line),
+                body,
+                "tester",
+                "2026-10-22T00:00:00Z",
+                None,
+            ));
+            Ok(())
+        }
+
+        fn post_reply(
+            &self,
+            _loc: &github::PrLocator,
+            comment_id: u64,
+            body: &str,
+        ) -> Result<(), github::ClientError> {
+            self.posted.lock().unwrap().push(Post::Reply {
+                comment_id,
+                body: body.to_string(),
+            });
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 100;
+            self.comments.lock().unwrap().push(rc(
+                id,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                body,
+                "tester",
+                "2026-10-22T00:00:00Z",
+                Some(comment_id),
+            ));
+            Ok(())
+        }
+
+        fn submit_review(
+            &self,
+            _loc: &github::PrLocator,
+            verdict: github::ReviewVerdict,
+            body: &str,
+        ) -> Result<(), github::ClientError> {
+            self.posted.lock().unwrap().push(Post::Review {
+                verdict,
+                body: body.to_string(),
+            });
+            Ok(())
+        }
+    }
+
+    /// Install `item` as the pane's only, active item, off the queue screen —
+    /// the state after a finished open.
+    fn install_item(
+        app: &gpui::Entity<ReviewApp>,
+        item: ReviewItem,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            app.update(cx, |this, _| {
+                this.show_queue = false;
+                this.items = vec![item];
+                this.active = 0;
+                this.next_id = 1;
+            });
+        });
+    }
+
+    /// The `C` anchor when the *keyboard* picks the line: split rows take
+    /// the side from their shape (right cell when there is one, else left),
+    /// unified rows from their kind, and non-text rows anchor nothing.
+    #[test]
+    fn cursor_anchor_picks_the_split_side_from_row_shape() {
+        // Split rows: a context pair anchors on the new side, an old1|new1
+        // pair too (its right cell exists), and a removal-only row on the
+        // left.
+        let (rows, _, hunk_rows) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            None,
+            true,
+            COMMENT_WRAP_CHARS,
+            0,
+        );
+        assert_eq!(cursor_anchor(&rows, 0), None, "a file header never anchors");
+        assert_eq!(cursor_anchor(&rows, 1), Some((CommentSide::Right, 1)));
+        assert_eq!(cursor_anchor(&rows, 2), Some((CommentSide::Right, 2)));
+        let h2 = hunk_rows[1];
+        assert_eq!(cursor_anchor(&rows, h2 + 1), Some((CommentSide::Left, 11)));
+
+        // Comment rows never anchor, whichever half they sit in.
+        let index = sample_comments();
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            Some(&index),
+            true,
+            COMMENT_WRAP_CHARS,
+            0,
+        );
+        assert_eq!(
+            cursor_anchor(&rows, 3),
+            None,
+            "a comment header never anchors"
+        );
+        assert_eq!(
+            cursor_anchor(&rows, 5),
+            None,
+            "a reply affordance never anchors"
+        );
+        // old2|new2 still anchors beneath the threads.
+        assert_eq!(cursor_anchor(&rows, 11), Some((CommentSide::Right, 3)));
+
+        // Unified rows: the side is irrelevant, the kind decides — removed
+        // lines anchor LEFT, everything else RIGHT.
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+            COMMENT_WRAP_CHARS,
+            0,
+        );
+        assert_eq!(cursor_anchor(&rows, 2), Some((CommentSide::Left, 2)));
+        assert_eq!(cursor_anchor(&rows, 7), Some((CommentSide::Right, 2)));
+    }
+
+    /// File mode rides the threads along: the displayed file's threads
+    /// render under their anchor — with the reply affordance — and other
+    /// files' threads stay off the pane.
+    #[test]
+    fn file_mode_rows_carry_only_the_displayed_files_threads() {
+        let index = group_comments(vec![
+            rc(
+                1,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "on a's added line",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                2,
+                "b.rs",
+                Some("LEFT"),
+                Some(1),
+                "on b's removed line",
+                "bob",
+                "2026-01-02T00:00:00Z",
+                None,
+            ),
+        ]);
+        let diff = two_file_diff();
+
+        // File mode on a.rs (file 0): header, its added line 1, the thread,
+        // then the rest of the file — and nothing from b.rs.
+        let (rows, _, _) = build_rows(
+            &diff,
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+            COMMENT_WRAP_CHARS,
+            0,
+        );
+        let names: Vec<&str> = rows.iter().map(row_name).collect();
+        // The whole pane: a.rs's header, its two added lines, the one
+        // thread under its anchor — and nothing from b.rs.
+        assert_eq!(
+            &names[..],
+            &[
+                "FileHeader",
+                "Line",          // add 1
+                "CommentHeader", // alice on a.rs RIGHT 1
+                "CommentBody",
+                "CommentActions",
+                "Line", // add 10
+            ]
+        );
+        match &rows[4] {
+            Row::CommentActions {
+                root_id,
+                path,
+                side,
+                line,
+                ..
+            } => {
+                assert_eq!(
+                    (*root_id, path.as_ref(), *side, *line),
+                    (1, "a.rs", CommentSide::Right, 1)
+                );
+            }
+            other => panic!("expected actions row, got {}", row_name(other)),
+        }
+        // The reply affordance rides along under the thread.
+
+        // On b.rs (file 1): only b.rs's thread, anchored on its removed
+        // line's left side.
+        let (rows, _, _) = build_rows(
+            &diff,
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+            COMMENT_WRAP_CHARS,
+            1,
+        );
+        let names: Vec<&str> = rows.iter().map(row_name).collect();
+        // On b.rs (file 1): only b.rs's header, its removed line, and its
+        // own thread, anchored on the left side.
+        assert_eq!(
+            &names[..],
+            &[
+                "FileHeader",
+                "Line",          // rem 1
+                "CommentHeader", // bob on b.rs LEFT 1
+                "CommentBody",
+                "CommentActions",
+            ]
+        );
+        match &rows[4] {
+            Row::CommentActions {
+                root_id,
+                path,
+                side,
+                line,
+                ..
+            } => {
+                assert_eq!(
+                    (*root_id, path.as_ref(), *side, *line),
+                    (2, "b.rs", CommentSide::Left, 1)
+                );
+            }
+            other => panic!("expected actions row, got {}", row_name(other)),
+        }
+    }
+
+    /// The loop's first leg: `C` opens the composer on the selected line,
+    /// and posting is a single comment at that anchor — the exact call
+    /// GitHub needs, nothing more. (user stories 40 and 42)
+    #[gpui::test]
+    fn c_posts_a_single_comment_at_the_selected_line(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(Vec::new());
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(&app, loop_pr_item(Vec::new()), cx);
+        cx.run_until_parked();
+
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                // `C` with no mouse selection anchors on the cursor's line —
+                // the reveal put it on a.rs's added line 1.
+                this.open_composer_on_selection(window, cx);
+                let composer = this.composer.as_ref().expect("C opens the composer");
+                assert_eq!(composer.reply_to, None, "C starts a new thread");
+                assert_eq!(composer.commit_id, "dead10cc");
+                assert_eq!(composer.path, "a.rs");
+                assert_eq!(composer.side, CommentSide::Right);
+                assert_eq!(composer.line, 1);
+                assert_eq!(composer.row_ix, 1, "the card sits beneath its line");
+                composer.input.update(cx, |state, cx| {
+                    state.set_value("nit: s/teh/the/", window, cx)
+                });
+                this.submit_composer(window, cx);
+                assert!(
+                    this.composer.as_ref().unwrap().in_flight,
+                    "posting is in flight until gh answers"
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        // Exactly one post, at the anchor the composer showed.
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Comment {
+                commit_id: "dead10cc".into(),
+                path: "a.rs".into(),
+                side: "RIGHT".into(),
+                line: 1,
+                body: "nit: s/teh/the/".into(),
+            }]
+        );
+        cx.update(|cx| {
+            app.update(cx, |this, _cx| {
+                assert!(
+                    this.composer.is_none(),
+                    "a posted comment closes the composer"
+                );
+                // The post landed and the refetch shows it: the thread rides
+                // under its anchor line.
+                let data = this.active_data().expect("the item is ready");
+                let thread = &data.comments.as_ref().expect("comments refetched").threads["a.rs"]
+                    [&(CommentSide::Right, 1)][0];
+                assert_eq!(thread.root.body, "nit: s/teh/the/");
+            });
+        });
+    }
+
+    /// A failed post surfaces inline in the composer (and doesn't stick
+    /// in flight), and Esc cancels without posting anything. (criterion:
+    /// errors surface inline; Esc never posts)
+    #[gpui::test]
+    fn a_failed_post_surfaces_inline_and_escape_cancels_cleanly(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(Vec::new());
+        fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(&app, loop_pr_item(Vec::new()), cx);
+        cx.run_until_parked();
+
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open_composer_on_selection(window, cx);
+                this.composer
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |state, cx| state.set_value("doomed", window, cx));
+                this.submit_composer(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            app.update(cx, |this, _cx| {
+                let composer = this
+                    .composer
+                    .as_ref()
+                    .expect("the composer stays open on failure");
+                assert!(!composer.in_flight, "a failed post is retryable");
+                assert!(composer.error.is_some(), "gh's failure shows inline");
+            });
+        });
+
+        // Esc cancels: the composer goes away and nothing more posts (the
+        // failed attempt is the only thing gh ever saw).
+        vcx.dispatch_action(InputEscape);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            app.update(cx, |this, _cx| {
+                assert!(this.composer.is_none(), "escape closes the composer");
+            });
+        });
+        assert_eq!(fake.posts().len(), 1, "cancelling posts nothing");
+    }
+
+    /// Replies post into their thread: the reply affordance opens the
+    /// composer against the thread's root, and the post is a reply to
+    /// that root — never a new top-level comment. (user story 47)
+    #[gpui::test]
+    fn a_reply_posts_into_its_thread(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "why remove the guard?",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(
+            &app,
+            loop_pr_item(fake.comments.lock().unwrap().clone()),
+            cx,
+        );
+        cx.run_until_parked();
+
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                // The thread is on the pane with its reply affordance; click
+                // it the way the affordance does.
+                let data = this.active_data().expect("the item is ready");
+                let row_ix = data
+                    .rows
+                    .iter()
+                    .position(|row| matches!(row, Row::CommentActions { root_id: 11, .. }))
+                    .expect("the thread's reply affordance rides along in file mode");
+                let (path, side, line) = match &data.rows[row_ix] {
+                    Row::CommentActions {
+                        path, side, line, ..
+                    } => (path.clone(), *side, *line),
+                    _ => unreachable!(),
+                };
+                this.open_composer(Some(11), path.to_string(), side, line, row_ix, window, cx);
+                let composer = this.composer.as_ref().expect("the reply composer opens");
+                assert_eq!(composer.reply_to, Some(11), "it targets the thread's root");
+                composer.input.update(cx, |state, cx| {
+                    state.set_value("nil is fine on this path", window, cx)
+                });
+                this.submit_composer(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // One post: a reply carrying the root's id — no new thread.
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Reply {
+                comment_id: 11,
+                body: "nil is fine on this path".into(),
+            }]
+        );
+        cx.update(|cx| {
+            app.update(cx, |this, _cx| {
+                assert!(this.composer.is_none());
+                // The refetch shows the reply inside the thread it belongs to.
+                let data = this.active_data().expect("the item is ready");
+                let thread = &data.comments.as_ref().expect("comments refetched").threads["a.rs"]
+                    [&(CommentSide::Right, 1)][0];
+                assert_eq!(thread.root.id, 11);
+                assert_eq!(thread.replies.len(), 1);
+                assert_eq!(thread.replies[0].body, "nil is fine on this path");
+            });
+        });
+    }
+
+    /// ⌘↵'s dialog: approve / request changes / comment with an optional
+    /// body. A bodyless non-approve verdict is rejected locally — inline,
+    /// no round trip — and a valid verdict posts exactly once and closes
+    /// the dialog. (user story 46)
+    #[gpui::test]
+    fn the_review_dialog_submits_the_verdict_with_its_body(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(Vec::new());
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(&app, loop_pr_item(Vec::new()), cx);
+        cx.run_until_parked();
+
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open_review(window, cx);
+                // Request changes with no body: rejected inline, nothing sent.
+                this.review.as_mut().unwrap().verdict = github::ReviewVerdict::RequestChanges;
+                this.submit_review(window, cx);
+                let review = this.review.as_ref().expect("the dialog stays up");
+                assert!(!review.in_flight);
+                assert!(review.error.is_some(), "the rejection says why inline");
+                // Approve with a body: posts, closes, updates the meta.
+                this.review.as_mut().unwrap().verdict = github::ReviewVerdict::Approve;
+                this.review
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |state, cx| state.set_value("lgtm", window, cx));
+                this.submit_review(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Review {
+                verdict: github::ReviewVerdict::Approve,
+                body: "lgtm".into(),
+            }]
+        );
+        cx.update(|cx| {
+            app.update(cx, |this, _cx| {
+                assert!(
+                    this.review.is_none(),
+                    "a submitted review closes the dialog"
+                );
+            });
+        });
     }
 }

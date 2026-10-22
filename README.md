@@ -57,7 +57,7 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - cmd-k palette with fuzzy PR picker
 - local repo diffs
 - minimap
-- inline GitHub review comments (reading + posting, hover a line for `+`)
+- inline GitHub review comments (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
 - follows the system light/dark appearance
 
@@ -91,6 +91,7 @@ re-fetch, nothing more.
 | `/` | fuzzy file filter |
 | `m` | toggle minimap |
 | `c` | toggle inline comments |
+| `C` | comment on the selected line (Esc cancels) |
 | `r` | refresh active item |
 | `cmd-enter` | submit review (approve / request changes / comment) |
 | `home` / `end` | top / bottom |
