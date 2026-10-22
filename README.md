@@ -46,9 +46,9 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
   when the network answers (works offline, too)
 - enter (or click) opens a queue row straight into its changes view; `u` comes
   back to the queue with open PRs kept open behind the scenes
-- file mode by default: one whole file fills the pane, revealed at its first
-  change, `]`/`[` move between files and `n`/`p` between hunks (both wrap),
-  `a` toggles the all-files scrolling view
+- one file at a time: the whole file fills the pane — no `@@` markers, hunk
+  boundaries read from the highlighting — revealed at its first change;
+  `]`/`[` move between files and `n`/`p` between hunks (both wrap)
 - unified + split views
 - tree-sitter highlighting (18 languages)
 - word-level intra-line diffs

@@ -129,7 +129,6 @@ actions!(
         GoToTop,
         GoToBottom,
         ToggleView,
-        TogglePresentation,
         Quit,
         ToggleSidebar,
         OpenInput,
@@ -279,7 +278,6 @@ fn main() {
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
                 KeyBinding::new("v", ToggleView, Some("ReviewApp")),
-                KeyBinding::new("a", TogglePresentation, Some("ReviewApp")),
                 KeyBinding::new("m", ToggleMinimap, Some("ReviewApp")),
                 KeyBinding::new("c", ToggleComments, Some("ReviewApp")),
                 KeyBinding::new("r", Refresh, Some("ReviewApp")),
@@ -386,18 +384,6 @@ enum ViewMode {
     Split,
 }
 
-/// What the diff pane shows for an item (user stories 28–31).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Presentation {
-    /// One file fills the pane: whole file side-by-side once the upgrade
-    /// lands (gaps render as plain context), the hunk strips before it —
-    /// either way revealed so the first change is on screen.
-    File { file_ix: usize },
-    /// The classic all-files scroll: every file stacked, gaps between hunks
-    /// collapsed into clickable `Gap` rows.
-    AllFiles,
-}
-
 /// One side of a split row: line number, kind, text, word-level highlights,
 /// and tree-sitter token spans.
 struct Cell {
@@ -409,7 +395,6 @@ struct Cell {
 }
 
 enum Row {
-    Spacer,
     FileHeader {
         path: SharedString,
         old_path: Option<SharedString>,
@@ -422,21 +407,7 @@ enum Row {
         comments: usize,
         outdated: usize,
     },
-    HunkHeader {
-        label: SharedString,
-        /// True once the file's hunks come from the Phase-2 full-content
-        /// re-diff (renders the label in a subtly different color).
-        upgraded: bool,
-    },
     Binary,
-    /// Hidden shared lines in an upgraded file: before the first hunk, between
-    /// hunks, or after the last one. Clicking expands the whole gap.
-    /// Selectable-through like headers (`row_side_text` returns None).
-    Gap {
-        file_ix: usize,
-        gap_ix: usize,
-        hidden: u32,
-    },
     Line {
         old_no: Option<u32>,
         new_no: Option<u32>,
@@ -963,18 +934,16 @@ fn hunk_syntax(
 }
 
 /// Phase-2 result for one file: full new-side lines and whole-file syntax
-/// span tables (per line, both sides), plus which gaps the user has expanded.
-/// The authoritative re-diffed hunks live in `diff.files[ix].hunks` — this is
-/// the extra state needed to render spans and expand context. Lives in
-/// `ItemData.upgrades`, so a view-mode toggle preserves expansion and a
+/// span tables (per line, both sides). The authoritative re-diffed hunks
+/// live in `diff.files[ix].hunks` — this is the extra state needed to render
+/// spans and fill in the context around the hunks. Lives in
+/// `ItemData.upgrades`, so a view-mode toggle preserves it and a
 /// refresh (which rebuilds ItemData contents) resets it.
 struct FileUpgrade {
     /// The complete new-side file, line-ending-normalized, split into lines.
     new_lines: Vec<SharedString>,
     old_spans: Vec<Vec<(Range<usize>, syntax::Token)>>,
     new_spans: Vec<Vec<(Range<usize>, syntax::Token)>>,
-    /// Expanded gap indices (0 = before the first hunk, i+1 = after hunk i).
-    expanded: HashSet<usize>,
 }
 
 impl FileUpgrade {
@@ -1028,33 +997,22 @@ fn gap_span(hunks: &[Hunk], gap_ix: usize, total_new: u32) -> (u32, u32, u32) {
     (old_lo, new_lo, (new_hi + 1).saturating_sub(new_lo))
 }
 
-/// Emit gap `gap_ix` of an upgraded file into `rows`: nothing when no lines
-/// are hidden there, synthesized full-context rows when expanded (or forced
-/// by file mode, which renders the whole file), otherwise one clickable Gap
-/// row.
+/// Emit gap `gap_ix` of an upgraded file into `rows` as plain context:
+/// nothing when no lines are hidden there — the whole file always renders,
+/// with no clickable `Gap` affordance.
 fn push_gap_rows(
     rows: &mut Vec<Row>,
     upgrade: &FileUpgrade,
     hunks: &[Hunk],
-    file_ix: usize,
     gap_ix: usize,
     mode: ViewMode,
     path: &str,
     anchors: Option<&FileAnchors>,
     now: i64,
     wrap: usize,
-    force_expand: bool,
 ) {
     let (old_lo, new_lo, count) = gap_span(hunks, gap_ix, upgrade.new_lines.len() as u32);
     if count == 0 {
-        return;
-    }
-    if !force_expand && !upgrade.expanded.contains(&gap_ix) {
-        rows.push(Row::Gap {
-            file_ix,
-            gap_ix,
-            hidden: count,
-        });
         return;
     }
     for j in 0..count {
@@ -1119,17 +1077,15 @@ fn push_gap_rows(
 }
 
 /// Flatten the diff into display rows plus the row indices of file headers and
-/// hunk headers. Split mode pairs removed/added runs positionally into
+/// hunk starts. Split mode pairs removed/added runs positionally into
 /// two-cell rows; unequal runs leave one-sided rows. Files present in
-/// `upgrades` use whole-file syntax spans and get gap rows between hunks
-/// (plain context instead when `focus` names a single file — file mode).
-/// Review threads render beneath the line they anchor to when
-/// `show_comments` is set; file headers always carry the comment counts.
+/// `upgrades` use whole-file syntax spans, with the gaps between hunks
+/// filled in as plain context — the whole file renders, with no `@@`
+/// hunk-marker rows. Review threads render beneath the line they anchor to
+/// when `show_comments` is set; file headers always carry the comment counts.
 ///
-/// `focus` restricts the build to one file (`Some(file_ix)`): that file's
-/// header, its hunks, and — once upgraded — the whole file with every gap
-/// expanded. With `None`, every file is built (all-files mode) and gaps stay
-/// clickable `Gap` rows.
+/// `focus` names the one file the build renders (file mode is the only
+/// presentation).
 fn build_rows(
     diff: &PrDiff,
     mode: ViewMode,
@@ -1137,7 +1093,7 @@ fn build_rows(
     comments: Option<&CommentIndex>,
     show_comments: bool,
     wrap: usize,
-    focus: Option<usize>,
+    focus: usize,
 ) -> (Vec<Row>, Vec<usize>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut file_rows = Vec::new();
@@ -1145,7 +1101,7 @@ fn build_rows(
     let now = now_unix();
 
     for (file_ix, file) in diff.files.iter().enumerate() {
-        if focus.is_some_and(|focus| focus != file_ix) {
+        if focus != file_ix {
             continue;
         }
         let upgrade = upgrades.get(&file_ix);
@@ -1159,9 +1115,6 @@ fn build_rows(
         } else {
             None
         };
-        if !rows.is_empty() && focus.is_none() {
-            rows.push(Row::Spacer);
-        }
         file_rows.push(rows.len());
         rows.push(Row::FileHeader {
             path: path.to_string().into(),
@@ -1186,33 +1139,21 @@ fn build_rows(
                     &mut rows,
                     upgrade,
                     &file.hunks,
-                    file_ix,
                     hunk_ix,
                     mode,
                     path,
                     anchors,
                     now,
                     wrap,
-                    focus.is_some(),
                 );
             }
             let syntax_spans = match upgrade {
                 Some(upgrade) => hunk.rows.iter().map(|row| upgrade.row_spans(row)).collect(),
                 None => hunk_syntax(lang, &hunk.rows),
             };
+            // The first row of the hunk — its `@@` marker is never rendered;
+            // hunk boundaries read from the highlighting alone.
             hunk_rows.push(rows.len());
-            let mut label = format!(
-                "@@ -{},{} +{},{} @@",
-                hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
-            );
-            if !hunk.section.is_empty() {
-                label.push(' ');
-                label.push_str(&hunk.section);
-            }
-            rows.push(Row::HunkHeader {
-                label: label.into(),
-                upgraded: upgrade.is_some(),
-            });
             match mode {
                 ViewMode::Unified => {
                     for (ix, row) in hunk.rows.iter().enumerate() {
@@ -1442,14 +1383,12 @@ fn build_rows(
                 &mut rows,
                 upgrade,
                 &file.hunks,
-                file_ix,
                 file.hunks.len(),
                 mode,
                 path,
                 anchors,
                 now,
                 wrap,
-                focus.is_some(),
             );
         }
     }
@@ -1654,8 +1593,8 @@ fn comment_row(
 /// `selection` is this row's selected byte range (side + non-empty range),
 /// computed by the caller via `row_selection_range`; its side always matches
 /// the row shape (Unified for Line rows, Left/Right for SplitLine rows).
-/// `entity` is used by Gap rows (click expands) and CommentActions rows
-/// (click opens the reply composer); `ix` is the display-row index.
+/// `entity` is used by CommentActions rows (click opens the reply
+/// composer); `ix` is the display-row index.
 fn render_row(
     ix: usize,
     row: &Row,
@@ -1749,32 +1688,6 @@ fn render_row(
                 CardEdge::Bottom,
             )
         }
-        Row::Spacer => div().h(row_height).into_any_element(),
-        Row::Gap {
-            file_ix,
-            gap_ix,
-            hidden,
-        } => {
-            let (file_ix, gap_ix) = (*file_ix, *gap_ix);
-            let entity = entity.clone();
-            let noun = if *hidden == 1 { "line" } else { "lines" };
-            div()
-                .id(("gap", (file_ix << 20) | gap_ix))
-                .h(row_height)
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme::crust())
-                .hover(|style| style.bg(theme::surface0()))
-                .cursor_pointer()
-                .text_color(theme::overlay0())
-                .child(SharedString::from(format!("⋯ {hidden} hidden {noun}")))
-                .on_click(move |_, _, cx| {
-                    entity.update(cx, |this, cx| this.expand_gap(file_ix, gap_ix, cx));
-                })
-                .into_any_element()
-        }
         Row::FileHeader {
             path,
             old_path,
@@ -1847,22 +1760,6 @@ fn render_row(
                 )
                 .into_any_element()
         }
-        Row::HunkHeader { label, upgraded } => div()
-            .h(row_height)
-            .w_full()
-            .flex()
-            .items_center()
-            .px_3()
-            .bg(theme::crust())
-            // Subtle upgrade indicator: full-content re-diffed hunks get a
-            // faint blue label instead of the plain overlay color.
-            .text_color(if *upgraded {
-                Hsla::from(theme::blue()).opacity(0.55)
-            } else {
-                theme::overlay0().into()
-            })
-            .child(label.clone())
-            .into_any_element(),
         Row::Binary => div()
             .h(row_height)
             .flex()
@@ -2024,7 +1921,6 @@ enum MinimapKind {
         right: bool,
     },
     Header,
-    Gap,
     Blank,
 }
 
@@ -2040,20 +1936,15 @@ fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
         .map(|row| match row {
             // Comment rows stay blank in the minimap: threads are short and
             // already flagged by the file-header counts.
-            Row::Spacer
-            | Row::Binary
+            Row::Binary
             | Row::CommentHeader { .. }
             | Row::CommentBody { .. }
             | Row::CommentActions { .. } => MinimapRow {
                 kind: MinimapKind::Blank,
                 len_frac: 0.,
             },
-            Row::FileHeader { .. } | Row::HunkHeader { .. } => MinimapRow {
+            Row::FileHeader { .. } => MinimapRow {
                 kind: MinimapKind::Header,
-                len_frac: 1.,
-            },
-            Row::Gap { .. } => MinimapRow {
-                kind: MinimapKind::Gap,
                 len_frac: 1.,
             },
             Row::Line { kind, text, .. } => MinimapRow {
@@ -2101,7 +1992,6 @@ enum MinimapColor {
     Removed,
     Context,
     Header,
-    Gap,
 }
 
 /// Downsample priority: when several rows share one pixel-row, the highest
@@ -2111,7 +2001,6 @@ fn minimap_priority(color: MinimapColor) -> u8 {
         MinimapColor::Removed => 5,
         MinimapColor::Added => 4,
         MinimapColor::Header => 3,
-        MinimapColor::Gap => 2,
         MinimapColor::Context => 1,
     }
 }
@@ -2176,7 +2065,6 @@ fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
             match row.kind {
                 MinimapKind::Blank => {}
                 MinimapKind::Header => fold(MinimapLane::Full, MinimapColor::Header, 1.),
-                MinimapKind::Gap => fold(MinimapLane::Full, MinimapColor::Gap, 1.),
                 MinimapKind::Context => {
                     fold(MinimapLane::Full, MinimapColor::Context, row.len_frac)
                 }
@@ -2222,7 +2110,7 @@ fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
             }
             // Header/gap ticks are 1px marks; when a slot is already 1px
             // they're plain bars and coalesce like everything else.
-            let tick = matches!(color, MinimapColor::Header | MinimapColor::Gap) && slot_h > 1.;
+            let tick = matches!(color, MinimapColor::Header) && slot_h > 1.;
             if let Some(run_ix) = open[ix] {
                 let run = &mut runs[run_ix];
                 if !tick && !run.tick && run.color == color && run.frac == f {
@@ -2558,8 +2446,8 @@ struct ItemData {
     pr_meta: Option<github::PrMeta>,
     diff: PrDiff,
     mode: ViewMode,
-    /// What the pane shows: one file (the default) or all files.
-    presentation: Presentation,
+    /// The one file the pane shows (file mode is the only presentation).
+    file_ix: usize,
     rows: Vec<Row>,
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
@@ -2577,8 +2465,8 @@ struct ItemData {
     /// change meaning.
     selection: Option<Selection>,
     /// Phase-2 upgrades by file index into `diff.files`: whole-file span
-    /// tables, full new-side lines, and expanded gaps. The re-diffed hunks
-    /// themselves replace `diff.files[ix].hunks`. Reset on refresh.
+    /// tables and full new-side lines. The re-diffed hunks themselves
+    /// replace `diff.files[ix].hunks`. Reset on refresh.
     upgrades: HashMap<usize, FileUpgrade>,
     /// Review threads grouped by anchor; Some for PR items (possibly empty),
     /// and for local items with in-memory draft comments.
@@ -2612,12 +2500,13 @@ struct ItemData {
 }
 
 impl ItemData {
-    /// A fresh item's data, ready to show: file mode on the first file,
-    /// revealed at its first change.
+    /// A fresh item's data, ready to show: `file_ix` on screen, revealed
+    /// at its first change.
     fn new(
         pr_meta: Option<github::PrMeta>,
         diff: PrDiff,
         mode: ViewMode,
+        file_ix: usize,
         rows: (Vec<Row>, Vec<usize>, Vec<usize>),
         comments: Option<CommentIndex>,
         local_review: Option<LocalReview>,
@@ -2626,7 +2515,7 @@ impl ItemData {
             pr_meta,
             diff,
             mode,
-            presentation: Presentation::File { file_ix: 0 },
+            file_ix,
             rows: Vec::new(),
             file_rows: Vec::new(),
             hunk_rows: Vec::new(),
@@ -2667,15 +2556,7 @@ impl ItemData {
         self.hunk_rows = hunk_rows;
     }
 
-    /// The file the presentation is focused on, if any (file mode).
-    fn focus(&self) -> Option<usize> {
-        match self.presentation {
-            Presentation::File { file_ix } => Some(file_ix),
-            Presentation::AllFiles => None,
-        }
-    }
-
-    /// Rebuild the display rows for the current presentation and mode.
+    /// Rebuild the display rows for the displayed file and mode.
     fn row_build(&self) -> (Vec<Row>, Vec<usize>, Vec<usize>) {
         build_rows(
             &self.diff,
@@ -2684,75 +2565,12 @@ impl ItemData {
             self.comments.as_ref(),
             self.comments_visible,
             self.comment_wrap,
-            self.focus(),
+            self.file_ix,
         )
     }
 
-    /// Rebuild the display rows after diff, upgrade, or comment changes.
-    fn rebuild(&mut self) {
-        self.set_rows(self.row_build());
-    }
-
-    /// The file a diff row belongs to in the current presentation.
-    fn file_of_row(&self, row_ix: usize) -> Option<usize> {
-        match self.presentation {
-            Presentation::File { file_ix } => Some(file_ix),
-            Presentation::AllFiles => self.file_rows.iter().rposition(|&header| header <= row_ix),
-        }
-    }
-
-    /// The file the pane is on: the displayed file in file mode, otherwise
-    /// the file whose header row is at (or scrolled past) the top of the
-    /// viewport. Drives the tree highlight.
-    fn displayed_file(&self) -> Option<usize> {
-        match self.presentation {
-            Presentation::File { file_ix } => Some(file_ix),
-            Presentation::AllFiles => {
-                let scroll = self.scroll.0.borrow();
-                // A pending scroll_to_item (from ]/[ or a tree click) hasn't
-                // reached the offset yet, so it takes precedence; otherwise
-                // the same offset/row_height() math the selection hit test
-                // uses.
-                let top_row = match &scroll.deferred_scroll_to_item {
-                    Some(deferred) => deferred.item_index,
-                    None => {
-                        (f32::from(-scroll.base_handle.offset().y) / row_height()).max(0.) as usize
-                    }
-                };
-                self.file_rows.iter().rposition(|&ix| ix <= top_row)
-            }
-        }
-    }
-
-    /// The review position at/above the cursor: (file index, hunk index
-    /// within that file). Survives presentation switches because hunk
-    /// indices within a file are the same in either mode.
-    fn current_position(&self) -> (Option<usize>, Option<usize>) {
-        let global = self.hunk_rows.iter().rposition(|&ix| ix <= self.cursor);
-        match self.presentation {
-            // hunk_rows covers only this file: its list index is already
-            // the hunk index within the file.
-            Presentation::File { file_ix } => (Some(file_ix), global),
-            Presentation::AllFiles => {
-                let file = self.file_rows.iter().rposition(|&ix| ix <= self.cursor);
-                let hunk = global.map(|g| {
-                    let before = match file {
-                        Some(f) => self
-                            .hunk_rows
-                            .iter()
-                            .filter(|&&ix| ix < self.file_rows[f])
-                            .count(),
-                        None => 0,
-                    };
-                    g - before
-                });
-                (file, hunk)
-            }
-        }
-    }
-
     /// Put `hunk_ix`-th hunk (the first when None) on screen: cursor + scroll
-    /// to its header row, or the file header when the file has no hunks.
+    /// to its first row, or the file header when the file has no hunks.
     /// This is the "first change on screen" reveal of file mode.
     fn reveal_hunk(&mut self, hunk_ix: Option<usize>) {
         let target = hunk_ix
@@ -2764,28 +2582,23 @@ impl ItemData {
             .scroll_to_item_strict(target, ScrollStrategy::Top);
     }
 
-    /// Show `file_ix` alone in the pane (file mode), revealed at `hunk_ix`
-    /// (its first hunk when None).
+    /// Show `file_ix` alone in the pane, revealed at `hunk_ix` (its first
+    /// hunk when None).
     fn open_file(&mut self, file_ix: usize, hunk_ix: Option<usize>) {
-        self.presentation = Presentation::File { file_ix };
+        self.file_ix = file_ix;
         self.selection = None;
         self.set_rows(self.row_build());
         self.reveal_hunk(hunk_ix);
     }
 
     /// The next (delta = +1) or previous (delta = -1) file, wrapping over
-    /// the diff's file list; None when there is nothing to move to. Steps
-    /// from the displayed file in file mode, the cursor's file otherwise.
+    /// the diff's file list; None when there is nothing to move to.
     fn step_file(&self, delta: i32) -> Option<usize> {
         let n = self.diff.files.len();
         if n < 2 {
             return None;
         }
-        let cur = match self.focus() {
-            Some(file_ix) => file_ix as i32,
-            None => self.file_rows.iter().rposition(|&ix| ix <= self.cursor)? as i32,
-        };
-        Some((cur + delta).rem_euclid(n as i32) as usize)
+        Some(((self.file_ix as i32 + delta).rem_euclid(n as i32)) as usize)
     }
 
     /// The next (delta = +1) or previous (delta = -1) file *with hunks*,
@@ -2797,7 +2610,7 @@ impl ItemData {
         if n == 0 {
             return None;
         }
-        let start = self.focus()? as i32;
+        let start = self.file_ix as i32;
         for step in 1..=n {
             let file_ix = (start + delta * step as i32).rem_euclid(n as i32) as usize;
             let count = self.diff.files.get(file_ix)?.hunks.len();
@@ -2809,8 +2622,8 @@ impl ItemData {
     }
 
     /// The target of `n` (delta = +1) or `p` (delta = -1): a row to jump to,
-    /// or — having run off the end of the current file's hunks — the file to
-    /// wrap into (which switches the display in file mode).
+    /// or — having run off the end of the displayed file's hunks — the file
+    /// to wrap into, which switches the display.
     fn step_hunk(&self, delta: i32) -> Option<HunkNav> {
         let within = if delta > 0 {
             self.hunk_rows.iter().find(|&&ix| ix > self.cursor)
@@ -2820,21 +2633,8 @@ impl ItemData {
         if let Some(&ix) = within {
             return Some(HunkNav::Row(ix));
         }
-        match self.focus() {
-            // All files are built: wrap to the first/last hunk overall.
-            None => {
-                let ix = if delta > 0 {
-                    self.hunk_rows.first()
-                } else {
-                    self.hunk_rows.last()
-                };
-                ix.map(|&ix| HunkNav::Row(ix))
-            }
-            // File mode: wrap into the next/previous file that has hunks.
-            Some(_) => self
-                .step_hunk_file(delta)
-                .map(|(file_ix, hunk_ix)| HunkNav::File { file_ix, hunk_ix }),
-        }
+        self.step_hunk_file(delta)
+            .map(|(file_ix, hunk_ix)| HunkNav::File { file_ix, hunk_ix })
     }
 
     /// Rebuild the display rows after only the comment rows changed
@@ -2975,12 +2775,13 @@ impl ReviewItem {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         let data = Box::new(ItemData::new(
             Some(meta),
             diff,
             ViewMode::Split,
+            0,
             (rows, file_rows, hunk_rows),
             None,
             None,
@@ -3019,7 +2820,7 @@ impl ReviewItem {
             mut file_rows,
             mut hunk_rows,
             mode,
-            focus,
+            file_ix,
             comments,
             snapshot,
         } = loaded;
@@ -3038,21 +2839,22 @@ impl ReviewItem {
         self.refresh_error = None;
         match &mut self.state {
             ItemState::Ready(data) => {
-                // Fresh patch-derived data: any previous upgrade (and its
-                // expanded gaps) is stale — the upgrade re-runs from scratch.
+                // Fresh patch-derived data: any previous upgrade is stale —
+                // the upgrade re-runs from scratch.
                 data.upgrades.clear();
                 data.comments = match &data.local_review {
                     Some(local) => Some(local.index()),
                     None => comments,
                 };
-                // Background rows assumed the fetched comments and focus.
-                // Local drafts are reattached here, and view/comment toggles —
-                // or a presentation switch while the fetch ran — may have
-                // moved the target, so anything that drifted rebuilds.
+                // Background rows assumed the fetched comments and the
+                // displayed file. Local drafts are reattached here, and
+                // view/comment toggles — or a file switch while the fetch
+                // ran — may have moved the target, so anything that drifted
+                // rebuilds.
                 if data.local_review.is_some()
                     || data.mode != mode
                     || !data.comments_visible
-                    || focus != data.focus()
+                    || file_ix != data.file_ix
                 {
                     (rows, file_rows, hunk_rows) = build_rows(
                         &diff,
@@ -3061,7 +2863,7 @@ impl ReviewItem {
                         data.comments.as_ref(),
                         data.comments_visible,
                         data.comment_wrap,
-                        data.focus(),
+                        data.file_ix,
                     );
                 }
                 if pr_meta.is_some() {
@@ -3082,23 +2884,15 @@ impl ReviewItem {
                     Some(local) => Some(local.index()),
                     None => comments,
                 };
-                let mut data = Box::new(ItemData::new(
+                let data = Box::new(ItemData::new(
                     pr_meta,
                     diff,
                     mode,
+                    file_ix,
                     (rows, file_rows, hunk_rows),
                     comments,
                     local_review,
                 ));
-                // The rows were built for the focus the fetch was told about;
-                // a mismatch (stale call) falls back to the first file.
-                data.presentation = Presentation::File {
-                    file_ix: focus.unwrap_or(0),
-                };
-                if data.focus() != focus {
-                    data.rebuild();
-                }
-                data.reveal_hunk(None);
                 self.state = ItemState::Ready(data);
             }
         }
@@ -3124,8 +2918,8 @@ struct Loaded {
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
     mode: ViewMode,
-    /// The file the rows were built for (file mode); None = all files.
-    focus: Option<usize>,
+    /// The file the rows were built for (file mode).
+    file_ix: usize,
     /// Some (possibly empty) for PR items, None for local ones.
     comments: Option<CommentIndex>,
     /// The snapshot of a PR's fetch, for the local store: what the app
@@ -3146,7 +2940,7 @@ fn fetch_item(
     github: Arc<dyn github::GitHubClient>,
     source: &Source,
     mode: ViewMode,
-    focus: Option<usize>,
+    file_ix: usize,
 ) -> anyhow::Result<Loaded> {
     let (meta, patch, comments, snapshot) = match source {
         Source::Pr(loc) => {
@@ -3186,7 +2980,7 @@ fn fetch_item(
         comments.as_ref(),
         true,
         COMMENT_WRAP_CHARS,
-        focus,
+        file_ix,
     );
     Ok(Loaded {
         meta,
@@ -3195,7 +2989,7 @@ fn fetch_item(
         file_rows,
         hunk_rows,
         mode,
-        focus,
+        file_ix,
         comments,
         snapshot,
     })
@@ -3429,7 +3223,6 @@ fn upgrade_file(
                 .lines()
                 .map(|line| SharedString::from(line.to_string()))
                 .collect(),
-            expanded: HashSet::new(),
         },
     })
 }
@@ -5298,19 +5091,19 @@ impl ReviewApp {
     fn spawn_fetch(&self, id: u64, source: Source, mode: ViewMode, cx: &mut Context<Self>) {
         let github = self.github.clone();
         // Build rows for what the item will show when they land: the ready
-        // item's focus, or — for a first load — file mode on the first file.
-        let focus = match self
+        // item's displayed file, or the first file for a first load.
+        let file_ix = match self
             .items
             .iter()
             .find(|item| item.id == id)
             .map(|item| &item.state)
         {
-            Some(ItemState::Ready(data)) => data.focus(),
-            _ => Some(0),
+            Some(ItemState::Ready(data)) => data.file_ix,
+            _ => 0,
         };
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { fetch_item(github, &source, mode, focus) })
+                .background_spawn(async move { fetch_item(github, &source, mode, file_ix) })
                 .await;
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
@@ -5428,14 +5221,11 @@ impl ReviewApp {
                 let ItemState::Ready(data) = &mut item.state else {
                     return;
                 };
-                // File mode: keep the cursor on the same hunk (the re-diff
-                // preserves the hunks, so the first change stays on screen);
-                // None means the cursor sits at/before the first hunk — the
-                // reveal itself, re-anchored below. All-files keeps the
-                // pixel offset as before.
-                let hunk_ix = data
-                    .focus()
-                    .and_then(|_| data.hunk_rows.iter().rposition(|&ix| ix <= data.cursor));
+                // Keep the cursor on the same hunk (the re-diff preserves
+                // the hunks, so the first change stays on screen); None means
+                // the cursor sits at/before the first hunk — the reveal
+                // itself, re-anchored below.
+                let hunk_ix = data.hunk_rows.iter().rposition(|&ix| ix <= data.cursor);
                 for file in upgraded {
                     let Some(target) = data.diff.files.get_mut(file.file_ix) else {
                         continue;
@@ -5460,7 +5250,7 @@ impl ReviewApp {
                     data.comments.as_ref(),
                     data.comments_visible,
                     data.comment_wrap,
-                    data.focus(),
+                    data.file_ix,
                 ));
                 data.selection = None;
                 match hunk_ix {
@@ -5485,47 +5275,6 @@ impl ReviewApp {
             .ok();
         })
         .detach();
-    }
-
-    /// Reveal all hidden lines of one gap in an upgraded file, keeping the
-    /// viewport stable: when the expansion happens above the visible top row,
-    /// the scroll offset shifts down by exactly the inserted height.
-    fn expand_gap(&mut self, file_ix: usize, gap_ix: usize, cx: &mut Context<Self>) {
-        let Some(data) = self.active_data_mut() else {
-            return;
-        };
-        let Some(upgrade) = data.upgrades.get_mut(&file_ix) else {
-            return;
-        };
-        if !upgrade.expanded.insert(gap_ix) {
-            return;
-        }
-        let gap_row = data.rows.iter().position(|row| {
-            matches!(row, Row::Gap { file_ix: f, gap_ix: g, .. } if *f == file_ix && *g == gap_ix)
-        });
-        let old_len = data.rows.len();
-        data.rebuild();
-        // The gap row is replaced by its hidden context rows (plus any
-        // comment threads anchored inside them): the row-count delta is
-        // exactly what got inserted.
-        let inserted = data.rows.len().saturating_sub(old_len);
-        data.selection = None;
-        if let Some(gap_row) = gap_row {
-            if data.cursor > gap_row {
-                data.cursor += inserted;
-            }
-            let scroll = data.scroll.0.borrow();
-            let offset = scroll.base_handle.offset();
-            // offset.y is negative when scrolled down.
-            let top_row = (f32::from(-offset.y) / row_height()).floor() as usize;
-            if gap_row < top_row {
-                scroll.base_handle.set_offset(point(
-                    offset.x,
-                    offset.y - px(inserted as f32 * row_height()),
-                ));
-            }
-        }
-        cx.notify();
     }
 
     fn submit_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6017,55 +5766,20 @@ impl ReviewApp {
         let Some(data) = self.active_data_mut() else {
             return;
         };
-        // Best-effort position preservation: stay on the same file, and in
-        // file mode on the same hunk within it (hunk indices within a file
-        // are identical across modes).
-        let (file, hunk) = data.current_position();
+        // Position preservation: stay on the same hunk (hunk indices are
+        // identical across modes).
+        let hunk = data.hunk_rows.iter().rposition(|&ix| ix <= data.cursor);
         data.selection = None;
         data.mode = match data.mode {
             ViewMode::Unified => ViewMode::Split,
             ViewMode::Split => ViewMode::Unified,
         };
         data.set_rows(data.row_build());
-        let target = match data.presentation {
-            Presentation::File { .. } => hunk
-                .and_then(|ix| data.hunk_rows.get(ix).copied())
-                .or_else(|| data.hunk_rows.first().copied())
-                .unwrap_or(0),
-            Presentation::AllFiles => file
-                .and_then(|pos| data.file_rows.get(pos).copied())
-                .unwrap_or(0),
-        };
+        let target = hunk
+            .and_then(|ix| data.hunk_rows.get(ix).copied())
+            .or_else(|| data.hunk_rows.first().copied())
+            .unwrap_or(0);
         self.jump(target, cx);
-    }
-
-    /// `a`: flip the pane between one-file mode (the default) and the
-    /// all-files scrolling view, keeping the current file (and hunk, when
-    /// entering file mode) on screen.
-    fn toggle_presentation(&mut self, cx: &mut Context<Self>) {
-        let Some(data) = self.active_data_mut() else {
-            return;
-        };
-        let (file, hunk) = data.current_position();
-        match data.presentation {
-            Presentation::File { .. } => {
-                data.presentation = Presentation::AllFiles;
-                data.set_rows(data.row_build());
-                let target = file
-                    .and_then(|pos| data.file_rows.get(pos).copied())
-                    .unwrap_or(0);
-                self.jump(target, cx);
-            }
-            Presentation::AllFiles => {
-                // Open the file on screen — falling back to the cursor's file
-                // — keeping the cursor's hunk when it belongs to that file.
-                let (pos_file, hunk) = data.current_position();
-                let file = data.displayed_file().or(pos_file);
-                let hunk = (pos_file == file).then_some(hunk).flatten();
-                data.open_file(file.unwrap_or(0), hunk);
-                cx.notify();
-            }
-        }
     }
 
     fn jump(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -6077,8 +5791,7 @@ impl ReviewApp {
     }
 
     /// `n`/`p`: step to the next/previous hunk, wrapping past the ends —
-    /// into the next/previous file in file mode, to the first/last hunk
-    /// overall in all-files mode.
+    /// into the next/previous file that has hunks, switching the display.
     fn step_hunk(&mut self, delta: i32, cx: &mut Context<Self>) {
         let nav = self.active_data().and_then(|data| data.step_hunk(delta));
         match nav {
@@ -6093,52 +5806,27 @@ impl ReviewApp {
         }
     }
 
-    /// `]`/`[`: step to the next/previous file in tree order, wrapping.
-    /// File mode switches the displayed file (revealed at its first change);
-    /// all-files jumps to the file's header row.
+    /// `]`/`[`: step to the next/previous file in tree order, wrapping —
+    /// the pane switches to it, revealed at its first change.
     fn step_file(&mut self, delta: i32, cx: &mut Context<Self>) {
         let target = self.active_data().and_then(|data| data.step_file(delta));
         let Some(file_ix) = target else {
             return;
         };
-        let file_mode = matches!(
-            self.active_data().map(|data| data.presentation),
-            Some(Presentation::File { .. })
-        );
-        if file_mode {
-            if let Some(data) = self.active_data_mut() {
-                data.open_file(file_ix, None);
-            }
-        } else if let Some(&row) = self
-            .active_data()
-            .and_then(|data| data.file_rows.get(file_ix))
-        {
-            self.jump(row, cx);
-            return;
+        if let Some(data) = self.active_data_mut() {
+            data.open_file(file_ix, None);
         }
         cx.notify();
     }
 
-    /// Jump the diff to `file_ix` and hand focus to the diff pane (like
-    /// clicking a sidebar item does): the file's header row in all-files
-    /// mode, or file mode opened on it (revealed at its first change).
+    /// Show `file_ix` in the pane (revealed at its first change) and hand
+    /// focus to the diff pane — what clicking a sidebar item does.
     fn jump_to_file(&mut self, file_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
-        let file_mode = matches!(
-            self.active_data().map(|data| data.presentation),
-            Some(Presentation::File { .. })
-        );
-        if file_mode {
-            if let Some(data) = self.active_data_mut() {
-                data.open_file(file_ix, None);
-            }
-            cx.notify();
-        } else if let Some(&row) = self
-            .active_data()
-            .and_then(|data| data.file_rows.get(file_ix))
-        {
-            self.jump(row, cx);
+        if let Some(data) = self.active_data_mut() {
+            data.open_file(file_ix, None);
         }
+        cx.notify();
     }
 
     /// Click on an unfiltered tree row: directories toggle collapse, files
@@ -6706,8 +6394,7 @@ impl ReviewApp {
             }
         }
         let (anchor_side, line) = comment_anchor(&data.rows, row_ix, side)?;
-        let file_ix = data.file_of_row(row_ix)?;
-        let path = data.diff.files[file_ix].display_path().to_string();
+        let path = data.diff.files[data.file_ix].display_path().to_string();
         let (bounds, offset) = {
             let state = data.scroll.0.borrow();
             (state.base_handle.bounds(), state.base_handle.offset())
@@ -7068,7 +6755,6 @@ impl ReviewApp {
                                     Hsla::from(theme::overlay0()).opacity(0.35)
                                 }
                                 MinimapColor::Header => Hsla::from(theme::blue()).opacity(0.5),
-                                MinimapColor::Gap => Hsla::from(theme::overlay0()).opacity(0.2),
                             };
                             window.paint_quad(fill(
                                 Bounds::new(
@@ -7326,10 +7012,8 @@ impl ReviewApp {
                     .map(TreeListRow::FilteredFile)
                     .collect();
             }
-            // Follow the diff: highlight the file the pane is showing — in
-            // file mode, the displayed file; otherwise the file whose header
-            // row is at (or scrolled past) the top of the viewport.
-            current_file = data.displayed_file();
+            // Follow the diff: highlight the file the pane is showing.
+            current_file = Some(data.file_ix);
             current_row = current_file.and_then(|file| {
                 tree_rows.iter().position(|row| match row {
                     TreeListRow::Entry(ix) => matches!(
@@ -8152,7 +7836,6 @@ impl ReviewApp {
             footer = footer
                 .child(hint(&["]", "["], "files"))
                 .child(hint(&["n", "p"], "hunks"))
-                .child(hint(&["a"], "one file / all files"))
                 .child(hint(&["u"], "queue"))
                 .child(hint(&["v"], "unified/split"))
                 .child(hint(&["m"], "minimap"))
@@ -8343,9 +8026,6 @@ impl Render for ReviewApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleView, _, cx| this.toggle_view(cx)))
-            .on_action(
-                cx.listener(|this, _: &TogglePresentation, _, cx| this.toggle_presentation(cx)),
-            )
             .on_action(cx.listener(|this, _: &ToggleMinimap, _, cx| {
                 this.minimap_visible = !this.minimap_visible;
                 cx.notify();
@@ -8639,10 +8319,10 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
-        // rows[0] = FileHeader, rows[1] = HunkHeader, rows[2] = first context.
-        match &rows[2] {
+        // rows[0] = FileHeader, rows[1] = first context (no `@@` row).
+        match &rows[1] {
             Row::SplitLine { left, right } => {
                 assert_eq!(cell(left), (1, LineKind::Context, "ctx", &[][..]));
                 assert_eq!(cell(right), (1, LineKind::Context, "ctx", &[][..]));
@@ -8660,16 +8340,16 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
-        match &rows[3] {
+        match &rows[2] {
             Row::SplitLine { left, right } => {
                 assert_eq!(cell(left), (2, LineKind::Removed, "old1", &[0..3][..]));
                 assert_eq!(cell(right), (2, LineKind::Added, "new1", &[0..3][..]));
             }
             _ => panic!("expected split line"),
         }
-        match &rows[4] {
+        match &rows[3] {
             Row::SplitLine { left, right } => {
                 assert_eq!(cell(left), (3, LineKind::Removed, "old2", &[][..]));
                 assert_eq!(cell(right), (3, LineKind::Added, "new2", &[][..]));
@@ -8677,7 +8357,7 @@ mod tests {
             _ => panic!("expected split line"),
         }
         // Equal run + 2 context rows: 4 split lines for a 6-row hunk.
-        match &rows[5] {
+        match &rows[4] {
             Row::SplitLine { left, right } => {
                 assert_eq!(cell(left).2, "tail");
                 assert_eq!(cell(right).2, "tail");
@@ -8695,18 +8375,19 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         let h2 = hunk_rows[1];
-        // 2 removed / 1 added: first row paired, second left-only.
-        match &rows[h2 + 1] {
+        // h2 itself pairs r1 with a1.
+        match &rows[h2] {
             Row::SplitLine { left, right } => {
                 assert_eq!(cell(left), (10, LineKind::Removed, "r1", &[][..]));
                 assert_eq!(cell(right), (10, LineKind::Added, "a1", &[][..]));
             }
             _ => panic!("expected split line"),
         }
-        match &rows[h2 + 2] {
+        // 2 removed / 1 added: the second removed row is left-only.
+        match &rows[h2 + 1] {
             Row::SplitLine { left, right } => {
                 assert_eq!(cell(left), (11, LineKind::Removed, "r2", &[][..]));
                 assert!(right.is_none());
@@ -8714,7 +8395,7 @@ mod tests {
             _ => panic!("expected split line"),
         }
         // Lone added run after context: right-only.
-        match &rows[h2 + 4] {
+        match &rows[h2 + 3] {
             Row::SplitLine { left, right } => {
                 assert!(left.is_none());
                 assert_eq!(cell(right), (12, LineKind::Added, "lone", &[][..]));
@@ -8743,7 +8424,6 @@ mod tests {
             new_lines,
             old_spans: vec![Vec::new(); 20],
             new_spans: vec![Vec::new(); n],
-            expanded: HashSet::new(),
         };
         (PrDiff { files: vec![file] }, HashMap::from([(0, upgrade)]))
     }
@@ -8770,11 +8450,8 @@ mod tests {
 
     fn row_name(row: &Row) -> &'static str {
         match row {
-            Row::Spacer => "Spacer",
             Row::FileHeader { .. } => "FileHeader",
-            Row::HunkHeader { .. } => "HunkHeader",
             Row::Binary => "Binary",
-            Row::Gap { .. } => "Gap",
             Row::Line { .. } => "Line",
             Row::SplitLine { .. } => "SplitLine",
             Row::CommentHeader { .. } => "CommentHeader",
@@ -8784,56 +8461,60 @@ mod tests {
     }
 
     #[test]
-    fn upgraded_file_gets_gap_rows_and_marked_headers() {
+    fn upgraded_file_renders_whole_with_hunks_inline() {
         let (diff, upgrades) = upgraded_diff();
         for mode in [ViewMode::Unified, ViewMode::Split] {
             let (rows, _, hunk_rows) =
-                build_rows(&diff, mode, &upgrades, None, true, COMMENT_WRAP_CHARS, None);
-            // FileHeader, Gap(6), HunkHeader, 7 hunk rows, Gap(7).
-            match &rows[1] {
-                Row::Gap {
-                    file_ix,
-                    gap_ix,
-                    hidden,
-                } => {
-                    assert_eq!((*file_ix, *gap_ix, *hidden), (0, 0, 6));
+                build_rows(&diff, mode, &upgrades, None, true, COMMENT_WRAP_CHARS, 0);
+            // FileHeader, 6 leading context rows, the hunk (8 rows unified:
+            // 3 context, 1 removed, 1 added, 3 context; 7 split: removed and
+            // added pair up), 7 trailing context rows — the whole 20-line
+            // file, no gap affordances.
+            assert_eq!(
+                rows.len(),
+                1 + 6 + if mode == ViewMode::Unified { 8 } else { 7 } + 7
+            );
+            assert_eq!(hunk_rows, vec![7]);
+            if mode == ViewMode::Unified {
+                match &rows[1] {
+                    Row::Line { new_no, text, .. } => {
+                        assert_eq!(*new_no, Some(1));
+                        assert_eq!(text.as_ref(), "line 1");
+                    }
+                    other => panic!("expected leading context, got {}", row_name(other)),
                 }
-                other => panic!("expected leading gap, got {}", row_name(other)),
+                match rows.last().unwrap() {
+                    Row::Line { new_no, text, .. } => {
+                        assert_eq!(*new_no, Some(20));
+                        assert_eq!(text.as_ref(), "line 20");
+                    }
+                    other => panic!("expected trailing context, got {}", row_name(other)),
+                }
             }
-            assert_eq!(hunk_rows, vec![2]);
-            assert!(matches!(rows[2], Row::HunkHeader { upgraded: true, .. }));
-            match rows.last().unwrap() {
-                Row::Gap { gap_ix, hidden, .. } => assert_eq!((*gap_ix, *hidden), (1, 7)),
-                other => panic!("expected trailing gap, got {}", row_name(other)),
-            }
-            // Gap rows are selectable-through, like headers.
-            assert!(row_side_text(&rows[1], SelSide::Unified).is_none());
-            assert!(row_side_text(&rows[1], SelSide::Left).is_none());
         }
-        // Un-upgraded build of the same diff has no gap rows.
-        let (rows, _, _) = build_rows(
+        // Un-upgraded build of the same diff paints just the hunk.
+        let (rows, _, hunk_rows) = build_rows(
             &diff,
             ViewMode::Unified,
             &HashMap::new(),
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
-        assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
-        assert!(matches!(
-            rows[1],
-            Row::HunkHeader {
-                upgraded: false,
-                ..
-            }
-        ));
+        assert_eq!(hunk_rows, vec![1]);
+        assert!(matches!(rows[1], Row::Line { .. }));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, Row::Line { .. }))
+                .count(),
+            8
+        );
     }
 
     #[test]
-    fn expanded_gap_synthesizes_context_rows_with_correct_numbers() {
-        let (diff, mut upgrades) = upgraded_diff();
-        upgrades.get_mut(&0).unwrap().expanded.insert(0);
+    fn gap_context_rows_carry_correct_numbers() {
+        let (diff, upgrades) = upgraded_diff();
 
         let (rows, _, hunk_rows) = build_rows(
             &diff,
@@ -8842,9 +8523,9 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
-        // Leading gap expanded into 6 context rows before the hunk header.
+        // The leading gap renders as 6 context rows before the hunk.
         assert_eq!(hunk_rows, vec![7]); // FileHeader + 6 context rows
         for (j, row) in rows[1..7].iter().enumerate() {
             match row {
@@ -8863,10 +8544,7 @@ mod tests {
                 other => panic!("expected context line, got {}", row_name(other)),
             }
         }
-        // Trailing gap still collapsed.
-        assert!(matches!(rows.last(), Some(Row::Gap { gap_ix: 1, .. })));
-
-        // Split mode: same expansion as two-cell context rows.
+        // Split mode: same gap as two-cell context rows.
         let (rows, _, _) = build_rows(
             &diff,
             ViewMode::Split,
@@ -8874,7 +8552,7 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         match &rows[1] {
             Row::SplitLine { left, right } => {
@@ -8887,8 +8565,7 @@ mod tests {
             other => panic!("expected split context, got {}", row_name(other)),
         }
 
-        // Expanding the trailing gap too: numbering continues past the hunk.
-        upgrades.get_mut(&0).unwrap().expanded.insert(1);
+        // The trailing gap continues the numbering past the hunk.
         let (rows, _, _) = build_rows(
             &diff,
             ViewMode::Unified,
@@ -8896,9 +8573,8 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
-        assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
         match rows.last().unwrap() {
             Row::Line {
                 old_no,
@@ -8925,12 +8601,13 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            Some(0),
+            0,
         );
         Box::new(ItemData::new(
             None,
             diff,
             ViewMode::Unified,
+            0,
             rows,
             None,
             None,
@@ -8963,26 +8640,18 @@ mod tests {
     }
 
     #[test]
-    fn file_mode_is_the_default_and_reveals_the_first_hunk() {
+    fn opening_a_pr_shows_one_file_revealed_at_its_first_hunk() {
         let data = file_mode_data(two_file_diff());
-        assert_eq!(data.presentation, Presentation::File { file_ix: 0 });
-        // One file fills the pane: a single header, no spacer, and nothing
-        // from b.rs.
+        assert_eq!(data.file_ix, 0);
+        // One file fills the pane: a single header and nothing from b.rs.
         assert_eq!(data.file_rows, vec![0]);
         assert!(matches!(data.rows[0], Row::FileHeader { .. }));
-        assert!(!data
-            .rows
-            .iter()
-            .any(|row| matches!(row, Row::Spacer | Row::Gap { .. })));
         // Only a.rs's two hunks are built.
         assert_eq!(data.hunk_rows.len(), 2);
-        // The first change is on screen: the cursor sits on the first hunk
-        // header, right after the file header.
+        // The first change is on screen: the cursor sits on the first hunk's
+        // first row, right after the file header — no `@@` marker row.
         assert_eq!(data.cursor, 1);
-        assert!(matches!(data.rows[data.cursor], Row::HunkHeader { .. }));
-        // The tree highlight follows the displayed file.
-        assert_eq!(data.displayed_file(), Some(0));
-        assert_eq!(data.file_of_row(data.rows.len() - 1), Some(0));
+        assert!(matches!(data.rows[data.cursor], Row::Line { .. }));
     }
 
     #[test]
@@ -9003,7 +8672,7 @@ mod tests {
             Some(HunkNav::File { file_ix, hunk_ix }) => data.open_file(file_ix, Some(hunk_ix)),
             _ => unreachable!(),
         }
-        assert_eq!(data.presentation, Presentation::File { file_ix: 1 });
+        assert_eq!(data.file_ix, 1);
         assert_eq!(data.hunk_rows.len(), 1);
         assert_eq!(data.cursor, data.hunk_rows[0]);
         // Past the last hunk of the last file: wraps around to a.rs again.
@@ -9026,19 +8695,6 @@ mod tests {
     }
 
     #[test]
-    fn all_files_hunk_navigation_wraps_to_the_ends() {
-        let mut data = file_mode_data(two_file_diff());
-        data.presentation = Presentation::AllFiles;
-        data.rebuild();
-        assert_eq!(data.hunk_rows.len(), 3);
-        let last = *data.hunk_rows.last().unwrap();
-        data.cursor = last;
-        assert_eq!(data.step_hunk(1), Some(HunkNav::Row(data.hunk_rows[0])));
-        data.cursor = data.hunk_rows[0];
-        assert_eq!(data.step_hunk(-1), Some(HunkNav::Row(last)));
-    }
-
-    #[test]
     fn file_navigation_wraps_over_the_file_list() {
         let mut data = file_mode_data(two_file_diff());
         // `]` from the last file wraps to the first, `[` from the first
@@ -9052,26 +8708,9 @@ mod tests {
         assert_eq!(data.step_file(-1), Some(0));
         // Opening a file applies the reveal: first change on screen.
         data.open_file(1, None);
-        assert_eq!(data.presentation, Presentation::File { file_ix: 1 });
+        assert_eq!(data.file_ix, 1);
         assert!(matches!(data.rows[0], Row::FileHeader { .. }));
         assert_eq!(data.cursor, data.hunk_rows[0]);
-        assert_eq!(data.displayed_file(), Some(1));
-    }
-
-    #[test]
-    fn presentation_switches_keep_the_review_position() {
-        let mut data = file_mode_data(two_file_diff());
-        // The cursor's (file, hunk-within-file) position is the same pair
-        // in either presentation — the anchor the `v` and `a` toggles use.
-        data.presentation = Presentation::AllFiles;
-        data.rebuild();
-        assert_eq!(data.current_position(), (Some(0), Some(0)));
-        // Moving the cursor into the second hunk survives the switch back.
-        data.cursor = data.hunk_rows[1];
-        assert_eq!(data.current_position(), (Some(0), Some(1)));
-        data.open_file(0, Some(1));
-        assert_eq!(data.cursor, data.hunk_rows[1]);
-        assert_eq!(data.current_position(), (Some(0), Some(1)));
     }
 
     #[test]
@@ -9084,10 +8723,8 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            Some(0),
+            0,
         );
-        // No Gap rows in file mode: the gaps are plain context.
-        assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
         // All 20 new-side lines are present, the change highlighted inline.
         let lines: Vec<(u32, String)> = rows
             .iter()
@@ -9102,12 +8739,6 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 20);
         assert_eq!(lines[9], (10, "line ten".to_string()));
-        assert_eq!(
-            rows.iter()
-                .filter(|row| matches!(row, Row::HunkHeader { .. }))
-                .count(),
-            1
-        );
     }
 
     #[test]
@@ -9120,18 +8751,17 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            Some(0),
+            0,
         );
         // Phase 1: exactly the patch's hunk — 3 context, 1 removed, 1
-        // added, 3 context — and nothing else.
-        assert!(matches!(rows[1], Row::HunkHeader { .. }));
+        // added, 3 context — and nothing else, with no `@@` marker row.
+        assert!(matches!(rows[1], Row::Line { .. }));
         assert_eq!(
             rows.iter()
                 .filter(|row| matches!(row, Row::Line { .. }))
                 .count(),
             8
         );
-        assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
     }
 
     #[test]
@@ -9163,10 +8793,6 @@ mod tests {
                 .count()
                 >= 3
         );
-        assert!(!data
-            .rows
-            .iter()
-            .any(|row| matches!(row, Row::Gap { .. } | Row::Spacer)));
 
         // Renamed: the header carries the old path, hunks render normally.
         let renamed = FileDiff {
@@ -9196,8 +8822,7 @@ mod tests {
             }
             other => panic!("expected file header, got {}", row_name(other)),
         }
-        assert!(matches!(data.rows[1], Row::HunkHeader { .. }));
-        assert!(matches!(data.rows[2], Row::Line { .. }));
+        assert!(matches!(data.rows[1], Row::Line { .. }));
     }
 
     use syntax::Token;
@@ -10804,18 +10429,28 @@ mod tests {
                 None,
                 true,
                 COMMENT_WRAP_CHARS,
-                None,
+                0,
             );
-            assert_eq!(file_rows.len(), 2);
+            // Only the focused file builds: a.rs, header first.
+            assert_eq!(file_rows, vec![0]);
             assert_eq!(hunk_rows.len(), 2);
-            for &ix in &file_rows {
-                assert!(matches!(rows[ix], Row::FileHeader { .. }));
-            }
+            assert!(matches!(rows[0], Row::FileHeader { .. }));
             for &ix in &hunk_rows {
-                assert!(matches!(rows[ix], Row::HunkHeader { .. }));
+                assert!(matches!(rows[ix], Row::Line { .. } | Row::SplitLine { .. }));
             }
-            // Binary file: header immediately followed by the binary row.
-            assert!(matches!(rows[file_rows[1] + 1], Row::Binary));
+            // Binary file: focused alone, header followed by the binary row.
+            let (rows, file_rows, _) = build_rows(
+                &diff,
+                mode,
+                &HashMap::new(),
+                None,
+                true,
+                COMMENT_WRAP_CHARS,
+                1,
+            );
+            assert_eq!(file_rows, vec![0]);
+            assert!(matches!(rows[0], Row::FileHeader { .. }));
+            assert!(matches!(rows[1], Row::Binary));
         }
         // Unified emits one row per diff row; split collapses the equal run.
         let (unified, _, _) = build_rows(
@@ -10825,7 +10460,7 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         let (split, _, _) = build_rows(
             &diff,
@@ -10834,7 +10469,7 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         let unified_lines = unified
             .iter()
@@ -10927,14 +10562,9 @@ mod tests {
 
     #[test]
     fn row_range_skips_non_text_rows() {
-        let header = Row::HunkHeader {
-            label: "@@".into(),
-            upgraded: false,
-        };
         let sel = sel(SelSide::Unified, (0, 0), (2, 3));
-        // Headers/spacers inside the span contribute nothing…
-        assert_eq!(row_selection_range(&sel, 1, &header), None);
-        assert_eq!(row_selection_range(&sel, 1, &Row::Spacer), None);
+        // Non-text rows inside the span contribute nothing…
+        assert_eq!(row_selection_range(&sel, 1, &Row::Binary), None);
         // …and split rows never match a Unified-side selection.
         assert_eq!(
             row_selection_range(&sel, 1, &split(Some("x"), Some("y"))),
@@ -10972,16 +10602,13 @@ mod tests {
     fn copy_assembles_contributing_rows() {
         let rows = vec![
             line("fn main() {"),
-            Row::HunkHeader {
-                label: "@@".into(),
-                upgraded: false,
-            },
+            Row::Binary,
             line(""),
             line("    body();"),
             line("}"),
         ];
-        // From col 3 of row 0 through col 1 of row 4: the header is skipped
-        // (no blank line for it), the empty line survives as an empty line.
+        // From col 3 of row 0 through col 1 of row 4: the binary row is
+        // skipped (no blank line for it), the empty line survives.
         let forward = sel(SelSide::Unified, (0, 3), (4, 1));
         assert_eq!(
             selection_text(&forward, &rows),
@@ -11027,24 +10654,21 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
-        // FileHeader and HunkHeader both map to Header ticks.
+        // The file header maps to a Header tick; the hunk's first row
+        // follows directly — no `@@` marker rows anymore.
         assert_eq!(mm[0], mrow(MinimapKind::Header, 1.));
-        assert_eq!(mm[1], mrow(MinimapKind::Header, 1.));
         // Line rows: kind from the row, frac = chars / MAX_MINIMAP_CHARS.
-        assert_eq!(mm[2], mrow(MinimapKind::Context, 3. / 160.)); // "ctx"
-        assert_eq!(mm[3], mrow(MinimapKind::Removed, 4. / 160.)); // "old1"
-        assert_eq!(mm[5], mrow(MinimapKind::Added, 4. / 160.)); // "new1"
-                                                                // Spacer and Binary rows are blank.
-        assert_eq!(mm[14], mrow(MinimapKind::Blank, 0.));
-        assert_eq!(mm[16], mrow(MinimapKind::Blank, 0.));
+        assert_eq!(mm[1], mrow(MinimapKind::Context, 3. / 160.)); // "ctx"
+        assert_eq!(mm[2], mrow(MinimapKind::Removed, 4. / 160.)); // "old1"
+        assert_eq!(mm[4], mrow(MinimapKind::Added, 4. / 160.)); // "new1"
     }
 
     #[test]
-    fn minimap_rows_split_pairs_and_gaps() {
+    fn minimap_rows_split_pairs() {
         let (rows, _, _) = build_rows(
             &sample_diff(),
             ViewMode::Split,
@@ -11052,13 +10676,13 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
         // Context pair: both halves, no change flags.
         assert_eq!(
-            mm[2].kind,
+            mm[1].kind,
             MinimapKind::SplitPair {
                 left_frac: 3. / 160.,
                 right_frac: 3. / 160.,
@@ -11068,7 +10692,7 @@ mod tests {
         );
         // Paired removed/added ("old1" / "new1").
         assert_eq!(
-            mm[3].kind,
+            mm[2].kind,
             MinimapKind::SplitPair {
                 left_frac: 4. / 160.,
                 right_frac: 4. / 160.,
@@ -11076,11 +10700,11 @@ mod tests {
                 right: true,
             }
         );
-        assert_eq!(mm[3].len_frac, 4. / 160.);
+        assert_eq!(mm[2].len_frac, 4. / 160.);
         // One-sided rows: the absent half has a zero fraction and no flag.
-        let h2 = 6; // second HunkHeader (see split tests above)
+        let h2 = 5; // the second hunk's first row
         assert_eq!(
-            mm[h2 + 2].kind,
+            mm[h2 + 1].kind,
             MinimapKind::SplitPair {
                 left_frac: 2. / 160., // "r2"
                 right_frac: 0.,
@@ -11089,7 +10713,7 @@ mod tests {
             }
         );
         assert_eq!(
-            mm[h2 + 4].kind,
+            mm[h2 + 3].kind,
             MinimapKind::SplitPair {
                 left_frac: 0.,
                 right_frac: 4. / 160., // "lone"
@@ -11097,15 +10721,6 @@ mod tests {
                 right: true,
             }
         );
-
-        // Gap rows map to Gap in both modes.
-        let (diff, upgrades) = upgraded_diff();
-        for mode in [ViewMode::Unified, ViewMode::Split] {
-            let (rows, _, _) =
-                build_rows(&diff, mode, &upgrades, None, true, COMMENT_WRAP_CHARS, None);
-            let mm = minimap_rows(&rows);
-            assert_eq!(mm[1], mrow(MinimapKind::Gap, 1.));
-        }
     }
 
     #[test]
@@ -11500,16 +11115,15 @@ mod tests {
             Some(&index),
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
-        // rows: FileHeader, HunkHeader, ctx, rem old1 (old_no 2) + LEFT
-        // thread, rem old2, add new1 (new_no 2) + RIGHT thread, …
+        // rows: FileHeader, ctx, rem old1 (old_no 2) + LEFT thread, rem
+        // old2, add new1 (new_no 2) + RIGHT thread, …
         let names: Vec<&str> = rows.iter().map(row_name).collect();
         assert_eq!(
             &names[..12],
             &[
                 "FileHeader",
-                "HunkHeader",
                 "Line",          // ctx 1/1
                 "Line",          // rem old1 (old 2)
                 "CommentHeader", // carol on old1
@@ -11520,12 +11134,12 @@ mod tests {
                 "CommentHeader", // alice
                 "CommentBody",
                 "CommentHeader", // bob's reply
+                "CommentBody",
             ]
         );
-        assert_eq!(names[12], "CommentBody");
-        assert_eq!(names[13], "CommentActions");
+        assert_eq!(names[12], "CommentActions");
         // The LEFT thread is carol's; the reply flag follows position.
-        match &rows[4] {
+        match &rows[3] {
             Row::CommentHeader {
                 author, is_reply, ..
             } => {
@@ -11534,7 +11148,7 @@ mod tests {
             }
             other => panic!("expected comment header, got {}", row_name(other)),
         }
-        match &rows[11] {
+        match &rows[10] {
             Row::CommentHeader {
                 author, is_reply, ..
             } => {
@@ -11544,7 +11158,7 @@ mod tests {
             other => panic!("expected reply header, got {}", row_name(other)),
         }
         // Actions row targets the thread root and carries the anchor.
-        match &rows[13] {
+        match &rows[12] {
             Row::CommentActions {
                 root_id,
                 path,
@@ -11582,13 +11196,13 @@ mod tests {
             Some(&index),
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
-        // rows[3] pairs old1/new1 (both line 2): LEFT thread then RIGHT
+        // rows[2] pairs old1/new1 (both line 2): LEFT thread then RIGHT
         // thread directly beneath it.
         let names: Vec<&str> = rows.iter().map(row_name).collect();
         assert_eq!(
-            &names[2..11],
+            &names[1..10],
             &[
                 "SplitLine",     // ctx
                 "SplitLine",     // old1 | new1
@@ -11601,8 +11215,8 @@ mod tests {
                 "CommentBody",
             ]
         );
-        assert_eq!(names[11], "CommentActions");
-        assert_eq!(names[12], "SplitLine"); // old2 | new2
+        assert_eq!(names[10], "CommentActions");
+        assert_eq!(names[11], "SplitLine"); // old2 | new2
     }
 
     /// The half a comment row renders in, or None for a full-width card.
@@ -11625,11 +11239,11 @@ mod tests {
             Some(&index),
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
-        // rows[4..7] are carol's LEFT thread, rows[7..12] the RIGHT one; each
+        // rows[3..6] are carol's LEFT thread, rows[6..11] the RIGHT one; each
         // row of a thread carries the side it was anchored to.
-        let halves: Vec<Option<Option<CommentSide>>> = rows[4..12].iter().map(row_half).collect();
+        let halves: Vec<Option<Option<CommentSide>>> = rows[3..11].iter().map(row_half).collect();
         assert_eq!(
             halves,
             vec![
@@ -11655,7 +11269,7 @@ mod tests {
             Some(&index),
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         // Exactly one top edge per thread, and it's the root's header — a
         // reply's header sits mid-card and must not cap it.
@@ -11795,7 +11409,7 @@ mod tests {
                 Some(&index),
                 true,
                 cap,
-                None,
+                0,
             );
             let bodies: Vec<&SharedString> = rows
                 .iter()
@@ -11825,7 +11439,7 @@ mod tests {
             Some(&index),
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         // Unified has one column, so no comment row is confined to a half.
         assert!(rows.iter().filter_map(row_half).all(|half| half.is_none()));
@@ -11843,7 +11457,7 @@ mod tests {
             Some(&index),
             false,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
@@ -11862,7 +11476,7 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
@@ -11876,8 +11490,8 @@ mod tests {
     }
 
     #[test]
-    fn expanded_gap_context_rows_host_threads() {
-        let (diff, mut upgrades) = upgraded_diff();
+    fn gap_context_rows_host_threads() {
+        let (diff, upgrades) = upgraded_diff();
         // a.txt line 3 lives in the leading gap (hunk covers 7..=13).
         let index = group_comments(vec![rc(
             9,
@@ -11896,21 +11510,11 @@ mod tests {
             Some(&index),
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
-        // Collapsed gap: the thread has no anchor row and stays hidden.
-        assert!(!rows.iter().any(is_comment_row));
-        upgrades.get_mut(&0).unwrap().expanded.insert(0);
-        let (rows, _, _) = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &upgrades,
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            None,
-        );
-        // FileHeader, ctx 1, ctx 2, ctx 3, then the thread.
+        // The gap always renders as context (the whole file shows), so the
+        // thread anchors immediately: FileHeader, ctx 1, ctx 2, ctx 3, then
+        // the thread.
         assert_eq!(row_name(&rows[3]), "Line");
         assert_eq!(row_name(&rows[4]), "CommentHeader");
         assert_eq!(row_name(&rows[5]), "CommentBody");
@@ -11927,22 +11531,22 @@ mod tests {
             Some(&index),
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         // Headers and comment rows anchor nothing.
         assert_eq!(comment_anchor(&rows, 0, SelSide::Unified), None);
         assert_eq!(comment_anchor(&rows, 4, SelSide::Unified), None);
         // Context row (1,1) → RIGHT 1; removed old1 → LEFT 2; added new1 → RIGHT 2.
         assert_eq!(
-            comment_anchor(&rows, 2, SelSide::Unified),
+            comment_anchor(&rows, 1, SelSide::Unified),
             Some((CommentSide::Right, 1))
         );
         assert_eq!(
-            comment_anchor(&rows, 3, SelSide::Unified),
+            comment_anchor(&rows, 2, SelSide::Unified),
             Some((CommentSide::Left, 2))
         );
         assert_eq!(
-            comment_anchor(&rows, 8, SelSide::Unified),
+            comment_anchor(&rows, 7, SelSide::Unified),
             Some((CommentSide::Right, 2))
         );
         // Split: the half under the pointer decides; absent cells refuse.
@@ -11953,21 +11557,21 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         assert_eq!(
-            comment_anchor(&rows, 3, SelSide::Left),
+            comment_anchor(&rows, 2, SelSide::Left),
             Some((CommentSide::Left, 2))
         );
         assert_eq!(
-            comment_anchor(&rows, 3, SelSide::Right),
+            comment_anchor(&rows, 2, SelSide::Right),
             Some((CommentSide::Right, 2))
         );
         // Second hunk: r2 has no right cell (see split tests above).
         let h2 = hunk_rows[1];
-        assert_eq!(comment_anchor(&rows, h2 + 2, SelSide::Right), None);
+        assert_eq!(comment_anchor(&rows, h2 + 1, SelSide::Right), None);
         assert_eq!(
-            comment_anchor(&rows, h2 + 2, SelSide::Left),
+            comment_anchor(&rows, h2 + 1, SelSide::Left),
             Some((CommentSide::Left, 11))
         );
     }
@@ -11982,7 +11586,7 @@ mod tests {
             None,
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         let (with, _, _) = build_rows(
             &sample_diff(),
@@ -11991,7 +11595,7 @@ mod tests {
             Some(&index),
             true,
             COMMENT_WRAP_CHARS,
-            None,
+            0,
         );
         // Every plain row maps to the same row content with comments shown.
         for (n, row) in plain.iter().enumerate() {
