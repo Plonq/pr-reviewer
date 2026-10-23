@@ -1,4 +1,4 @@
-//! Review-comment threads: grouping REST comments into anchored threads,
+//! App-owned review comments and threads, anchored indexing,
 //! comment-body wrapping, and comment age formatting.
 
 use crate::{rows::ViewMode, SPLIT_DIVIDER};
@@ -21,12 +21,70 @@ impl CommentSide {
     }
 }
 
-/// One review thread: the top-level comment plus its replies, in
-/// created_at order.
+/// The comment's display age and legacy lexical ordering key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CommentTime {
+    Posted(String),
+    Draft,
+}
+
+impl CommentTime {
+    fn sort_key(&self) -> &str {
+        match self {
+            Self::Posted(raw) => raw,
+            Self::Draft => "draft",
+        }
+    }
+
+    pub(crate) fn short_age(&self, now: i64) -> String {
+        match self {
+            Self::Posted(raw) => short_age(raw, now),
+            Self::Draft => "draft".to_string(),
+        }
+    }
+}
+
+/// A comment used by the app. Local drafts and PR comments live in separate
+/// item collections, so their numeric identities never need to be combined.
+#[derive(Clone, Debug)]
+pub(crate) struct ReviewComment {
+    pub(crate) id: u64,
+    pub(crate) path: String,
+    pub(crate) line: Option<u64>,
+    pub(crate) side: CommentSide,
+    pub(crate) start_line: Option<u64>,
+    pub(crate) body: String,
+    pub(crate) author: String,
+    pub(crate) time: CommentTime,
+    pub(crate) in_reply_to_id: Option<u64>,
+}
+
+impl From<github::ReviewComment> for ReviewComment {
+    fn from(comment: github::ReviewComment) -> Self {
+        Self {
+            id: comment.id,
+            path: comment.path,
+            line: comment.line,
+            side: if comment.side.as_deref() == Some("LEFT") {
+                CommentSide::Left
+            } else {
+                CommentSide::Right
+            },
+            start_line: comment.start_line,
+            body: comment.body,
+            author: comment.user.login,
+            time: CommentTime::Posted(comment.created_at),
+            in_reply_to_id: comment.in_reply_to_id,
+        }
+    }
+}
+
+/// One review thread: the top-level comment plus its replies, in lexical
+/// timestamp order (then numeric id), including unanchored/outdated roots.
 #[derive(Debug)]
 pub(crate) struct CommentThread {
-    pub(crate) root: github::ReviewComment,
-    pub(crate) replies: Vec<github::ReviewComment>,
+    pub(crate) root: ReviewComment,
+    pub(crate) replies: Vec<ReviewComment>,
 }
 
 /// One file's threads, keyed by anchor.
@@ -41,13 +99,16 @@ pub(crate) struct CommentIndex {
     pub(crate) counts: HashMap<String, (usize, usize)>,
 }
 
-/// Group flat REST comments into anchored threads: replies attach to their
-/// thread via `in_reply_to_id` (orphans are dropped), threads whose root has
-/// no current line are only counted as outdated.
-pub(crate) fn group_comments(mut comments: Vec<github::ReviewComment>) -> CommentIndex {
-    // ISO-8601 UTC strings sort lexicographically = chronologically, so this
-    // orders roots before their replies and threads by root creation.
-    comments.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+/// Assemble global-order threads for both export and anchored row indexing.
+/// Replies whose parents have not yet been encountered are dropped, even if
+/// their parent appears later in the sorted input.
+pub(crate) fn assemble_threads(mut comments: Vec<ReviewComment>) -> Vec<CommentThread> {
+    comments.sort_by(|a, b| {
+        a.time
+            .sort_key()
+            .cmp(b.time.sort_key())
+            .then(a.id.cmp(&b.id))
+    });
     let mut threads: Vec<CommentThread> = Vec::new();
     // Comment id (root or reply) → thread index, so replies-to-replies still
     // land in the right thread.
@@ -70,6 +131,12 @@ pub(crate) fn group_comments(mut comments: Vec<github::ReviewComment>) -> Commen
             }
         }
     }
+    threads
+}
+
+/// Index assembled threads by their root anchor. Outdated roots and their
+/// replies contribute to counts but have no rows.
+pub(crate) fn index_threads(threads: Vec<CommentThread>) -> CommentIndex {
     let mut index = CommentIndex::default();
     for thread in threads {
         let size = 1 + thread.replies.len();
@@ -79,20 +146,20 @@ pub(crate) fn group_comments(mut comments: Vec<github::ReviewComment>) -> Commen
             continue;
         };
         counts.0 += size;
-        let side = if thread.root.side.as_deref() == Some("LEFT") {
-            CommentSide::Left
-        } else {
-            CommentSide::Right
-        };
         index
             .threads
             .entry(thread.root.path.clone())
             .or_default()
-            .entry((side, line))
+            .entry((thread.root.side, line))
             .or_default()
             .push(thread);
     }
     index
+}
+
+/// Assemble and index comments for row building.
+pub(crate) fn group_comments(comments: Vec<ReviewComment>) -> CommentIndex {
+    index_threads(assemble_threads(comments))
 }
 
 /// Widest a comment body ever wraps, however roomy the pane: past ~80 columns
@@ -196,7 +263,131 @@ pub(crate) fn short_age(iso: &str, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::rc;
+    use crate::test_util::{app_rc as rc, rc as api_rc};
+
+    #[test]
+    fn review_comment_conversion_preserves_raw_fields_and_defaults_side() {
+        for (side, expected) in [
+            (Some("LEFT"), CommentSide::Left),
+            (Some("RIGHT"), CommentSide::Right),
+            (Some("left"), CommentSide::Right),
+            (Some("unknown"), CommentSide::Right),
+            (None, CommentSide::Right),
+        ] {
+            let mut raw = api_rc(
+                u64::MAX,
+                "old/renamed.rs",
+                side,
+                Some(42),
+                "body\nunchanged",
+                "alice",
+                "raw malformed timestamp",
+                Some(u64::MAX - 1),
+            );
+            raw.start_line = Some(39);
+            let comment = ReviewComment::from(raw);
+            assert_eq!(comment.id, u64::MAX);
+            assert_eq!(comment.path, "old/renamed.rs");
+            assert_eq!(comment.line, Some(42));
+            assert_eq!(comment.start_line, Some(39));
+            assert_eq!(comment.side, expected);
+            assert_eq!(comment.body, "body\nunchanged");
+            assert_eq!(comment.author, "alice");
+            assert_eq!(comment.in_reply_to_id, Some(u64::MAX - 1));
+            assert_eq!(
+                comment.time,
+                CommentTime::Posted("raw malformed timestamp".into())
+            );
+            assert_eq!(comment.time.short_age(0), "raw malformed timestamp");
+            assert_eq!(comment.time.sort_key(), "raw malformed timestamp");
+        }
+    }
+
+    #[test]
+    fn assemble_threads_equal_timestamp_orders_roots_and_nested_replies_by_id() {
+        let comment = |id, parent| rc(id, "a.rs", None, Some(2), "body", "author", "same", parent);
+        let threads = assemble_threads(vec![
+            comment(6, Some(4)),
+            comment(5, None),
+            comment(4, Some(3)),
+            comment(2, None),
+            comment(3, Some(1)),
+            comment(1, None),
+        ]);
+        assert_eq!(
+            threads.iter().map(|t| t.root.id).collect::<Vec<_>>(),
+            vec![1, 2, 5]
+        );
+        assert_eq!(
+            threads[0].replies.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![3, 4, 6]
+        );
+        let index = index_threads(threads);
+        let anchored = &index.threads["a.rs"][&(CommentSide::Right, 2)];
+        assert_eq!(
+            anchored.iter().map(|t| t.root.id).collect::<Vec<_>>(),
+            vec![1, 2, 5]
+        );
+        assert_eq!(index.counts["a.rs"], (6, 0));
+    }
+
+    #[test]
+    fn assemble_threads_draft_uses_literal_age_and_legacy_sort_key_then_id() {
+        let draft = |id, parent| ReviewComment {
+            time: CommentTime::Draft,
+            ..rc(
+                id,
+                "a.rs",
+                Some("LEFT"),
+                Some(2),
+                "draft body",
+                "you",
+                "unused",
+                parent,
+            )
+        };
+        assert_eq!(CommentTime::Draft.short_age(0), "draft");
+        assert_eq!(CommentTime::Draft.short_age(i64::MAX), "draft");
+        let threads = assemble_threads(vec![
+            draft(4, None),
+            draft(3, Some(2)),
+            draft(2, Some(1)),
+            draft(1, None),
+        ]);
+        assert_eq!(
+            threads.iter().map(|t| t.root.id).collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        assert_eq!(
+            threads[0].replies.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(CommentTime::Draft.sort_key(), "draft");
+    }
+
+    #[test]
+    fn assemble_threads_drops_early_and_missing_parents_but_keeps_outdated_replies() {
+        let comment =
+            |id, time, parent| rc(id, "stale.rs", None, None, "body", "author", time, parent);
+        let threads = assemble_threads(vec![
+            comment(2, "a", Some(1)), // Parent is later in lexical timestamp order.
+            comment(3, "c", Some(2)), // Descendant of the dropped reply is also dropped.
+            comment(4, "c", Some(999)),
+            comment(1, "b", None),
+            comment(5, "d", Some(1)),
+            comment(6, "e", Some(5)),
+            comment(0, "b", Some(1)), // Equal time but lower id: also too early.
+        ]);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].root.id, 1);
+        assert_eq!(
+            threads[0].replies.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        let index = index_threads(threads);
+        assert!(index.threads.is_empty());
+        assert_eq!(index.counts["stale.rs"], (0, 3));
+    }
 
     #[test]
     fn wrap_preserves_newlines_and_breaks_at_spaces() {
@@ -221,6 +412,10 @@ mod tests {
     #[test]
     fn short_age_buckets() {
         let now = parse_iso_utc("2026-07-09T12:00:00Z").unwrap();
+        assert_eq!(
+            CommentTime::Posted("2026-07-06T12:00:00Z".into()).short_age(now),
+            "3d ago"
+        );
         assert_eq!(short_age("2026-07-09T11:59:30Z", now), "just now");
         assert_eq!(short_age("2026-07-09T11:15:00Z", now), "45m ago");
         assert_eq!(short_age("2026-07-09T05:00:00Z", now), "7h ago");

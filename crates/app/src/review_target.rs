@@ -3,7 +3,7 @@
 
 use crate::local_store;
 use crate::rows::{build_rows, BuiltRows, RowOptions, RowsView, ViewMode};
-use crate::threads::{group_comments, CommentIndex, COMMENT_WRAP_CHARS};
+use crate::threads::{group_comments, CommentIndex, ReviewComment, COMMENT_WRAP_CHARS};
 use anyhow::anyhow;
 use diff_core::PrDiff;
 use std::collections::HashMap;
@@ -89,11 +89,15 @@ pub(crate) fn fetch_item(
             let comments = comments_thread
                 .join()
                 .map_err(|_| anyhow!("GitHub comments fetch panicked"))??;
+            // Persistence walks raw parent relationships independently of UI
+            // timestamp ordering and early-parent dropping; snapshot before consuming.
             let snapshot = pr_snapshot(loc, &meta, &comments);
             (
                 LoadedMeta::Pr(meta),
                 patch,
-                Some(group_comments(comments)),
+                Some(group_comments(
+                    comments.into_iter().map(ReviewComment::from).collect(),
+                )),
                 Some(snapshot),
             )
         }
@@ -190,6 +194,161 @@ fn pr_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::test_util::rc;
+    use crate::threads::assemble_threads;
+
+    fn snapshot(comments: &[github::ReviewComment]) -> local_store::StoredPrSnapshot {
+        let loc = github::PrLocator {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 7,
+        };
+        let meta = github::PrMeta {
+            number: 7,
+            title: "Title".into(),
+            body: "Body".into(),
+            author: github::Author {
+                login: "alice".into(),
+            },
+            state: "OPEN".into(),
+            url: String::new(),
+            base_ref_name: "main".into(),
+            head_ref_name: "feature".into(),
+            base_ref_oid: "base".into(),
+            head_ref_oid: "head".into(),
+            additions: 0,
+            deletions: 0,
+            changed_files: 0,
+            review_decision: String::new(),
+        };
+        pr_snapshot(&loc, &meta, comments)
+    }
+
+    #[test]
+    fn pr_snapshot_keeps_raw_root_order_outdated_roots_and_unordered_descendant_max() {
+        let raw = vec![
+            rc(
+                20,
+                "stale.rs",
+                None,
+                None,
+                "outdated",
+                "alice",
+                "2026-03-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                3,
+                "a.rs",
+                None,
+                Some(1),
+                "nested",
+                "bob",
+                "2026-04-01T00:00:00Z",
+                Some(2),
+            ),
+            rc(
+                2,
+                "a.rs",
+                None,
+                Some(1),
+                "early reply",
+                "bob",
+                "2026-01-01T00:00:00Z",
+                Some(1),
+            ),
+            rc(
+                1,
+                "a.rs",
+                None,
+                Some(1),
+                "root",
+                "alice",
+                "2026-02-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                21,
+                "stale.rs",
+                None,
+                None,
+                "outdated reply",
+                "bob",
+                "2026-05-01T00:00:00Z",
+                Some(20),
+            ),
+            rc(
+                99,
+                "a.rs",
+                None,
+                Some(1),
+                "orphan",
+                "bob",
+                "2099-01-01T00:00:00Z",
+                Some(999),
+            ),
+        ];
+        // The persistence boundary sees the raw API collection before conversion.
+        let snapshot = snapshot(&raw);
+        assert_eq!(snapshot.repository, "acme/widgets");
+        assert_eq!(snapshot.number, 7);
+        assert_eq!(snapshot.head_sha, "head");
+        assert_eq!(
+            snapshot
+                .threads
+                .iter()
+                .map(|t| (t.id.as_str(), t.updated_at.as_str(), t.resolved))
+                .collect::<Vec<_>>(),
+            vec![
+                ("20", "2026-05-01T00:00:00Z", false),
+                ("1", "2026-04-01T00:00:00Z", false),
+            ]
+        );
+        let ui = assemble_threads(raw.into_iter().map(ReviewComment::from).collect());
+        assert_eq!(
+            ui.iter().map(|t| t.root.id).collect::<Vec<_>>(),
+            vec![1, 20]
+        );
+        assert!(
+            ui[0].replies.is_empty(),
+            "UI drops the early parent and its descendant"
+        );
+        assert_eq!(ui[1].replies[0].id, 21);
+    }
+
+    #[test]
+    fn pr_snapshot_preserves_its_parent_walk_depth_limit_and_raw_timestamps() {
+        let mut raw = vec![rc(1, "stale.rs", None, None, "root", "alice", "a", None)];
+        for id in 2..=35 {
+            raw.push(rc(
+                id,
+                "stale.rs",
+                None,
+                None,
+                "reply",
+                "bob",
+                match id {
+                    34 => "y", // 33 edges to root: still reached.
+                    35 => "z", // 34 edges: guard stops before reaching root.
+                    _ => "b",
+                },
+                Some(id - 1),
+            ));
+        }
+        raw.reverse(); // Snapshot parent walks do not depend on input order.
+        let snapshot = snapshot(&raw);
+        assert_eq!(snapshot.threads.len(), 1);
+        assert_eq!(snapshot.threads[0].id, "1");
+        assert_eq!(snapshot.threads[0].updated_at, "y");
+        assert!(!snapshot.threads[0].resolved);
+        let ui = assemble_threads(raw.into_iter().map(ReviewComment::from).collect());
+        assert_eq!(
+            ui[0].replies.last().unwrap().id,
+            35,
+            "UI assembly has no snapshot depth bound"
+        );
+    }
 
     /// One item per source: a PR is its owner/repo/number, a local diff
     /// is its working tree and base — anything else is a different thing

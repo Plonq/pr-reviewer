@@ -2,7 +2,7 @@
 
 use crate::minimap::{MinimapKind, MinimapRow};
 use crate::rows::{FileUpgrade, Row};
-use crate::threads::{group_comments, CommentIndex};
+use crate::threads::{group_comments, CommentIndex, ReviewComment};
 use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
 use gpui::SharedString;
 use std::collections::HashMap;
@@ -121,6 +121,20 @@ pub(crate) fn rc(
     }
 }
 
+/// An app comment fixture, distinct from the raw API fixture `rc`.
+pub(crate) fn app_rc(
+    id: u64,
+    path: &str,
+    side: Option<&str>,
+    line: Option<u64>,
+    body: &str,
+    author: &str,
+    created_at: &str,
+    reply_to: Option<u64>,
+) -> ReviewComment {
+    rc(id, path, side, line, body, author, created_at, reply_to).into()
+}
+
 pub(crate) fn pr(number: u64, title: &str, author: &str, branch: &str) -> github::PrSummary {
     github::PrSummary {
         number,
@@ -221,7 +235,7 @@ pub(crate) fn two_file_diff() -> PrDiff {
 /// one outdated comment.
 pub(crate) fn sample_comments() -> CommentIndex {
     group_comments(vec![
-        rc(
+        app_rc(
             1,
             "a.rs",
             Some("RIGHT"),
@@ -231,7 +245,7 @@ pub(crate) fn sample_comments() -> CommentIndex {
             "2026-01-01T00:00:00Z",
             None,
         ),
-        rc(
+        app_rc(
             2,
             "a.rs",
             Some("RIGHT"),
@@ -241,7 +255,7 @@ pub(crate) fn sample_comments() -> CommentIndex {
             "2026-01-02T00:00:00Z",
             Some(1),
         ),
-        rc(
+        app_rc(
             3,
             "a.rs",
             Some("LEFT"),
@@ -251,7 +265,7 @@ pub(crate) fn sample_comments() -> CommentIndex {
             "2026-01-03T00:00:00Z",
             None,
         ),
-        rc(
+        app_rc(
             4,
             "a.rs",
             None,

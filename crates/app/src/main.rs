@@ -57,7 +57,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use threads::{
-    comment_wrap_cols, group_comments, CommentIndex, CommentSide, CommentThread, COMMENT_WRAP_CHARS,
+    assemble_threads, comment_wrap_cols, group_comments, CommentIndex, CommentSide, CommentThread,
+    CommentTime, ReviewComment, COMMENT_WRAP_CHARS,
 };
 use tree::{
     build_tree, fuzzy_file_matches, render_tree_row, visible_entries, TreeEntry, TreeEntryKind,
@@ -430,7 +431,7 @@ fn main() {
 
 #[derive(Debug, Default)]
 struct LocalReview {
-    comments: Vec<github::ReviewComment>,
+    comments: Vec<ReviewComment>,
     next_id: u64,
 }
 
@@ -448,17 +449,15 @@ impl LocalReview {
         body: String,
     ) {
         self.next_id += 1;
-        self.comments.push(github::ReviewComment {
+        self.comments.push(ReviewComment {
             id: self.next_id,
             path,
             line: Some(line),
-            side: Some(side.api_str().to_string()),
+            side,
             start_line: None,
             body,
-            user: github::Author {
-                login: "you".to_string(),
-            },
-            created_at: "draft".to_string(),
+            author: "you".to_string(),
+            time: CommentTime::Draft,
             in_reply_to_id: reply_to,
         });
     }
@@ -1300,9 +1299,9 @@ fn seed_mentions(cell: &Rc<RefCell<Vec<github::Mention>>>, data: &ItemData) {
         for anchors in index.threads.values() {
             for threads in anchors.values() {
                 for thread in threads {
-                    add(&thread.root.user.login);
+                    add(&thread.root.author);
                     for reply in &thread.replies {
-                        add(&reply.user.login);
+                        add(&reply.author);
                     }
                 }
             }
@@ -1343,7 +1342,7 @@ struct ReviewDialog {
 }
 
 fn local_review_prompt(src: &git::LocalSource, review: &LocalReview) -> String {
-    let threads = local_review_threads(review)
+    let threads = assemble_threads(review.comments.clone())
         .iter()
         .map(format_local_thread_prompt)
         .collect::<Vec<_>>()
@@ -1354,31 +1353,6 @@ fn local_review_prompt(src: &git::LocalSource, review: &LocalReview) -> String {
     )
 }
 
-fn local_review_threads(review: &LocalReview) -> Vec<CommentThread> {
-    let mut comments = review.comments.clone();
-    comments.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-    let mut threads = Vec::new();
-    let mut thread_of: HashMap<u64, usize> = HashMap::new();
-    for comment in comments {
-        match comment.in_reply_to_id {
-            None => {
-                thread_of.insert(comment.id, threads.len());
-                threads.push(CommentThread {
-                    root: comment,
-                    replies: Vec::new(),
-                });
-            }
-            Some(parent) => {
-                if let Some(&ix) = thread_of.get(&parent) {
-                    thread_of.insert(comment.id, ix);
-                    threads[ix].replies.push(comment);
-                }
-            }
-        }
-    }
-    threads
-}
-
 fn format_local_thread_prompt(thread: &CommentThread) -> String {
     let file = if thread.root.path.is_empty() {
         "<unknown file>"
@@ -1386,14 +1360,14 @@ fn format_local_thread_prompt(thread: &CommentThread) -> String {
         &thread.root.path
     };
     let mut sections = vec![
-        local_comment_location(file, thread.root.side.as_deref(), thread.root.line),
+        local_comment_location(file, thread.root.side, thread.root.line),
         thread.root.body.clone(),
     ];
     for (ix, reply) in thread.replies.iter().enumerate() {
-        let author = if reply.user.login.trim().is_empty() {
+        let author = if reply.author.trim().is_empty() {
             "Unknown"
         } else {
-            reply.user.login.as_str()
+            reply.author.as_str()
         };
         sections.push(format!("Reply {} ({author})", ix + 1));
         sections.push(reply.body.clone());
@@ -1401,11 +1375,11 @@ fn format_local_thread_prompt(thread: &CommentThread) -> String {
     sections.join("\n")
 }
 
-fn local_comment_location(file: &str, side: Option<&str>, line: Option<u64>) -> String {
+fn local_comment_location(file: &str, side: CommentSide, line: Option<u64>) -> String {
     let line = line.unwrap_or(0);
     match side {
-        Some("LEFT") => format!("{file}:L{line}"),
-        _ => format!("{file}:R{line}"),
+        CommentSide::Left => format!("{file}:L{line}"),
+        CommentSide::Right => format!("{file}:R{line}"),
     }
 }
 
@@ -3451,7 +3425,9 @@ impl ReviewApp {
                 };
                 match fetched {
                     Ok(comments) => {
-                        data.comments = Some(group_comments(comments));
+                        data.comments = Some(group_comments(
+                            comments.into_iter().map(ReviewComment::from).collect(),
+                        ));
                         data.rebuild_rows_anchored();
                     }
                     Err(err) => {
@@ -7018,6 +6994,11 @@ mod tests {
             "also add a test".to_string(),
         );
 
+        assert_eq!(review.comments[0].id, 1);
+        assert_eq!(review.comments[1].in_reply_to_id, Some(1));
+        assert!(review.comments.iter().all(|c| c.time == CommentTime::Draft));
+        assert!(review.comments.iter().all(|c| c.author == "you"));
+        assert!(review.comments.iter().all(|c| c.start_line.is_none()));
         let index = review.index();
         assert_eq!(index.counts["src/lib.rs"], (2, 0));
         let threads = &index.threads["src/lib.rs"][&(CommentSide::Right, 12)];
@@ -7064,6 +7045,137 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_review_prompt_keeps_global_draft_order_outdated_threads_and_fallbacks() {
+        let src = git::LocalSource {
+            repo_root: "/tmp/myrepo".into(),
+            branch: "feature".into(),
+            base_ref: None,
+            base_label: "main".into(),
+            base_oid: None,
+        };
+        let mut review = LocalReview::default();
+        review.add_comment(
+            None,
+            "z.rs".into(),
+            CommentSide::Left,
+            7,
+            "first\nbody".into(),
+        );
+        review.add_comment(None, "".into(), CommentSide::Right, 0, "outdated".into());
+        review.comments[1].line = None;
+        review.add_comment(
+            Some(2),
+            "".into(),
+            CommentSide::Right,
+            0,
+            "reply\nbody".into(),
+        );
+        review.comments[2].author = "  ".into();
+        review.add_comment(Some(3), "".into(), CommentSide::Right, 0, "nested".into());
+        review.comments[3].author = "bob".into();
+        review.add_comment(None, "a.rs".into(), CommentSide::Right, 2, "last".into());
+        review.add_comment(
+            Some(999),
+            "a.rs".into(),
+            CommentSide::Right,
+            2,
+            "orphan".into(),
+        );
+        review.comments.reverse();
+
+        assert_eq!(local_review_prompt(&src, &review),
+            "Diff: main ← feature. Locations are GitHub diff-style: path:Rline for right/new, path:Lline for left/old.\n\nz.rs:L7\nfirst\nbody\n=====\n<unknown file>:R0\noutdated\nReply 1 (Unknown)\nreply\nbody\nReply 2 (bob)\nnested\n=====\na.rs:R2\nlast");
+        let index = review.index();
+        assert_eq!(index.counts[""], (0, 3));
+        assert_eq!(index.counts["z.rs"], (1, 0));
+        assert_eq!(index.counts["a.rs"], (1, 0));
+        assert!(!index.threads.contains_key(""));
+    }
+
+    #[test]
+    fn local_review_rows_show_draft_age_and_numeric_root_reply_action() {
+        let mut review = LocalReview::default();
+        review.add_comment(None, "a.rs".into(), CommentSide::Right, 1, "root".into());
+        review.add_comment(
+            Some(1),
+            "a.rs".into(),
+            CommentSide::Right,
+            1,
+            "reply".into(),
+        );
+        let index = review.index();
+        let built = build_rows(RowsView {
+            diff: &two_file_diff(),
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
+        let headers = built
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::CommentHeader {
+                    author,
+                    when,
+                    is_reply,
+                    ..
+                } => Some((author.as_ref(), when.as_ref(), *is_reply)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            headers,
+            vec![("you", "draft", false), ("you", "draft", true)]
+        );
+        assert_eq!(
+            built
+                .rows
+                .iter()
+                .filter(|row| matches!(
+                    row,
+                    Row::CommentActions {
+                        root_id: 1,
+                        side: CommentSide::Right,
+                        line: 1,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn seed_mentions_reads_app_comment_authors_and_keeps_existing_users() {
+        let item = loop_pr_item(vec![
+            rc(1, "a.rs", None, Some(1), "root", "BOB", "a", None),
+            rc(2, "a.rs", None, Some(1), "reply", "carol", "b", Some(1)),
+            rc(3, "a.rs", None, Some(1), "blank author", "", "c", Some(1)),
+        ]);
+        let ItemState::Ready(data) = item.state else {
+            panic!("ready fixture")
+        };
+        let pool = Rc::new(RefCell::new(vec![
+            mention("bob", None),
+            mention("fetched", None),
+        ]));
+        seed_mentions(&pool, &data);
+        seed_mentions(&pool, &data);
+        assert_eq!(
+            pool.borrow()
+                .iter()
+                .map(|m| m.login.clone())
+                .collect::<Vec<_>>(),
+            vec!["bob", "fetched", "alice", "carol"]
+        );
+    }
+
     // --- The review loop: comment, reply, submit (user stories 40, 42, 46, 47)
 
     /// The meta of the fake PR every loop test runs against: open, head
@@ -7102,7 +7214,7 @@ mod tests {
     /// change (the added line 1), carrying `comments` on the diff.
     fn loop_pr_item(comments: Vec<github::ReviewComment>) -> ReviewItem {
         let diff = two_file_diff();
-        let index = group_comments(comments);
+        let index = group_comments(comments.into_iter().map(ReviewComment::from).collect());
         let built_rows = build_rows(RowsView {
             diff: &diff,
             upgrades: &HashMap::new(),

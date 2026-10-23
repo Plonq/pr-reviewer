@@ -1,7 +1,7 @@
 //! The diff pane's display rows: the row/cell model, diff-to-rows building, and row rendering.
 
 use crate::selection::SelSide;
-use crate::threads::{short_age, wrap_body, CommentIndex, CommentSide, FileAnchors};
+use crate::threads::{wrap_body, CommentIndex, CommentSide, FileAnchors};
 use crate::tree::status_style;
 use crate::{row_height, theme, ReviewApp, SPLIT_DIVIDER};
 use diff_core::{DiffRow, FileStatus, Hunk, PrDiff};
@@ -161,8 +161,8 @@ fn push_thread_rows(
             .enumerate()
         {
             rows.push(Row::CommentHeader {
-                author: comment.user.login.clone().into(),
-                when: short_age(&comment.created_at, now).into(),
+                author: comment.author.clone().into(),
+                when: comment.time.short_age(now).into(),
                 is_reply: ix > 0,
                 half,
                 // A thread always opens with its root's header and closes with
@@ -1253,7 +1253,7 @@ mod tests {
     use crate::minimap::{minimap_rows, MinimapKind};
     use crate::selection::row_side_text;
     use crate::test_util::{
-        add, ctx, mrow, rc, rem, row_name, sample_comments, sample_diff, two_file_diff,
+        add, app_rc as rc, ctx, mrow, rem, row_name, sample_comments, sample_diff, two_file_diff,
         upgraded_diff,
     };
     use crate::threads::{group_comments, COMMENT_WRAP_CHARS};
