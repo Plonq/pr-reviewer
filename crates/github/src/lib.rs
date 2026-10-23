@@ -14,6 +14,8 @@
 //! text is the user-facing message and moves with the backend (it carries
 //! v0.1's `gh`-CLI wording today, including the `gh auth login` fix).
 pub mod gh_cli;
+pub mod review_session;
+pub use review_session::{CommentAnchor, DiffSide, PendingComment, PendingReview};
 
 /// The signed-in GitHub user, as far as the app needs to know her: who she
 /// is, and how to draw her.
@@ -498,6 +500,74 @@ impl std::error::Error for ClientError {}
 /// construct and synchronous — they run on background threads, never the UI
 /// thread — and may spawn subprocesses or make network calls inside a call.
 pub trait GitHubClient: Send + Sync {
+    /// The viewer's server-side draft, including drafts started on the web.
+    fn pending_review(&self, _loc: &PrLocator) -> Result<Option<PendingReview>, ClientError> {
+        Ok(None)
+    }
+    fn start_review(&self, _loc: &PrLocator, _commit: &str) -> Result<PendingReview, ClientError> {
+        Err(ClientError::Failed(
+            "pending reviews are not supported by this backend".into(),
+        ))
+    }
+    fn add_pending_comment(
+        &self,
+        _loc: &PrLocator,
+        _review: &PendingReview,
+        _anchor: &CommentAnchor,
+        _body: &str,
+    ) -> Result<PendingComment, ClientError> {
+        Err(ClientError::Failed(
+            "pending reviews are not supported by this backend".into(),
+        ))
+    }
+    fn edit_pending_comment(
+        &self,
+        _loc: &PrLocator,
+        _id: u64,
+        _body: &str,
+    ) -> Result<(), ClientError> {
+        Err(ClientError::Failed(
+            "pending reviews are not supported by this backend".into(),
+        ))
+    }
+    fn delete_pending_comment(&self, _loc: &PrLocator, _id: u64) -> Result<(), ClientError> {
+        Err(ClientError::Failed(
+            "pending reviews are not supported by this backend".into(),
+        ))
+    }
+    fn submit_pending_review(
+        &self,
+        _loc: &PrLocator,
+        _review: &PendingReview,
+        _verdict: ReviewVerdict,
+        _body: &str,
+    ) -> Result<(), ClientError> {
+        Err(ClientError::Failed(
+            "pending reviews are not supported by this backend".into(),
+        ))
+    }
+    /// Explicitly immediate, never an add-to-pending operation.
+    fn post_anchored_comment(
+        &self,
+        loc: &PrLocator,
+        anchor: &CommentAnchor,
+        body: &str,
+    ) -> Result<(), ClientError> {
+        if anchor.start_line.is_some() {
+            return Err(ClientError::Invalid(
+                "range comments are not supported by this backend".into(),
+            ));
+        }
+        self.post_review_comment(
+            loc,
+            &anchor.commit_id,
+            &anchor.path,
+            anchor.side.api_str(),
+            anchor.line,
+            body,
+        )
+    }
+
     /// The signed-in viewer — also the app's auth check in one round trip:
     /// `Ok` says GitHub is usable as her, `Err` says why it isn't, in words
     /// that name the fix.

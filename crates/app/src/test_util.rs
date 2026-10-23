@@ -35,9 +35,15 @@ pub(crate) fn rem(old_no: u32, text: &str, intra: Vec<Range<usize>>) -> DiffRow 
 pub(crate) fn hunk(old_start: u32, new_start: u32, rows: Vec<DiffRow>) -> Hunk {
     Hunk {
         old_start,
-        old_count: 0,
+        old_count: rows
+            .iter()
+            .filter(|row| !matches!(row, DiffRow::Added { .. }))
+            .count() as u32,
         new_start,
-        new_count: 0,
+        new_count: rows
+            .iter()
+            .filter(|row| !matches!(row, DiffRow::Removed { .. }))
+            .count() as u32,
         section: String::new(),
         rows,
     }

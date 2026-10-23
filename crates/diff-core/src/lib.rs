@@ -38,7 +38,7 @@ impl FileDiff {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Hunk {
     pub old_start: u32,
     pub old_count: u32,
@@ -51,7 +51,7 @@ pub struct Hunk {
 
 /// A row is only ever Context, Added, or Removed — "modified" exists only at
 /// the hunk level, as removed rows followed by added rows.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DiffRow {
     Context {
         old_no: u32,

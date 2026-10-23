@@ -58,6 +58,11 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - local repo diffs
 - minimap
 - inline GitHub review comments (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
+- multi-line comments: click then shift-click a line, or drag a selection and
+  press `C` (ranges stay on one side within one GitHub patch hunk)
+- pending reviews: start/add to a review without posting, resume drafts started
+  on GitHub, and edit/delete them in the pending-review tray before submitting;
+  **Add single comment** still posts immediately
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
 - follows the system light/dark appearance
 
@@ -70,6 +75,8 @@ The app keeps its own memory in one SQLite database (WAL mode) at
   still works with no network,
 - **per-PR bookkeeping** — the head SHA and the review-thread timestamps the
   app last saw, for "what changed since I looked",
+- **pending reviews** — a local mirror of server-side drafts, reconciled with
+  GitHub on open, refresh, and before each review mutation,
 - **settings** — the queue's chips and sort, so the app opens the queue you left.
 
 The store is a cache, never a source of truth: deleting the directory costs a

@@ -1,4 +1,5 @@
 mod chrome;
+mod comment_anchor;
 mod conversation;
 mod http;
 mod local_store;
@@ -20,6 +21,7 @@ use chrome::{
     PrListState, PALETTE_ROW_HEIGHT, PALETTE_SOURCES, SOURCE_FOLDER, SOURCE_PR,
 };
 use diff_core::{FileStatus, PrDiff};
+use github::review_session::{Command as SessionCommand, ReviewSession};
 use gpui::{
     actions, canvas, div, fill, font, point, prelude::*, px, relative, rems, size, uniform_list,
     App, Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding,
@@ -45,8 +47,9 @@ use minimap::{
 use queue::{filter_base_refs, filter_prs, label_chip_colors, queue_chips, queue_row};
 use review_target::{dir_name, fetch_item, sources_match, Loaded, LoadedMeta, Source};
 use rows::{
-    build_rows, is_comment_row, now_unix, nth_noncomment_row, render_row, widest_row_ix, BuiltRows,
-    FileUpgrade, LineKind, Row, RowOptions, RowsView, ViewMode,
+    build_rows, comment_anchor, cursor_anchor, is_comment_row, now_unix, nth_noncomment_row,
+    render_row, widest_row_ix, BuiltRows, FileUpgrade, LineKind, Row, RowOptions, RowsView,
+    ViewMode,
 };
 use selection::{row_selection_range, selection_text, RowCol, SelSide, Selection};
 use std::borrow::Cow;
@@ -65,6 +68,20 @@ use tree::{
     TreeListRow,
 };
 use upgrade::{run_upgrade, UpgradeJob, UpgradeSource};
+
+#[derive(Default)]
+struct SessionUi {
+    state: ReviewSession,
+    busy: bool,
+    error: Option<SharedString>,
+}
+
+#[derive(Clone, Copy)]
+enum SessionCompletion {
+    None,
+    Composer(u64),
+    Review(u64),
+}
 
 const MONO: &str = "Menlo";
 
@@ -499,6 +516,10 @@ pub(crate) struct ItemData {
     /// paint and reused until the height changes or the rows are rebuilt.
     minimap_cache: RefCell<Option<(f32, Rc<MinimapLayout>)>>,
     cursor: usize,
+    cursor_side: Option<SelSide>,
+    /// Original server-patch hunks, retained when phase 2 replaces display
+    /// hunks. GitHub's anchor boundaries need not match our local re-diff.
+    anchor_hunks: Vec<Vec<diff_core::Hunk>>,
     scroll: UniformListScrollHandle,
     /// The conversation pane's scroll position. A pane-level container (not
     /// the TextView's own), so the wheel scrolls from anywhere over the pane
@@ -559,6 +580,7 @@ impl ItemData {
     ) -> Self {
         let mut data = Self {
             pr_meta,
+            anchor_hunks: diff.files.iter().map(|file| file.hunks.clone()).collect(),
             diff,
             mode,
             file_ix,
@@ -569,6 +591,7 @@ impl ItemData {
             minimap: Vec::new(),
             minimap_cache: RefCell::new(None),
             cursor: 0,
+            cursor_side: None,
             scroll: UniformListScrollHandle::new(),
             conv_scroll: ScrollHandle::new(),
             additions: 0,
@@ -634,6 +657,7 @@ impl ItemData {
             .or_else(|| self.hunk_rows.first().copied())
             .unwrap_or(0);
         self.cursor = target;
+        self.cursor_side = None;
         self.scroll
             .scroll_to_item_strict(target, ScrollStrategy::Top);
     }
@@ -940,12 +964,14 @@ impl ReviewItem {
                 if pr_meta.is_some() {
                     data.pr_meta = pr_meta;
                 }
+                data.anchor_hunks = diff.files.iter().map(|file| file.hunks.clone()).collect();
                 data.diff = diff;
                 data.set_rows(built_rows);
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.additions = additions;
                 data.deletions = deletions;
                 data.selection = None;
+                data.cursor_side = None;
                 data.rebuild_tree();
             }
             _ => {
@@ -1321,6 +1347,9 @@ struct Composer {
     path: String,
     side: CommentSide,
     line: u64,
+    start_line: Option<u64>,
+    pending: bool,
+    edit_id: Option<u64>,
     /// Display row the composer is anchored beneath (best effort; goes stale
     /// harmlessly if rows rebuild while it is open).
     row_ix: usize,
@@ -1507,6 +1536,7 @@ pub(crate) struct ReviewApp {
     /// Bumped on every review-dialog open/close, same protocol as
     /// `composer_gen`.
     review_gen: u64,
+    sessions: HashMap<u64, SessionUi>,
     /// The GitHub facade every GitHub operation goes through.
     github: Arc<dyn github::GitHubClient>,
     /// The account check surfaced in the title bar (see `render_account`).
@@ -1536,45 +1566,6 @@ pub(crate) struct ReviewApp {
     /// a newer generation, so there is never more than one running.
     poll_gen: u64,
     _subscriptions: Vec<Subscription>,
-}
-
-/// The comment anchor of a display row: which (side, line) a new comment on
-/// it targets. Unified rows anchor by kind (Removed → LEFT, else RIGHT);
-/// split rows by the half under the pointer. Rows without line numbers and
-/// absent cells yield None.
-fn comment_anchor(rows: &[Row], row_ix: usize, side: SelSide) -> Option<(CommentSide, u64)> {
-    match (rows.get(row_ix)?, side) {
-        (
-            Row::Line {
-                kind: LineKind::Removed,
-                old_no,
-                ..
-            },
-            _,
-        ) => Some((CommentSide::Left, (*old_no)? as u64)),
-        (Row::Line { new_no, .. }, _) => Some((CommentSide::Right, (*new_no)? as u64)),
-        (Row::SplitLine { left, .. }, SelSide::Left) => {
-            Some((CommentSide::Left, left.as_ref()?.no as u64))
-        }
-        (Row::SplitLine { right, .. }, SelSide::Right) => {
-            Some((CommentSide::Right, right.as_ref()?.no as u64))
-        }
-        _ => None,
-    }
-}
-
-/// The anchor `C` resolves when the *keyboard* picks the line (there is no
-/// pointer half to take): like the hover `+`, but with the split side chosen
-/// by row shape — the right cell when the row has one (a context pair or an
-/// added line), the left when the row is a removal with no right cell. The
-/// side is irrelevant for unified rows; `comment_anchor` derives theirs from
-/// the row kind.
-fn cursor_anchor(rows: &[Row], row_ix: usize) -> Option<(CommentSide, u64)> {
-    let side = match rows.get(row_ix) {
-        Some(Row::SplitLine { right, .. }) if right.is_none() => SelSide::Left,
-        _ => SelSide::Right,
-    };
-    comment_anchor(rows, row_ix, side)
 }
 
 /// The comment composer card's x, window-absolute: in split view the card
@@ -1679,6 +1670,7 @@ impl ReviewApp {
             composer_gen: 0,
             review: None,
             review_gen: 0,
+            sessions: HashMap::new(),
             github,
             account: AccountStatus::Checking,
             account_gen: 0,
@@ -1722,6 +1714,9 @@ impl ReviewApp {
         }
         self.frontmost = frontmost;
         if frontmost {
+            for id in self.items.iter().map(|item| item.id).collect::<Vec<_>>() {
+                self.resume_session(id, cx);
+            }
             // Coming back to the front is the moment the queue is most
             // likely to have moved on: refresh it, and let the poll run
             // again (the new poll ends the old one).
@@ -2191,6 +2186,7 @@ impl ReviewApp {
             self.active = ix;
             // Opening something leaves the home screen for the item's pane.
             self.show_queue = false;
+            self.resume_session(self.items[ix].id, cx);
             cx.notify();
             return;
         }
@@ -2208,6 +2204,16 @@ impl ReviewApp {
             // revisited at dogfood (task 28).
             pane: ItemPane::default(),
         });
+        if let Source::Pr(loc) = &source {
+            self.sessions.insert(
+                id,
+                SessionUi {
+                    state: self.store.review_session(loc),
+                    ..Default::default()
+                },
+            );
+            self.resume_session(id, cx);
+        }
         self.active = self.items.len() - 1;
         // Opening something leaves the home screen for the item's pane.
         self.show_queue = false;
@@ -2372,6 +2378,7 @@ impl ReviewApp {
                 // rows without translation.
                 data.set_rows(data.row_build());
                 data.selection = None;
+                data.cursor_side = None;
                 match hunk_ix {
                     Some(hunk_ix) => {
                         let target = data
@@ -2890,6 +2897,7 @@ impl ReviewApp {
         }
         item.refresh_error = None;
         let (id, source) = (item.id, item.source.clone());
+        self.resume_session(id, cx);
         self.spawn_fetch(id, source, mode, cx);
         cx.notify();
     }
@@ -2917,6 +2925,7 @@ impl ReviewApp {
     fn jump(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(data) = self.active_data_mut() {
             data.cursor = ix;
+            data.cursor_side = None;
             data.scroll.scroll_to_item_strict(ix, ScrollStrategy::Top);
         }
         cx.notify();
@@ -3146,13 +3155,210 @@ impl ReviewApp {
             }
             // No selection: the keyboard cursor names the line; a split
             // row's side falls out of its shape.
-            None => (data.cursor, cursor_anchor(&data.rows, data.cursor)),
+            None => (
+                data.cursor,
+                match data.cursor_side {
+                    Some(side) => comment_anchor(&data.rows, data.cursor, side),
+                    None => cursor_anchor(&data.rows, data.cursor),
+                },
+            ),
         };
         let Some((anchor_side, line)) = anchor else {
+            if let Some(item) = self.items.get_mut(self.active) {
+                item.refresh_error = Some("select a source line, not a header or comment".into());
+                cx.notify();
+            }
             return;
         };
         let path = data.diff.files[data.file_ix].display_path().to_string();
+        let range = if matches!(item.source, Source::Pr(_)) {
+            let points = match data.selection {
+                Some(sel) => {
+                    let (start, end) = sel.ordered();
+                    if comment_anchor(&data.rows, end.row, sel.side).is_none() {
+                        if let Some(item) = self.items.get_mut(self.active) {
+                            item.refresh_error = Some("end the range on a source line".into());
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    (start.row..=end.row)
+                        .filter_map(|row| comment_anchor(&data.rows, row, sel.side))
+                        .collect::<Vec<_>>()
+                }
+                None => vec![(anchor_side, line)],
+            };
+            match comment_anchor::selection_anchor(
+                &path,
+                data.pr_meta
+                    .as_ref()
+                    .map_or("", |meta| meta.head_ref_oid.as_str()),
+                &data.anchor_hunks[data.file_ix],
+                &points,
+            ) {
+                Ok(anchor) => Some(anchor),
+                Err(error) => {
+                    self.items[self.active].refresh_error = Some(error.into());
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         self.open_composer(None, path, anchor_side, line, row_ix, window, cx);
+        if let (Some(composer), Some(anchor)) = (&mut self.composer, range) {
+            composer.line = anchor.line;
+            composer.start_line = anchor.start_line;
+        }
+    }
+
+    fn extend_comment_selection(
+        &mut self,
+        side: SelSide,
+        head: RowCol,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        if data.cursor_side.is_some_and(|origin| origin != side) {
+            self.items[self.active].refresh_error =
+                Some("a comment range must stay on the same side".into());
+            cx.notify();
+            return;
+        }
+        let anchor = data.selection.map(|sel| sel.anchor).unwrap_or(RowCol {
+            row: data.cursor,
+            col: 0,
+        });
+        data.selection = Some(Selection { side, anchor, head });
+        self.drag_anchor = None;
+        self.open_composer_on_selection(window, cx);
+        cx.notify();
+    }
+
+    /// Serialize per-PR operations, not dialog generations: a closed dialog
+    /// must not lose the result of a write that has already reached GitHub.
+    fn session_job(
+        &mut self,
+        item_id: u64,
+        command: SessionCommand,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<(ReviewSession, Result<(), github::ClientError>)>> {
+        let item = self.items.iter().find(|item| item.id == item_id)?;
+        let Source::Pr(loc) = &item.source else {
+            return None;
+        };
+        let loc = loc.clone();
+        let ui = self.sessions.entry(item_id).or_default();
+        if ui.busy {
+            return None;
+        }
+        ui.busy = true;
+        ui.error = None;
+        let mut session = ui.state.clone();
+        let github = self.github.clone();
+        let store = self.store.clone();
+        cx.notify();
+        Some(cx.background_spawn(async move {
+            let result = session.execute(github.as_ref(), &loc, command);
+            // Also mirror partial success (e.g. start succeeded, add failed).
+            store.save_review_session(&loc, &session);
+            (session, result)
+        }))
+    }
+
+    fn finish_session(
+        &mut self,
+        item_id: u64,
+        state: ReviewSession,
+        result: &Result<(), github::ClientError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.items.iter().any(|item| item.id == item_id) {
+            self.sessions.insert(
+                item_id,
+                SessionUi {
+                    state,
+                    busy: false,
+                    error: result.as_ref().err().map(|error| error.to_string().into()),
+                },
+            );
+        } else {
+            self.sessions.remove(&item_id);
+        }
+        cx.notify();
+    }
+
+    fn resume_session(&mut self, item_id: u64, cx: &mut Context<Self>) {
+        let Some(job) = self.session_job(item_id, SessionCommand::Resume, cx) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let (session, result) = job.await;
+            this.update(cx, |app, cx| {
+                app.finish_session(item_id, session, &result, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn run_session(
+        &mut self,
+        item_id: u64,
+        command: SessionCommand,
+        completion: SessionCompletion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let submitted = matches!(command, SessionCommand::Submit { .. });
+        let Some(job) = self.session_job(item_id, command, cx) else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let (session, result) = job.await;
+            this.update_in(cx, |app, window, cx| {
+                app.finish_session(item_id, session, &result, cx);
+                match completion {
+                    SessionCompletion::Composer(gen) if app.composer_gen == gen => match &result {
+                        Ok(()) => app.close_composer(window, cx),
+                        Err(error) => {
+                            if let Some(composer) = &mut app.composer {
+                                composer.in_flight = false;
+                                composer.error = Some(error.to_string().into());
+                            }
+                        }
+                    },
+                    SessionCompletion::Review(gen) if app.review_gen == gen => match &result {
+                        Ok(()) => app.close_review(window, cx),
+                        Err(error) => {
+                            if let Some(review) = &mut app.review {
+                                review.in_flight = false;
+                                review.error = Some(error.to_string().into());
+                            }
+                        }
+                    },
+                    _ => {}
+                }
+                if submitted && result.is_ok() {
+                    if let Some(Source::Pr(loc)) = app
+                        .items
+                        .iter()
+                        .find(|item| item.id == item_id)
+                        .map(|item| item.source.clone())
+                    {
+                        app.refetch_comments(item_id, loc.clone(), cx);
+                        app.refetch_meta(item_id, loc, cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_composer(
@@ -3182,6 +3388,24 @@ impl ReviewApp {
             match &item.source {
                 Source::Pr(_) if commit_id.is_empty() => return,
                 Source::Pr(_) | Source::Local(_) => {}
+            }
+            if matches!(item.source, Source::Pr(_)) {
+                let Some(data) = self.active_data() else {
+                    return;
+                };
+                if data.diff.files.get(data.file_ix).is_none() {
+                    return;
+                }
+                if let Err(error) = comment_anchor::selection_anchor(
+                    &path,
+                    &commit_id,
+                    &data.anchor_hunks[data.file_ix],
+                    &[(side, line)],
+                ) {
+                    self.items[self.active].refresh_error = Some(error.into());
+                    cx.notify();
+                    return;
+                }
             }
         }
         self.composer_gen += 1;
@@ -3220,6 +3444,9 @@ impl ReviewApp {
             path,
             side,
             line,
+            start_line: None,
+            pending: false,
+            edit_id: None,
             row_ix,
             input,
             error: None,
@@ -3302,13 +3529,37 @@ impl ReviewApp {
         let item_id = item.id;
         let source = item.source.clone();
         let gen = self.composer_gen;
-        let (reply_to, commit_id, path, side, line) = {
+        let anchor = github::CommentAnchor {
+            commit_id: composer.commit_id.clone(),
+            path: composer.path.clone(),
+            side: composer.side,
+            line: composer.line,
+            start_line: composer.start_line,
+        };
+        if matches!(source, Source::Pr(_)) && (composer.pending || composer.edit_id.is_some()) {
+            if self.sessions.get(&item_id).is_some_and(|ui| ui.busy) {
+                return;
+            }
+            let command = match composer.edit_id {
+                Some(id) => SessionCommand::Edit { id, body },
+                None => SessionCommand::Add { anchor, body },
+            };
+            self.composer.as_mut().unwrap().in_flight = true;
+            self.run_session(
+                item_id,
+                command,
+                SessionCompletion::Composer(gen),
+                window,
+                cx,
+            );
+            return;
+        }
+        let (reply_to, path, side, line) = {
             let composer = self.composer.as_mut().unwrap();
             composer.in_flight = true;
             composer.error = None;
             (
                 composer.reply_to,
-                composer.commit_id.clone(),
                 composer.path.clone(),
                 composer.side,
                 composer.line,
@@ -3332,13 +3583,10 @@ impl ReviewApp {
                 .background_spawn(async move {
                     match reply_to {
                         Some(root_id) => github.post_reply(&post_loc, root_id, &body),
-                        None => github.post_review_comment(
+                        None => ReviewSession::default().execute(
+                            github.as_ref(),
                             &post_loc,
-                            &commit_id,
-                            &path,
-                            side.api_str(),
-                            line,
-                            &body,
+                            SessionCommand::Immediate { anchor, body },
                         ),
                     }
                 })
@@ -3457,8 +3705,17 @@ impl ReviewApp {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(3, 8)
-                .placeholder("leave a review comment… (optional when approving)")
+                .placeholder("review summary… (optional with pending comments)")
         });
+        if let Some(pending) = self
+            .sessions
+            .get(&item_id)
+            .and_then(|ui| ui.state.pending.as_ref())
+        {
+            input.update(cx, |state, cx| {
+                state.set_value(pending.body.clone(), window, cx)
+            });
+        }
         let _subscription =
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { secondary: true }) {
@@ -3497,56 +3754,29 @@ impl ReviewApp {
         }
         let body = review.input.read(cx).value().trim().to_string();
         let verdict = review.verdict;
-        // GitHub rejects bodyless request-changes/comment reviews; fail
-        // locally with a clearer message.
-        if body.is_empty() && verdict != github::ReviewVerdict::Approve {
-            if let Some(review) = &mut self.review {
-                review.error = Some("this review type needs a comment".into());
-            }
-            cx.notify();
+        let item_id = review.item_id;
+        if self.sessions.get(&item_id).is_some_and(|ui| ui.busy) {
             return;
         }
         let Some(item) = self.items.iter().find(|item| item.id == review.item_id) else {
             return;
         };
-        let Source::Pr(loc) = &item.source else {
+        let Source::Pr(_) = &item.source else {
             return;
         };
-        let loc = loc.clone();
         let item_id = item.id;
         let gen = self.review_gen;
         if let Some(review) = &mut self.review {
             review.in_flight = true;
             review.error = None;
         }
-        cx.notify();
-        let github = self.github.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let submit_loc = loc.clone();
-            let result = cx
-                .background_spawn(async move { github.submit_review(&submit_loc, verdict, &body) })
-                .await;
-            this.update_in(cx, |app, window, cx| {
-                if app.review_gen != gen {
-                    return; // The dialog was closed and reopened meanwhile.
-                }
-                match result {
-                    Ok(()) => {
-                        app.close_review(window, cx);
-                        app.refetch_meta(item_id, loc, cx);
-                    }
-                    Err(err) => {
-                        if let Some(review) = &mut app.review {
-                            review.in_flight = false;
-                            review.error = Some(err.to_string().into());
-                        }
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.run_session(
+            item_id,
+            SessionCommand::Submit { verdict, body },
+            SessionCompletion::Review(gen),
+            window,
+            cx,
+        );
     }
 
     /// Refetch only the PR meta — the post-review counterpart of
@@ -3634,11 +3864,23 @@ impl ReviewApp {
                 .text_size(px(13.))
                 .cursor_pointer()
                 .child(SharedString::from("+"))
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                     cx.stop_propagation();
                     let path = path.clone();
                     entity.update(cx, |this, cx| {
-                        this.open_composer(None, path, anchor_side, line, row_ix, window, cx);
+                        if event.modifiers.shift {
+                            this.extend_comment_selection(
+                                side,
+                                RowCol {
+                                    row: row_ix,
+                                    col: 0,
+                                },
+                                window,
+                                cx,
+                            );
+                        } else {
+                            this.open_composer(None, path, anchor_side, line, row_ix, window, cx);
+                        }
                     });
                 })
                 .into_any_element(),
@@ -3673,7 +3915,11 @@ impl ReviewApp {
             data.mode,
             composer.side,
         );
-        let action = if composer.reply_to.is_some() {
+        let action = if composer.edit_id.is_some() {
+            "Save draft"
+        } else if composer.pending {
+            "Add to review"
+        } else if composer.reply_to.is_some() {
             "Reply"
         } else {
             // GitHub's own label for the posts-now mode — the counterpart
@@ -3681,13 +3927,17 @@ impl ReviewApp {
             "Add single comment"
         };
         let target = format!(
-            "{}{}:{} ({})",
+            "{}{}:{}{} ({})",
             if composer.reply_to.is_some() {
                 "reply · "
             } else {
                 ""
             },
             composer.path,
+            composer
+                .start_line
+                .map(|start| format!("{start}–"))
+                .unwrap_or_default(),
             composer.line,
             composer.side.api_str()
         );
@@ -3754,9 +4004,249 @@ impl ReviewApp {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.submit_composer(window, cx);
                             })),
+                    )
+                    .when(
+                        composer.reply_to.is_none()
+                            && composer.edit_id.is_none()
+                            && !composer.pending
+                            && matches!(
+                                self.active_item().map(|item| &item.source),
+                                Some(Source::Pr(_))
+                            ),
+                        |row| {
+                            let pending = self
+                                .sessions
+                                .get(&composer.item_id)
+                                .is_some_and(|ui| ui.state.pending.is_some());
+                            row.child(
+                                Button::new("composer-add-to-review")
+                                    .label(if pending {
+                                        "Add to review"
+                                    } else {
+                                        "Start review"
+                                    })
+                                    .small()
+                                    .disabled(
+                                        composer.in_flight
+                                            || self
+                                                .sessions
+                                                .get(&composer.item_id)
+                                                .is_some_and(|ui| ui.busy),
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let Some(composer) = &mut this.composer {
+                                            composer.pending = true;
+                                        }
+                                        this.submit_composer(window, cx);
+                                    })),
+                            )
+                        },
                     ),
             )
             .into_any_element()
+    }
+
+    fn edit_pending(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.active_item() else {
+            return;
+        };
+        let Some(comment) = self
+            .sessions
+            .get(&item.id)
+            .and_then(|ui| ui.state.pending.as_ref())
+            .and_then(|review| review.comments.iter().find(|comment| comment.id == id))
+            .cloned()
+        else {
+            return;
+        };
+        // Edits address an existing id, including outdated comments; they do
+        // not create a new anchor or pretend the old one is current.
+        self.open_composer(
+            Some(id),
+            comment.path,
+            comment.side,
+            comment.line.unwrap_or(0),
+            0,
+            window,
+            cx,
+        );
+        if let Some(composer) = &mut self.composer {
+            composer.reply_to = None;
+            composer.edit_id = Some(id);
+            composer.pending = true;
+            composer.start_line = comment.start_line;
+            composer
+                .input
+                .update(cx, |state, cx| state.set_value(comment.body, window, cx));
+        }
+    }
+
+    fn render_pending_tray(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let empty = || div().into_any_element();
+        if self.show_queue {
+            return empty();
+        }
+        let Some(item) = self.active_item() else {
+            return empty();
+        };
+        if !matches!(item.source, Source::Pr(_)) {
+            return empty();
+        }
+        let Some(ui) = self.sessions.get(&item.id) else {
+            return empty();
+        };
+        let id = item.id;
+        let commit = match &item.state {
+            ItemState::Ready(data) => data
+                .pr_meta
+                .as_ref()
+                .map(|meta| meta.head_ref_oid.clone())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let pending = ui.state.pending.is_some();
+        let label = if pending {
+            format!(
+                "Pending review · {} comment{}{}",
+                ui.state.count(),
+                if ui.state.count() == 1 { "" } else { "s" },
+                if ui.busy {
+                    " · syncing…"
+                } else if !ui.state.verified {
+                    " · cached"
+                } else {
+                    ""
+                }
+            )
+        } else if ui.busy {
+            "Checking for a pending review…".into()
+        } else {
+            "Comments can be posted now or batched in a review".into()
+        };
+        let mut tray = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(theme::surface0())
+            .bg(theme::mantle())
+            .text_size(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().child(SharedString::from(label)))
+                    .child(
+                        Button::new("pending-refresh")
+                            .label("Refresh drafts")
+                            .ghost()
+                            .small()
+                            .disabled(ui.busy)
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.resume_session(id, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("pending-review")
+                            .label(if pending {
+                                "Finish review · ⌘↵"
+                            } else {
+                                "Start review"
+                            })
+                            .small()
+                            .disabled(ui.busy || (!pending && commit.is_empty()))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if pending {
+                                    this.open_review(window, cx);
+                                } else {
+                                    this.run_session(
+                                        id,
+                                        SessionCommand::Start {
+                                            commit_id: commit.clone(),
+                                        },
+                                        SessionCompletion::None,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            })),
+                    ),
+            );
+        if let Some(error) = &ui.error {
+            tray = tray.child(div().text_color(theme::red()).child(error.clone()));
+        }
+        if let Some(review) = &ui.state.pending {
+            let mut comments = div()
+                .id("pending-comments")
+                .max_h(px(160.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_1();
+            for comment in &review.comments {
+                let comment_id = comment.id;
+                let location = match comment.line {
+                    Some(line) => format!(
+                        "{}:{}{} ({})",
+                        comment.path,
+                        comment
+                            .start_line
+                            .map(|start| format!("{start}–"))
+                            .unwrap_or_default(),
+                        line,
+                        comment.side.api_str()
+                    ),
+                    None => format!("{} (outdated)", comment.path),
+                };
+                comments = comments.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(format!(
+                                    "{location} · {}",
+                                    comment.body
+                                ))),
+                        )
+                        .child(
+                            Button::new(("pending-edit", comment_id))
+                                .label("Edit")
+                                .ghost()
+                                .small()
+                                .disabled(ui.busy)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.edit_pending(comment_id, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(("pending-delete", comment_id))
+                                .label("Delete")
+                                .ghost()
+                                .small()
+                                .disabled(ui.busy)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.run_session(
+                                        id,
+                                        SessionCommand::Delete { id: comment_id },
+                                        SessionCompletion::None,
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        ),
+                );
+            }
+            tray = tray.child(comments);
+        }
+        tray.into_any_element()
     }
 
     /// The "submit review" modal: a dimming backdrop (click closes) over a
@@ -5126,13 +5616,23 @@ impl ReviewApp {
                             }
                             window.focus(&this.focus_handle);
                             let char_width = this.char_width(window);
+                            if event.modifiers.shift {
+                                let Some((side, head)) =
+                                    this.pane_hit(event.position, char_width, None)
+                                else {
+                                    return;
+                                };
+                                this.extend_comment_selection(side, head, window, cx);
+                                return;
+                            }
                             this.drag_anchor = this.pane_hit(event.position, char_width, None);
                             // A plain click also moves the keyboard cursor:
                             // `C` and `n`/`p` follow the line the reviewer
                             // last touched, mouse or keyboard alike.
-                            if let Some((_, hit)) = this.drag_anchor {
+                            if let Some((side, hit)) = this.drag_anchor {
                                 if let Some(data) = this.active_data_mut() {
                                     data.cursor = hit.row;
+                                    data.cursor_side = Some(side);
                                 }
                             }
                             // A plain click clears; a selection only appears
@@ -5515,6 +6015,7 @@ impl Render for ReviewApp {
                     ),
             )
             .child(self.render_footer())
+            .child(self.render_pending_tray(cx))
             // Root-level so the composer's input escapes the "ReviewApp" key
             // context (plain letters must stay text, like the palette input).
             .when(self.composer.is_some(), |root| {
@@ -7278,6 +7779,7 @@ mod tests {
         fail: std::sync::atomic::AtomicBool,
         /// The id the next posted comment gets.
         next_id: std::sync::atomic::AtomicU64,
+        pending: std::sync::Mutex<Option<github::PendingReview>>,
     }
 
     impl FakePr {
@@ -7294,6 +7796,103 @@ mod tests {
     }
 
     impl github::GitHubClient for FakePr {
+        fn pending_review(
+            &self,
+            _loc: &github::PrLocator,
+        ) -> Result<Option<github::PendingReview>, github::ClientError> {
+            Ok(self.pending.lock().unwrap().clone())
+        }
+
+        fn start_review(
+            &self,
+            _loc: &github::PrLocator,
+            _commit: &str,
+        ) -> Result<github::PendingReview, github::ClientError> {
+            let review = github::PendingReview {
+                id: 91,
+                node_id: "pending".into(),
+                body: String::new(),
+                comments: vec![],
+            };
+            *self.pending.lock().unwrap() = Some(review.clone());
+            Ok(review)
+        }
+
+        fn add_pending_comment(
+            &self,
+            _loc: &github::PrLocator,
+            review: &github::PendingReview,
+            anchor: &github::CommentAnchor,
+            body: &str,
+        ) -> Result<github::PendingComment, github::ClientError> {
+            assert_eq!(review.id, 91);
+            let comment = github::PendingComment {
+                id: 12,
+                path: anchor.path.clone(),
+                side: anchor.side,
+                line: Some(anchor.line),
+                start_line: anchor.start_line,
+                body: body.into(),
+            };
+            self.pending
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .comments
+                .push(comment.clone());
+            Ok(comment)
+        }
+
+        fn edit_pending_comment(
+            &self,
+            _loc: &github::PrLocator,
+            id: u64,
+            body: &str,
+        ) -> Result<(), github::ClientError> {
+            self.pending
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .comments
+                .iter_mut()
+                .find(|comment| comment.id == id)
+                .unwrap()
+                .body = body.into();
+            Ok(())
+        }
+
+        fn delete_pending_comment(
+            &self,
+            _loc: &github::PrLocator,
+            id: u64,
+        ) -> Result<(), github::ClientError> {
+            self.pending
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .comments
+                .retain(|comment| comment.id != id);
+            Ok(())
+        }
+
+        fn submit_pending_review(
+            &self,
+            _loc: &github::PrLocator,
+            _review: &github::PendingReview,
+            verdict: github::ReviewVerdict,
+            body: &str,
+        ) -> Result<(), github::ClientError> {
+            self.pending.lock().unwrap().take().unwrap();
+            self.posted.lock().unwrap().push(Post::Review {
+                verdict,
+                body: body.into(),
+            });
+            Ok(())
+        }
+
         fn viewer(&self) -> Result<github::Viewer, github::ClientError> {
             Ok(github::Viewer {
                 login: "tester".into(),
@@ -7730,8 +8329,9 @@ mod tests {
     }
 
     /// ⌘↵'s dialog: approve / request changes / comment with an optional
-    /// body. A bodyless non-approve verdict is rejected locally — inline,
-    /// no round trip — and a valid verdict posts exactly once and closes
+    /// body. A bodyless non-approve verdict with no pending comments is
+    /// rejected inline after reconciliation, without posting a review;
+    /// a valid verdict posts exactly once and closes
     /// the dialog. (user story 46)
     #[gpui::test]
     fn the_review_dialog_submits_the_verdict_with_its_body(cx: &mut gpui::TestAppContext) {
@@ -7747,6 +8347,12 @@ mod tests {
                 // Request changes with no body: rejected inline, nothing sent.
                 this.review.as_mut().unwrap().verdict = github::ReviewVerdict::RequestChanges;
                 this.submit_review(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert!(fake.posts().is_empty());
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
                 let review = this.review.as_ref().expect("the dialog stays up");
                 assert!(!review.in_flight);
                 assert!(review.error.is_some(), "the rejection says why inline");
@@ -7776,6 +8382,241 @@ mod tests {
                     "a submitted review closes the dialog"
                 );
             });
+        });
+    }
+
+    fn range_pr_item() -> ReviewItem {
+        let mut item = loop_pr_item(Vec::new());
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -0,0 +1,3 @@\n+one\n+two\n+three\n@@ -9,0 +10 @@\n+ten\n");
+        data.anchor_hunks = data
+            .diff
+            .files
+            .iter()
+            .map(|file| file.hunks.clone())
+            .collect();
+        data.set_rows(data.row_build());
+        data.cursor = 1;
+        item
+    }
+
+    #[gpui::test]
+    fn range_drafts_resume_edit_delete_and_submit_without_posting_single_comments(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(Vec::new());
+        *fake.pending.lock().unwrap() = Some(github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: "from web".into(),
+            comments: vec![github::PendingComment {
+                id: 13,
+                path: "old.rs".into(),
+                side: CommentSide::Left,
+                line: None,
+                start_line: None,
+                body: "web draft".into(),
+            }],
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(&app, range_pr_item(), cx);
+        cx.update(|cx| app.update(cx, |this, cx| this.resume_session(0, cx)));
+        cx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                assert_eq!(
+                    this.sessions[&0].state.count(),
+                    1,
+                    "web drafts resume in the tray"
+                );
+                this.active_data_mut().unwrap().selection = Some(Selection {
+                    side: SelSide::Unified,
+                    anchor: RowCol { row: 3, col: 2 },
+                    head: RowCol { row: 1, col: 0 },
+                });
+                this.open_composer_on_selection(window, cx);
+                let composer = this.composer.as_mut().unwrap();
+                assert_eq!((composer.start_line, composer.line), (Some(1), 3));
+                composer.pending = true;
+                composer
+                    .input
+                    .update(cx, |state, cx| state.set_value("range draft", window, cx));
+                this.submit_composer(window, cx);
+                assert!(this.sessions[&0].busy);
+                assert!(
+                    this.session_job(0, SessionCommand::Resume, cx).is_none(),
+                    "one operation per PR, not per dialog"
+                );
+            })
+        });
+        cx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                assert!(this.composer.is_none());
+                assert_eq!(this.sessions[&0].state.count(), 2);
+                assert_eq!(this.store.review_session(&loop_loc()).count(), 2);
+                this.edit_pending(12, window, cx);
+                let composer = this.composer.as_ref().unwrap();
+                assert_eq!(composer.edit_id, Some(12));
+                composer
+                    .input
+                    .update(cx, |state, cx| state.set_value("edited range", window, cx));
+                this.submit_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                assert_eq!(
+                    this.sessions[&0].state.pending.as_ref().unwrap().comments[1].body,
+                    "edited range"
+                );
+                this.run_session(
+                    0,
+                    SessionCommand::Delete { id: 13 },
+                    SessionCompletion::None,
+                    window,
+                    cx,
+                );
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            fake.posts().is_empty(),
+            "draft adds, edits, and deletes never post immediately"
+        );
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                assert_eq!(this.sessions[&0].state.count(), 1);
+                this.open_review(window, cx);
+                this.review.as_mut().unwrap().verdict = github::ReviewVerdict::Comment;
+                this.review
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                this.submit_review(window, cx);
+                // Closing a modal never cancels or loses a server mutation.
+                this.close_review(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Review {
+                verdict: github::ReviewVerdict::Comment,
+                body: String::new()
+            }]
+        );
+        cx.update(|cx| {
+            app.update(cx, |this, _| {
+                assert!(this.sessions[&0].state.pending.is_none());
+                assert!(this.store.review_session(&loop_loc()).pending.is_none());
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn invalid_ranges_and_whole_file_rediff_boundaries_are_rejected_in_the_ui(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(Vec::new());
+        let (window, app) = queue_window(cx, fake);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(&app, range_pr_item(), cx);
+        cx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                let data = this.active_data_mut().unwrap();
+                let end_row = data
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .find(|(ix, _)| {
+                        comment_anchor(&data.rows, *ix, SelSide::Unified)
+                            == Some((CommentSide::Right, 10))
+                    })
+                    .unwrap()
+                    .0;
+                data.selection = Some(Selection {
+                    side: SelSide::Unified,
+                    anchor: RowCol { row: 1, col: 0 },
+                    head: RowCol {
+                        row: end_row,
+                        col: 1,
+                    },
+                });
+                this.open_composer_on_selection(window, cx);
+                assert!(this.composer.is_none());
+                assert!(this.items[0]
+                    .refresh_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("one GitHub diff hunk"));
+                // Simulate a phase-2 display hunk that merges both server hunks.
+                let data = this.active_data_mut().unwrap();
+                data.diff.files[0].hunks[0].new_count = 10;
+                for line in 4..=10 {
+                    data.diff.files[0].hunks[0]
+                        .rows
+                        .push(diff_core::DiffRow::Added {
+                            new_no: line,
+                            text: "synthetic".into(),
+                            intra: vec![],
+                        });
+                }
+                this.open_composer_on_selection(window, cx);
+                assert!(
+                    this.composer.is_none(),
+                    "original patch boundaries survive phase 2"
+                );
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn shift_click_opens_a_range_composer_through_the_mouse_handlers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(Vec::new());
+        let (window, app) = queue_window(cx, fake);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(&app, range_pr_item(), cx);
+        cx.run_until_parked();
+        let at_row = |row: usize, cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                let app = app.read(cx);
+                let data = app.active_data().unwrap();
+                let scroll = data.scroll.0.borrow();
+                let bounds = scroll.base_handle.bounds();
+                point(
+                    bounds.left() + px(140.),
+                    bounds.top()
+                        + scroll.base_handle.offset().y
+                        + px((row as f32 + 0.5) * row_height()),
+                )
+            })
+        };
+        let first = at_row(1, &mut vcx.cx);
+        vcx.simulate_mouse_down(first, MouseButton::Left, gpui::Modifiers::default());
+        vcx.simulate_mouse_up(first, MouseButton::Left, gpui::Modifiers::default());
+        let last = at_row(3, &mut vcx.cx);
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        vcx.simulate_mouse_down(last, MouseButton::Left, shift);
+        vcx.simulate_mouse_up(last, MouseButton::Left, shift);
+        vcx.run_until_parked();
+        vcx.cx.update(|cx| {
+            let app = app.read(cx);
+            let composer = app.composer.as_ref().expect("shift-click composes a range");
+            assert_eq!(composer.start_line, Some(1));
+            assert_eq!(composer.line, 3);
+            assert_eq!(composer.side, CommentSide::Right);
         });
     }
 }

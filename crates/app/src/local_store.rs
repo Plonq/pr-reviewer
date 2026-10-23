@@ -39,6 +39,39 @@ impl std::fmt::Debug for LocalStore {
 }
 
 impl LocalStore {
+    /// A display-only mirror. The session always reconciles with GitHub before
+    /// writing, so a draft submitted elsewhere is never resurrected.
+    pub fn review_session(&self, loc: &github::PrLocator) -> github::review_session::ReviewSession {
+        let Ok(store) = self.inner.lock() else {
+            return Default::default();
+        };
+        store
+            .snapshots()
+            .pending_review(&loc.repo_slug(), loc.number)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_review_session(
+        &self,
+        loc: &github::PrLocator,
+        session: &github::review_session::ReviewSession,
+    ) {
+        let Ok(store) = self.inner.lock() else {
+            return;
+        };
+        let value = session
+            .pending
+            .as_ref()
+            .and_then(|_| serde_json::to_value(session).ok());
+        let _ =
+            store
+                .snapshots()
+                .write_pending_review(&loc.repo_slug(), loc.number, value.as_ref());
+    }
+
     /// Open the store at the platform's application-support location.
     ///
     /// A store that can't be opened (an unwritable directory, a corrupt
@@ -409,5 +442,67 @@ mod tests {
             store.setting("sort"),
             Some(serde_json::Value::String("oldest".into()))
         );
+    }
+
+    #[test]
+    fn pending_drafts_survive_reopening_the_database_and_clear_after_submission() {
+        use github::review_session::ReviewSession;
+        let path = std::env::temp_dir().join("opencode").join(format!(
+            "gander-review-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let open = || LocalStore {
+            inner: Arc::new(Mutex::new(Store::open(&path).unwrap())),
+            path: Some(path.clone()),
+        };
+        let loc = github::PrLocator {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 7,
+        };
+        let pending = github::PendingReview {
+            id: 91,
+            node_id: "PRR_pending".into(),
+            body: "summary".into(),
+            comments: vec![github::PendingComment {
+                id: 12,
+                path: "a.rs".into(),
+                side: github::DiffSide::Left,
+                line: Some(7),
+                start_line: Some(5),
+                body: "draft".into(),
+            }],
+        };
+        {
+            let store = open();
+            store.save_review_session(
+                &loc,
+                &ReviewSession {
+                    pending: Some(pending.clone()),
+                    verified: true,
+                },
+            );
+        }
+        {
+            let store = open();
+            let restored = store.review_session(&loc);
+            assert_eq!(restored.pending, Some(pending));
+            assert!(
+                !restored.verified,
+                "disk mirrors must be reconciled before mutation"
+            );
+            let other = github::PrLocator {
+                number: 8,
+                ..loc.clone()
+            };
+            assert!(store.review_session(&other).pending.is_none());
+            store.save_review_session(&loc, &ReviewSession::default());
+        }
+        {
+            let store = open();
+            assert!(store.review_session(&loc).pending.is_none());
+        }
+        let _ = std::fs::remove_file(path);
     }
 }

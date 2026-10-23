@@ -6,20 +6,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 /// Which diff side a review comment anchors to, GitHub's LEFT/RIGHT.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum CommentSide {
-    Left,
-    Right,
-}
-
-impl CommentSide {
-    pub(crate) fn api_str(self) -> &'static str {
-        match self {
-            CommentSide::Left => "LEFT",
-            CommentSide::Right => "RIGHT",
-        }
-    }
-}
+pub(crate) use github::DiffSide as CommentSide;
 
 /// The comment's display age and legacy lexical ordering key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,16 +48,17 @@ pub(crate) struct ReviewComment {
 
 impl From<github::ReviewComment> for ReviewComment {
     fn from(comment: github::ReviewComment) -> Self {
+        let position = crate::comment_anchor::display_line(comment.line, comment.start_line);
         Self {
             id: comment.id,
             path: comment.path,
-            line: comment.line,
+            line: position.map(|(_, line)| line),
             side: if comment.side.as_deref() == Some("LEFT") {
                 CommentSide::Left
             } else {
                 CommentSide::Right
             },
-            start_line: comment.start_line,
+            start_line: position.and_then(|(start, _)| start),
             body: comment.body,
             author: comment.user.login,
             time: CommentTime::Posted(comment.created_at),

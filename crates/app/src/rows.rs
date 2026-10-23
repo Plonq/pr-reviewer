@@ -94,6 +94,42 @@ pub(crate) fn is_comment_row(row: &Row) -> bool {
     )
 }
 
+/// Display-row adapter only. Validation against original GitHub hunks lives
+/// in `comment_anchor`, which never imports these UI row types.
+pub(crate) fn comment_anchor(
+    rows: &[Row],
+    row_ix: usize,
+    side: SelSide,
+) -> Option<(CommentSide, u64)> {
+    let (side, line) = match (rows.get(row_ix)?, side) {
+        (
+            Row::Line {
+                kind: LineKind::Removed,
+                old_no,
+                ..
+            },
+            _,
+        ) => (CommentSide::Left, (*old_no)? as u64),
+        (Row::Line { new_no, .. }, _) => (CommentSide::Right, (*new_no)? as u64),
+        (Row::SplitLine { left, .. }, SelSide::Left) => {
+            (CommentSide::Left, left.as_ref()?.no as u64)
+        }
+        (Row::SplitLine { right, .. }, SelSide::Right) => {
+            (CommentSide::Right, right.as_ref()?.no as u64)
+        }
+        _ => return None,
+    };
+    (line > 0).then_some((side, line))
+}
+
+pub(crate) fn cursor_anchor(rows: &[Row], row_ix: usize) -> Option<(CommentSide, u64)> {
+    let side = match rows.get(row_ix) {
+        Some(Row::SplitLine { right: None, .. }) => SelSide::Left,
+        _ => SelSide::Right,
+    };
+    comment_anchor(rows, row_ix, side)
+}
+
 /// Index of the row with the widest min-content: the longest no-wrap text
 /// (diff lines, comment bodies, file-header paths). `uniform_list` measures
 /// exactly one item to derive its horizontal scroll range, so the list must

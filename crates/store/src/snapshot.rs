@@ -76,6 +76,49 @@ pub struct SnapshotStore<'a> {
 }
 
 impl<'a> SnapshotStore<'a> {
+    /// Display-only server draft mirror. The domain shape belongs to the
+    /// GitHub/session layer, so the store keeps it as opaque JSON.
+    pub fn pending_review(
+        &self,
+        repository: &str,
+        number: u64,
+    ) -> Result<Option<serde_json::Value>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT snapshot FROM pending_reviews WHERE repository = ?1 AND number = ?2",
+                rusqlite::params![repository, number as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("couldn't read the pending review mirror")?;
+        Ok(json.and_then(|json| serde_json::from_str(&json).ok()))
+    }
+
+    pub fn write_pending_review(
+        &self,
+        repository: &str,
+        number: u64,
+        value: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        match value {
+            Some(value) => {
+                self.conn.execute(
+                    "INSERT INTO pending_reviews (repository, number, snapshot) VALUES (?1, ?2, ?3)
+                    ON CONFLICT(repository, number) DO UPDATE SET snapshot = ?3",
+                    rusqlite::params![repository, number as i64, serde_json::to_string(value)?],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "DELETE FROM pending_reviews WHERE repository = ?1 AND number = ?2",
+                    rusqlite::params![repository, number as i64],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(conn: &'a Connection) -> Self {
         Self { conn }
     }
@@ -202,6 +245,7 @@ impl<'a> SnapshotStore<'a> {
     /// Forget a PR's bookkeeping — the PR left the queue, or the app is
     /// starting over.
     pub fn forget(&self, repository: &str, number: u64) -> Result<()> {
+        self.write_pending_review(repository, number, None)?;
         self.conn
             .execute(
                 "DELETE FROM pr_snapshots WHERE repository = ?1 AND number = ?2",
@@ -221,6 +265,40 @@ impl<'a> SnapshotStore<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_mirrors_are_per_pr_replaceable_clearable_and_tolerate_corruption() {
+        let store = crate::Store::open_in_memory().unwrap();
+        let snapshots = store.snapshots();
+        let first = serde_json::json!({"id":1,"comments":[{"body":"draft"}]});
+        snapshots
+            .write_pending_review("acme/widgets", 7, Some(&first))
+            .unwrap();
+        assert_eq!(
+            snapshots.pending_review("acme/widgets", 7).unwrap(),
+            Some(first)
+        );
+        assert_eq!(snapshots.pending_review("acme/other", 7).unwrap(), None);
+        assert_eq!(snapshots.pending_review("acme/widgets", 8).unwrap(), None);
+        let second = serde_json::json!({"id":1,"comments":[]});
+        snapshots
+            .write_pending_review("acme/widgets", 7, Some(&second))
+            .unwrap();
+        assert_eq!(
+            snapshots.pending_review("acme/widgets", 7).unwrap(),
+            Some(second)
+        );
+        snapshots.forget("acme/widgets", 7).unwrap();
+        assert_eq!(snapshots.pending_review("acme/widgets", 7).unwrap(), None);
+        store
+            .conn
+            .execute(
+                "INSERT INTO pending_reviews VALUES ('acme/widgets', 7, 'invalid json')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(snapshots.pending_review("acme/widgets", 7).unwrap(), None);
+    }
 
     /// A snapshot, as a detail fetch would produce it.
     fn sample() -> PrSnapshot {

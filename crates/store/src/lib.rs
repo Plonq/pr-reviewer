@@ -36,7 +36,7 @@ pub use snapshot::{PrSnapshot, SnapshotStore, ThreadSeen};
 
 /// The app's database schema version. Bumped whenever a migration runs;
 /// the stored version is what the next open migrates *from*.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Where the database lives: the platform's application-support directory,
 /// under the app's name.
@@ -164,6 +164,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     for step in (version as u64)..(SCHEMA_VERSION as u64) {
         match step {
             0 => migrate_v0_to_v1(&tx)?,
+            1 => migrate_v1_to_v2(&tx)?,
             other => anyhow::bail!("no migration from schema version {other}"),
         }
     }
@@ -206,6 +207,20 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<()> {
         );",
     )
     .context("couldn't create the store's schema")?;
+    Ok(())
+}
+
+/// A separate mirror: refreshing PR metadata must not overwrite pending work.
+fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_reviews (
+        repository TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        snapshot TEXT NOT NULL,
+        PRIMARY KEY (repository, number)
+    );",
+    )
+    .context("couldn't create the pending review mirror")?;
     Ok(())
 }
 
@@ -269,7 +284,13 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("the schema version must be readable");
         assert_eq!(version, SCHEMA_VERSION);
-        for table in ["queue_cache", "pr_snapshots", "pr_threads", "settings"] {
+        for table in [
+            "queue_cache",
+            "pr_snapshots",
+            "pr_threads",
+            "settings",
+            "pending_reviews",
+        ] {
             let count: i64 = store
                 .conn
                 .query_row(
@@ -280,6 +301,45 @@ mod tests {
                 .expect("sqlite_master must be readable");
             assert_eq!(count, 1, "the {table} table must exist");
         }
+    }
+
+    #[test]
+    fn v1_migration_adds_draft_mirrors_without_touching_settings_or_prs() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_v0_to_v1(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        let before = Store { conn, path: None };
+        before
+            .settings()
+            .set("kept", serde_json::json!(true))
+            .unwrap();
+        let snapshot = PrSnapshot {
+            repository: "acme/widgets".into(),
+            number: 7,
+            title: "kept".into(),
+            ..Default::default()
+        };
+        before.snapshots().write(&snapshot).unwrap();
+        Store::prepare(&before.conn).unwrap();
+        assert_eq!(
+            before.settings().get("kept").unwrap(),
+            Some(serde_json::json!(true))
+        );
+        assert_eq!(
+            before.snapshots().read("acme/widgets", 7).unwrap(),
+            Some(snapshot)
+        );
+        before
+            .snapshots()
+            .write_pending_review("acme/widgets", 7, Some(&serde_json::json!({"draft":true})))
+            .unwrap();
+        assert_eq!(
+            before
+                .snapshots()
+                .pending_review("acme/widgets", 7)
+                .unwrap(),
+            Some(serde_json::json!({"draft":true}))
+        );
     }
 
     /// The store opens the same database twice without complaint — the
