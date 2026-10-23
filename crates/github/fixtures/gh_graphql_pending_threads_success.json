@@ -1,0 +1,56 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "nodes": [
+            {
+              "id": "PRRT_kwDOVTOJkc6vzB0D",
+              "side": "LEFT",
+              "line": 76,
+              "start_line": 76,
+              "isOutdated": false,
+              "comments": {
+                "nodes": [{
+                  "id": "4364887081",
+                  "node_id": "PRRC_kwDOVTOJkc8AAAABBCrkKQ",
+                  "path": "crates/app/src/main.rs",
+                  "body": "A single comment",
+                  "pullRequestReview": {"id": "PRR_kwDOVTOJkc8AAAABT-NiSw"}
+                }],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yM1QyMjo1NTowNlrPAAAAAQQq5Ck="
+                }
+              }
+            },
+            {
+              "id": "PRRT_kwDOVTOJkc6vzLWU",
+              "side": "LEFT",
+              "line": 78,
+              "start_line": 78,
+              "isOutdated": false,
+              "comments": {
+                "nodes": [{
+                  "id": "4364951833",
+                  "node_id": "PRRC_kwDOVTOJkc8AAAABBCvhGQ",
+                  "path": "crates/app/src/main.rs",
+                  "body": "Test",
+                  "pullRequestReview": {"id": "PRR_kwDOVTOJkc8AAAABT-S5OQ"}
+                }],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yM1QyMzowNzowN1rPAAAAAQQr4Rk="
+                }
+              }
+            }
+          ],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0xMC0yM1QyMzowNzowN1rOr8y1lA=="
+          }
+        }
+      }
+    }
+  }
+}

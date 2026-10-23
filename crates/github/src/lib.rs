@@ -486,10 +486,7 @@ impl std::fmt::Display for ClientError {
                 )
             }
             Self::Invalid(cause) => write!(f, "{cause}"),
-            Self::Failed(cause) => write!(
-                f,
-                "Couldn't reach GitHub: {cause}. Run `gh auth login` if you haven't signed in."
-            ),
+            Self::Failed(cause) => write!(f, "GitHub operation failed: {cause}"),
         }
     }
 }
@@ -523,14 +520,18 @@ pub trait GitHubClient: Send + Sync {
     fn edit_pending_comment(
         &self,
         _loc: &PrLocator,
-        _id: u64,
+        _comment: &PendingComment,
         _body: &str,
     ) -> Result<(), ClientError> {
         Err(ClientError::Failed(
             "pending reviews are not supported by this backend".into(),
         ))
     }
-    fn delete_pending_comment(&self, _loc: &PrLocator, _id: u64) -> Result<(), ClientError> {
+    fn delete_pending_comment(
+        &self,
+        _loc: &PrLocator,
+        _comment: &PendingComment,
+    ) -> Result<(), ClientError> {
         Err(ClientError::Failed(
             "pending reviews are not supported by this backend".into(),
         ))
@@ -652,22 +653,31 @@ pub trait GitHubClient: Send + Sync {
 mod tests {
     use super::*;
 
-    /// The contract every failure message must meet, whatever the backend:
-    /// the app shows it as the fix, so it has to name `gh auth login`.
-    /// [`ClientError::Invalid`] is the one exception by design — nothing
-    /// was asked of GitHub, so its message names the expected input instead.
+    /// Only credential failures should advise signing in again.
     #[test]
-    fn every_github_failure_message_names_the_gh_auth_login_fix() {
+    fn credential_failure_messages_name_the_gh_auth_login_fix() {
         for err in [
             ClientError::NoCredentialSource,
             ClientError::Unauthenticated,
-            ClientError::Failed("solar flares".into()),
         ] {
             let message = err.to_string();
             assert!(
                 message.contains("gh auth login"),
                 "{err:?} doesn't name the fix: {message}"
             );
+        }
+    }
+
+    #[test]
+    fn api_failures_preserve_the_cause_without_misdiagnosing_authentication() {
+        for cause in [
+            "Not Found (HTTP 404)",
+            "network unavailable",
+            "invalid line (HTTP 422)",
+        ] {
+            let message = ClientError::Failed(cause.into()).to_string();
+            assert!(message.contains(cause));
+            assert!(!message.contains("gh auth login"));
         }
     }
 

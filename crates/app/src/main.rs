@@ -2316,6 +2316,7 @@ impl ReviewApp {
                         }
                     }
                 }
+                app.sync_pending_comments(id);
                 cx.notify();
             })
             .ok();
@@ -3289,7 +3290,26 @@ impl ReviewApp {
         } else {
             self.sessions.remove(&item_id);
         }
+        self.sync_pending_comments(item_id);
         cx.notify();
+    }
+
+    /// Keep the diff and tray on the same session snapshot, including cached
+    /// drafts and operations that finish after their composer was closed.
+    fn sync_pending_comments(&mut self, item_id: u64) {
+        let Some(ui) = self.sessions.get(&item_id) else {
+            return;
+        };
+        let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) else {
+            return;
+        };
+        let ItemState::Ready(data) = &mut item.state else {
+            return;
+        };
+        data.comments
+            .get_or_insert_with(CommentIndex::default)
+            .replace_pending(ui.state.pending.as_ref());
+        data.rebuild_rows_anchored();
     }
 
     fn resume_session(&mut self, item_id: u64, cx: &mut Context<Self>) {
@@ -3676,6 +3696,12 @@ impl ReviewApp {
                         data.comments = Some(group_comments(
                             comments.into_iter().map(ReviewComment::from).collect(),
                         ));
+                        if let Some(ui) = app.sessions.get(&item_id) {
+                            data.comments
+                                .as_mut()
+                                .unwrap()
+                                .replace_pending(ui.state.pending.as_ref());
+                        }
                         data.rebuild_rows_anchored();
                     }
                     Err(err) => {
@@ -7828,6 +7854,7 @@ mod tests {
             assert_eq!(review.id, 91);
             let comment = github::PendingComment {
                 id: 12,
+                node_id: "draft_node".into(),
                 path: anchor.path.clone(),
                 side: anchor.side,
                 line: Some(anchor.line),
@@ -7847,7 +7874,7 @@ mod tests {
         fn edit_pending_comment(
             &self,
             _loc: &github::PrLocator,
-            id: u64,
+            comment: &github::PendingComment,
             body: &str,
         ) -> Result<(), github::ClientError> {
             self.pending
@@ -7857,7 +7884,7 @@ mod tests {
                 .unwrap()
                 .comments
                 .iter_mut()
-                .find(|comment| comment.id == id)
+                .find(|draft| draft.id == comment.id)
                 .unwrap()
                 .body = body.into();
             Ok(())
@@ -7866,7 +7893,7 @@ mod tests {
         fn delete_pending_comment(
             &self,
             _loc: &github::PrLocator,
-            id: u64,
+            comment: &github::PendingComment,
         ) -> Result<(), github::ClientError> {
             self.pending
                 .lock()
@@ -7874,7 +7901,7 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .comments
-                .retain(|comment| comment.id != id);
+                .retain(|draft| draft.id != comment.id);
             Ok(())
         }
 
@@ -8403,6 +8430,105 @@ mod tests {
     }
 
     #[gpui::test]
+    fn removed_line_drafts_render_in_both_modes_and_track_resume_edit_delete(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(Vec::new());
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(Vec::new());
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -5,2 +5,2 @@\n-old\n-removed\n+new\n+added\n");
+        data.anchor_hunks = data
+            .diff
+            .files
+            .iter()
+            .map(|file| file.hunks.clone())
+            .collect();
+        data.set_rows(data.row_build());
+        install_item(&app, item, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open_composer(None, "a.rs".into(), CommentSide::Left, 6, 2, window, cx);
+                let composer = this.composer.as_mut().unwrap();
+                composer.pending = true;
+                composer.start_line = Some(5);
+                composer
+                    .input
+                    .update(cx, |state, cx| state.set_value("removed draft", window, cx));
+                this.submit_composer(window, cx);
+                this.close_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| app.update(cx, |this, cx| {
+            let data = this.active_data_mut().unwrap();
+            assert_eq!(data.comments.as_ref().unwrap().counts["a.rs"], (1, 0));
+            for mode in [ViewMode::Unified, ViewMode::Split] {
+                data.mode = mode;
+                data.rebuild_rows_anchored();
+                assert!(data.rows.iter().any(|row| matches!(row,
+                    Row::CommentBody { line, half } if line.as_ref() == "removed draft"
+                        && *half == if mode == ViewMode::Split { Some(CommentSide::Left) } else { None }
+                )));
+                assert!(data.rows.iter().any(|row| matches!(row,
+                    Row::CommentHeader { when, .. } if when.as_ref() == "draft")));
+                assert!(!data.rows.iter().any(|row| matches!(row, Row::CommentActions { .. })));
+            }
+            // A comment-only refresh must not remove or duplicate the draft.
+            this.refetch_comments(0, loop_loc(), cx);
+            this.resume_session(0, cx);
+        }));
+        cx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                let data = this.active_data().unwrap();
+                assert_eq!(data.comments.as_ref().unwrap().counts["a.rs"], (1, 0));
+                this.edit_pending(12, window, cx);
+                this.composer
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |state, cx| {
+                        state.set_value("edited removed draft", window, cx)
+                    });
+                this.submit_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                assert!(this
+                    .active_data()
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .any(|row| matches!(row,
+                Row::CommentBody { line, .. } if line.as_ref() == "edited removed draft")));
+                this.run_session(
+                    0,
+                    SessionCommand::Delete { id: 12 },
+                    SessionCompletion::None,
+                    window,
+                    cx,
+                );
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            app.update(cx, |this, _| {
+                let data = this.active_data().unwrap();
+                assert!(!data.rows.iter().any(rows::is_comment_row));
+                assert!(!data.comments.as_ref().unwrap().counts.contains_key("a.rs"));
+                assert_eq!(this.sessions[&0].state.count(), 0);
+            })
+        });
+        assert!(fake.posts().is_empty());
+    }
+
+    #[gpui::test]
     fn range_drafts_resume_edit_delete_and_submit_without_posting_single_comments(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -8413,6 +8539,7 @@ mod tests {
             body: "from web".into(),
             comments: vec![github::PendingComment {
                 id: 13,
+                node_id: "old_draft_node".into(),
                 path: "old.rs".into(),
                 side: CommentSide::Left,
                 line: None,

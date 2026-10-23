@@ -1,7 +1,7 @@
 //! The diff pane's display rows: the row/cell model, diff-to-rows building, and row rendering.
 
 use crate::selection::SelSide;
-use crate::threads::{wrap_body, CommentIndex, CommentSide, FileAnchors};
+use crate::threads::{wrap_body, CommentIndex, CommentSide, CommentTime, FileAnchors};
 use crate::tree::status_style;
 use crate::{row_height, theme, ReviewApp, SPLIT_DIVIDER};
 use diff_core::{DiffRow, FileStatus, Hunk, PrDiff};
@@ -211,6 +211,11 @@ fn push_thread_rows(
                     half,
                 });
             }
+        }
+        // Pending threads are edited/deleted in the review tray, not replied
+        // to through the immediate-comment endpoint. Local drafts still reply.
+        if thread.root.time == CommentTime::Pending {
+            continue;
         }
         rows.push(Row::CommentActions {
             root_id: thread.root.id,

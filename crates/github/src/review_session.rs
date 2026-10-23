@@ -50,6 +50,10 @@ impl CommentAnchor {
 pub struct PendingComment {
     #[serde(deserialize_with = "deserialize_id")]
     pub id: u64,
+    /// Opaque GraphQL identity, required for mutations on unpublished drafts.
+    /// Older local mirrors did not store it; reconciliation fills it in.
+    #[serde(default)]
+    pub node_id: String,
     pub path: String,
     #[serde(default, deserialize_with = "deserialize_side")]
     pub side: DiffSide,
@@ -183,12 +187,12 @@ impl ReviewSession {
             }
             Command::Edit { id, body } => {
                 let comment = self.comment_mut(id)?;
-                client.edit_pending_comment(loc, id, body.trim())?;
+                client.edit_pending_comment(loc, comment, body.trim())?;
                 comment.body = body.trim().into();
             }
             Command::Delete { id } => {
-                self.comment_mut(id)?;
-                client.delete_pending_comment(loc, id)?;
+                let comment = self.comment_mut(id)?;
+                client.delete_pending_comment(loc, comment)?;
                 self.pending
                     .as_mut()
                     .unwrap()

@@ -13,20 +13,21 @@ pub(crate) use github::DiffSide as CommentSide;
 pub(crate) enum CommentTime {
     Posted(String),
     Draft,
+    Pending,
 }
 
 impl CommentTime {
     fn sort_key(&self) -> &str {
         match self {
             Self::Posted(raw) => raw,
-            Self::Draft => "draft",
+            Self::Draft | Self::Pending => "draft",
         }
     }
 
     pub(crate) fn short_age(&self, now: i64) -> String {
         match self {
             Self::Posted(raw) => short_age(raw, now),
-            Self::Draft => "draft".to_string(),
+            Self::Draft | Self::Pending => "draft".to_string(),
         }
     }
 }
@@ -85,6 +86,48 @@ pub(crate) struct CommentIndex {
     pub(crate) threads: HashMap<String, FileAnchors>,
     /// path → (anchored comment count, outdated comment count).
     pub(crate) counts: HashMap<String, (usize, usize)>,
+    /// Retained so replacing pending drafts can rebuild accurate counts
+    /// without losing genuinely outdated published threads.
+    unanchored: Vec<CommentThread>,
+}
+
+impl CommentIndex {
+    /// Replace only the pending-review layer. GitHub may also include these
+    /// ids in its comments response; the session's copy wins without duplicates.
+    pub(crate) fn replace_pending(&mut self, pending: Option<&github::PendingReview>) {
+        let old = std::mem::take(self);
+        let mut comments: Vec<_> = old
+            .threads
+            .into_values()
+            .flat_map(|anchors| anchors.into_values().flatten())
+            .chain(old.unanchored)
+            .flat_map(|thread| std::iter::once(thread.root).chain(thread.replies))
+            .filter(|comment| {
+                comment.time != CommentTime::Pending
+                    && !pending.is_some_and(|review| {
+                        review.comments.iter().any(|draft| draft.id == comment.id)
+                    })
+            })
+            .collect();
+        if let Some(review) = pending {
+            comments.extend(review.comments.iter().map(|comment| {
+                let position =
+                    crate::comment_anchor::display_line(comment.line, comment.start_line);
+                ReviewComment {
+                    id: comment.id,
+                    path: comment.path.clone(),
+                    line: position.map(|(_, line)| line),
+                    side: comment.side,
+                    start_line: position.and_then(|(start, _)| start),
+                    body: comment.body.clone(),
+                    author: "you".into(),
+                    time: CommentTime::Pending,
+                    in_reply_to_id: None,
+                }
+            }));
+        }
+        *self = group_comments(comments);
+    }
 }
 
 /// Assemble global-order threads for both export and anchored row indexing.
@@ -131,6 +174,7 @@ pub(crate) fn index_threads(threads: Vec<CommentThread>) -> CommentIndex {
         let counts = index.counts.entry(thread.root.path.clone()).or_default();
         let Some(line) = thread.root.line else {
             counts.1 += size;
+            index.unanchored.push(thread);
             continue;
         };
         counts.0 += size;
@@ -351,6 +395,86 @@ mod tests {
             vec![2, 3]
         );
         assert_eq!(CommentTime::Draft.sort_key(), "draft");
+    }
+
+    #[test]
+    fn pending_layer_replaces_duplicates_edits_and_deletes_without_losing_outdated_counts() {
+        let mut index = group_comments(vec![
+            rc(
+                1,
+                "a.rs",
+                Some("RIGHT"),
+                Some(7),
+                "published",
+                "alice",
+                "a",
+                None,
+            ),
+            rc(
+                2,
+                "a.rs",
+                Some("LEFT"),
+                None,
+                "outdated",
+                "alice",
+                "b",
+                None,
+            ),
+            rc(
+                12,
+                "a.rs",
+                Some("LEFT"),
+                Some(7),
+                "stale copy",
+                "you",
+                "c",
+                None,
+            ),
+        ]);
+        let mut review = github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: String::new(),
+            comments: vec![
+                github::PendingComment {
+                    id: 12,
+                    node_id: "draft_node".into(),
+                    path: "a.rs".into(),
+                    side: CommentSide::Left,
+                    line: Some(7),
+                    start_line: Some(5),
+                    body: "draft".into(),
+                },
+                github::PendingComment {
+                    id: 13,
+                    node_id: "old_draft_node".into(),
+                    path: "a.rs".into(),
+                    side: CommentSide::Left,
+                    line: None,
+                    start_line: None,
+                    body: "old draft".into(),
+                },
+            ],
+        };
+        for _ in 0..2 {
+            index.replace_pending(Some(&review));
+            assert_eq!(index.counts["a.rs"], (2, 2));
+            let threads = &index.threads["a.rs"][&(CommentSide::Left, 7)];
+            assert_eq!(threads.len(), 1);
+            assert_eq!(threads[0].root.start_line, Some(5));
+            assert_eq!(threads[0].root.time, CommentTime::Pending);
+        }
+        review.comments[0].body = "edited".into();
+        review.comments.pop();
+        index.replace_pending(Some(&review));
+        assert_eq!(index.counts["a.rs"], (2, 1));
+        assert_eq!(
+            index.threads["a.rs"][&(CommentSide::Left, 7)][0].root.body,
+            "edited"
+        );
+        index.replace_pending(None);
+        assert_eq!(index.counts["a.rs"], (1, 1));
+        assert!(!index.threads["a.rs"].contains_key(&(CommentSide::Left, 7)));
     }
 
     #[test]
