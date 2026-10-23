@@ -106,12 +106,6 @@ const UNIFIED_GUTTER: f32 = 44. + 44. + 28.;
 const SPLIT_GUTTER: f32 = 44. + 28.;
 const SPLIT_DIVIDER: f32 = 6.0;
 
-/// How often the queue refreshes itself while the window is frontmost.
-///
-/// GitHub's search costs a couple of GraphQL points, so a poll every few
-/// minutes is cheap; the reviewer never has to think about it. The poll
-/// stops when the window is backgrounded and the focus refresh covers the
-/// moment the user comes back.
 const BACKGROUND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// The settings key the queue's search (its chips and its sort) is
