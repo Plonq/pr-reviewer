@@ -243,6 +243,15 @@ pub fn selection_bg() -> Rgba {
     }
 }
 
+/// A quiet click anchor in the line-number gutter, never over the code.
+pub fn active_line_gutter_bg() -> Rgba {
+    if is_light() {
+        rgba(0x1e66f514)
+    } else {
+        rgba(0x89b4fa14)
+    }
+}
+
 /// Review comment card: a blue tint that lifts the thread off the diff without
 /// hiding it, with a stronger wash behind each comment's author line.
 pub fn comment_bg() -> Rgba {

@@ -5669,16 +5669,18 @@ impl ReviewApp {
                             // A plain click also moves the keyboard cursor:
                             // `C` and `n`/`p` follow the line the reviewer
                             // last touched, mouse or keyboard alike.
-                            if let Some((side, hit)) = this.drag_anchor {
-                                if let Some(data) = this.active_data_mut() {
+                            let hit = this.drag_anchor;
+                            if let Some(data) = this.active_data_mut() {
+                                let previous = (data.cursor, data.cursor_side);
+                                if let Some((side, hit)) = hit {
                                     data.cursor = hit.row;
                                     data.cursor_side = Some(side);
                                 }
-                            }
-                            // A plain click clears; a selection only appears
-                            // once the drag covers ≥ 1 char.
-                            if let Some(data) = this.active_data_mut() {
-                                if data.selection.take().is_some() {
+                                // Repaint even without a text selection: the
+                                // gutter cue follows a plain click immediately.
+                                let cleared_selection = data.selection.take().is_some();
+                                if cleared_selection || previous != (data.cursor, data.cursor_side)
+                                {
                                     cx.notify();
                                 }
                             }
@@ -5742,7 +5744,10 @@ impl ReviewApp {
                                                     .filter(|range| !range.is_empty())
                                                     .map(|range| (sel.side, range))
                                             });
-                                            render_row(ix, row, row_sel, &entity)
+                                            let active = (ix == data.cursor)
+                                                .then_some(data.cursor_side)
+                                                .flatten();
+                                            render_row(ix, row, row_sel, active, &entity)
                                         })
                                         .collect()
                                 }
@@ -8723,6 +8728,81 @@ mod tests {
                 assert!(this.composer.as_ref().unwrap().position.is_some());
             })
         });
+    }
+
+    #[gpui::test]
+    fn plain_line_clicks_repaint_the_gutter_without_selecting_code(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(Vec::new());
+        let (window, app) = queue_window(cx, fake);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(Vec::new());
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n");
+        data.set_rows(data.row_build());
+        install_item(&app, item, cx);
+        vcx.run_until_parked();
+        let notifications = Rc::new(std::cell::Cell::new(0usize));
+        let _subscription = vcx.cx.update(|cx| {
+            let notifications = notifications.clone();
+            cx.observe(&app, move |_, _| notifications.set(notifications.get() + 1))
+        });
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            vcx.cx.update(|cx| {
+                app.update(cx, |this, cx| {
+                    let data = this.active_data_mut().unwrap();
+                    data.mode = mode;
+                    data.cursor = 1;
+                    data.cursor_side = None;
+                    data.set_rows(data.row_build());
+                    cx.notify();
+                })
+            });
+            vcx.run_until_parked();
+            let sides = match mode {
+                ViewMode::Unified => vec![SelSide::Unified],
+                ViewMode::Split => vec![SelSide::Left, SelSide::Right],
+            };
+            for row in [1, 3] {
+                for &side in &sides {
+                    let at = vcx.cx.update(|cx| {
+                        let data = app.read(cx).active_data().unwrap();
+                        let scroll = data.scroll.0.borrow();
+                        let bounds = scroll.base_handle.bounds();
+                        let x = if side == SelSide::Right {
+                            (bounds.size.width - px(SPLIT_DIVIDER)) / 2. + px(SPLIT_DIVIDER + 22.)
+                        } else {
+                            px(22.)
+                        };
+                        point(
+                            bounds.left() + x,
+                            bounds.top()
+                                + scroll.base_handle.offset().y
+                                + px((row as f32 + 0.5) * row_height()),
+                        )
+                    });
+                    let before = notifications.get();
+                    vcx.simulate_mouse_down(at, MouseButton::Left, gpui::Modifiers::default());
+                    vcx.simulate_mouse_up(at, MouseButton::Left, gpui::Modifiers::default());
+                    vcx.run_until_parked();
+                    assert!(
+                        notifications.get() > before,
+                        "a plain click must repaint, even without a selection"
+                    );
+                    vcx.cx.update(|cx| {
+                        let app = app.read(cx);
+                        let data = app.active_data().unwrap();
+                        assert_eq!((data.cursor, data.cursor_side), (row, Some(side)));
+                        assert!(
+                            data.selection.is_none(),
+                            "the cue must not select or recolour code"
+                        );
+                        assert!(app.composer.is_none());
+                    });
+                }
+            }
+        }
     }
 
     #[gpui::test]

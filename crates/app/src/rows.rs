@@ -994,15 +994,40 @@ fn comment_row(
     }
 }
 
+/// Fixed-size gutter: the click cue is painted inside the existing space so
+/// neither code alignment nor diff/syntax backgrounds change when it moves.
+fn line_gutter(width: f32, active: bool) -> gpui::Div {
+    div()
+        .relative()
+        .w(px(width))
+        .h_full()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .when(active, |gutter| {
+            gutter.bg(theme::active_line_gutter_bg()).child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.))
+                    .bg(Hsla::from(theme::blue()).opacity(0.55)),
+            )
+        })
+}
+
 /// `selection` is this row's selected byte range (side + non-empty range),
 /// computed by the caller via `row_selection_range`; its side always matches
 /// the row shape (Unified for Line rows, Left/Right for SplitLine rows).
 /// `entity` is used by CommentActions rows (click opens the reply
 /// composer); `ix` is the display-row index.
+/// `active` marks only the clicked side's line-number gutter.
 pub(crate) fn render_row(
     ix: usize,
     row: &Row,
     selection: Option<(SelSide, Range<usize>)>,
+    active: Option<SelSide>,
     entity: &gpui::Entity<ReviewApp>,
 ) -> gpui::AnyElement {
     let row_height = px(row_height());
@@ -1196,25 +1221,28 @@ pub(crate) fn render_row(
             if let Some(bg) = row_bg {
                 line = line.bg(bg);
             }
-            line.child(number(*old_no))
-                .child(number(*new_no))
-                .child(
-                    div()
-                        .w(px(28.))
-                        .flex_shrink_0()
-                        .flex()
-                        .justify_center()
-                        .text_color(marker_color)
-                        .child(SharedString::from(marker)),
-                )
-                .child(div().whitespace_nowrap().child(line_content(
-                    text,
-                    syntax,
-                    intra,
-                    word_bg,
-                    selection.map(|(_, range)| range),
-                )))
-                .into_any_element()
+            line.child(
+                line_gutter(88., active == Some(SelSide::Unified))
+                    .child(number(*old_no))
+                    .child(number(*new_no)),
+            )
+            .child(
+                div()
+                    .w(px(28.))
+                    .flex_shrink_0()
+                    .flex()
+                    .justify_center()
+                    .text_color(marker_color)
+                    .child(SharedString::from(marker)),
+            )
+            .child(div().whitespace_nowrap().child(line_content(
+                text,
+                syntax,
+                intra,
+                word_bg,
+                selection.map(|(_, range)| range),
+            )))
+            .into_any_element()
         }
         Row::SplitLine { left, right } => {
             let (left_sel, right_sel) = match selection {
@@ -1222,7 +1250,7 @@ pub(crate) fn render_row(
                 Some((SelSide::Right, range)) => (None, Some(range)),
                 _ => (None, None),
             };
-            let cell = |cell: &Option<Cell>, sel: Option<Range<usize>>| {
+            let cell = |cell: &Option<Cell>, sel: Option<Range<usize>>, active: bool| {
                 let base = div()
                     .flex_1()
                     .min_w_0()
@@ -1239,11 +1267,8 @@ pub(crate) fn render_row(
                     side = side.bg(bg);
                 }
                 side.child(
-                    div()
-                        .w(px(44.))
-                        .flex_shrink_0()
+                    line_gutter(44., active)
                         .text_color(theme::overlay0())
-                        .flex()
                         .justify_end()
                         .child(SharedString::from(cell.no.to_string())),
                 )
@@ -1271,7 +1296,7 @@ pub(crate) fn render_row(
                 .h(row_height)
                 .w_full()
                 .flex()
-                .child(cell(left, left_sel))
+                .child(cell(left, left_sel, active == Some(SelSide::Left)))
                 .child(
                     div()
                         .w(px(6.))
@@ -1282,7 +1307,7 @@ pub(crate) fn render_row(
                         .border_r_1()
                         .border_color(theme::surface0()),
                 )
-                .child(cell(right, right_sel))
+                .child(cell(right, right_sel, active == Some(SelSide::Right)))
                 .into_any_element()
         }
     }
@@ -1300,6 +1325,22 @@ mod tests {
     use crate::threads::{group_comments, COMMENT_WRAP_CHARS};
     use diff_core::diff_texts;
     use syntax::Token;
+
+    #[test]
+    fn active_gutter_does_not_change_line_geometry() {
+        for width in [44., 88.] {
+            let mut plain = line_gutter(width, false);
+            let mut active = line_gutter(width, true);
+            let plain = plain.style();
+            let active = active.style();
+            assert_eq!(plain.size, active.size);
+            assert_eq!(plain.padding, active.padding);
+            assert_eq!(plain.border_widths, active.border_widths);
+            assert_eq!(plain.flex_shrink, active.flex_shrink);
+            assert!(plain.background.is_none());
+            assert!(active.background.is_some());
+        }
+    }
 
     #[test]
     fn widest_row_ix_points_at_the_longest_nowrap_row() {
