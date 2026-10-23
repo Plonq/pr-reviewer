@@ -2,7 +2,7 @@
 //! and the blocking fetch that loads one.
 
 use crate::local_store;
-use crate::rows::{build_rows, Row, ViewMode};
+use crate::rows::{build_rows, BuiltRows, RowOptions, RowsView, ViewMode};
 use crate::threads::{group_comments, CommentIndex, COMMENT_WRAP_CHARS};
 use anyhow::anyhow;
 use diff_core::PrDiff;
@@ -47,9 +47,7 @@ pub(crate) enum LoadedMeta {
 pub(crate) struct Loaded {
     pub(crate) meta: LoadedMeta,
     pub(crate) diff: PrDiff,
-    pub(crate) rows: Vec<Row>,
-    pub(crate) file_rows: Vec<usize>,
-    pub(crate) hunk_rows: Vec<usize>,
+    pub(crate) built_rows: BuiltRows,
     pub(crate) mode: ViewMode,
     /// The file the rows were built for (file mode).
     pub(crate) file_ix: usize,
@@ -106,21 +104,21 @@ pub(crate) fn fetch_item(
         }
     };
     let diff = diff_core::parse_patch(&patch);
-    let (rows, file_rows, hunk_rows) = build_rows(
-        &diff,
-        mode,
-        &HashMap::new(),
-        comments.as_ref(),
-        true,
-        COMMENT_WRAP_CHARS,
-        file_ix,
-    );
+    let built_rows = build_rows(RowsView {
+        diff: &diff,
+        upgrades: &HashMap::new(),
+        comments: comments.as_ref(),
+        options: RowOptions {
+            mode,
+            file_ix,
+            comments_visible: true,
+            comment_wrap: COMMENT_WRAP_CHARS,
+        },
+    });
     Ok(Loaded {
         meta,
         diff,
-        rows,
-        file_rows,
-        hunk_rows,
+        built_rows,
         mode,
         file_ix,
         comments,

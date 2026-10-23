@@ -45,8 +45,8 @@ use minimap::{
 use queue::{filter_base_refs, filter_prs, label_chip_colors, queue_chips, queue_row};
 use review_target::{dir_name, fetch_item, sources_match, Loaded, LoadedMeta, Source};
 use rows::{
-    build_rows, is_comment_row, now_unix, nth_noncomment_row, render_row, widest_row_ix,
-    FileUpgrade, LineKind, Row, ViewMode,
+    build_rows, is_comment_row, now_unix, nth_noncomment_row, render_row, widest_row_ix, BuiltRows,
+    FileUpgrade, LineKind, Row, RowOptions, RowsView, ViewMode,
 };
 use selection::{row_selection_range, selection_text, RowCol, SelSide, Selection};
 use std::borrow::Cow;
@@ -554,7 +554,7 @@ impl ItemData {
         diff: PrDiff,
         mode: ViewMode,
         file_ix: usize,
-        rows: (Vec<Row>, Vec<usize>, Vec<usize>),
+        built_rows: BuiltRows,
         comments: Option<CommentIndex>,
         local_review: Option<LocalReview>,
     ) -> Self {
@@ -589,7 +589,7 @@ impl ItemData {
         };
         data.additions = data.diff.files.iter().fold(0, |a, f| a + f.additions);
         data.deletions = data.diff.files.iter().fold(0, |d, f| d + f.deletions);
-        data.set_rows(rows);
+        data.set_rows(built_rows);
         data.rebuild_tree();
         data.reveal_hunk(None);
         data
@@ -597,7 +597,12 @@ impl ItemData {
 
     /// Install freshly built display rows, keeping the minimap model in sync
     /// (every row rebuild goes through here).
-    fn set_rows(&mut self, (rows, file_rows, hunk_rows): (Vec<Row>, Vec<usize>, Vec<usize>)) {
+    fn set_rows(&mut self, built_rows: BuiltRows) {
+        let BuiltRows {
+            rows,
+            file_rows,
+            hunk_rows,
+        } = built_rows;
         self.minimap = minimap_rows(&rows);
         self.minimap_cache.replace(None);
         self.wide_row = widest_row_ix(&rows);
@@ -607,16 +612,18 @@ impl ItemData {
     }
 
     /// Rebuild the display rows for the displayed file and mode.
-    fn row_build(&self) -> (Vec<Row>, Vec<usize>, Vec<usize>) {
-        build_rows(
-            &self.diff,
-            self.mode,
-            &self.upgrades,
-            self.comments.as_ref(),
-            self.comments_visible,
-            self.comment_wrap,
-            self.file_ix,
-        )
+    fn row_build(&self) -> BuiltRows {
+        build_rows(RowsView {
+            diff: &self.diff,
+            upgrades: &self.upgrades,
+            comments: self.comments.as_ref(),
+            options: RowOptions {
+                mode: self.mode,
+                file_ix: self.file_ix,
+                comments_visible: self.comments_visible,
+                comment_wrap: self.comment_wrap,
+            },
+        })
     }
 
     /// Put `hunk_ix`-th hunk (the first when None) on screen: cursor + scroll
@@ -831,21 +838,23 @@ impl ReviewItem {
             review_decision: String::new(),
         };
         let diff = diff_core::PrDiff::default();
-        let (rows, file_rows, hunk_rows) = build_rows(
-            &diff,
-            ViewMode::Split,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let built_rows = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         let data = Box::new(ItemData::new(
             Some(meta),
             diff,
             ViewMode::Split,
             0,
-            (rows, file_rows, hunk_rows),
+            built_rows,
             None,
             None,
         ));
@@ -879,9 +888,7 @@ impl ReviewItem {
         let Loaded {
             meta,
             diff,
-            mut rows,
-            mut file_rows,
-            mut hunk_rows,
+            mut built_rows,
             mode,
             file_ix,
             comments,
@@ -919,21 +926,23 @@ impl ReviewItem {
                     || !data.comments_visible
                     || file_ix != data.file_ix
                 {
-                    (rows, file_rows, hunk_rows) = build_rows(
-                        &diff,
-                        data.mode,
-                        &data.upgrades,
-                        data.comments.as_ref(),
-                        data.comments_visible,
-                        data.comment_wrap,
-                        data.file_ix,
-                    );
+                    built_rows = build_rows(RowsView {
+                        diff: &diff,
+                        upgrades: &data.upgrades,
+                        comments: data.comments.as_ref(),
+                        options: RowOptions {
+                            mode: data.mode,
+                            file_ix: data.file_ix,
+                            comments_visible: data.comments_visible,
+                            comment_wrap: data.comment_wrap,
+                        },
+                    });
                 }
                 if pr_meta.is_some() {
                     data.pr_meta = pr_meta;
                 }
                 data.diff = diff;
-                data.set_rows((rows, file_rows, hunk_rows));
+                data.set_rows(built_rows);
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.additions = additions;
                 data.deletions = deletions;
@@ -952,7 +961,7 @@ impl ReviewItem {
                     diff,
                     mode,
                     file_ix,
-                    (rows, file_rows, hunk_rows),
+                    built_rows,
                     comments,
                     local_review,
                 ));
@@ -2387,15 +2396,7 @@ impl ReviewApp {
                 // Comment anchors live in the same absolute line-number space
                 // the re-diff produces, so threads re-insert at the re-diffed
                 // rows without translation.
-                data.set_rows(build_rows(
-                    &data.diff,
-                    data.mode,
-                    &data.upgrades,
-                    data.comments.as_ref(),
-                    data.comments_visible,
-                    data.comment_wrap,
-                    data.file_ix,
-                ));
+                data.set_rows(data.row_build());
                 data.selection = None;
                 match hunk_ix {
                     Some(hunk_ix) => {
@@ -5610,21 +5611,23 @@ mod tests {
     /// ItemData exactly as a fresh load builds it: file mode on the first
     /// file (unified, no comments), revealed at its first change.
     fn file_mode_data(diff: PrDiff) -> Box<ItemData> {
-        let rows = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let built_rows = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         Box::new(ItemData::new(
             None,
             diff,
             ViewMode::Unified,
             0,
-            rows,
+            built_rows,
             None,
             None,
         ))
@@ -6939,15 +6942,17 @@ mod tests {
     #[test]
     fn comment_anchor_resolves_sides_and_skips_non_lines() {
         let index = sample_comments();
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // Headers and comment rows anchor nothing.
         assert_eq!(comment_anchor(&rows, 0, SelSide::Unified), None);
         assert_eq!(comment_anchor(&rows, 4, SelSide::Unified), None);
@@ -6965,15 +6970,19 @@ mod tests {
             Some((CommentSide::Right, 2))
         );
         // Split: the half under the pointer decides; absent cells refuse.
-        let (rows, _, hunk_rows) = build_rows(
-            &sample_diff(),
-            ViewMode::Split,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows {
+            rows, hunk_rows, ..
+        } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         assert_eq!(
             comment_anchor(&rows, 2, SelSide::Left),
             Some((CommentSide::Left, 2))
@@ -7094,15 +7103,17 @@ mod tests {
     fn loop_pr_item(comments: Vec<github::ReviewComment>) -> ReviewItem {
         let diff = two_file_diff();
         let index = group_comments(comments);
-        let rows = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let built_rows = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         ReviewItem {
             id: 0,
             source: Source::Pr(loop_loc()),
@@ -7111,7 +7122,7 @@ mod tests {
                 diff,
                 ViewMode::Unified,
                 0,
-                rows,
+                built_rows,
                 Some(index),
                 None,
             ))),
@@ -7330,15 +7341,19 @@ mod tests {
         // Split rows: a context pair anchors on the new side, an old1|new1
         // pair too (its right cell exists), and a removal-only row on the
         // left.
-        let (rows, _, hunk_rows) = build_rows(
-            &sample_diff(),
-            ViewMode::Split,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows {
+            rows, hunk_rows, ..
+        } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         assert_eq!(cursor_anchor(&rows, 0), None, "a file header never anchors");
         assert_eq!(cursor_anchor(&rows, 1), Some((CommentSide::Right, 1)));
         assert_eq!(cursor_anchor(&rows, 2), Some((CommentSide::Right, 2)));
@@ -7347,15 +7362,17 @@ mod tests {
 
         // Comment rows never anchor, whichever half they sit in.
         let index = sample_comments();
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Split,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         assert_eq!(
             cursor_anchor(&rows, 3),
             None,
@@ -7371,15 +7388,17 @@ mod tests {
 
         // Unified rows: the side is irrelevant, the kind decides — removed
         // lines anchor LEFT, everything else RIGHT.
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         assert_eq!(cursor_anchor(&rows, 2), Some((CommentSide::Left, 2)));
         assert_eq!(cursor_anchor(&rows, 7), Some((CommentSide::Right, 2)));
     }

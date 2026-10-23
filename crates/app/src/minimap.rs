@@ -255,22 +255,24 @@ pub(crate) fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rows::{build_rows, ViewMode};
+    use crate::rows::{build_rows, BuiltRows, RowOptions, RowsView, ViewMode};
     use crate::test_util::{mrow, sample_diff};
     use crate::threads::COMMENT_WRAP_CHARS;
     use std::collections::HashMap;
 
     #[test]
     fn minimap_rows_unified_kinds_and_fracs() {
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
         // The file header maps to a Header tick; the hunk's first row
@@ -284,15 +286,17 @@ mod tests {
 
     #[test]
     fn minimap_rows_split_pairs() {
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Split,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
         // Context pair: both halves, no change flags.

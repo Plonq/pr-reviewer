@@ -409,25 +409,51 @@ fn push_gap_rows(
     }
 }
 
+/// Borrowed source data and presentation options for one row build.
+pub(crate) struct RowsView<'a> {
+    pub(crate) diff: &'a PrDiff,
+    pub(crate) upgrades: &'a HashMap<usize, FileUpgrade>,
+    pub(crate) comments: Option<&'a CommentIndex>,
+    pub(crate) options: RowOptions,
+}
+
+pub(crate) struct RowOptions {
+    pub(crate) mode: ViewMode,
+    pub(crate) file_ix: usize,
+    pub(crate) comments_visible: bool,
+    pub(crate) comment_wrap: usize,
+}
+
+/// Display rows and navigation offsets, installed together by `ItemData::set_rows`.
+pub(crate) struct BuiltRows {
+    pub(crate) rows: Vec<Row>,
+    pub(crate) file_rows: Vec<usize>,
+    pub(crate) hunk_rows: Vec<usize>,
+}
+
 /// Flatten the diff into display rows plus the row indices of file headers and
 /// hunk starts. Split mode pairs removed/added runs positionally into
 /// two-cell rows; unequal runs leave one-sided rows. Files present in
 /// `upgrades` use whole-file syntax spans, with the gaps between hunks
 /// filled in as plain context — the whole file renders, with no `@@`
 /// hunk-marker rows. Review threads render beneath the line they anchor to
-/// when `show_comments` is set; file headers always carry the comment counts.
+/// when `comments_visible` is set; file headers always carry the comment counts.
 ///
-/// `focus` names the one file the build renders (file mode is the only
-/// presentation).
-pub(crate) fn build_rows(
-    diff: &PrDiff,
-    mode: ViewMode,
-    upgrades: &HashMap<usize, FileUpgrade>,
-    comments: Option<&CommentIndex>,
-    show_comments: bool,
-    wrap: usize,
-    focus: usize,
-) -> (Vec<Row>, Vec<usize>, Vec<usize>) {
+/// `RowsView::options.file_ix` names the one file the build renders (file
+/// mode is the only presentation).
+pub(crate) fn build_rows(view: RowsView<'_>) -> BuiltRows {
+    let RowsView {
+        diff,
+        upgrades,
+        comments,
+        options:
+            RowOptions {
+                mode,
+                file_ix: focus,
+                comments_visible: show_comments,
+                comment_wrap: wrap,
+            },
+    } = view;
     let mut rows = Vec::new();
     let mut file_rows = Vec::new();
     let mut hunk_rows = Vec::new();
@@ -726,7 +752,11 @@ pub(crate) fn build_rows(
         }
     }
 
-    (rows, file_rows, hunk_rows)
+    BuiltRows {
+        rows,
+        file_rows,
+        hunk_rows,
+    }
 }
 
 /// Per-kind row tint, word-highlight tint, gutter marker, and marker color.
@@ -1265,16 +1295,62 @@ mod tests {
     }
 
     #[test]
+    fn build_rows_empty_diff_has_no_rows_or_offsets() {
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let built = build_rows(RowsView {
+                diff: &PrDiff::default(),
+                upgrades: &HashMap::new(),
+                comments: None,
+                options: RowOptions {
+                    mode,
+                    file_ix: 0,
+                    comments_visible: true,
+                    comment_wrap: COMMENT_WRAP_CHARS,
+                },
+            });
+            assert!(built.rows.is_empty());
+            assert!(built.file_rows.is_empty());
+            assert!(built.hunk_rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn build_rows_out_of_range_file_has_no_rows_or_offsets() {
+        let diff = two_file_diff();
+        let comments = sample_comments();
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            for file_ix in [diff.files.len(), usize::MAX] {
+                let built = build_rows(RowsView {
+                    diff: &diff,
+                    upgrades: &HashMap::new(),
+                    comments: Some(&comments),
+                    options: RowOptions {
+                        mode,
+                        file_ix,
+                        comments_visible: true,
+                        comment_wrap: COMMENT_WRAP_CHARS,
+                    },
+                });
+                assert!(built.rows.is_empty());
+                assert!(built.file_rows.is_empty());
+                assert!(built.hunk_rows.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn split_context_fills_both_cells() {
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Split,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // rows[0] = FileHeader, rows[1] = first context (no `@@` row).
         match &rows[1] {
             Row::SplitLine { left, right } => {
@@ -1287,15 +1363,17 @@ mod tests {
 
     #[test]
     fn split_pairs_equal_runs_positionally() {
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Split,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         match &rows[2] {
             Row::SplitLine { left, right } => {
                 assert_eq!(cell(left), (2, LineKind::Removed, "old1", &[0..3][..]));
@@ -1322,15 +1400,19 @@ mod tests {
 
     #[test]
     fn split_unequal_and_lone_runs_are_one_sided() {
-        let (rows, _, hunk_rows) = build_rows(
-            &sample_diff(),
-            ViewMode::Split,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows {
+            rows, hunk_rows, ..
+        } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         let h2 = hunk_rows[1];
         // h2 itself pairs r1 with a1.
         match &rows[h2] {
@@ -1382,8 +1464,19 @@ mod tests {
     fn upgraded_file_renders_whole_with_hunks_inline() {
         let (diff, upgrades) = upgraded_diff();
         for mode in [ViewMode::Unified, ViewMode::Split] {
-            let (rows, _, hunk_rows) =
-                build_rows(&diff, mode, &upgrades, None, true, COMMENT_WRAP_CHARS, 0);
+            let BuiltRows {
+                rows, hunk_rows, ..
+            } = build_rows(RowsView {
+                diff: &diff,
+                upgrades: &upgrades,
+                comments: None,
+                options: RowOptions {
+                    mode,
+                    file_ix: 0,
+                    comments_visible: true,
+                    comment_wrap: COMMENT_WRAP_CHARS,
+                },
+            });
             // FileHeader, 6 leading context rows, the hunk (8 rows unified:
             // 3 context, 1 removed, 1 added, 3 context; 7 split: removed and
             // added pair up), 7 trailing context rows — the whole 20-line
@@ -1411,15 +1504,19 @@ mod tests {
             }
         }
         // Un-upgraded build of the same diff paints just the hunk.
-        let (rows, _, hunk_rows) = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows {
+            rows, hunk_rows, ..
+        } = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         assert_eq!(hunk_rows, vec![1]);
         assert!(matches!(rows[1], Row::Line { .. }));
         assert_eq!(
@@ -1434,15 +1531,19 @@ mod tests {
     fn gap_context_rows_carry_correct_numbers() {
         let (diff, upgrades) = upgraded_diff();
 
-        let (rows, _, hunk_rows) = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &upgrades,
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows {
+            rows, hunk_rows, ..
+        } = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &upgrades,
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // The leading gap renders as 6 context rows before the hunk.
         assert_eq!(hunk_rows, vec![7]); // FileHeader + 6 context rows
         for (j, row) in rows[1..7].iter().enumerate() {
@@ -1463,15 +1564,17 @@ mod tests {
             }
         }
         // Split mode: same gap as two-cell context rows.
-        let (rows, _, _) = build_rows(
-            &diff,
-            ViewMode::Split,
-            &upgrades,
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &upgrades,
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         match &rows[1] {
             Row::SplitLine { left, right } => {
                 let (l, r) = (left.as_ref().unwrap(), right.as_ref().unwrap());
@@ -1484,15 +1587,17 @@ mod tests {
         }
 
         // The trailing gap continues the numbering past the hunk.
-        let (rows, _, _) = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &upgrades,
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &upgrades,
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         match rows.last().unwrap() {
             Row::Line {
                 old_no,
@@ -1510,15 +1615,17 @@ mod tests {
     #[test]
     fn file_mode_renders_the_whole_file_with_hunks_inline() {
         let (diff, upgrades) = upgraded_diff();
-        let (rows, _, _) = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &upgrades,
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &upgrades,
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // All 20 new-side lines are present, the change highlighted inline.
         let lines: Vec<(u32, String)> = rows
             .iter()
@@ -1538,15 +1645,17 @@ mod tests {
     #[test]
     fn file_mode_paints_hunk_strips_before_the_upgrade_lands() {
         let (diff, _) = upgraded_diff();
-        let (rows, _, _) = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // Phase 1: exactly the patch's hunk — 3 context, 1 removed, 1
         // added, 3 context — and nothing else, with no `@@` marker row.
         assert!(matches!(rows[1], Row::Line { .. }));
@@ -1677,15 +1786,21 @@ mod tests {
     fn header_indices_are_correct_in_both_modes() {
         let diff = sample_diff();
         for mode in [ViewMode::Unified, ViewMode::Split] {
-            let (rows, file_rows, hunk_rows) = build_rows(
-                &diff,
-                mode,
-                &HashMap::new(),
-                None,
-                true,
-                COMMENT_WRAP_CHARS,
-                0,
-            );
+            let BuiltRows {
+                rows,
+                file_rows,
+                hunk_rows,
+            } = build_rows(RowsView {
+                diff: &diff,
+                upgrades: &HashMap::new(),
+                comments: None,
+                options: RowOptions {
+                    mode,
+                    file_ix: 0,
+                    comments_visible: true,
+                    comment_wrap: COMMENT_WRAP_CHARS,
+                },
+            });
             // Only the focused file builds: a.rs, header first.
             assert_eq!(file_rows, vec![0]);
             assert_eq!(hunk_rows.len(), 2);
@@ -1694,38 +1809,46 @@ mod tests {
                 assert!(matches!(rows[ix], Row::Line { .. } | Row::SplitLine { .. }));
             }
             // Binary file: focused alone, header followed by the binary row.
-            let (rows, file_rows, _) = build_rows(
-                &diff,
-                mode,
-                &HashMap::new(),
-                None,
-                true,
-                COMMENT_WRAP_CHARS,
-                1,
-            );
+            let BuiltRows {
+                rows, file_rows, ..
+            } = build_rows(RowsView {
+                diff: &diff,
+                upgrades: &HashMap::new(),
+                comments: None,
+                options: RowOptions {
+                    mode,
+                    file_ix: 1,
+                    comments_visible: true,
+                    comment_wrap: COMMENT_WRAP_CHARS,
+                },
+            });
             assert_eq!(file_rows, vec![0]);
             assert!(matches!(rows[0], Row::FileHeader { .. }));
             assert!(matches!(rows[1], Row::Binary));
         }
         // Unified emits one row per diff row; split collapses the equal run.
-        let (unified, _, _) = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
-        let (split, _, _) = build_rows(
-            &diff,
-            ViewMode::Split,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows: unified, .. } = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
+        let BuiltRows { rows: split, .. } = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         let unified_lines = unified
             .iter()
             .filter(|r| matches!(r, Row::Line { .. }))
@@ -1741,15 +1864,17 @@ mod tests {
     #[test]
     fn unified_rows_insert_threads_beneath_their_anchor() {
         let index = sample_comments();
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // rows: FileHeader, ctx, rem old1 (old_no 2) + LEFT thread, rem
         // old2, add new1 (new_no 2) + RIGHT thread, …
         let names: Vec<&str> = rows.iter().map(row_name).collect();
@@ -1822,15 +1947,17 @@ mod tests {
     #[test]
     fn split_rows_anchor_threads_by_cell() {
         let index = sample_comments();
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Split,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // rows[2] pairs old1/new1 (both line 2): LEFT thread then RIGHT
         // thread directly beneath it.
         let names: Vec<&str> = rows.iter().map(row_name).collect();
@@ -1865,15 +1992,17 @@ mod tests {
     #[test]
     fn split_comments_render_in_the_half_they_were_left_on() {
         let index = sample_comments();
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Split,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Split,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // rows[3..6] are carol's LEFT thread, rows[6..11] the RIGHT one; each
         // row of a thread carries the side it was anchored to.
         let halves: Vec<Option<Option<CommentSide>>> = rows[3..11].iter().map(row_half).collect();
@@ -1895,15 +2024,17 @@ mod tests {
     #[test]
     fn only_a_threads_first_row_draws_the_card_top() {
         let index = sample_comments();
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // Exactly one top edge per thread, and it's the root's header — a
         // reply's header sits mid-card and must not cap it.
         let mut tops = 0;
@@ -1948,15 +2079,17 @@ mod tests {
             ("unified", ViewMode::Unified, COMMENT_WRAP_CHARS),
             ("split", ViewMode::Split, 40),
         ] {
-            let (rows, _, _) = build_rows(
-                &sample_diff(),
-                mode,
-                &HashMap::new(),
-                Some(&index),
-                true,
-                cap,
-                0,
-            );
+            let BuiltRows { rows, .. } = build_rows(RowsView {
+                diff: &sample_diff(),
+                upgrades: &HashMap::new(),
+                comments: Some(&index),
+                options: RowOptions {
+                    mode,
+                    file_ix: 0,
+                    comments_visible: true,
+                    comment_wrap: cap,
+                },
+            });
             let bodies: Vec<&SharedString> = rows
                 .iter()
                 .filter_map(|row| match row {
@@ -1978,15 +2111,17 @@ mod tests {
     #[test]
     fn unified_comments_span_the_full_width() {
         let index = sample_comments();
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // Unified has one column, so no comment row is confined to a half.
         assert!(rows.iter().filter_map(row_half).all(|half| half.is_none()));
         // ...and the diff really does contain comment rows to check.
@@ -1996,15 +2131,17 @@ mod tests {
     #[test]
     fn hidden_comments_keep_header_counts() {
         let index = sample_comments();
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            Some(&index),
-            false,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: false,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
             Row::FileHeader {
@@ -2015,15 +2152,17 @@ mod tests {
             other => panic!("expected file header, got {}", row_name(other)),
         }
         // And with no index at all (local items): zero counts, no rows.
-        let (rows, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
             Row::FileHeader {
@@ -2049,15 +2188,17 @@ mod tests {
             "2026-01-01T00:00:00Z",
             None,
         )]);
-        let (rows, _, _) = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &upgrades,
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &upgrades,
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // The gap always renders as context (the whole file shows), so the
         // thread anchors immediately: FileHeader, ctx 1, ctx 2, ctx 3, then
         // the thread.
@@ -2070,24 +2211,28 @@ mod tests {
     #[test]
     fn nth_noncomment_row_maps_positions_across_comment_insertions() {
         let index = sample_comments();
-        let (plain, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            None,
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
-        let (with, _, _) = build_rows(
-            &sample_diff(),
-            ViewMode::Unified,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows: plain, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
+        let BuiltRows { rows: with, .. } = build_rows(RowsView {
+            diff: &sample_diff(),
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         // Every plain row maps to the same row content with comments shown.
         for (n, row) in plain.iter().enumerate() {
             let ix = nth_noncomment_row(&with, n);
@@ -2153,15 +2298,17 @@ mod tests {
 
         // File mode on a.rs (file 0): header, its added line 1, the thread,
         // then the rest of the file — and nothing from b.rs.
-        let (rows, _, _) = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            0,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         let names: Vec<&str> = rows.iter().map(row_name).collect();
         // The whole pane: a.rs's header, its two added lines, the one
         // thread under its anchor — and nothing from b.rs.
@@ -2195,15 +2342,17 @@ mod tests {
 
         // On b.rs (file 1): only b.rs's thread, anchored on its removed
         // line's left side.
-        let (rows, _, _) = build_rows(
-            &diff,
-            ViewMode::Unified,
-            &HashMap::new(),
-            Some(&index),
-            true,
-            COMMENT_WRAP_CHARS,
-            1,
-        );
+        let BuiltRows { rows, .. } = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: Some(&index),
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 1,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
         let names: Vec<&str> = rows.iter().map(row_name).collect();
         // On b.rs (file 1): only b.rs's header, its removed line, and its
         // own thread, anchored on the left side.
