@@ -59,7 +59,9 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - minimap
 - inline GitHub review comments (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
 - multi-line comments: click then shift-click a line, or drag a selection and
-  press `C` (ranges stay on one side within one GitHub patch hunk)
+  press `C` (ranges stay on one side); comments outside a patch hunk, including
+  cross-hunk ranges, use GitHub's experimental positioning API and may depend
+  on GitHub's rollout for the repository
 - pending reviews: start/add to a review without posting, resume drafts started
   on GitHub, and edit/delete them in the pending-review tray before submitting;
   **Add single comment** still posts immediately

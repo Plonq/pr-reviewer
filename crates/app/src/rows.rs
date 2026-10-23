@@ -94,8 +94,8 @@ pub(crate) fn is_comment_row(row: &Row) -> bool {
     )
 }
 
-/// Display-row adapter only. Validation against original GitHub hunks lives
-/// in `comment_anchor`, which never imports these UI row types.
+/// Display-row adapter only. Anchor validation and API positioning selection
+/// live in `comment_anchor`, which never imports these UI row types.
 pub(crate) fn comment_anchor(
     rows: &[Row],
     row_ix: usize,

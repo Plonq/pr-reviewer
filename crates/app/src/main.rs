@@ -518,7 +518,7 @@ pub(crate) struct ItemData {
     cursor: usize,
     cursor_side: Option<SelSide>,
     /// Original server-patch hunks, retained when phase 2 replaces display
-    /// hunks. GitHub's anchor boundaries need not match our local re-diff.
+    /// hunks. Determines when comments need the experimental positioning API.
     anchor_hunks: Vec<Vec<diff_core::Hunk>>,
     scroll: UniformListScrollHandle,
     /// The conversation pane's scroll position. A pane-level container (not
@@ -1348,6 +1348,7 @@ struct Composer {
     side: CommentSide,
     line: u64,
     start_line: Option<u64>,
+    position: Option<github::CommentPosition>,
     pending: bool,
     edit_id: Option<u64>,
     /// Display row the composer is anchored beneath (best effort; goes stale
@@ -3190,10 +3191,13 @@ impl ReviewApp {
                 None => vec![(anchor_side, line)],
             };
             match comment_anchor::selection_anchor(
-                &path,
+                &data.diff.files[data.file_ix],
                 data.pr_meta
                     .as_ref()
                     .map_or("", |meta| meta.head_ref_oid.as_str()),
+                data.pr_meta
+                    .as_ref()
+                    .map_or("", |meta| meta.base_ref_oid.as_str()),
                 &data.anchor_hunks[data.file_ix],
                 &points,
             ) {
@@ -3211,6 +3215,7 @@ impl ReviewApp {
         if let (Some(composer), Some(anchor)) = (&mut self.composer, range) {
             composer.line = anchor.line;
             composer.start_line = anchor.start_line;
+            composer.position = anchor.position;
         }
     }
 
@@ -3404,6 +3409,7 @@ impl ReviewApp {
             .and_then(|data| data.pr_meta.as_ref())
             .map(|meta| meta.head_ref_oid.clone())
             .unwrap_or_default();
+        let mut position = None;
         if reply_to.is_none() {
             match &item.source {
                 Source::Pr(_) if commit_id.is_empty() => return,
@@ -3416,15 +3422,21 @@ impl ReviewApp {
                 if data.diff.files.get(data.file_ix).is_none() {
                     return;
                 }
-                if let Err(error) = comment_anchor::selection_anchor(
-                    &path,
+                match comment_anchor::selection_anchor(
+                    &data.diff.files[data.file_ix],
                     &commit_id,
+                    data.pr_meta
+                        .as_ref()
+                        .map_or("", |meta| meta.base_ref_oid.as_str()),
                     &data.anchor_hunks[data.file_ix],
                     &[(side, line)],
                 ) {
-                    self.items[self.active].refresh_error = Some(error.into());
-                    cx.notify();
-                    return;
+                    Ok(anchor) => position = anchor.position,
+                    Err(error) => {
+                        self.items[self.active].refresh_error = Some(error.into());
+                        cx.notify();
+                        return;
+                    }
                 }
             }
         }
@@ -3465,6 +3477,7 @@ impl ReviewApp {
             side,
             line,
             start_line: None,
+            position,
             pending: false,
             edit_id: None,
             row_ix,
@@ -3555,6 +3568,7 @@ impl ReviewApp {
             side: composer.side,
             line: composer.line,
             start_line: composer.start_line,
+            position: composer.position.clone(),
         };
         if matches!(source, Source::Pr(_)) && (composer.pending || composer.edit_id.is_some()) {
             if self.sessions.get(&item_id).is_some_and(|ui| ui.busy) {
@@ -8647,7 +8661,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn invalid_ranges_and_whole_file_rediff_boundaries_are_rejected_in_the_ui(
+    fn cross_hunk_ranges_and_whole_file_lines_use_blob_positions_in_the_ui(
         cx: &mut gpui::TestAppContext,
     ) {
         let fake = FakePr::with_threads(Vec::new());
@@ -8677,12 +8691,10 @@ mod tests {
                     },
                 });
                 this.open_composer_on_selection(window, cx);
-                assert!(this.composer.is_none());
-                assert!(this.items[0]
-                    .refresh_error
-                    .as_ref()
-                    .unwrap()
-                    .contains("one GitHub diff hunk"));
+                let composer = this.composer.as_ref().unwrap();
+                assert_eq!((composer.start_line, composer.line), (Some(1), 10));
+                assert_eq!(composer.position.as_ref().unwrap().commit_id, "dead10cc");
+                this.close_composer(window, cx);
                 // Simulate a phase-2 display hunk that merges both server hunks.
                 let data = this.active_data_mut().unwrap();
                 data.diff.files[0].hunks[0].new_count = 10;
@@ -8695,11 +8707,20 @@ mod tests {
                             intra: vec![],
                         });
                 }
+                data.set_rows(data.row_build());
+                data.selection = None;
+                data.cursor = 5;
                 this.open_composer_on_selection(window, cx);
+                let composer = this.composer.as_ref().unwrap();
+                assert_eq!((composer.start_line, composer.line), (None, 5));
                 assert!(
-                    this.composer.is_none(),
-                    "original patch boundaries survive phase 2"
+                    composer.position.is_some(),
+                    "whole-file lines use the preview API"
                 );
+                this.close_composer(window, cx);
+                // Hover's + button reaches the same validation, without a selection.
+                this.open_composer(None, "a.rs".into(), CommentSide::Right, 5, 5, window, cx);
+                assert!(this.composer.as_ref().unwrap().position.is_some());
             })
         });
     }

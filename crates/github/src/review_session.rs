@@ -28,6 +28,17 @@ pub struct CommentAnchor {
     pub side: DiffSide,
     pub line: u64,
     pub start_line: Option<u64>,
+    /// Explicit blob positioning for comments outside a single patch hunk.
+    /// `commit_id` above remains the PR head; this source may be the old side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<CommentPosition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentPosition {
+    pub path: String,
+    pub commit_id: String,
+    pub base_commit_id: Option<String>,
 }
 
 impl CommentAnchor {
@@ -39,6 +50,14 @@ impl CommentAnchor {
             || self
                 .start_line
                 .is_some_and(|start| start == 0 || start >= self.line)
+            || self.position.as_ref().is_some_and(|position| {
+                position.path.is_empty()
+                    || position.commit_id.is_empty()
+                    || position
+                        .base_commit_id
+                        .as_ref()
+                        .is_some_and(String::is_empty)
+            })
         {
             return Err(ClientError::Invalid("invalid comment anchor".into()));
         }

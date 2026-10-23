@@ -111,6 +111,8 @@ impl<P: GhProcess> GhCliClient<P> {
             "graphql".into(),
             "-f".into(),
             format!("query={query}"),
+            "-H".into(),
+            "GraphQL-Features: graphql_pr_comment_positioning".into(),
         ])?;
         if !value["data"].is_object() {
             return Err(ClientError::Failed("GitHub returned no review data".into()));
@@ -126,19 +128,42 @@ impl<P: GhProcess> GhCliClient<P> {
         review_id: &str,
     ) -> Result<Vec<PendingComment>, ClientError> {
         let mut comments = Vec::new();
+        self.for_each_thread_comment(loc, |thread, comment, head, base| {
+            if comment["pullRequestReview"]["id"].as_str() == Some(review_id) {
+                comments.push(pending_thread_comment(thread, comment.clone(), head, base)?);
+            }
+            Ok(())
+        })?;
+        Ok(comments)
+    }
+
+    fn for_each_thread_comment(
+        &self,
+        loc: &PrLocator,
+        mut visit: impl FnMut(
+            &serde_json::Value,
+            &serde_json::Value,
+            Option<&str>,
+            Option<&str>,
+        ) -> Result<(), ClientError>,
+    ) -> Result<(), ClientError> {
         let mut after = None;
         loop {
-            let query = format!("query {{ repository(owner:{},name:{}) {{ pullRequest(number:{}) {{ reviewThreads(first:100{}) {{ nodes {{ {} }} pageInfo {{ hasNextPage endCursor }} }} }} }} }}",
+            let query = format!("query {{ repository(owner:{},name:{}) {{ pullRequest(number:{}) {{ headRefOid baseRefOid reviewThreads(first:100{}) {{ nodes {{ {} }} pageInfo {{ hasNextPage endCursor }} }} }} }} }}",
                 json_string(&loc.owner), json_string(&loc.repo), loc.number, after_arg(after.as_deref()), review_thread_fields(None));
             let value = self.review_graphql(query)?;
-            let connection = &value["data"]["repository"]["pullRequest"]["reviewThreads"];
+            let pr = &value["data"]["repository"]["pullRequest"];
+            let connection = &pr["reviewThreads"];
             for thread in connection_nodes(connection)? {
                 let mut page = thread.clone();
                 loop {
                     for comment in connection_nodes(&page["comments"])? {
-                        if comment["pullRequestReview"]["id"].as_str() == Some(review_id) {
-                            comments.push(pending_thread_comment(&page, comment.clone())?);
-                        }
+                        visit(
+                            &page,
+                            comment,
+                            pr["headRefOid"].as_str(),
+                            pr["baseRefOid"].as_str(),
+                        )?;
                     }
                     let Some(cursor) = next_cursor(&page["comments"])? else {
                         break;
@@ -168,7 +193,7 @@ impl<P: GhProcess> GhCliClient<P> {
                 break;
             }
         }
-        Ok(comments)
+        Ok(())
     }
 
     /// Run against a specific process boundary — how tests replay recorded
@@ -326,11 +351,22 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             .start_line
             .map(|start| format!(",startLine:{start},startSide:{}", anchor.side.api_str()))
             .unwrap_or_default();
-        let query = format!("mutation {{ addPullRequestReviewThread(input:{{pullRequestReviewId:{},path:{},side:{},line:{},body:{}{range}}}) {{ thread {{ side:diffSide line start_line:startLine isOutdated comments(first:1) {{ nodes {{ id:fullDatabaseId node_id:id path body }} }} }} }} }}",
+        let positioning = positioning_input(anchor);
+        let query = format!("mutation {{ addPullRequestReviewThread(input:{{pullRequestReviewId:{},path:{},side:{},line:{},body:{}{range}{positioning}}}) {{ thread {{ side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:1) {{ nodes {{ id:fullDatabaseId node_id:id path body }} }} }} }} }}",
             json_string(&review.node_id), json_string(&anchor.path), anchor.side.api_str(), anchor.line, json_string(body));
-        let value = self.review_graphql(query)?;
+        let value = self
+            .review_graphql(query)
+            .map_err(|error| positioning_error(anchor, error))?;
         let thread = &value["data"]["addPullRequestReviewThread"]["thread"];
-        pending_thread_comment(thread, thread["comments"]["nodes"][0].clone())
+        pending_thread_comment(
+            thread,
+            thread["comments"]["nodes"][0].clone(),
+            Some(&anchor.commit_id),
+            anchor
+                .position
+                .as_ref()
+                .and_then(|position| position.base_commit_id.as_deref()),
+        )
     }
 
     fn edit_pending_comment(
@@ -396,6 +432,28 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         body: &str,
     ) -> Result<(), ClientError> {
         anchor.validate()?;
+        if anchor.position.is_some() {
+            // One atomic, already-submitted review: never add to or submit the
+            // viewer's existing pending review, including when this fails.
+            let value =
+                self.review_graphql(format!(
+                "query {{ repository(owner:{},name:{}) {{ pullRequest(number:{}) {{ id }} }} }}",
+                json_string(&loc.owner), json_string(&loc.repo), loc.number
+            ))?;
+            let id: String =
+                decode_value(value["data"]["repository"]["pullRequest"]["id"].clone())?;
+            let value = self.review_graphql(format!(
+                "mutation {{ addPullRequestReview(input:{{pullRequestId:{},commitOID:{},event:COMMENT,threads:[{{path:{},side:{},body:{}{}}}]}}) {{ pullRequestReview {{ id state }} }} }}",
+                json_string(&id), json_string(&anchor.commit_id), json_string(&anchor.path), anchor.side.api_str(), json_string(body), positioning_input(anchor)
+            )).map_err(|error| positioning_error(anchor, error))?;
+            let review = &value["data"]["addPullRequestReview"]["pullRequestReview"];
+            if !review["id"].is_string() || review["state"].as_str() != Some("COMMENTED") {
+                return Err(ClientError::Failed(
+                    "GitHub returned no posted comment review".into(),
+                ));
+            }
+            return Ok(());
+        }
         if anchor.start_line.is_none() {
             return self.post_review_comment(
                 loc,
@@ -564,7 +622,38 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         // parse.
         let pages: Vec<Vec<ReviewComment>> = serde_json::from_str(out.text()?)
             .map_err(|err| ClientError::Failed(format!("unexpected GitHub response: {err}")))?;
-        Ok(pages.into_iter().flatten().collect())
+        let mut comments: Vec<_> = pages.into_iter().flatten().collect();
+        // REST has no blob-positioning fields. Recover preview-only anchors
+        // from threads, retaining REST's authors, timestamps, and reply ids.
+        if comments.iter().any(|comment| comment.line.is_none()) {
+            let by_id: HashMap<_, _> = comments
+                .iter_mut()
+                .map(|comment| (comment.id, comment))
+                .collect();
+            let mut by_id = by_id;
+            self.for_each_thread_comment(loc, |thread, raw, head, base| {
+                let id: u64 = decode_value(raw["id"].clone()).or_else(|_| {
+                    raw["id"]
+                        .as_str()
+                        .and_then(|id| id.parse().ok())
+                        .ok_or_else(|| ClientError::Failed("GitHub returned no comment id".into()))
+                })?;
+                if let Some(comment) = by_id.get_mut(&id) {
+                    if comment.line.is_none() {
+                        let (start, line) = thread_position(thread, head, base)?;
+                        comment.line = line;
+                        comment.start_line = start;
+                        comment.side = Some(
+                            decode_value::<crate::DiffSide>(thread["side"].clone())?
+                                .api_str()
+                                .into(),
+                        );
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(comments)
     }
 
     fn mentionable_users(&self, loc: &PrLocator) -> Result<Vec<Mention>, ClientError> {
@@ -790,7 +879,81 @@ fn after_arg(cursor: Option<&str>) -> String {
 }
 
 fn review_thread_fields(cursor: Option<&str>) -> String {
-    format!("id side:diffSide line start_line:startLine isOutdated comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id path body pullRequestReview {{ id }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
+    format!("id side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id path body pullRequestReview {{ id }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
+}
+
+const POSITIONING_FIELDS: &str = "positioning { __typename ... on LineComment { line commitOid headCommitOid baseCommitOid } ... on MultilineComment { startLine endLine startCommitOid endCommitOid headCommitOid baseCommitOid } }";
+
+fn positioning_input(anchor: &CommentAnchor) -> String {
+    let Some(position) = &anchor.position else {
+        return String::new();
+    };
+    let base = position
+        .base_commit_id
+        .as_ref()
+        .map(|base| format!(",baseCommitOid:{}", json_string(base)))
+        .unwrap_or_default();
+    let path = json_string(&position.path);
+    let commit = json_string(&position.commit_id);
+    let head = json_string(&anchor.commit_id);
+    match anchor.start_line {
+        Some(start) => format!(",multilinePositioning:{{startPath:{path},endPath:{path},startLine:{start},endLine:{},startCommitOid:{commit},endCommitOid:{commit},headCommitOid:{head}{base}}}", anchor.line),
+        None => format!(",linePositioning:{{path:{path},line:{},commitOid:{commit},headCommitOid:{head}{base}}}", anchor.line),
+    }
+}
+
+fn positioning_error(anchor: &CommentAnchor, error: ClientError) -> ClientError {
+    if anchor.position.is_some() && matches!(error, ClientError::Failed(_)) {
+        ClientError::Failed(format!("outside-diff comments use GitHub's experimental positioning API, which may not be enabled for this repository: {error}"))
+    } else {
+        error
+    }
+}
+
+/// Legacy current positions win. Preview blob positions can look outdated in
+/// the legacy API; use them only when their captured diff is still current.
+fn thread_position(
+    thread: &serde_json::Value,
+    head: Option<&str>,
+    base: Option<&str>,
+) -> Result<(Option<u64>, Option<u64>), ClientError> {
+    let outdated: bool = decode_value(thread["isOutdated"].clone())?;
+    if !outdated && thread["line"].is_u64() {
+        let line = thread["line"].as_u64();
+        return Ok((
+            thread["start_line"]
+                .as_u64()
+                .filter(|start| line.is_some_and(|line| *start < line)),
+            line,
+        ));
+    }
+    let position = &thread["positioning"];
+    let right = thread["side"].as_str() == Some("RIGHT");
+    let position_head = position["headCommitOid"].as_str().or_else(|| {
+        right
+            .then(|| {
+                position["commitOid"]
+                    .as_str()
+                    .or(position["endCommitOid"].as_str())
+            })
+            .flatten()
+    });
+    if head.is_none() || head == Some("") || position_head != head {
+        return Ok((None, None));
+    }
+    if !right && (base.is_none() || position["baseCommitOid"].as_str() != base) {
+        return Ok((None, None));
+    }
+    let (start, line) = match position["__typename"].as_str() {
+        Some("LineComment") => (None, position["line"].as_u64()),
+        Some("MultilineComment") => (position["startLine"].as_u64(), position["endLine"].as_u64()),
+        _ => (None, None),
+    };
+    let line = line.filter(|line| *line > 0 && *line <= i32::MAX as u64);
+    Ok((
+        start.filter(|start| *start > 0 && line.is_some_and(|line| *start < line)),
+        line,
+    ))
 }
 
 fn connection_nodes(
@@ -818,21 +981,15 @@ fn next_cursor(connection: &serde_json::Value) -> Result<Option<String>, ClientE
 fn pending_thread_comment(
     thread: &serde_json::Value,
     mut comment: serde_json::Value,
+    head: Option<&str>,
+    base: Option<&str>,
 ) -> Result<PendingComment, ClientError> {
     let side: crate::DiffSide = decode_value(thread["side"].clone())?;
-    let outdated: bool = decode_value(thread["isOutdated"].clone())?;
+    let (start, line) = thread_position(thread, head, base)?;
     if let Some(comment) = comment.as_object_mut() {
         comment.insert("side".into(), serde_json::json!(side));
-        for field in ["line", "start_line"] {
-            comment.insert(
-                field.into(),
-                if outdated {
-                    serde_json::Value::Null
-                } else {
-                    thread[field].clone()
-                },
-            );
-        }
+        comment.insert("line".into(), serde_json::json!(line));
+        comment.insert("start_line".into(), serde_json::json!(start));
     }
     let mut comment: PendingComment = decode_value(comment)?;
     pending_node_id(&comment)?;
@@ -1498,6 +1655,186 @@ mod tests {
             side: crate::DiffSide::Right,
             line: 7,
             start_line: Some(5),
+            position: None,
+        }
+    }
+
+    fn positioned_anchor(side: crate::DiffSide, range: bool) -> CommentAnchor {
+        CommentAnchor {
+            side,
+            start_line: range.then_some(5),
+            position: Some(crate::CommentPosition {
+                path: if side == crate::DiffSide::Left {
+                    "old-name.rs"
+                } else {
+                    "a.rs"
+                }
+                .into(),
+                commit_id: if side == crate::DiffSide::Left {
+                    "base"
+                } else {
+                    "head"
+                }
+                .into(),
+                base_commit_id: (side == crate::DiffSide::Left).then(|| "base".into()),
+            }),
+            ..range_anchor()
+        }
+    }
+
+    fn preview_thread(anchor: &CommentAnchor) -> serde_json::Value {
+        let position = anchor.position.as_ref().unwrap();
+        let positioning = match anchor.start_line {
+            Some(start) => serde_json::json!({"__typename":"MultilineComment", "startLine":start,
+                "endLine":anchor.line, "startCommitOid":position.commit_id,
+                "endCommitOid":position.commit_id, "headCommitOid":"head", "baseCommitOid":"base"}),
+            None => serde_json::json!({"__typename":"LineComment", "line":anchor.line,
+                "commitOid":position.commit_id, "headCommitOid":"head", "baseCommitOid":"base"}),
+        };
+        serde_json::json!({"id":"thread", "side":anchor.side, "line":null, "start_line":null,
+            "isOutdated":true, "positioning":positioning,
+            "comments":{"nodes":[{"id":"12", "node_id":"PRRC_draft", "path":"a.rs", "body":"draft",
+                "pullRequestReview":{"id":"PRR_pending"}}],
+                "pageInfo":{"hasNextPage":false,"endCursor":null}}})
+    }
+
+    #[test]
+    fn outside_diff_drafts_use_preview_blob_positions_on_both_sides_and_ranges() {
+        for side in [crate::DiffSide::Left, crate::DiffSide::Right] {
+            for range in [false, true] {
+                let anchor = positioned_anchor(side, range);
+                let response = serde_json::json!({"data":{"addPullRequestReviewThread":{
+                    "thread":preview_thread(&anchor)}}})
+                .to_string();
+                let (client, calls) = session_script(&[&response]);
+                let review = PendingReview {
+                    id: 91,
+                    node_id: "PRR_pending".into(),
+                    body: String::new(),
+                    comments: vec![],
+                };
+                let comment = client
+                    .add_pending_comment(&loc(), &review, &anchor, "draft")
+                    .unwrap();
+                assert_eq!(
+                    comment.line,
+                    Some(7),
+                    "preview-only positions are not outdated"
+                );
+                assert_eq!(comment.start_line, anchor.start_line);
+                assert_eq!(comment.side, side);
+                let calls = calls.lock().unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(
+                    calls[0][5],
+                    "GraphQL-Features: graphql_pr_comment_positioning"
+                );
+                let query = &calls[0][3];
+                assert!(query.contains("pullRequestReviewId:\"PRR_pending\""));
+                assert!(query.contains(if range {
+                    "multilinePositioning:"
+                } else {
+                    "linePositioning:"
+                }));
+                assert!(query.contains("headCommitOid:\"head\""));
+                if side == crate::DiffSide::Left {
+                    assert!(query.contains("baseCommitOid:\"base\""));
+                    assert!(
+                        query.contains("old-name.rs"),
+                        "renames use the source blob's path"
+                    );
+                    assert!(query.contains(if range {
+                        "startCommitOid:\"base\""
+                    } else {
+                        "commitOid:\"base\""
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preview_only_comments_resume_and_refresh_without_resurrecting_stale_positions() {
+        for side in [crate::DiffSide::Left, crate::DiffSide::Right] {
+            for range in [false, true] {
+                for current in [false, true] {
+                    let anchor = positioned_anchor(side, range);
+                    let thread = preview_thread(&anchor);
+                    let page = serde_json::json!({"data":{"repository":{"pullRequest":{
+                        "headRefOid":if current { "head" } else { "new-head" }, "baseRefOid":"base",
+                        "reviewThreads":{"nodes":[thread],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+                    }}}}).to_string();
+                    let rest = r#"[[{"id":12,"path":"a.rs","line":null,"side":null,"start_line":null,"body":"draft","user":{"login":"octocat"},"created_at":"2026-10-24T00:00:00Z","in_reply_to_id":null}]]"#;
+                    let (client, _) = session_script(&[SUCCESS, PENDING, &page, rest, &page]);
+                    let review = client.pending_review(&loc()).unwrap().unwrap();
+                    let comments = client.review_comments(&loc()).unwrap();
+                    assert_eq!(review.comments[0].line, current.then_some(7));
+                    assert_eq!(comments[0].line, current.then_some(7));
+                    assert_eq!(
+                        comments[0].start_line,
+                        if current { anchor.start_line } else { None }
+                    );
+                    assert_eq!(comments[0].side.as_deref(), Some(side.api_str()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preview_immediate_comments_are_atomic_and_never_touch_existing_drafts_or_retry() {
+        use crate::review_session::{Command, ReviewSession};
+        for side in [crate::DiffSide::Left, crate::DiffSide::Right] {
+            for range in [false, true] {
+                for succeeds in [false, true] {
+                    let response = if succeeds {
+                        r#"{"data":{"addPullRequestReview":{"pullRequestReview":{"id":"new-review","state":"COMMENTED"}}}}"#
+                    } else {
+                        r#"{"errors":[{"message":"positioning not enabled"}],"data":null}"#
+                    };
+                    let (client, calls) = session_script(&[
+                        r#"{"data":{"repository":{"pullRequest":{"id":"PR_id"}}}}"#,
+                        response,
+                    ]);
+                    let mut session = ReviewSession {
+                        verified: true,
+                        pending: Some(PendingReview {
+                            id: 91,
+                            node_id: "PRR_pending".into(),
+                            body: "keep me".into(),
+                            comments: vec![serde_json::from_str(DRAFT).unwrap()],
+                        }),
+                    };
+                    let saved = session.pending.clone();
+                    let result = session.execute(
+                        &client,
+                        &loc(),
+                        Command::Immediate {
+                            anchor: positioned_anchor(side, range),
+                            body: "now".into(),
+                        },
+                    );
+                    assert_eq!(result.is_ok(), succeeds);
+                    if let Err(error) = result {
+                        assert!(error.to_string().contains("experimental positioning API"));
+                    }
+                    assert_eq!(session.pending, saved);
+                    assert!(session.verified);
+                    let calls = calls.lock().unwrap();
+                    assert_eq!(
+                        calls.len(),
+                        2,
+                        "no fallback or retry can duplicate a comment"
+                    );
+                    assert!(calls[1][3].contains("addPullRequestReview(input:{pullRequestId:\"PR_id\",commitOID:\"head\",event:COMMENT,threads:["));
+                    assert!(calls[1][3].contains(if range {
+                        "multilinePositioning:"
+                    } else {
+                        "linePositioning:"
+                    }));
+                    assert!(!calls[1][3].contains("pullRequestReviewId"));
+                    assert!(!calls[1][3].contains("submitPullRequestReview"));
+                }
+            }
         }
     }
 
@@ -1986,7 +2323,8 @@ mod tests {
         assert_eq!(comment.start_line, None);
         let calls = calls.lock().unwrap();
         assert!(calls[0][3]
-            .contains("thread { side:diffSide line start_line:startLine isOutdated comments(first:1) { nodes { id:fullDatabaseId"));
+            .contains("thread { side:diffSide line start_line:startLine isOutdated positioning"));
+        assert!(calls[0][3].contains("comments(first:1) { nodes { id:fullDatabaseId"));
         assert!(!calls[0][3].contains("startSide"));
         assert!(calls[0][3].contains(r#"body:"quoted \"body\"""#));
     }
@@ -2749,9 +3087,8 @@ mod tests {
 
     #[test]
     fn review_comments_flattens_the_recorded_pages() {
-        let comments = client(ok(Some(0), PULLS_COMMENTS_SUCCESS, ""))
-            .review_comments(&loc())
-            .unwrap();
+        let (client, _) = session_script(&[PULLS_COMMENTS_SUCCESS, EMPTY_THREADS]);
+        let comments = client.review_comments(&loc()).unwrap();
         assert_eq!(comments.len(), 3);
         let top = &comments[0];
         assert_eq!(top.id, 100);
@@ -2773,13 +3110,14 @@ mod tests {
 
     #[test]
     fn review_comments_invokes_the_paginated_slurp_verbatim() {
-        let fake = FakeGh::one(ok(Some(0), PULLS_COMMENTS_SUCCESS, ""));
-        let calls = fake.calls_handle();
-        GhCliClient::with_process(fake)
-            .review_comments(&loc())
-            .unwrap();
+        let (client, calls) = session_script(&[PULLS_COMMENTS_SUCCESS, EMPTY_THREADS]);
+        client.review_comments(&loc()).unwrap();
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls.len(),
+            2,
+            "null REST positions are checked against preview threads"
+        );
         assert_eq!(
             calls[0].join(" "),
             "api --paginate --slurp \

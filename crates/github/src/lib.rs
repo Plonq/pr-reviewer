@@ -15,7 +15,7 @@
 //! v0.1's `gh`-CLI wording today, including the `gh auth login` fix).
 pub mod gh_cli;
 pub mod review_session;
-pub use review_session::{CommentAnchor, DiffSide, PendingComment, PendingReview};
+pub use review_session::{CommentAnchor, CommentPosition, DiffSide, PendingComment, PendingReview};
 
 /// The signed-in GitHub user, as far as the app needs to know her: who she
 /// is, and how to draw her.
