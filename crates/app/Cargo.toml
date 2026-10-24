@@ -27,6 +27,8 @@ fuzzy-matcher = "0.3"
 # GitHub's emoji shortcode table (gemoji), for the conversation pane's
 # `:rocket:` → 🚀 pipe.
 emojis = "0.9"
+# Use the same GFM AST as TextView for our width-safe block/list layout.
+markdown = "1"
 http_client = { version = "0.2", package = "gpui_http_client" }
 futures = "0.3"
 ureq = "2"

@@ -2100,6 +2100,7 @@ dependencies = [
  "gpui_http_client",
  "libc",
  "lsp-types",
+ "markdown",
  "serde_json",
  "store",
  "syntax",

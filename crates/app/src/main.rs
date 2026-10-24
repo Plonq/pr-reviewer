@@ -23,8 +23,8 @@ use chrome::{
 use diff_core::{FileStatus, PrDiff};
 use github::review_session::{Command as SessionCommand, ReviewSession};
 use gpui::{
-    actions, canvas, div, fill, font, point, prelude::*, px, relative, rems, size, uniform_list,
-    App, Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding,
+    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
+    Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy, SharedString,
     Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
@@ -37,8 +37,7 @@ use gpui_component::{
     kbd::Kbd,
     scroll::Scrollbar,
     tag::Tag,
-    text::{TextView, TextViewStyle},
-    ActiveTheme, Disableable as _, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
+    Disableable as _, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
 };
 use minimap::{
     minimap_rows, minimap_runs, minimap_scale, MinimapColor, MinimapLane, MinimapLayout,
@@ -526,6 +525,8 @@ pub(crate) struct ItemData {
     /// and the scrollbar paints at the pane's edge — like the diff pane's.
     conv_scroll: ScrollHandle,
     discussion: Option<github::PrDiscussion>,
+    commits: Option<github::PrCommits>,
+    commits_expanded: bool,
     expanded_threads: HashSet<String>,
     additions: u32,
     deletions: u32,
@@ -597,6 +598,8 @@ impl ItemData {
             scroll: UniformListScrollHandle::new(),
             conv_scroll: ScrollHandle::new(),
             discussion: None,
+            commits: None,
+            commits_expanded: false,
             expanded_threads: HashSet::new(),
             additions: 0,
             deletions: 0,
@@ -888,6 +891,9 @@ impl ReviewItem {
         data.discussion = snapshot
             .discussion
             .and_then(|value| serde_json::from_value(value).ok());
+        data.commits = snapshot
+            .commits
+            .and_then(|value| serde_json::from_value(value).ok());
         self.state = ItemState::Ready(data);
         true
     }
@@ -923,6 +929,7 @@ impl ReviewItem {
             file_ix,
             comments,
             discussion,
+            commits,
             snapshot,
         } = loaded;
         let (additions, deletions) = diff
@@ -944,6 +951,7 @@ impl ReviewItem {
                 // the upgrade re-runs from scratch.
                 data.upgrades.clear();
                 data.discussion = discussion;
+                data.commits = commits;
                 data.comments = match &data.local_review {
                     Some(local) => Some(local.index()),
                     None => comments,
@@ -1000,6 +1008,7 @@ impl ReviewItem {
                     local_review,
                 ));
                 data.discussion = discussion;
+                data.commits = commits;
                 self.state = ItemState::Ready(data);
             }
         }
@@ -3748,9 +3757,12 @@ impl ReviewApp {
                 match fetched {
                     Ok(discussion) => {
                         if let (Source::Pr(loc), Some(meta)) = (&item.source, &data.pr_meta) {
-                            if let Ok(snapshot) =
-                                review_target::discussion_snapshot(loc, meta, &discussion)
-                            {
+                            if let Ok(snapshot) = review_target::discussion_snapshot(
+                                loc,
+                                meta,
+                                &discussion,
+                                data.commits.as_ref(),
+                            ) {
                                 app.store.save_snapshot(&snapshot);
                             }
                         }
@@ -5851,26 +5863,7 @@ impl ReviewApp {
                 .child(SharedString::from("No description provided."))
                 .into_any_element()
         } else {
-            TextView::markdown(
-                ("conversation", item.id),
-                SharedString::from(body),
-                window,
-                cx,
-            )
-            // Plain, not scrollable: the pane is the scroll container (see
-            // below). Selectable, for copying the description's text.
-            .selectable(true)
-            .style(TextViewStyle {
-                // The pane's font size follows the app's zoom (⌘±/⌘0);
-                // headings scale from it, and code blocks pick up the
-                // theme's highlight palette.
-                heading_base_font_size: px(text_size()),
-                paragraph_gap: rems(0.75),
-                highlight_theme: cx.theme().highlight_theme.clone(),
-                is_dark: !theme::is_light(),
-                ..Default::default()
-            })
-            .into_any_element()
+            conversation::render_markdown(&format!("conversation-{}", item.id), body, window, cx)
         };
         // The pane itself is the scroll container — like the diff pane, not
         // like the TextView's own scrollable mode — so the wheel scrolls
@@ -5905,6 +5898,7 @@ impl ReviewApp {
                             .px_8()
                             .py_6()
                             .child(content)
+                            .child(self.render_commits(item, data, cx))
                             .children(self.render_discussion(item, data, window, cx)),
                     ),
             )
@@ -6114,6 +6108,293 @@ mod tests {
         add, hunk, queued, rc, row_name, sample_comments, sample_diff, two_file_diff,
     };
     use diff_core::{diff_texts, FileDiff};
+
+    fn sample_commits() -> github::PrCommits {
+        github::PrCommits {
+            commits: vec![github::PrCommit {
+                sha: "abc123456789".into(),
+                message: "Fix the build\n\nKeep the full message.".into(),
+                author: "alice".into(),
+                ci: github::CiState::Fail,
+                actions: vec![github::ActionsRun {
+                    name: "Build".into(),
+                    url: "https://github.com/acme/widgets/actions/runs/123".into(),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn detail_fetch_installs_and_caches_commits_but_commits_failure_keeps_the_diff() {
+        for commits in [
+            Some(sample_commits()),
+            Some(github::PrCommits::default()),
+            None,
+        ] {
+            let fake = Arc::new(FakePr::default());
+            *fake.commits.lock().unwrap() = commits.clone();
+            let mut item = loop_pr_item(Vec::new());
+            let loaded = fetch_item(fake.clone(), &item.source, ViewMode::Split, 0).unwrap();
+            assert!(!loaded.diff.files.is_empty());
+            assert_eq!(loaded.commits, commits);
+            assert_eq!(
+                loaded.snapshot.as_ref().unwrap().commits,
+                commits
+                    .as_ref()
+                    .map(|commits| serde_json::to_value(commits).unwrap())
+            );
+            let snapshot = item.install(loaded).unwrap();
+            let ItemState::Ready(data) = &item.state else {
+                panic!("diff should load")
+            };
+            assert_eq!(data.commits, commits);
+            assert_eq!(
+                item.pane,
+                ItemPane::Changes,
+                "commits must not change the default pane"
+            );
+            let store = local_store::LocalStore::in_memory();
+            store.save_snapshot(&snapshot);
+            item.state = ItemState::Loading;
+            assert!(item.install_offline_snapshot(&store));
+            let ItemState::Ready(data) = &item.state else {
+                unreachable!()
+            };
+            assert_eq!(data.commits, commits);
+            assert_eq!(
+                fake.commit_fetches
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn discussion_only_refresh_preserves_cached_commits_without_refetching_them(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = Arc::new(FakePr::default());
+        let store = local_store::LocalStore::in_memory();
+        let (window, app) = queue_window_with_store(cx, fake.clone(), store.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(Vec::new());
+        let loc = match &item.source {
+            Source::Pr(loc) => loc.clone(),
+            _ => unreachable!(),
+        };
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.commits = Some(sample_commits());
+        install_item(&app, item, cx);
+        vcx.update(|_, cx| app.update(cx, |app, cx| app.refetch_comments(0, loc.clone(), cx)));
+        vcx.run_until_parked();
+        let snapshot = store
+            .snapshot(&loc.repo_slug(), loc.number)
+            .expect("refresh saved the snapshot");
+        assert_eq!(
+            snapshot.commits,
+            Some(serde_json::to_value(sample_commits()).unwrap())
+        );
+        assert!(snapshot.discussion.is_some());
+        assert_eq!(
+            fake.commit_fetches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[gpui::test]
+    fn conversation_commits_draw_and_actions_click_opens_the_exact_run_url(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = Arc::new(FakePr::default());
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(Vec::new());
+        item.pane = ItemPane::Conversation;
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.pr_meta.as_mut().unwrap().body = "Description before commits.".into();
+        data.commits = Some(sample_commits());
+        data.discussion = Some(conversation::tests::sample_discussion());
+        install_item(&app, item, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let bounds = vcx
+            .debug_bounds("commit-action-0-0-0")
+            .expect("Actions link is rendered in the shared scroller");
+        let point = bounds.center();
+        vcx.simulate_mouse_move(point, None, gpui::Modifiers::default());
+        vcx.simulate_mouse_down(point, gpui::MouseButton::Left, gpui::Modifiers::default());
+        vcx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/acme/widgets/actions/runs/123")
+        );
+        assert_eq!(
+            fake.commit_fetches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "rendering never fetches commits"
+        );
+        for payload in [None, Some(github::PrCommits::default())] {
+            vcx.update(|window, cx| {
+                app.update(cx, |app, _| {
+                    let ItemState::Ready(data) = &mut app.items[0].state else {
+                        unreachable!()
+                    };
+                    data.commits = payload;
+                });
+                let _ = window.draw(cx);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn commits_default_to_latest_and_expand_and_collapse_with_real_clicks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = Arc::new(FakePr::default());
+        let (window, app) = queue_window(cx, fake);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(Vec::new());
+        item.pane = ItemPane::Conversation;
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.pr_meta.as_mut().unwrap().body.clear();
+        let mut commits = sample_commits();
+        let mut latest = commits.commits[0].clone();
+        latest.sha = "latest-head".into();
+        latest.ci = github::CiState::Pass;
+        latest.actions[0].url = "https://github.com/acme/widgets/actions/runs/456".into();
+        commits.commits.push(latest);
+        data.commits = Some(commits);
+        assert!(!data.commits_expanded);
+        install_item(&app, item, cx);
+        let draw = |vcx: &mut gpui::VisualTestContext| {
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            })
+        };
+        let click = |vcx: &mut gpui::VisualTestContext, selector| {
+            let point = vcx.debug_bounds(selector).unwrap().center();
+            vcx.simulate_mouse_move(point, None, gpui::Modifiers::default());
+            vcx.simulate_mouse_down(point, gpui::MouseButton::Left, gpui::Modifiers::default());
+            vcx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::default());
+            vcx.run_until_parked();
+        };
+        draw(&mut vcx);
+        assert!(
+            vcx.debug_bounds("commit-0-0").is_none(),
+            "older failed CI is hidden"
+        );
+        assert!(
+            vcx.debug_bounds("commit-0-1").is_some(),
+            "latest CI remains visible"
+        );
+        click(&mut vcx, "commit-action-0-1-0");
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/acme/widgets/actions/runs/456")
+        );
+        click(&mut vcx, "commits-toggle-0");
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("commit-0-0").is_some());
+        assert!(vcx.debug_bounds("commit-0-1").is_some());
+        // A full data refresh keeps the user's disclosure choice.
+        cx.update(|cx| {
+            app.update(cx, |app, _| {
+                let loaded = fetch_item(
+                    Arc::new(FakePr::default()),
+                    &app.items[0].source,
+                    ViewMode::Split,
+                    0,
+                )
+                .unwrap();
+                app.items[0].install(loaded);
+                let ItemState::Ready(data) = &app.items[0].state else {
+                    unreachable!()
+                };
+                assert!(data.commits_expanded);
+            })
+        });
+        draw(&mut vcx);
+        click(&mut vcx, "commits-toggle-0");
+        cx.update(|cx| {
+            let ItemState::Ready(data) = &app.read(cx).items[0].state else {
+                unreachable!()
+            };
+            assert!(!data.commits_expanded);
+        });
+    }
+
+    #[gpui::test]
+    fn conversation_list_paragraphs_and_thread_headers_have_nonoverlapping_bounds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(Vec::new());
+        item.pane = ItemPane::Conversation;
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.pr_meta.as_mut().unwrap().body = format!(
+            "1. {}\n\n   {}\n\n   {}\n\n2. Next item.\n\nAfter the list.",
+            "The HTTP reply lands: `handoffVersion` changes. ".repeat(6),
+            "The ACTIVE branch has the mirror-image failure. ".repeat(6),
+            "Routing both branches through `isNewerHandoffState` fixes this. ".repeat(6),
+        );
+        let mut discussion = conversation::tests::sample_discussion();
+        let mut review = discussion.comments[0].clone();
+        review.id = 100;
+        review.body.clear();
+        review.review_state = Some("COMMENTED".into());
+        review.review_id = Some("R1".into());
+        discussion.comments.push(review);
+        discussion.threads[0].comments[0].review_id = Some("R1".into());
+        data.discussion = Some(discussion);
+        install_item(&app, item, cx);
+        for width in [1400., 1000.] {
+            vcx.simulate_resize(size(px(width), px(2200.)));
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            let marker = vcx.debug_bounds("conversation-0-0-0-marker").unwrap();
+            let body = vcx.debug_bounds("conversation-0-0-0-body").unwrap();
+            assert!(marker.size.width >= px(15.));
+            assert!(body.left() > marker.right(), "marker cannot overlap text");
+            assert!(body.size.width > px(150.), "no character-wide columns");
+            let first = vcx.debug_bounds("conversation-0-0-0-0-text").unwrap();
+            let second = vcx.debug_bounds("conversation-0-0-0-1-text").unwrap();
+            let third = vcx.debug_bounds("conversation-0-0-0-2-text").unwrap();
+            assert!(
+                second.top() >= first.bottom(),
+                "paragraphs stack vertically"
+            );
+            assert!(third.top() >= second.bottom());
+            assert!(
+                body.bottom() >= third.bottom(),
+                "text stays inside its list row"
+            );
+            let after = vcx.debug_bounds("conversation-0-1-text").unwrap();
+            assert!(
+                after.top() >= body.bottom(),
+                "following content starts below the entire item"
+            );
+            let header = vcx.debug_bounds("thread-header-0-T1").unwrap();
+            assert!(
+                header.size.width > px(150.),
+                "resolved thread label must not be an empty ellipsis"
+            );
+            assert!(header.top() >= after.bottom());
+        }
+    }
 
     fn mention(login: &str, name: Option<&str>) -> github::Mention {
         github::Mention {
@@ -6998,6 +7279,7 @@ mod tests {
             base_ref: "main".into(),
             head_ref: "feature/deactivation".into(),
             discussion: None,
+            commits: None,
             threads: vec![local_store::StoredThreadSeen {
                 id: "T_1".into(),
                 updated_at: "2026-10-20T08:07:08Z".into(),
@@ -7043,6 +7325,7 @@ mod tests {
             head_ref: "feature/deactivation".into(),
             threads: Vec::new(),
             discussion: Some(serde_json::to_value(&discussion).unwrap()),
+            commits: Some(serde_json::to_value(sample_commits()).unwrap()),
             is_draft: false,
             fetched_at_ms: 1_700_000_000_000,
         });
@@ -7074,6 +7357,7 @@ mod tests {
         assert_eq!(meta.title, "Add deactivation filters");
         assert_eq!(meta.body, "Some **markdown**.");
         assert_eq!(data.discussion.as_ref(), Some(&discussion));
+        assert_eq!(data.commits, Some(sample_commits()));
         assert!(
             data.expanded_threads.is_empty(),
             "cached resolved threads start collapsed too"
@@ -7123,6 +7407,7 @@ mod tests {
             head_ref: "feature/deactivation".into(),
             threads: Vec::new(),
             discussion: None,
+            commits: None,
             is_draft: false,
             fetched_at_ms: 1_700_000_000_000,
         });
@@ -7398,6 +7683,7 @@ mod tests {
             threads: Vec::new(),
             discussion: None,
             is_draft: false,
+            commits: None,
             fetched_at_ms: 1_700_000_000_000,
         });
         let (window, app) = queue_window_with_store(cx, fake, store.clone());
@@ -8055,6 +8341,8 @@ mod tests {
         /// The id the next posted comment gets.
         next_id: std::sync::atomic::AtomicU64,
         pending: std::sync::Mutex<Option<github::PendingReview>>,
+        commits: std::sync::Mutex<Option<github::PrCommits>>,
+        commit_fetches: std::sync::atomic::AtomicUsize,
     }
 
     impl FakePr {
@@ -8071,6 +8359,19 @@ mod tests {
     }
 
     impl github::GitHubClient for FakePr {
+        fn pr_commits(
+            &self,
+            _loc: &github::PrLocator,
+        ) -> Result<github::PrCommits, github::ClientError> {
+            self.commit_fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.commits
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| github::ClientError::Failed("commits unavailable".into()))
+        }
+
         fn pending_review(
             &self,
             _loc: &github::PrLocator,
@@ -8240,7 +8541,10 @@ mod tests {
         }
 
         fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
-            unimplemented!("loop tests install ready items; no patch is fetched")
+            Ok(
+                "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n"
+                    .into(),
+            )
         }
 
         fn review_comments(

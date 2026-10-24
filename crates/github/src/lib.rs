@@ -13,6 +13,8 @@
 //! Error kinds are stable vocabulary for callers to match on; the `Display`
 //! text is the user-facing message and moves with the backend (it carries
 //! v0.1's `gh`-CLI wording today, including the `gh auth login` fix).
+pub mod commits;
+pub use commits::{ActionsRun, PrCommit, PrCommits};
 pub mod discussion;
 pub mod gh_cli;
 pub use discussion::{DiscussionComment, PrDiscussion, Reaction, ReviewCodeContext, ReviewThread};
@@ -499,6 +501,14 @@ impl std::error::Error for ClientError {}
 /// construct and synchronous — they run on background threads, never the UI
 /// thread — and may spawn subprocesses or make network calls inside a call.
 pub trait GitHubClient: Send + Sync {
+    /// Ordered PR commits and per-commit CI. Detail-only: queue searches must
+    /// not call this. Unsupported backends report unavailable, not empty.
+    fn pr_commits(&self, _loc: &PrLocator) -> Result<PrCommits, ClientError> {
+        Err(ClientError::Failed(
+            "PR commits are not supported by this backend".into(),
+        ))
+    }
+
     /// Complete published conversation, with paginated replies and resolution
     /// state. Pending review comments belong to the separate review session.
     fn pr_discussion(&self, loc: &PrLocator) -> Result<PrDiscussion, ClientError> {

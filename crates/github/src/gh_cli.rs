@@ -286,6 +286,84 @@ impl<P: GhProcess> GhCliClient<P> {
 }
 
 impl<P: GhProcess> GitHubClient for GhCliClient<P> {
+    fn pr_commits(&self, loc: &PrLocator) -> Result<crate::PrCommits, ClientError> {
+        let mut result = crate::PrCommits::default();
+        let mut after = None;
+        let mut commit_cursors = std::collections::HashSet::new();
+        loop {
+            let value = self.review_graphql(format!(
+                "query {{ repository(owner:{},name:{}) {{ pullRequest(number:{}) {{ commits(first:100{}) {{ nodes {{ commit {{ id oid message author {{ name user {{ login }} }} statusCheckRollup {{ state }} {} }} }} pageInfo {{ hasNextPage endCursor }} }} }} }} }}",
+                json_string(&loc.owner), json_string(&loc.repo), loc.number,
+                after_arg(after.as_deref()), commit_suites(None)
+            ))?;
+            let connection = &value["data"]["repository"]["pullRequest"]["commits"];
+            for raw in connection_nodes(connection)? {
+                let raw = &raw["commit"];
+                let mut commit = crate::PrCommit {
+                    sha: decode_value(raw["oid"].clone())?,
+                    message: decode_value(raw["message"].clone())?,
+                    author: raw["author"]["user"]["login"]
+                        .as_str()
+                        .or_else(|| raw["author"]["name"].as_str())
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                    ci: CiState::from_rollup_state(raw["statusCheckRollup"]["state"].as_str()),
+                    actions: Vec::new(),
+                };
+                // Each commit has its own suite connection/cursor. A suite's
+                // workflowRun is singular: no check-run connection is truncated.
+                // GitHub's rollup already includes non-Actions/legacy statuses.
+                let mut suites = raw["checkSuites"].clone();
+                let mut suite_cursors = std::collections::HashSet::new();
+                loop {
+                    for suite in connection_nodes(&suites)? {
+                        let run = &suite["workflowRun"];
+                        if run.is_null() {
+                            continue;
+                        } // third-party check suite
+                        let run = crate::ActionsRun {
+                            name: decode_value(run["workflow"]["name"].clone())?,
+                            url: decode_value(run["url"].clone())?,
+                        };
+                        if !commit
+                            .actions
+                            .iter()
+                            .any(|existing| existing.url == run.url)
+                        {
+                            commit.actions.push(run);
+                        }
+                    }
+                    let Some(cursor) = next_cursor(&suites)? else {
+                        break;
+                    };
+                    if !suite_cursors.insert(cursor.clone()) {
+                        return Err(ClientError::Failed(
+                            "GitHub repeated a commit check-suite cursor".into(),
+                        ));
+                    }
+                    let id: String = decode_value(raw["id"].clone())?;
+                    let page = self.review_graphql(format!(
+                        "query {{ node(id:{}) {{ ... on Commit {{ {} }} }} }}",
+                        json_string(&id),
+                        commit_suites(Some(&cursor))
+                    ))?;
+                    suites = page["data"]["node"]["checkSuites"].clone();
+                }
+                result.commits.push(commit);
+            }
+            after = next_cursor(connection)?;
+            let Some(cursor) = &after else {
+                break;
+            };
+            if !commit_cursors.insert(cursor.clone()) {
+                return Err(ClientError::Failed(
+                    "GitHub repeated a PR commit cursor".into(),
+                ));
+            }
+        }
+        Ok(result)
+    }
+
     fn pr_discussion(&self, loc: &PrLocator) -> Result<crate::PrDiscussion, ClientError> {
         let mut discussion = crate::PrDiscussion::default();
         // Paginate each connection independently: a busy PR can have >100
@@ -1167,6 +1245,12 @@ fn captured_code_position(thread: &serde_json::Value) -> Option<(&str, Option<u6
         return None;
     }
     Some((commit, start, line))
+}
+
+// CheckSuite.workflowRun and WorkflowRun.url/workflow are documented GraphQL
+// fields (Checks/Actions reference). A CheckSuite.url is NOT an Actions run URL.
+fn commit_suites(after: Option<&str>) -> String {
+    format!("checkSuites(first:100{}) {{ nodes {{ workflowRun {{ url workflow {{ name }} }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(after))
 }
 
 fn connection_nodes(
@@ -2128,6 +2212,170 @@ mod tests {
         );
         let calls = fake.calls_handle();
         (GhCliClient::with_process(fake), calls)
+    }
+
+    fn commit_connection(nodes: Vec<serde_json::Value>, next: Option<&str>) -> serde_json::Value {
+        serde_json::json!({"nodes": nodes, "pageInfo": {"hasNextPage": next.is_some(), "endCursor": next}})
+    }
+
+    fn commit_page(connection: serde_json::Value) -> String {
+        serde_json::json!({"data":{"repository":{"pullRequest":{"commits":connection}}}})
+            .to_string()
+    }
+
+    fn commit_node(ix: usize, suites: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"commit": {
+            "id": format!("commit-{ix}"), "oid": format!("sha-{ix}"),
+            "message": format!("Subject {ix}\n\nFull message body"),
+            "author": {"name":"Git Author", "user":{"login":"octocat"}},
+            "statusCheckRollup":{"state":(["SUCCESS", "FAILURE", "PENDING", "UNKNOWN"][ix % 4])},
+            "checkSuites":suites
+        }})
+    }
+
+    fn actions_suite(ix: usize) -> serde_json::Value {
+        serde_json::json!({"workflowRun": {
+            "url":format!("https://github.com/octocat/Hello-World/actions/runs/{ix}"),
+            "workflow":{"name":format!("Workflow {ix}")}
+        }})
+    }
+
+    #[test]
+    fn pr_commits_paginates_commits_and_each_nested_suite_connection_independently() {
+        let empty = commit_connection(vec![], None);
+        let mut nodes: Vec<_> = (0..100).map(|ix| commit_node(ix, empty.clone())).collect();
+        nodes[0]["commit"]["checkSuites"] =
+            commit_connection((0..100).map(actions_suite).collect(), Some("suites-next"));
+        // A second commit's independent connection can use the same cursor.
+        nodes[1]["commit"]["checkSuites"] = commit_connection(
+            vec![serde_json::json!({"workflowRun":null})],
+            Some("suites-next"),
+        );
+        nodes[2]["commit"]["author"]["user"] = serde_json::Value::Null;
+        nodes[3]["commit"]["author"] = serde_json::Value::Null;
+        nodes[3]["commit"]["statusCheckRollup"] = serde_json::Value::Null;
+        let first = commit_page(commit_connection(nodes, Some("commits-next")));
+        let suites_a = serde_json::json!({"data":{"node":{"checkSuites":commit_connection(vec![actions_suite(100), actions_suite(0)], None)}}}).to_string();
+        let suites_b = serde_json::json!({"data":{"node":{"checkSuites":commit_connection(vec![actions_suite(101)], None)}}}).to_string();
+        let last = commit_page(commit_connection(vec![commit_node(100, empty)], None));
+        let (client, calls) = session_script(&[&first, &suites_a, &suites_b, &last]);
+        let result = client.pr_commits(&loc()).unwrap();
+        assert_eq!(result.commits.len(), 101);
+        assert_eq!(
+            result
+                .commits
+                .iter()
+                .map(|c| c.sha.clone())
+                .collect::<Vec<_>>(),
+            (0..101).map(|ix| format!("sha-{ix}")).collect::<Vec<_>>()
+        );
+        assert_eq!(result.commits[0].message, "Subject 0\n\nFull message body");
+        assert_eq!(result.commits[0].author, "octocat");
+        assert_eq!(result.commits[2].author, "Git Author");
+        assert_eq!(result.commits[3].author, "unknown");
+        assert_eq!(
+            result.commits[..4].iter().map(|c| c.ci).collect::<Vec<_>>(),
+            vec![
+                CiState::Pass,
+                CiState::Fail,
+                CiState::Pending,
+                CiState::NoChecks
+            ]
+        );
+        assert_eq!(
+            result.commits[0].actions.len(),
+            101,
+            "duplicate run URLs are deduplicated"
+        );
+        assert_eq!(
+            result.commits[0].actions[100].url,
+            "https://github.com/octocat/Hello-World/actions/runs/100"
+        );
+        assert_eq!(
+            result.commits[1].actions.len(),
+            1,
+            "third-party suites invent no Actions link"
+        );
+        assert!(result.commits[2].actions.is_empty());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        let query = |ix: usize| calls[ix].iter().find(|a| a.starts_with("query=")).unwrap();
+        assert!(query(0).contains("commits(first:100)"));
+        assert!(query(0).contains("workflowRun { url workflow { name } }"));
+        assert!(query(1).contains("node(id:\"commit-0\")"));
+        assert!(query(2).contains("node(id:\"commit-1\")"));
+        assert!(query(1).contains("checkSuites(first:100,after:\"suites-next\")"));
+        assert!(query(3).contains("commits(first:100,after:\"commits-next\")"));
+        assert!(
+            query(3).contains("checkSuites(first:100)"),
+            "suite cursor must not leak across commits"
+        );
+    }
+
+    #[test]
+    fn pr_commits_empty_is_success_but_errors_and_broken_pagination_are_unavailable() {
+        let empty = commit_page(commit_connection(vec![], None));
+        let (client, _) = session_script(&[&empty]);
+        assert_eq!(
+            client.pr_commits(&loc()).unwrap(),
+            crate::PrCommits::default()
+        );
+        for payload in [
+            r#"{"data":{"repository":{"pullRequest":null}}}"#,
+            r#"{"errors":[{"message":"rate limited"}]}"#,
+            r#"{"data":{"repository":{"pullRequest":{"commits":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":null}}}}}}"#,
+        ] {
+            let (client, _) = session_script(&[payload]);
+            assert!(client.pr_commits(&loc()).is_err());
+        }
+        let repeated = commit_page(commit_connection(vec![], Some("same")));
+        let (client, _) = session_script(&[&repeated, &repeated]);
+        assert!(client
+            .pr_commits(&loc())
+            .unwrap_err()
+            .to_string()
+            .contains("repeated"));
+        let nested = commit_connection(vec![], Some("same"));
+        let first = commit_page(commit_connection(
+            vec![commit_node(0, nested.clone())],
+            None,
+        ));
+        let repeat = serde_json::json!({"data":{"node":{"checkSuites":nested}}}).to_string();
+        let (client, _) = session_script(&[&first, &repeat]);
+        assert!(client
+            .pr_commits(&loc())
+            .unwrap_err()
+            .to_string()
+            .contains("repeated"));
+        let client = GhCliClient::with_process(FakeGh::one(ok(Some(1), "", "network unavailable")));
+        assert!(client.pr_commits(&loc()).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires authenticated gh and network; read-only public PR"]
+    fn real_pr_commits_use_available_graphql_fields_and_direct_actions_urls() {
+        let loc = PrLocator {
+            owner: "zed-industries".into(),
+            repo: "zed".into(),
+            number: 66062,
+        };
+        let commits = GhCliClient::new().pr_commits(&loc).unwrap();
+        assert!(!commits.commits.is_empty());
+        assert!(
+            commits
+                .commits
+                .iter()
+                .any(|commit| !commit.actions.is_empty()),
+            "use a recent PR with retained Actions runs for this live smoke test"
+        );
+        for commit in &commits.commits {
+            assert_eq!(commit.sha.len(), 40);
+            for run in &commit.actions {
+                assert!(run
+                    .url
+                    .starts_with("https://github.com/zed-industries/zed/actions/runs/"));
+            }
+        }
     }
 
     fn range_anchor() -> CommentAnchor {

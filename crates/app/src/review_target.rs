@@ -54,6 +54,7 @@ pub(crate) struct Loaded {
     /// Some (possibly empty) for PR items, None for local ones.
     pub(crate) comments: Option<CommentIndex>,
     pub(crate) discussion: Option<github::PrDiscussion>,
+    pub(crate) commits: Option<github::PrCommits>,
     /// The snapshot of a PR's fetch, for the local store: what the app
     /// saw of the PR, and when. None for local items.
     pub(crate) snapshot: Option<local_store::StoredPrSnapshot>,
@@ -61,7 +62,7 @@ pub(crate) struct Loaded {
 
 /// Blocking fetch + parse + row building for one item; runs on the background
 /// executor, so subprocess waits and tree-sitter work stay off the main thread.
-/// PR items fetch meta, patch, and the complete discussion concurrently — three
+/// PR items fetch meta, patch, discussion, and commits concurrently — four
 /// facade calls, one error vocabulary.
 ///
 /// A PR's fetch also produces the snapshot the local store keeps: what the
@@ -74,7 +75,7 @@ pub(crate) fn fetch_item(
     mode: ViewMode,
     file_ix: usize,
 ) -> anyhow::Result<Loaded> {
-    let (meta, patch, comments, discussion, snapshot) = match source {
+    let (meta, patch, comments, discussion, commits, snapshot) = match source {
         Source::Pr(loc) => {
             let meta_client = github.clone();
             let meta_loc = loc.clone();
@@ -83,6 +84,10 @@ pub(crate) fn fetch_item(
             let comments_loc = loc.clone();
             let comments_thread =
                 std::thread::spawn(move || comments_client.pr_discussion(&comments_loc));
+            let commits_client = github.clone();
+            let commits_loc = loc.clone();
+            let commits_thread =
+                std::thread::spawn(move || commits_client.pr_commits(&commits_loc));
             let patch = github.pr_patch(loc)?;
             let meta = meta_thread
                 .join()
@@ -93,7 +98,9 @@ pub(crate) fn fetch_item(
             // Both the timeline and inline index derive from this discussion;
             // never fetch a second, potentially inconsistent comment collection.
             let comments = discussion.review_comments();
-            let snapshot = discussion_snapshot(loc, &meta, &discussion)?;
+            // Optional detail data must never make a usable diff fail to open.
+            let commits = commits_thread.join().ok().and_then(Result::ok);
+            let snapshot = discussion_snapshot(loc, &meta, &discussion, commits.as_ref())?;
             (
                 LoadedMeta::Pr(meta),
                 patch,
@@ -101,13 +108,14 @@ pub(crate) fn fetch_item(
                     comments.into_iter().map(ReviewComment::from).collect(),
                 )),
                 Some(discussion),
+                commits,
                 Some(snapshot),
             )
         }
         Source::Local(src) => {
             let src = git::resolve_local_with_base(&src.repo_root, src.base_ref.as_deref())?;
             let patch = git::diff_patch(&src)?;
-            (LoadedMeta::Local(src), patch, None, None, None)
+            (LoadedMeta::Local(src), patch, None, None, None, None)
         }
     };
     let diff = diff_core::parse_patch(&patch);
@@ -130,6 +138,7 @@ pub(crate) fn fetch_item(
         file_ix,
         comments,
         discussion,
+        commits,
         snapshot,
     })
 }
@@ -141,9 +150,11 @@ pub(crate) fn discussion_snapshot(
     loc: &github::PrLocator,
     meta: &github::PrMeta,
     discussion: &github::PrDiscussion,
+    commits: Option<&github::PrCommits>,
 ) -> anyhow::Result<local_store::StoredPrSnapshot> {
     let mut snapshot = pr_snapshot(loc, meta, &discussion.review_comments());
     snapshot.discussion = Some(serde_json::to_value(discussion)?);
+    snapshot.commits = commits.map(serde_json::to_value).transpose()?;
     let resolved: std::collections::HashSet<_> = discussion
         .threads
         .iter()
@@ -218,6 +229,7 @@ fn pr_snapshot(
         head_ref: meta.head_ref_name.clone(),
         threads,
         discussion: None,
+        commits: None,
         is_draft: false,
         fetched_at_ms: local_store::now_ms(),
     }

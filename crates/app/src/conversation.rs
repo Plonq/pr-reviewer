@@ -18,6 +18,9 @@
 //! eagerly. Task 12 reuses this pipe for comment bodies, where the same
 //! tradeoff holds.
 
+mod markdown;
+pub(crate) use markdown::render as render_markdown;
+
 /// Expand the GitHub-isms in a description or comment body into plain GFM:
 ///
 /// - `:shortcode:` → the emoji character, via the gemoji table,
@@ -114,6 +117,17 @@ pub(crate) fn timeline(discussion: &github::PrDiscussion) -> Vec<Entry<'_>> {
         }
     }
     entries.sort_by(|a, b| a.key().cmp(&b.key()));
+    // GitHub emits a bodyless COMMENTED review for inline comments, and can
+    // retain it after its threads disappear. It is not an empty comment card.
+    entries.retain(|entry| match entry {
+        Entry::Review(comment, threads) => {
+            !threads.is_empty()
+                || !matches!(comment.review_state.as_deref(), Some("COMMENTED"))
+                || markdown::has_content(&comment.body)
+                || comment.reactions.iter().any(|reaction| reaction.count > 0)
+        }
+        _ => true,
+    });
     entries
 }
 
@@ -239,15 +253,140 @@ pub(crate) fn anchor(thread: &github::ReviewThread) -> String {
 
 use crate::{text_size, theme, ItemData, ItemState, ReviewApp, ReviewItem, Source};
 use gpui::{
-    div, px, rems, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+    div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window,
-};
-use gpui_component::{
-    text::{TextView, TextViewStyle},
-    ActiveTheme,
 };
 
 impl ReviewApp {
+    pub(crate) fn render_commits(
+        &self,
+        item: &ReviewItem,
+        data: &ItemData,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let item_id = item.id;
+        let expanded = data.commits_expanded;
+        let mut section = div()
+            .mt_6()
+            .min_w_0()
+            .border_1()
+            .border_color(theme::surface0())
+            .rounded_md()
+            .p_4()
+            .child(
+                div()
+                    .id(SharedString::from(format!("commits-toggle-{item_id}")))
+                    .debug_selector(|| format!("commits-toggle-{item_id}"))
+                    .cursor_pointer()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(match &data.commits {
+                        Some(commits) => format!(
+                            "{} Commits ({}) · {}",
+                            if expanded { "▾" } else { "▸" },
+                            commits.commits.len(),
+                            if expanded { "collapse" } else { "expand" },
+                        ),
+                        None => "Commits".into(),
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(item) = this.items.iter_mut().find(|item| item.id == item_id)
+                        else {
+                            return;
+                        };
+                        if let ItemState::Ready(data) = &mut item.state {
+                            data.commits_expanded = !data.commits_expanded;
+                            cx.notify();
+                        }
+                    })),
+            );
+        let Some(commits) = &data.commits else {
+            return section
+                .child(
+                    div()
+                        .mt_2()
+                        .text_color(theme::overlay0())
+                        .child("Commits unavailable. Refresh to try again."),
+                )
+                .into_any_element();
+        };
+        if commits.commits.is_empty() {
+            section = section.child(
+                div()
+                    .mt_2()
+                    .text_color(theme::overlay0())
+                    .child("No commits."),
+            );
+        }
+        for (ix, commit) in commits.commits.iter().enumerate() {
+            if !expanded && ix + 1 != commits.commits.len() {
+                continue;
+            }
+            let (verdict, color) = commit_ci(commit.ci);
+            let mut row = div()
+                .debug_selector(|| format!("commit-{item_id}-{ix}"))
+                .mt_3()
+                .min_w_0()
+                .border_t_1()
+                .border_color(theme::surface0())
+                .pt_3();
+            if expanded {
+                row = row
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(theme::overlay0())
+                                    .child(format!("{}.", ix + 1)),
+                            )
+                            .child(
+                                div()
+                                    .font_family(crate::MONO)
+                                    .text_color(theme::subtext())
+                                    .child(commit.sha.chars().take(7).collect::<String>()),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme::subtext())
+                                    .child(format!("by {}", commit.author)),
+                            )
+                            .child(div().text_color(color).child(verdict)),
+                    )
+                    // Plain text, not markdown: commit messages cannot inject links.
+                    .child(div().mt_1().child(commit.message.clone()));
+            } else {
+                row = row.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(div().text_color(theme::subtext()).child("Latest commit"))
+                        .child(div().text_color(color).child(verdict)),
+                );
+            }
+            for (run_ix, run) in commit.actions.iter().enumerate() {
+                let url = run.url.clone();
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "commit-action-{}-{ix}-{run_ix}",
+                            item.id
+                        )))
+                        .debug_selector(|| format!("commit-action-{}-{ix}-{run_ix}", item.id))
+                        .mt_1()
+                        .text_color(theme::blue())
+                        .cursor_pointer()
+                        .child(format!("Actions: {} ↗", run.name))
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                );
+            }
+            section = section.child(row);
+        }
+        section.into_any_element()
+    }
+
     pub(crate) fn render_discussion(
         &self,
         item: &ReviewItem,
@@ -260,7 +399,8 @@ impl ReviewApp {
         };
         let slug = loc.repo_slug();
         let mut elements = Vec::new();
-        if discussion.comments.is_empty() && discussion.threads.is_empty() {
+        let entries = timeline(discussion);
+        if entries.is_empty() {
             elements.push(
                 div()
                     .mt_6()
@@ -269,11 +409,13 @@ impl ReviewApp {
                     .into_any_element(),
             );
         }
-        for entry in timeline(discussion) {
+        for entry in entries {
             match entry {
                 Entry::Comment(comment) => elements.push(
                     div()
                         .mt_6()
+                        .w_full()
+                        .min_w_0()
                         .border_1()
                         .border_color(theme::surface0())
                         .rounded_md()
@@ -284,6 +426,8 @@ impl ReviewApp {
                 Entry::Review(comment, threads) => {
                     let mut review = div()
                         .mt_6()
+                        .w_full()
+                        .min_w_0()
                         .border_1()
                         .border_color(theme::surface0())
                         .rounded_md()
@@ -291,12 +435,19 @@ impl ReviewApp {
                             self.discussion_comment(item.id, "main", comment, &slug, window, cx),
                         ));
                     if !threads.is_empty() {
-                        review =
-                            review.child(div().px_4().pb_4().flex().flex_col().gap_3().children(
-                                threads.into_iter().map(|thread| {
+                        review = review.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .px_4()
+                                .pb_4()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .children(threads.into_iter().map(|thread| {
                                     self.discussion_thread(item, data, thread, &slug, window, cx)
-                                }),
-                            ));
+                                })),
+                        );
                     }
                     elements.push(review.into_any_element());
                 }
@@ -353,6 +504,8 @@ impl ReviewApp {
                 "thread-{}-{}",
                 item.id, thread.id
             )))
+            .debug_selector(|| format!("thread-header-{}-{}", item.id, thread.id))
+            .w_full()
             .px_4()
             .py_2()
             .text_size(px(text_size() - 1.))
@@ -376,6 +529,8 @@ impl ReviewApp {
                 }));
         }
         let mut card = div()
+            .w_full()
+            .flex_shrink_0()
             .min_w_0()
             .border_1()
             .border_color(theme::surface0())
@@ -464,7 +619,7 @@ impl ReviewApp {
             Some(_) => " · reviewed",
             None => "",
         };
-        let mut card = div().min_w_0().child(
+        let mut card = div().w_full().min_w_0().child(
             div()
                 .mb_2()
                 .text_color(theme::subtext())
@@ -474,27 +629,17 @@ impl ReviewApp {
                     comment.author, comment.created_at
                 )),
         );
-        if !comment.body.trim().is_empty() {
-            card = card.child(
-                TextView::markdown(
-                    SharedString::from(format!(
-                        "discussion-{item_id}-{kind}-{}-{}",
-                        comment.review_state.is_some(),
-                        comment.id
-                    )),
-                    SharedString::from(preprocess(&comment.body, slug)),
-                    window,
-                    cx,
-                )
-                .selectable(true)
-                .style(TextViewStyle {
-                    heading_base_font_size: px(text_size()),
-                    paragraph_gap: rems(0.75),
-                    highlight_theme: cx.theme().highlight_theme.clone(),
-                    is_dark: !theme::is_light(),
-                    ..Default::default()
-                }),
-            );
+        if markdown::has_content(&comment.body) {
+            card = card.child(render_markdown(
+                &format!(
+                    "discussion-{item_id}-{kind}-{}-{}",
+                    comment.review_state.is_some(),
+                    comment.id
+                ),
+                preprocess(&comment.body, slug),
+                window,
+                cx,
+            ));
         }
         // Plain labels, deliberately not buttons: adding reactions is v0.2.
         let reactions: Vec<_> = comment
@@ -514,6 +659,15 @@ impl ReviewApp {
             card = card.child(div().mt_3().flex().flex_wrap().gap_2().children(reactions));
         }
         card.into_any_element()
+    }
+}
+
+fn commit_ci(ci: github::CiState) -> (&'static str, gpui::Rgba) {
+    match ci {
+        github::CiState::Pass => ("CI passed", theme::green()),
+        github::CiState::Fail => ("CI failed", theme::red()),
+        github::CiState::Pending => ("CI pending", theme::yellow()),
+        github::CiState::NoChecks => ("No checks", theme::overlay0()),
     }
 }
 
@@ -688,6 +842,26 @@ fn expand_text(text: &str, repo_slug: &str, out: &mut String) {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn commits_ci_has_visible_text_and_verdict_colors() {
+        assert_eq!(
+            commit_ci(github::CiState::Pass),
+            ("CI passed", theme::green())
+        );
+        assert_eq!(
+            commit_ci(github::CiState::Fail),
+            ("CI failed", theme::red())
+        );
+        assert_eq!(
+            commit_ci(github::CiState::Pending),
+            ("CI pending", theme::yellow())
+        );
+        assert_eq!(
+            commit_ci(github::CiState::NoChecks),
+            ("No checks", theme::overlay0())
+        );
+    }
+
     pub(crate) fn sample_discussion() -> github::PrDiscussion {
         let comment = |id, time: &str| github::DiscussionComment {
             id,
@@ -803,6 +977,42 @@ pub(crate) mod tests {
             timeline(&discussion).len(),
             5,
             "missing reviews retain standalone threads"
+        );
+    }
+
+    #[test]
+    fn empty_commented_reviews_are_hidden_but_verdicts_threads_and_reactions_remain() {
+        let mut discussion = sample_discussion();
+        let mut review = discussion.comments[0].clone();
+        review.review_state = Some("COMMENTED".into());
+        review.review_id = Some("R1".into());
+        review.body = " \n <!-- bot metadata --> \n".into();
+        review.reactions.clear();
+        discussion.comments = vec![review.clone()];
+        discussion.threads.clear();
+        assert!(timeline(&discussion).is_empty());
+        for state in ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"] {
+            discussion.comments[0].review_state = Some(state.into());
+            assert_eq!(
+                timeline(&discussion).len(),
+                1,
+                "keep meaningful {state} verdict"
+            );
+        }
+        discussion.comments[0] = review.clone();
+        discussion.comments[0].body = "Actual review summary".into();
+        assert_eq!(timeline(&discussion).len(), 1);
+        discussion.comments[0] = review.clone();
+        discussion.comments[0].reactions = vec![github::Reaction {
+            content: "THUMBS_UP".into(),
+            count: 1,
+        }];
+        assert_eq!(timeline(&discussion).len(), 1);
+        discussion.comments[0] = review;
+        discussion.threads = sample_discussion().threads;
+        discussion.threads[0].comments[0].review_id = Some("R1".into());
+        assert!(
+            matches!(&timeline(&discussion)[..], [Entry::Review(_, threads)] if threads.len() == 1)
         );
     }
 

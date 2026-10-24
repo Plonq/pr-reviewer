@@ -53,6 +53,10 @@ pub struct PrSnapshot {
     /// older snapshots without it still open with their description intact.
     #[serde(default)]
     pub discussion: Option<serde_json::Value>,
+    /// Detail-only commit/CI payload. Opaque to the store, absent in old
+    /// snapshots or when GitHub could not provide it (not an empty list).
+    #[serde(default)]
+    pub commits: Option<serde_json::Value>,
     /// Whether the PR was a draft when the snapshot was taken.
     #[serde(default)]
     pub is_draft: bool,
@@ -316,6 +320,7 @@ mod tests {
             base_ref: "main".into(),
             head_ref: "feature/deactivation".into(),
             discussion: Some(serde_json::json!({"comments": [], "threads": []})),
+            commits: Some(serde_json::json!({"commits": [{"sha": "abc123", "ci": "Fail"}]})),
             threads: vec![ThreadSeen {
                 id: "T_1".into(),
                 updated_at: "2026-10-20T08:07:08Z".into(),
@@ -358,6 +363,25 @@ mod tests {
         let snapshot: PrSnapshot = serde_json::from_value(json).unwrap();
         assert!(snapshot.discussion.is_none());
         assert_eq!(snapshot.body, "Some **markdown**.");
+    }
+
+    #[test]
+    fn pre_commits_snapshots_remain_readable_and_empty_differs_from_unavailable() {
+        let mut json = serde_json::to_value(sample()).unwrap();
+        json.as_object_mut().unwrap().remove("commits");
+        let mut snapshot: PrSnapshot = serde_json::from_value(json).unwrap();
+        assert!(snapshot.commits.is_none());
+        assert!(snapshot.discussion.is_some());
+        let store = crate::Store::open_in_memory().unwrap();
+        snapshot.commits = Some(serde_json::json!({"commits": []}));
+        store.snapshots().write(&snapshot).unwrap();
+        assert_eq!(
+            store
+                .snapshots()
+                .read(&snapshot.repository, snapshot.number)
+                .unwrap(),
+            Some(snapshot)
+        );
     }
 
     /// A PR the app has never seen reads as no snapshot — not an error.
