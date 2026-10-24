@@ -20,7 +20,7 @@ use std::time::Duration;
 /// Time budget for one request, connect and response combined. Image
 /// fetches are small; anything longer is a stuck connection not worth
 /// holding a thread for.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(42);
 
 /// The client the app registers with gpui in `main`.
 pub fn http_client() -> Arc<dyn HttpClient> {

@@ -1,0 +1,26 @@
+# Not loaded by the app. Pure diff-viewer fodder.
+review:
+  mode: goose
+  enthusiasm: excessive
+  reviewers:
+    - name: Captain Honk
+      specialties: [breadcrumbs, indentation]
+    - name: Professor Waddle
+      specialties: [moon-cheese, concurrency]
+  rules:
+    require_sunglasses: false
+    allow_interpretive_dance: true
+    max_comments_per_sandwich: 42
+
+weather:
+  refresh_seconds: 17
+  fallback: scattered-confetti
+  stations:
+    harbor: online
+    mountain: mildly-confused
+    pond: occupied-by-geese
+
+moon:
+  enabled: true
+  cache_directory: output/lunar-cheese
+  phases: [new, waxing, full, snack-time]

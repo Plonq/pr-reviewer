@@ -1,0 +1,16 @@
+{
+  "fake": true,
+  "schema": 7,
+  "message": "No actual geese were consulted.",
+  "queue": [
+    { "id": 1, "title": "Alphabetize the moon", "priority": "eventually", "approved": false },
+    { "id": 2, "title": "Refactor the sandwich", "priority": "urgent-ish", "approved": true },
+    { "id": 3, "title": "Deprecate Tuesdays", "priority": null, "approved": false },
+    { "id": 4, "title": "Translate honks into Rust", "priority": "🪿", "approved": true }
+  ],
+  "metadata": {
+    "owner": "nobody-in-particular",
+    "labels": ["fake", "diff-test", "do-not-ship"],
+    "breadcrumbs_remaining": 128
+  }
+}

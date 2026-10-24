@@ -4,13 +4,13 @@
       "id": "MDQ6VXNlcjU4MzIzMQ==",
       "is_bot": false,
       "login": "octocat",
-      "name": "The Octocat"
+      "name": "The Octogoose 🪿"
     },
-    "headRefName": "deactivation-filters",
+    "headRefName": "experimental/teach-geese-to-review",
     "isDraft": false,
     "number": 4781,
     "state": "OPEN",
-    "title": "Add deactivation filters to the users manage list",
+    "title": "Replace every loading spinner with a tiny migrating goose",
     "updatedAt": "2026-10-20T08:07:08Z"
   },
   {
@@ -21,10 +21,24 @@
       "name": "Nano Flux"
     },
     "headRefName": "nanoflux/wip",
-    "isDraft": true,
+    "isDraft": false,
     "number": 4761,
     "state": "OPEN",
-    "title": "wip: experiment",
+    "title": "Definitely production-ready confetti engine",
     "updatedAt": "2026-10-19T09:00:00Z"
+  },
+  {
+    "author": {
+      "id": "FAKE-DIFF-TOOL-ACCOUNT",
+      "is_bot": true,
+      "login": "goose-review-bot",
+      "name": "Captain Honk"
+    },
+    "headRefName": "fake/moon-cheese-cache",
+    "isDraft": true,
+    "number": 9999,
+    "state": "OPEN",
+    "title": "Cache lunar cheese samples for offline review",
+    "updatedAt": "2026-10-24T12:34:56Z"
   }
 ]

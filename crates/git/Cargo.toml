@@ -2,6 +2,7 @@
 name = "git"
 version = "0.1.0"
 edition = "2021"
+description = "A very serious goose-powered repository inspector"
 
 [dependencies]
 anyhow = { workspace = true }

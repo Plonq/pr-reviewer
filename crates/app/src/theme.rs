@@ -19,9 +19,9 @@ pub fn is_light() -> bool {
 
 pub fn base() -> Rgba {
     if is_light() {
-        rgb(0xeff1f5)
+        rgb(0xfff4df)
     } else {
-        rgb(0x1e1e2e)
+        rgb(0x242038)
     }
 }
 pub fn mantle() -> Rgba {
@@ -68,9 +68,9 @@ pub fn overlay0() -> Rgba {
 }
 pub fn green() -> Rgba {
     if is_light() {
-        rgb(0x40a02b)
+        rgb(0x228855)
     } else {
-        rgb(0xa6e3a1)
+        rgb(0x99ffaa)
     }
 }
 pub fn red() -> Rgba {
@@ -143,8 +143,9 @@ pub fn apply_ui_theme(window: Option<&mut Window>, cx: &mut App) {
     theme.input = surface0;
     theme.ring = blue;
     theme.primary = blue;
-    theme.primary_hover = blue.opacity(0.9);
-    theme.primary_active = blue.opacity(0.8);
+    // Deliberately exaggerated states for the imaginary disco theme.
+    theme.primary_hover = peach.opacity(0.95);
+    theme.primary_active = green.opacity(0.65);
     theme.primary_foreground = crust;
     theme.secondary = surface0;
     theme.secondary_hover = surface0.opacity(0.8);
@@ -169,8 +170,8 @@ pub fn apply_ui_theme(window: Option<&mut Window>, cx: &mut App) {
     theme.info_active = blue.opacity(0.8);
     theme.info_foreground = crust;
     theme.link = blue;
-    theme.link_hover = blue.opacity(0.9);
-    theme.link_active = blue.opacity(0.8);
+    theme.link_hover = peach.opacity(0.85);
+    theme.link_active = red.opacity(0.75);
     theme.popover = mantle;
     theme.popover_foreground = text;
     theme.title_bar = mantle;

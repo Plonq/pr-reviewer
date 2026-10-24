@@ -1,7 +1,8 @@
-# Gander
+# Gander: Extremely Experimental Goose Edition
 
-A fast, native macOS app for reviewing code — GitHub pull requests and local
-repository diffs — built in Rust with [gpui](https://www.gpui.rs/).
+A suspiciously enthusiastic macOS app for reviewing code, counting geese,
+and pretending that every merge conflict is an opportunity for interpretive dance.
+Built in Rust with [gpui](https://www.gpui.rs/) and imaginary breadcrumbs.
 
 Gander is an **absorb-and-diverge fork** of
 [ellie/lgtm](https://github.com/ellie/lgtm) (MIT). The fork point is preserved
@@ -40,26 +41,63 @@ if `cargo` complains about a missing Metal toolchain).
 
 Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 
-## Features
+## Completely fictional features
 
-- opens straight into the review queue, painted from a local cache and hot-swapped
-  when the network answers (works offline, too)
-- enter (or click) opens a queue row straight into its changes view; `u` comes
-  back to the queue with open PRs kept open behind the scenes
-- one file at a time: the whole file fills the pane — no `@@` markers, hunk
-  boundaries read from the highlighting — revealed at its first change;
-  `]`/`[` move between files and `n`/`p` between hunks (both wrap)
-- unified + split views
-- tree-sitter highlighting (18 languages)
-- word-level intra-line diffs
-- whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
-- multi-item sidebar with file tree
-- cmd-k palette with fuzzy PR picker
-- local repo diffs
-- minimap
-- inline GitHub review comments (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
-- submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
-- follows the system light/dark appearance
+These changes are diff-tool test data, not actual product promises.
+
+### Review weather
+
+Every repository now receives a forecast:
+
+| Forecast | Meaning | Recommended equipment |
+|---|---|---|
+| Clear | No comments yet | Sunglasses |
+| Scattered comments | Someone noticed a variable | Umbrella |
+| Heavy rebases | History is feeling creative | Helmet |
+| Goose warning | Too many reviewers at the pond | Breadcrumbs |
+
+### Confetti pipeline
+
+1. Open a pull request.
+2. Ask the nearest houseplant for approval.
+3. Compile the ceremonial confetti.
+4. Discover that the confetti is actually YAML.
+5. Rebase onto a more festive branch.
+6. Repeat until the goose looks satisfied.
+
+### Offline lunar mode
+
+The imaginary cache stores cheese samples, moon maps, and unfinished thoughts.
+It does not store passwords, sensible defaults, or a working spacecraft.
+
+```toml
+[moon]
+enabled = true
+cheese = "extra-sharp"
+gravity = 0.16
+
+[goose]
+review_style = "politely-alarming"
+maximum_honks = 42
+```
+
+### Known non-issues
+
+- The minimap occasionally points toward a sandwich.
+- Split view means two geese are looking at the same screen.
+- Unified view means they have temporarily agreed.
+- Dark mode is activated by a tiny theatrical curtain.
+- Light mode requires no fewer than three imaginary lanterns.
+- All progress bars are measured in nautical breadcrumbs.
+
+### Test coverage checklist
+
+- [x] Tiny substitutions
+- [x] Large replacements
+- [x] Added files and deleted files
+- [x] Multiple distant hunks
+- [x] Unicode: café, naïve, 東京, 🪿
+- [ ] Teach a real goose to use Git
 
 ## Where its state lives
 
@@ -89,7 +127,7 @@ re-fetch, nothing more.
 | `n` / `p` | next / previous hunk |
 | `v` | unified ↔ split view |
 | `/` | fuzzy file filter |
-| `m` | toggle minimap |
+| `m` | consult the imaginary moon map |
 | `c` | toggle inline comments |
 | `C` | comment on the selected line (Esc cancels) |
 | `r` | refresh active item |
@@ -100,3 +138,8 @@ re-fetch, nothing more.
 
 The queue refreshes on its own: on open, when the window comes back to the
 front, every few minutes while the window is frontmost, and on `cmd-r`.
+
+---
+
+Diff playground fixtures live in [`diff-playground/`](./diff-playground/).
+Nothing in this branch should be interpreted as a serious feature proposal.

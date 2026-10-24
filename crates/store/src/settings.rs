@@ -2,9 +2,6 @@
 //!
 //! Settings are small, read as a whole, and written as a whole — so they
 //! live in a single JSON column rather than a table of key/value rows.
-//! Unknown keys are preserved on write (a newer build's setting survives
-//! an older build's round trip), which is what makes the blob safe to
-//! extend without a migration.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -43,11 +40,6 @@ impl<'a> Settings<'a> {
 
     /// Replace the settings with `settings`, keeping any key this build
     /// doesn't know about.
-    ///
-    /// A key this build *does* know about is replaced outright — including
-    /// by a null, which is how a setting is turned off. A key this build
-    /// doesn't know about is left alone, so an older build never silently
-    /// drops a newer build's setting.
     pub fn write(&self, settings: &Map<String, Value>) -> Result<()> {
         let mut merged = self.read()?;
         for (key, value) in settings {
@@ -92,7 +84,6 @@ impl<'a> Settings<'a> {
 mod tests {
     use super::*;
 
-    /// Settings round-trip: what was written reads back unchanged.
     #[test]
     fn settings_round_trip() {
         let store = crate::Store::open_in_memory().unwrap();
@@ -107,7 +98,6 @@ mod tests {
         assert_eq!(read.get("wrap"), Some(&Value::Bool(true)));
     }
 
-    /// Writing a key replaces it; other keys stay.
     #[test]
     fn writing_a_key_leaves_the_others_alone() {
         let store = crate::Store::open_in_memory().unwrap();
@@ -158,8 +148,6 @@ mod tests {
         assert_eq!(read.get("wrap"), Some(&Value::Bool(true)));
     }
 
-    /// A settings blob that isn't an object reads as "no settings" — a
-    /// corrupt value must never keep the app from starting.
     #[test]
     fn a_corrupt_settings_blob_degrades_to_empty() {
         let store = crate::Store::open_in_memory().unwrap();

@@ -5,6 +5,69 @@ use imara_diff::intern::InternedInput;
 use imara_diff::Algorithm;
 use std::ops::Range;
 
+// Fake review telemetry: intentionally unused, only here to exercise a
+// substantial insertion in an otherwise real source file.
+#[allow(dead_code)]
+mod imaginary_review_weather {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Forecast {
+        Clear,
+        ScatteredComments,
+        HeavyRebases,
+        GooseWarning,
+    }
+
+    #[derive(Debug)]
+    pub struct Station {
+        pub name: &'static str,
+        pub comments: usize,
+        pub geese: usize,
+        pub forecast: Forecast,
+    }
+
+    impl Station {
+        pub fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                comments: 0,
+                geese: 1,
+                forecast: Forecast::Clear,
+            }
+        }
+
+        pub fn observe(&mut self, comments: usize, geese: usize) {
+            self.comments = comments;
+            self.geese = geese;
+            self.forecast = match (comments, geese) {
+                (_, 8..) => Forecast::GooseWarning,
+                (20.., _) => Forecast::HeavyRebases,
+                (1.., _) => Forecast::ScatteredComments,
+                _ => Forecast::Clear,
+            };
+        }
+
+        pub fn bulletin(&self) -> String {
+            format!(
+                "{}: {:?}; {} comments; {} geese",
+                self.name, self.forecast, self.comments, self.geese
+            )
+        }
+    }
+
+    pub fn sample_stations() -> Vec<Station> {
+        let mut harbor = Station::new("Harbor of Unmerged Ideas");
+        harbor.observe(3, 2);
+
+        let mut mountain = Station::new("Mount Rebase");
+        mountain.observe(27, 0);
+
+        let mut pond = Station::new("The Forbidden Pond");
+        pond.observe(0, 12);
+
+        vec![harbor, mountain, pond]
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PrDiff {
     pub files: Vec<FileDiff>,

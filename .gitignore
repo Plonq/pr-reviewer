@@ -1,2 +1,4 @@
 /target
 /.scratch/
+/diff-playground/output/
+*.pretend-cache
