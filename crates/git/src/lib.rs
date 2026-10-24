@@ -41,28 +41,30 @@ pub fn resolve_local_with_base(path: &Path, base_ref: Option<&str>) -> Result<Lo
         .trim()
         .to_string();
 
-    if let Some(base_ref) = base_ref {
-        let base_ref = base_ref.trim();
-        if base_ref == "HEAD" {
+    if true {
+        if let Some(base_ref) = base_ref {
+            let base_ref = base_ref.trim();
+            if base_ref == "HEAD" {
+                return Ok(LocalSource {
+                    repo_root,
+                    branch,
+                    base_ref: Some(base_ref.to_string()),
+                    base_label: "HEAD".to_string(),
+                    base_oid: git(path, &["rev-parse", "HEAD"])
+                        .ok()
+                        .map(|oid| oid.trim().to_string()),
+                });
+            }
+            let oid = git(&repo_root, &["merge-base", "HEAD", base_ref])
+                .with_context(|| format!("{base_ref} does not share history with HEAD"))?;
             return Ok(LocalSource {
                 repo_root,
                 branch,
                 base_ref: Some(base_ref.to_string()),
-                base_label: "HEAD".to_string(),
-                base_oid: git(path, &["rev-parse", "HEAD"])
-                    .ok()
-                    .map(|oid| oid.trim().to_string()),
+                base_label: base_ref.to_string(),
+                base_oid: Some(oid.trim().to_string()),
             });
         }
-        let oid = git(&repo_root, &["merge-base", "HEAD", base_ref])
-            .with_context(|| format!("{base_ref} does not share history with HEAD"))?;
-        return Ok(LocalSource {
-            repo_root,
-            branch,
-            base_ref: Some(base_ref.to_string()),
-            base_label: base_ref.to_string(),
-            base_oid: Some(oid.trim().to_string()),
-        });
     }
 
     // Default branch: prefer recorded remote HEAD symrefs, then conventional
