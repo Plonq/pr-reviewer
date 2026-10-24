@@ -4,6 +4,7 @@ mod conversation;
 mod http;
 mod local_store;
 mod minimap;
+mod position;
 mod queue;
 mod review_target;
 mod rows;
@@ -520,6 +521,8 @@ pub(crate) struct ItemData {
     /// hunks. Determines when comments need the experimental positioning API.
     anchor_hunks: Vec<Vec<diff_core::Hunk>>,
     scroll: UniformListScrollHandle,
+    position_restore: Option<position::PositionRestore>,
+    saved_position: Option<local_store::ReviewPosition>,
     /// The conversation pane's scroll position. A pane-level container (not
     /// the TextView's own), so the wheel scrolls from anywhere over the pane
     /// and the scrollbar paints at the pane's edge — like the diff pane's.
@@ -596,6 +599,8 @@ impl ItemData {
             cursor: 0,
             cursor_side: None,
             scroll: UniformListScrollHandle::new(),
+            position_restore: None,
+            saved_position: None,
             conv_scroll: ScrollHandle::new(),
             discussion: None,
             commits: None,
@@ -659,6 +664,7 @@ impl ItemData {
     /// to its first row, or the file header when the file has no hunks.
     /// This is the "first change on screen" reveal of file mode.
     fn reveal_hunk(&mut self, hunk_ix: Option<usize>) {
+        self.position_restore = None;
         let target = hunk_ix
             .and_then(|ix| self.hunk_rows.get(ix).copied())
             .or_else(|| self.hunk_rows.first().copied())
@@ -667,6 +673,7 @@ impl ItemData {
         self.cursor_side = None;
         self.scroll
             .scroll_to_item_strict(target, ScrollStrategy::Top);
+        self.remember_jump();
     }
 
     /// Show `file_ix` alone in the pane, revealed at `hunk_ix` (its first
@@ -729,6 +736,10 @@ impl ItemData {
     /// the first visible non-comment row stays put even though comment rows
     /// above it appeared or disappeared.
     fn rebuild_rows_anchored(&mut self) {
+        let pending = (self.position_restore.is_some()
+            || self.scroll.0.borrow().deferred_scroll_to_item.is_some())
+        .then(|| self.review_position())
+        .flatten();
         let offset = self.scroll.0.borrow().base_handle.offset();
         let top_px = f32::from(-offset.y).max(0.);
         let top_row =
@@ -747,6 +758,11 @@ impl ItemData {
             .borrow()
             .base_handle
             .set_offset(point(offset.x, px(-(new_top as f32 * row_height() + frac))));
+        if let Some(mut position) = pending {
+            position.split = self.mode == ViewMode::Split;
+            self.restore_review_position(position, true);
+            self.cursor = nth_noncomment_row(&self.rows, cursor_base);
+        }
     }
 
     /// The minimap quad runs for this pane height, from the cache when the
@@ -914,8 +930,8 @@ impl ReviewItem {
         }
     }
 
-    /// Swap fetched data in. On refresh (already Ready) scroll position,
-    /// cursor, and view mode are preserved.
+    /// Swap fetched data in. On refresh (already Ready) the file, scroll
+    /// anchor, and view mode are preserved.
     ///
     /// Returns the PR's snapshot, when the fetch was a PR's: the caller
     /// keeps it in the local store, so the next launch knows what the app
@@ -947,6 +963,7 @@ impl ReviewItem {
         self.refresh_error = None;
         match &mut self.state {
             ItemState::Ready(data) => {
+                let position = data.review_position();
                 // Fresh patch-derived data: any previous upgrade is stale —
                 // the upgrade re-runs from scratch.
                 data.upgrades.clear();
@@ -956,14 +973,20 @@ impl ReviewItem {
                     Some(local) => Some(local.index()),
                     None => comments,
                 };
-                // Background rows assumed the fetched comments and the
-                // displayed file. Local drafts are reattached here, and
-                // view/comment toggles — or a file switch while the fetch
-                // ran — may have moved the target, so anything that drifted
-                // rebuilds.
+                data.file_ix = position
+                    .as_ref()
+                    .and_then(|position| {
+                        diff.files
+                            .iter()
+                            .position(|file| file.display_path() == position.path)
+                    })
+                    .unwrap_or(0);
+                // Reuse the background-built rows unless the displayed file
+                // or presentation drifted while the fetch was in flight.
                 if data.local_review.is_some()
                     || data.mode != mode
                     || !data.comments_visible
+                    || data.comment_wrap != COMMENT_WRAP_CHARS
                     || file_ix != data.file_ix
                 {
                     built_rows = build_rows(RowsView {
@@ -984,6 +1007,9 @@ impl ReviewItem {
                 data.anchor_hunks = diff.files.iter().map(|file| file.hunks.clone()).collect();
                 data.diff = diff;
                 data.set_rows(built_rows);
+                if !position.is_some_and(|position| data.restore_review_position(position, true)) {
+                    data.open_file(0, None);
+                }
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.additions = additions;
                 data.deletions = deletions;
@@ -1618,6 +1644,11 @@ impl ReviewApp {
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
         let _subscriptions = vec![
+            cx.on_app_quit(|this, _| {
+                this.persist_positions();
+                async {}
+            }),
+            cx.on_release(|this, _| this.persist_positions()),
             // The system appearance can flip while we run; re-apply the
             // palette (Mocha ↔ Latte) and repaint when it does.
             cx.observe_window_appearance(window, |_, window, cx| {
@@ -1718,6 +1749,7 @@ impl ReviewApp {
         this.paint_queue_from_cache();
         this.spawn_queue_refresh(cx);
         this.spawn_background_poll(cx);
+        this.spawn_position_memory(cx);
         this
     }
 
@@ -1733,6 +1765,9 @@ impl ReviewApp {
             return;
         }
         self.frontmost = frontmost;
+        if !frontmost {
+            self.persist_positions();
+        }
         if frontmost {
             for id in self.items.iter().map(|item| item.id).collect::<Vec<_>>() {
                 self.resume_session(id, cx);
@@ -1945,6 +1980,7 @@ impl ReviewApp {
         if self.show_queue {
             return;
         }
+        self.persist_positions();
         self.show_queue = true;
         cx.notify();
     }
@@ -2099,6 +2135,7 @@ impl ReviewApp {
                 .borrow()
                 .base_handle
                 .set_offset(point(offset.x, px(-(top_row * new_rh))));
+            data.rescale_position_restore(new_rh / old_rh);
             // Minimap geometry is height-derived; drop the memoized layout.
             data.minimap_cache.replace(None);
         }
@@ -2193,6 +2230,7 @@ impl ReviewApp {
     }
 
     fn open_item(&mut self, source: Source, cx: &mut Context<Self>) {
+        self.persist_positions();
         // The session keeps one item per source: opening something it
         // already has brings that item forward — scroll, cursor, view mode
         // and comments exactly where they were left — instead of a second
@@ -2265,7 +2303,25 @@ impl ReviewApp {
                 item.reloading = false;
                 match fetched {
                     Ok(loaded) => {
+                        // An offline metadata-only copy has no viewport and
+                        // must not replace the last real diff anchor.
+                        let needs_restore = !matches!(&item.state,
+                            ItemState::Ready(data) if !data.diff.files.is_empty());
+                        let position = if needs_restore {
+                            match &item.source {
+                                Source::Pr(loc) => app.store.position(loc),
+                                Source::Local(_) => None,
+                            }
+                        } else {
+                            None
+                        };
                         let snapshot = item.install(loaded);
+                        if let (Some(position), ItemState::Ready(data)) =
+                            (position, &mut item.state)
+                        {
+                            data.saved_position = Some(position.clone());
+                            data.restore_review_position(position, true);
+                        }
                         // The PR's snapshot lands in the local store: the
                         // next launch knows what the app last saw of it
                         // (its head SHA, its threads), and an offline
@@ -2346,9 +2402,9 @@ impl ReviewApp {
 
     /// Phase 2, per item: fetch every file's full contents, re-diff, and
     /// re-highlight in the background, then rebuild rows once and swap
-    /// atomically. Scroll keeps its pixel offset (the re-diff normally
-    /// reproduces the patch's hunks, so drift is small); the selection is
-    /// cleared because row indices shift.
+    /// atomically. Source-line anchors preserve the viewport even when phase
+    /// 2 inserts whole-file context above it; selections use transient rows
+    /// and are cleared.
     fn spawn_upgrade(
         &self,
         id: u64,
@@ -2362,9 +2418,6 @@ impl ReviewApp {
             let upgraded = cx
                 .background_spawn(async move { run_upgrade(github.as_ref(), &source, jobs) })
                 .await;
-            if upgraded.is_empty() {
-                return;
-            }
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
                     return;
@@ -2375,11 +2428,7 @@ impl ReviewApp {
                 let ItemState::Ready(data) = &mut item.state else {
                     return;
                 };
-                // Keep the cursor on the same hunk (the re-diff preserves
-                // the hunks, so the first change stays on screen); None means
-                // the cursor sits at/before the first hunk — the reveal
-                // itself, re-anchored below.
-                let hunk_ix = data.hunk_rows.iter().rposition(|&ix| ix <= data.cursor);
+                let position = data.review_position();
                 for file in upgraded {
                     let Some(target) = data.diff.files.get_mut(file.file_ix) else {
                         continue;
@@ -2400,19 +2449,8 @@ impl ReviewApp {
                 data.set_rows(data.row_build());
                 data.selection = None;
                 data.cursor_side = None;
-                match hunk_ix {
-                    Some(hunk_ix) => {
-                        let target = data
-                            .hunk_rows
-                            .get(hunk_ix)
-                            .or_else(|| data.hunk_rows.first())
-                            .copied()
-                            .unwrap_or(0);
-                        data.cursor = target;
-                        data.scroll
-                            .scroll_to_item_strict(target, ScrollStrategy::Top);
-                    }
-                    None => data.cursor = data.cursor.min(data.rows.len().saturating_sub(1)),
+                if let Some(position) = position {
+                    data.restore_review_position(position, false);
                 }
                 // Paths can't change in an upgrade, but stats did; rebuilding
                 // keeps the tree in lockstep with every row rebuild.
@@ -2846,6 +2884,7 @@ impl ReviewApp {
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.items.len() {
+            self.persist_positions();
             self.active = ix;
             self.show_queue = false;
             window.focus(&self.focus_handle);
@@ -2857,6 +2896,7 @@ impl ReviewApp {
         if ix >= self.items.len() {
             return;
         }
+        self.persist_positions();
         self.items.remove(ix);
         if self.active > ix || self.active >= self.items.len() {
             self.active = self.active.saturating_sub(1);
@@ -2872,6 +2912,7 @@ impl ReviewApp {
     fn cycle_items(&mut self, delta: isize, cx: &mut Context<Self>) {
         let len = self.items.len() as isize;
         if len > 0 {
+            self.persist_positions();
             self.active = (self.active as isize + delta).rem_euclid(len) as usize;
             self.show_queue = false;
             cx.notify();
@@ -2945,9 +2986,11 @@ impl ReviewApp {
 
     fn jump(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(data) = self.active_data_mut() {
+            data.position_restore = None;
             data.cursor = ix;
             data.cursor_side = None;
             data.scroll.scroll_to_item_strict(ix, ScrollStrategy::Top);
+            data.remember_jump();
         }
         cx.notify();
     }
@@ -3070,9 +3113,11 @@ impl ReviewApp {
     /// by setting the scroll offset directly. Pure mouse math — verified
     /// manually, like the selection hit test.
     fn minimap_scrub_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(data) = self.active_data() else {
+        let Some(data) = self.active_data_mut() else {
             return;
         };
+        data.position_restore = None;
+        data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
         let total = data.rows.len();
         if total == 0 {
             return;
@@ -6543,6 +6588,105 @@ mod tests {
     }
 
     #[test]
+    fn review_positions_follow_paths_and_restore_fractional_scroll_and_mode() {
+        let mut data = file_mode_data(two_file_diff());
+        data.open_file(1, None);
+        data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        data.position_restore = None;
+        data.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(-17.), px(-1.375 * row_height())));
+        let position = data.review_position().unwrap();
+        assert_eq!(position.path, "b.rs");
+        assert_eq!(position.fraction, 0.375);
+        let mut diff = two_file_diff();
+        diff.files.swap(0, 1);
+        let mut restored = file_mode_data(diff);
+        restored.mode = ViewMode::Split;
+        restored.set_rows(restored.row_build());
+        assert!(restored.restore_review_position(position.clone(), false));
+        assert_eq!(restored.file_ix, 0, "file identity is a path, not an index");
+        assert!(restored.mode == ViewMode::Unified);
+        assert_eq!(restored.review_position(), Some(position));
+        assert_eq!(restored.minimap.len(), restored.rows.len());
+    }
+
+    #[test]
+    fn deferred_hunk_jumps_replace_a_restored_anchor_before_the_next_frame() {
+        let mut data = file_mode_data(two_file_diff());
+        let position = local_store::ReviewPosition {
+            path: "a.rs".into(),
+            new_line: Some(1),
+            ..Default::default()
+        };
+        data.restore_review_position(position.clone(), true);
+        data.reveal_hunk(Some(1));
+        let jumped = data.review_position().unwrap();
+        assert_ne!(jumped.new_line, position.new_line);
+        assert_eq!(jumped.row, data.hunk_rows[1]);
+        // Even after the short patch clamps the jump to its top, phase 2
+        // must retain the requested hunk, not resurrect the restored anchor.
+        data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        data.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(0.)));
+        assert_eq!(data.review_position(), Some(jumped));
+        data.open_file(1, None);
+        assert_eq!(data.review_position().unwrap().path, "b.rs");
+    }
+
+    #[test]
+    fn missing_files_and_shortened_files_degrade_without_invalid_rows() {
+        let mut data = file_mode_data(two_file_diff());
+        let cursor = data.cursor;
+        assert!(!data.restore_review_position(
+            local_store::ReviewPosition {
+                path: "gone.rs".into(),
+                ..Default::default()
+            },
+            false
+        ));
+        assert_eq!(data.cursor, cursor);
+        assert!(data.restore_review_position(
+            local_store::ReviewPosition {
+                path: "a.rs".into(),
+                new_line: Some(u32::MAX),
+                row_delta: usize::MAX,
+                ..Default::default()
+            },
+            false
+        ));
+        assert_eq!(data.cursor, data.rows.len() - 1);
+    }
+
+    #[test]
+    fn moving_the_viewport_supersedes_a_pending_restore() {
+        let mut data = file_mode_data(two_file_diff());
+        data.restore_review_position(
+            local_store::ReviewPosition {
+                path: "a.rs".into(),
+                new_line: Some(1),
+                ..Default::default()
+            },
+            true,
+        );
+        data.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(-2.25 * row_height())));
+        let moved = data.review_position().unwrap();
+        assert_eq!(moved.row, 2);
+        assert_eq!(moved.fraction, 0.25);
+        data.restore_review_position(moved.clone(), false);
+        assert_eq!(data.review_position(), Some(moved));
+    }
+
+    #[test]
     fn file_mode_renders_deleted_and_renamed_files() {
         // Deleted: every hunk row is a removed line with no new-side number.
         let hunks = diff_texts("a\nb\nc\n", "", 3);
@@ -7358,6 +7502,10 @@ mod tests {
         assert_eq!(meta.body, "Some **markdown**.");
         assert_eq!(data.discussion.as_ref(), Some(&discussion));
         assert_eq!(data.commits, Some(sample_commits()));
+        assert!(
+            data.review_position().is_none(),
+            "metadata-only offline views have no anchor to overwrite the saved diff position"
+        );
         assert!(
             data.expanded_threads.is_empty(),
             "cached resolved threads start collapsed too"
@@ -8343,6 +8491,8 @@ mod tests {
         pending: std::sync::Mutex<Option<github::PendingReview>>,
         commits: std::sync::Mutex<Option<github::PrCommits>>,
         commit_fetches: std::sync::atomic::AtomicUsize,
+        patch: Option<String>,
+        file_contents: HashMap<(String, String), String>,
     }
 
     impl FakePr {
@@ -8541,10 +8691,9 @@ mod tests {
         }
 
         fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
-            Ok(
-                "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n"
-                    .into(),
-            )
+            Ok(self.patch.clone().unwrap_or_else(|| {
+                "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n".into()
+            }))
         }
 
         fn review_comments(
@@ -8564,10 +8713,13 @@ mod tests {
         fn file_at(
             &self,
             _loc: &github::PrLocator,
-            _commit_oid: &str,
-            _path: &str,
+            commit_oid: &str,
+            path: &str,
         ) -> Result<Option<String>, github::ClientError> {
-            unimplemented!("loop tests never fetch file contents")
+            Ok(self
+                .file_contents
+                .get(&(commit_oid.into(), path.into()))
+                .cloned())
         }
 
         fn post_review_comment(
@@ -8670,6 +8822,127 @@ mod tests {
                 this.items = vec![item];
                 this.active = 0;
                 this.next_id = 1;
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn pr_position_resumes_through_fetch_upgrade_wheel_queue_and_reopen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The saved line is outside the patch: only phase 2 can restore it.
+        let old: String = (1..=400).map(|n| format!("line {n}\n")).collect();
+        let new = old.replace("line 200\n", "changed 200\n");
+        let mut patch = String::new();
+        let mut file_contents = HashMap::new();
+        for path in ["a.rs", "b.rs"] {
+            patch.push_str(&format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -197,7 +197,7 @@\n line 197\n line 198\n line 199\n-line 200\n+changed 200\n line 201\n line 202\n line 203\n"));
+            file_contents.insert(("ba5ec0de".into(), path.into()), old.clone());
+            file_contents.insert(("dead10cc".into(), path.into()), new.clone());
+        }
+        let client = Arc::new(FakePr {
+            patch: Some(patch),
+            file_contents,
+            ..Default::default()
+        });
+        let store = local_store::LocalStore::in_memory();
+        let saved = local_store::ReviewPosition {
+            path: "b.rs".into(),
+            new_line: Some(90),
+            old_line: Some(90),
+            row: 90,
+            fraction: 0.375,
+            ..Default::default()
+        };
+        store.save_position(&loop_loc(), &saved);
+        let (window, app) = queue_window_with_store(cx, client.clone(), store.clone());
+        cx.update(|cx| app.update(cx, |this, cx| this.open_item(Source::Pr(loop_loc()), cx)));
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let (bounds, resumed) = vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let data = app.read(cx).active_data().unwrap();
+            assert_eq!(data.file_ix, 1);
+            assert!(data.upgrades.contains_key(&1));
+            assert_eq!(data.review_position().unwrap().new_line, Some(90));
+            assert_eq!(data.review_position().unwrap().fraction, 0.375);
+            assert_eq!(data.minimap.len(), data.rows.len());
+            let state = data.scroll.0.borrow();
+            assert_eq!(state.base_handle.offset().y, px(-90.375 * row_height()));
+            (state.base_handle.bounds(), state.base_handle.offset())
+        });
+        vcx.simulate_event(gpui::ScrollWheelEvent {
+            position: bounds.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-137.))),
+            ..Default::default()
+        });
+        let scrolled = vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let data = app.read(cx).active_data().unwrap();
+            assert_ne!(data.scroll.0.borrow().base_handle.offset(), resumed);
+            data.review_position().unwrap()
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+        assert_eq!(
+            store.position(&loop_loc()),
+            Some(scrolled.clone()),
+            "wheel movement is persisted without a navigation action"
+        );
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.back_to_queue(cx);
+                this.open_item(Source::Pr(loop_loc()), cx);
+                assert_eq!(
+                    this.active_data().unwrap().review_position(),
+                    Some(scrolled.clone())
+                );
+                this.close_item(this.active, cx);
+                this.open_item(Source::Pr(loop_loc()), cx);
+            })
+        });
+        cx.run_until_parked();
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert_eq!(
+                app.read(cx).active_data().unwrap().review_position(),
+                Some(scrolled.clone())
+            );
+            app.update(cx, |this, cx| {
+                // Save immediately, before the hunk jump has painted.
+                this.step_hunk(1, cx);
+                this.back_to_queue(cx);
+            });
+        });
+        let jumped = store.position(&loop_loc()).unwrap();
+        assert_eq!(jumped.path, "b.rs");
+        assert_eq!(jumped.new_line, Some(197));
+        assert_eq!(jumped.fraction, 0.);
+
+        // A new app has no open item/scroll handle to reuse.
+        let (second_window, second) = queue_window_with_store(cx, client, store.clone());
+        cx.update(|cx| second.update(cx, |this, cx| this.open_item(Source::Pr(loop_loc()), cx)));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let data = second.read(cx).active_data().unwrap();
+            assert_eq!(data.file_ix, 1);
+            assert_eq!(data.review_position().unwrap().new_line, Some(197));
+        });
+        let mut second_vcx = gpui::VisualTestContext::from_window(second_window, cx);
+        second_vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+            second.update(cx, |this, cx| {
+                let data = this.active_data().unwrap();
+                let bounds = data.scroll.0.borrow().base_handle.bounds();
+                this.minimap_scrub_to(
+                    point(bounds.right(), bounds.top() + bounds.size.height * 0.75),
+                    cx,
+                );
+                let scrubbed = this.active_data().unwrap().review_position().unwrap();
+                assert_ne!(scrubbed.new_line, Some(197));
+                this.back_to_queue(cx);
+                assert_eq!(store.position(&loop_loc()), Some(scrubbed));
             });
         });
     }

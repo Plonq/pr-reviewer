@@ -15,7 +15,7 @@ use store::{CachedLabel, CachedQueue, CachedQueueRow, Store};
 
 /// Re-exported so the app can name the store's types without reaching
 /// past this module.
-pub use store::{PrSnapshot as StoredPrSnapshot, ThreadSeen as StoredThreadSeen};
+pub use store::{PrSnapshot as StoredPrSnapshot, ReviewPosition, ThreadSeen as StoredThreadSeen};
 
 /// The app's handle to the local store.
 ///
@@ -39,6 +39,25 @@ impl std::fmt::Debug for LocalStore {
 }
 
 impl LocalStore {
+    pub fn position(&self, loc: &github::PrLocator) -> Option<ReviewPosition> {
+        let store = self.inner.lock().ok()?;
+        store
+            .positions()
+            .read(&loc.repo_slug(), loc.number)
+            .ok()
+            .flatten()
+    }
+
+    pub fn save_position(&self, loc: &github::PrLocator, position: &ReviewPosition) -> bool {
+        let Ok(store) = self.inner.lock() else {
+            return false;
+        };
+        store
+            .positions()
+            .write(&loc.repo_slug(), loc.number, position)
+            .is_ok()
+    }
+
     /// A display-only mirror. The session always reconciles with GitHub before
     /// writing, so a draft submitted elsewhere is never resurrected.
     pub fn review_session(&self, loc: &github::PrLocator) -> github::review_session::ReviewSession {
@@ -442,6 +461,61 @@ mod tests {
             store.setting("sort"),
             Some(serde_json::Value::String("oldest".into()))
         );
+    }
+
+    #[test]
+    fn positions_survive_reopening_and_snapshot_refreshes_do_not_replace_them() {
+        let path = std::env::temp_dir().join("opencode").join(format!(
+            "gander-position-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let open = || LocalStore {
+            inner: Arc::new(Mutex::new(Store::open(&path).unwrap())),
+            path: Some(path.clone()),
+        };
+        let loc = github::PrLocator {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 7,
+        };
+        let position = ReviewPosition {
+            path: "src/lib.rs".into(),
+            new_line: Some(52),
+            row: 53,
+            fraction: 0.375,
+            horizontal_offset: 23.,
+            split: true,
+            ..Default::default()
+        };
+        {
+            let store = open();
+            assert!(store.save_position(&loc, &position));
+            store.save_snapshot(&StoredPrSnapshot {
+                repository: loc.repo_slug(),
+                number: loc.number,
+                ..Default::default()
+            });
+        }
+        {
+            let store = open();
+            assert_eq!(store.position(&loc), Some(position));
+            assert_eq!(
+                store.position(&github::PrLocator {
+                    number: 8,
+                    ..loc.clone()
+                }),
+                None
+            );
+            assert_eq!(
+                store.position(&github::PrLocator {
+                    owner: "other".into(),
+                    ..loc
+                }),
+                None
+            );
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

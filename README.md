@@ -48,7 +48,8 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
   back to the queue with open PRs kept open behind the scenes
 - one file at a time: the whole file fills the pane — no `@@` markers, hunk
   boundaries read from the highlighting — revealed at its first change;
-  `]`/`[` move between files and `n`/`p` between hunks (both wrap)
+  `]`/`[` move between files and `n`/`p` between hunks (both wrap); returning
+  to a PR resumes its last file and scroll position, even after restarting
 - unified + split views
 - tree-sitter highlighting (18 languages)
 - word-level intra-line diffs
@@ -83,10 +84,11 @@ The app keeps its own memory in one SQLite database (WAL mode) at
   app last saw, for "what changed since I looked",
 - **pending reviews** — a local mirror of server-side drafts, reconciled with
   GitHub on open, refresh, and before each review mutation,
+- **review positions** — the last file and scroll anchor for each PR,
 - **settings** — the queue's chips and sort, so the app opens the queue you left.
 
-The store is a cache, never a source of truth: deleting the directory costs a
-re-fetch, nothing more.
+GitHub data in the store is a cache, never a source of truth. Deleting the
+directory forces a re-fetch and resets local settings and review positions.
 
 ## Keymap
 

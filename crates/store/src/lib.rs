@@ -8,6 +8,7 @@
 //! - **per-PR bookkeeping** — the last head SHA a PR was seen at, the
 //!   thread timestamps the novelty module compares against, the pending
 //!   draft mirror,
+//! - **review positions** — the last file and source-line scroll anchor per PR,
 //! - **settings** — the JSON blob of user-facing configuration.
 //!
 //! Snapshots are stored as **JSON columns** rather than relational tables:
@@ -22,6 +23,7 @@
 //! every write is a single transaction.
 
 mod cache;
+mod position;
 mod settings;
 mod snapshot;
 
@@ -31,12 +33,13 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 pub use cache::{CachedLabel, CachedQueue, CachedQueueRow, QueueCache};
+pub use position::{PositionStore, ReviewPosition};
 pub use settings::Settings;
 pub use snapshot::{PrSnapshot, SnapshotStore, ThreadSeen};
 
 /// The app's database schema version. Bumped whenever a migration runs;
 /// the stored version is what the next open migrates *from*.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Where the database lives: the platform's application-support directory,
 /// under the app's name.
@@ -143,6 +146,11 @@ impl Store {
     pub fn settings(&self) -> Settings<'_> {
         Settings::new(&self.conn)
     }
+
+    /// Per-PR file and scroll anchors, never overwritten by a network fetch.
+    pub fn positions(&self) -> PositionStore<'_> {
+        PositionStore::new(&self.conn)
+    }
 }
 
 /// Bring a database's schema up to [`SCHEMA_VERSION`].
@@ -165,6 +173,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         match step {
             0 => migrate_v0_to_v1(&tx)?,
             1 => migrate_v1_to_v2(&tx)?,
+            2 => migrate_v2_to_v3(&tx)?,
             other => anyhow::bail!("no migration from schema version {other}"),
         }
     }
@@ -237,6 +246,19 @@ fn queue_cache_columns(conn: &Connection) -> Vec<String> {
     names
 }
 
+fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS review_positions (
+            repository TEXT NOT NULL,
+            number INTEGER NOT NULL,
+            position TEXT NOT NULL,
+            PRIMARY KEY (repository, number)
+        );",
+    )
+    .context("couldn't create review position memory")?;
+    Ok(())
+}
+
 /// Bring a `queue_cache` table up to the current shape: every column the
 /// cache reads, added when it's missing.
 ///
@@ -290,6 +312,7 @@ mod tests {
             "pr_threads",
             "settings",
             "pending_reviews",
+            "review_positions",
         ] {
             let count: i64 = store
                 .conn
@@ -339,6 +362,45 @@ mod tests {
                 .pending_review("acme/widgets", 7)
                 .unwrap(),
             Some(serde_json::json!({"draft":true}))
+        );
+    }
+
+    #[test]
+    fn v2_migration_adds_positions_without_touching_drafts_or_preferences() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_v0_to_v1(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        let store = Store { conn, path: None };
+        store
+            .settings()
+            .set("kept", serde_json::json!(true))
+            .unwrap();
+        let draft = serde_json::json!({"draft": true});
+        store
+            .snapshots()
+            .write_pending_review("acme/widgets", 7, Some(&draft))
+            .unwrap();
+        Store::prepare(&store.conn).unwrap();
+        assert_eq!(
+            store.settings().get("kept").unwrap(),
+            Some(serde_json::json!(true))
+        );
+        assert_eq!(
+            store.snapshots().pending_review("acme/widgets", 7).unwrap(),
+            Some(draft)
+        );
+        let position = ReviewPosition {
+            path: "a.rs".into(),
+            ..Default::default()
+        };
+        store
+            .positions()
+            .write("acme/widgets", 7, &position)
+            .unwrap();
+        assert_eq!(
+            store.positions().read("acme/widgets", 7).unwrap(),
+            Some(position)
         );
     }
 
