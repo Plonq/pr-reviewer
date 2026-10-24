@@ -79,6 +79,9 @@ pub struct PendingComment {
     pub line: Option<u64>,
     pub start_line: Option<u64>,
     pub body: String,
+    /// Published (or draft) parent, retained so pending replies stay in-thread.
+    #[serde(default)]
+    pub in_reply_to_id: Option<u64>,
 }
 
 // GraphQL BigInt identifiers are strings; REST identifiers are JSON integers.
@@ -124,6 +127,10 @@ pub enum Command {
     },
     Add {
         anchor: CommentAnchor,
+        body: String,
+    },
+    Reply {
+        comment_id: u64,
         body: String,
     },
     Edit {
@@ -180,7 +187,7 @@ impl ReviewSession {
                 anchor.validate()?;
                 nonempty(body)?;
             }
-            Command::Edit { body, .. } => nonempty(body)?,
+            Command::Edit { body, .. } | Command::Reply { body, .. } => nonempty(body)?,
             _ => {}
         }
         self.verified = false;
@@ -208,6 +215,14 @@ impl ReviewSession {
                 let comment = self.comment_mut(id)?;
                 client.edit_pending_comment(loc, comment, body.trim())?;
                 comment.body = body.trim().into();
+            }
+            Command::Reply { comment_id, body } => {
+                if let Some(review) = &mut self.pending {
+                    let comment = client.add_pending_reply(loc, review, comment_id, body.trim())?;
+                    review.comments.push(comment);
+                } else {
+                    client.post_reply(loc, comment_id, body.trim())?;
+                }
             }
             Command::Delete { id } => {
                 let comment = self.comment_mut(id)?;

@@ -466,6 +466,7 @@ mod tests {
             node_id: "PRR_pending".into(),
             body: "summary".into(),
             comments: vec![github::PendingComment {
+                in_reply_to_id: None,
                 node_id: "draft_node".into(),
                 id: 12,
                 path: "a.rs".into(),

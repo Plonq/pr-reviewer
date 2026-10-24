@@ -525,6 +525,8 @@ pub(crate) struct ItemData {
     /// the TextView's own), so the wheel scrolls from anywhere over the pane
     /// and the scrollbar paints at the pane's edge — like the diff pane's.
     conv_scroll: ScrollHandle,
+    discussion: Option<github::PrDiscussion>,
+    expanded_threads: HashSet<String>,
     additions: u32,
     deletions: u32,
     /// Mouse text selection, in display-row space. Per item (survives item
@@ -594,6 +596,8 @@ impl ItemData {
             cursor_side: None,
             scroll: UniformListScrollHandle::new(),
             conv_scroll: ScrollHandle::new(),
+            discussion: None,
+            expanded_threads: HashSet::new(),
             additions: 0,
             deletions: 0,
             selection: None,
@@ -872,7 +876,7 @@ impl ReviewItem {
                 comment_wrap: COMMENT_WRAP_CHARS,
             },
         });
-        let data = Box::new(ItemData::new(
+        let mut data = Box::new(ItemData::new(
             Some(meta),
             diff,
             ViewMode::Split,
@@ -881,6 +885,9 @@ impl ReviewItem {
             None,
             None,
         ));
+        data.discussion = snapshot
+            .discussion
+            .and_then(|value| serde_json::from_value(value).ok());
         self.state = ItemState::Ready(data);
         true
     }
@@ -915,6 +922,7 @@ impl ReviewItem {
             mode,
             file_ix,
             comments,
+            discussion,
             snapshot,
         } = loaded;
         let (additions, deletions) = diff
@@ -935,6 +943,7 @@ impl ReviewItem {
                 // Fresh patch-derived data: any previous upgrade is stale —
                 // the upgrade re-runs from scratch.
                 data.upgrades.clear();
+                data.discussion = discussion;
                 data.comments = match &data.local_review {
                     Some(local) => Some(local.index()),
                     None => comments,
@@ -981,7 +990,7 @@ impl ReviewItem {
                     Some(local) => Some(local.index()),
                     None => comments,
                 };
-                let data = Box::new(ItemData::new(
+                let mut data = Box::new(ItemData::new(
                     pr_meta,
                     diff,
                     mode,
@@ -990,6 +999,7 @@ impl ReviewItem {
                     comments,
                     local_review,
                 ));
+                data.discussion = discussion;
                 self.state = ItemState::Ready(data);
             }
         }
@@ -3340,6 +3350,7 @@ impl ReviewApp {
         cx: &mut Context<Self>,
     ) {
         let submitted = matches!(command, SessionCommand::Submit { .. });
+        let replied = matches!(command, SessionCommand::Reply { .. });
         let Some(job) = self.session_job(item_id, command, cx) else {
             return;
         };
@@ -3368,7 +3379,7 @@ impl ReviewApp {
                     },
                     _ => {}
                 }
-                if submitted && result.is_ok() {
+                if (submitted || replied) && result.is_ok() {
                     if let Some(Source::Pr(loc)) = app
                         .items
                         .iter()
@@ -3376,7 +3387,9 @@ impl ReviewApp {
                         .map(|item| item.source.clone())
                     {
                         app.refetch_comments(item_id, loc.clone(), cx);
-                        app.refetch_meta(item_id, loc, cx);
+                        if submitted {
+                            app.refetch_meta(item_id, loc, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -3543,6 +3556,26 @@ impl ReviewApp {
         }
     }
 
+    fn composer_uses_pending_review(&self, composer: &Composer) -> bool {
+        composer.pending
+            || self
+                .sessions
+                .get(&composer.item_id)
+                .is_some_and(|ui| ui.state.pending.is_some())
+    }
+
+    fn composer_submit_label(&self, composer: &Composer) -> &'static str {
+        if composer.edit_id.is_some() {
+            "Save draft"
+        } else if self.composer_uses_pending_review(composer) {
+            "Add to review"
+        } else if composer.reply_to.is_some() {
+            "Reply"
+        } else {
+            "Add single comment"
+        }
+    }
+
     /// Submit the composer's comment (or reply): local items update in-memory
     /// drafts immediately; PR items post via gh on the background executor.
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3562,6 +3595,12 @@ impl ReviewApp {
         let item_id = item.id;
         let source = item.source.clone();
         let gen = self.composer_gen;
+        // Keyboard submission must obey the same per-PR serialization as the
+        // disabled button, including while pending-review reconciliation runs.
+        if matches!(source, Source::Pr(_)) && self.sessions.get(&item_id).is_some_and(|ui| ui.busy)
+        {
+            return;
+        }
         let anchor = github::CommentAnchor {
             commit_id: composer.commit_id.clone(),
             path: composer.path.clone(),
@@ -3570,15 +3609,19 @@ impl ReviewApp {
             start_line: composer.start_line,
             position: composer.position.clone(),
         };
-        if matches!(source, Source::Pr(_)) && (composer.pending || composer.edit_id.is_some()) {
-            if self.sessions.get(&item_id).is_some_and(|ui| ui.busy) {
-                return;
-            }
-            let command = match composer.edit_id {
-                Some(id) => SessionCommand::Edit { id, body },
-                None => SessionCommand::Add { anchor, body },
+        if matches!(source, Source::Pr(_))
+            && (self.composer_uses_pending_review(composer)
+                || composer.edit_id.is_some()
+                || composer.reply_to.is_some())
+        {
+            let command = match (composer.edit_id, composer.reply_to) {
+                (Some(id), _) => SessionCommand::Edit { id, body },
+                (_, Some(comment_id)) => SessionCommand::Reply { comment_id, body },
+                _ => SessionCommand::Add { anchor, body },
             };
-            self.composer.as_mut().unwrap().in_flight = true;
+            let composer = self.composer.as_mut().unwrap();
+            composer.in_flight = true;
+            composer.error = None;
             self.run_session(
                 item_id,
                 command,
@@ -3615,14 +3658,11 @@ impl ReviewApp {
             let post_loc = loc.clone();
             let result = cx
                 .background_spawn(async move {
-                    match reply_to {
-                        Some(root_id) => github.post_reply(&post_loc, root_id, &body),
-                        None => ReviewSession::default().execute(
-                            github.as_ref(),
-                            &post_loc,
-                            SessionCommand::Immediate { anchor, body },
-                        ),
-                    }
+                    ReviewSession::default().execute(
+                        github.as_ref(),
+                        &post_loc,
+                        SessionCommand::Immediate { anchor, body },
+                    )
                 })
                 .await;
             this.update_in(cx, |app, window, cx| {
@@ -3689,14 +3729,14 @@ impl ReviewApp {
         cx.write_to_clipboard(ClipboardItem::new_string(local_review_prompt(src, local)));
     }
 
-    /// Refetch only the review comments (not meta/patch), regroup, and
+    /// Refetch the published discussion (not meta/patch), regroup, and
     /// rebuild the rows with the viewport anchored — the counterpart of a
     /// full refresh for the post-comment path.
     fn refetch_comments(&mut self, item_id: u64, loc: github::PrLocator, cx: &mut Context<Self>) {
         let github = self.github.clone();
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { github.review_comments(&loc) })
+                .background_spawn(async move { github.pr_discussion(&loc) })
                 .await;
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) else {
@@ -3706,10 +3746,22 @@ impl ReviewApp {
                     return;
                 };
                 match fetched {
-                    Ok(comments) => {
+                    Ok(discussion) => {
+                        if let (Source::Pr(loc), Some(meta)) = (&item.source, &data.pr_meta) {
+                            if let Ok(snapshot) =
+                                review_target::discussion_snapshot(loc, meta, &discussion)
+                            {
+                                app.store.save_snapshot(&snapshot);
+                            }
+                        }
                         data.comments = Some(group_comments(
-                            comments.into_iter().map(ReviewComment::from).collect(),
+                            discussion
+                                .review_comments()
+                                .into_iter()
+                                .map(ReviewComment::from)
+                                .collect(),
                         ));
+                        data.discussion = Some(discussion);
                         if let Some(ui) = app.sessions.get(&item_id) {
                             data.comments
                                 .as_mut()
@@ -3955,17 +4007,12 @@ impl ReviewApp {
             data.mode,
             composer.side,
         );
-        let action = if composer.edit_id.is_some() {
-            "Save draft"
-        } else if composer.pending {
-            "Add to review"
-        } else if composer.reply_to.is_some() {
-            "Reply"
-        } else {
-            // GitHub's own label for the posts-now mode — the counterpart
-            // ("start a review", batched) arrives with pending reviews.
-            "Add single comment"
-        };
+        let pending = self.composer_uses_pending_review(composer);
+        let session_busy = self
+            .sessions
+            .get(&composer.item_id)
+            .is_some_and(|ui| ui.busy);
+        let action = self.composer_submit_label(composer);
         let target = format!(
             "{}{}:{}{} ({})",
             if composer.reply_to.is_some() {
@@ -4039,7 +4086,7 @@ impl ReviewApp {
                             .label(action)
                             .primary()
                             .small()
-                            .disabled(composer.in_flight)
+                            .disabled(composer.in_flight || session_busy)
                             .loading(composer.in_flight)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.submit_composer(window, cx);
@@ -4048,31 +4095,17 @@ impl ReviewApp {
                     .when(
                         composer.reply_to.is_none()
                             && composer.edit_id.is_none()
-                            && !composer.pending
+                            && !pending
                             && matches!(
                                 self.active_item().map(|item| &item.source),
                                 Some(Source::Pr(_))
                             ),
                         |row| {
-                            let pending = self
-                                .sessions
-                                .get(&composer.item_id)
-                                .is_some_and(|ui| ui.state.pending.is_some());
                             row.child(
                                 Button::new("composer-add-to-review")
-                                    .label(if pending {
-                                        "Add to review"
-                                    } else {
-                                        "Start review"
-                                    })
+                                    .label("Start review")
                                     .small()
-                                    .disabled(
-                                        composer.in_flight
-                                            || self
-                                                .sessions
-                                                .get(&composer.item_id)
-                                                .is_some_and(|ui| ui.busy),
-                                    )
+                                    .disabled(composer.in_flight || session_busy)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         if let Some(composer) = &mut this.composer {
                                             composer.pending = true;
@@ -5789,7 +5822,7 @@ impl ReviewApp {
         }
     }
 
-    /// The conversation pane: the PR's description, rendered as full GFM
+    /// The conversation pane: description and published timeline as full GFM
     /// — tables, task lists, highlighted code blocks, links — through the
     /// Kit TextView's markdown setup, after the conversation pipe expands
     /// GitHub's `:shortcodes:`, `@mentions`, and `#refs` into characters
@@ -5802,8 +5835,7 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        // Only a PR has a conversation to read; the titlebar keeps the PR's
-        // identity, so the pane can be just the description.
+        // Only a PR has a conversation to read; its title stays in the titlebar.
         let (Some(meta), Source::Pr(loc)) = (&data.pr_meta, &item.source) else {
             return centered_message("A local diff has no conversation".into(), theme::overlay0());
         };
@@ -5843,9 +5875,8 @@ impl ReviewApp {
         // The pane itself is the scroll container — like the diff pane, not
         // like the TextView's own scrollable mode — so the wheel scrolls
         // from anywhere over the pane (the centered column's gutters
-        // included). The tradeoff: the TextView renders the whole
-        // description rather than virtualizing, which descriptions (unlike
-        // diffs) are short enough for.
+        // included). The timeline shares this scroller. TextViews keep keyed
+        // parse state; resolved bodies are not rendered until expanded.
         //
         // Two layers, like the diff pane's: the scroller below, and the
         // Scrollbar overlay outside it, in a non-scrolling relative parent —
@@ -5873,7 +5904,8 @@ impl ReviewApp {
                             .mx_auto()
                             .px_8()
                             .py_6()
-                            .child(content),
+                            .child(content)
+                            .children(self.render_discussion(item, data, window, cx)),
                     ),
             )
             .child(Scrollbar::vertical(&data.conv_scroll))
@@ -6965,6 +6997,7 @@ mod tests {
             head_sha: "abc123".into(),
             base_ref: "main".into(),
             head_ref: "feature/deactivation".into(),
+            discussion: None,
             threads: vec![local_store::StoredThreadSeen {
                 id: "T_1".into(),
                 updated_at: "2026-10-20T08:07:08Z".into(),
@@ -6998,6 +7031,7 @@ mod tests {
     #[test]
     fn a_pr_opens_from_the_store_when_the_fetch_fails() {
         let store = local_store::LocalStore::in_memory();
+        let discussion = conversation::tests::sample_discussion();
         store.save_snapshot(&local_store::StoredPrSnapshot {
             repository: "acme/widgets".into(),
             number: 7,
@@ -7008,6 +7042,7 @@ mod tests {
             base_ref: "main".into(),
             head_ref: "feature/deactivation".into(),
             threads: Vec::new(),
+            discussion: Some(serde_json::to_value(&discussion).unwrap()),
             is_draft: false,
             fetched_at_ms: 1_700_000_000_000,
         });
@@ -7038,6 +7073,11 @@ mod tests {
             .expect("the PR's metadata must be there");
         assert_eq!(meta.title, "Add deactivation filters");
         assert_eq!(meta.body, "Some **markdown**.");
+        assert_eq!(data.discussion.as_ref(), Some(&discussion));
+        assert!(
+            data.expanded_threads.is_empty(),
+            "cached resolved threads start collapsed too"
+        );
         assert_eq!(meta.author.login, "alice");
         assert_eq!(meta.head_ref_oid, "abc123");
 
@@ -7082,6 +7122,7 @@ mod tests {
             base_ref: "main".into(),
             head_ref: "feature/deactivation".into(),
             threads: Vec::new(),
+            discussion: None,
             is_draft: false,
             fetched_at_ms: 1_700_000_000_000,
         });
@@ -7142,6 +7183,156 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn resolved_conversation_threads_expand_and_collapse_through_real_clicks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (window, app) = queue_window(cx, fake);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(Vec::new());
+        item.pane = ItemPane::Conversation;
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        let mut discussion = conversation::tests::sample_discussion();
+        discussion.comments.clear();
+        data.discussion = Some(discussion);
+        install_item(&app, item, cx);
+        let expanded = |cx: &gpui::TestAppContext| {
+            cx.update(|cx| {
+                let ItemState::Ready(data) = &app.read(cx).items[0].state else {
+                    unreachable!()
+                };
+                data.expanded_threads.contains("T1")
+            })
+        };
+        assert!(!expanded(cx));
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let click = |vcx: &mut gpui::VisualTestContext, y| {
+            let point = gpui::point(px(1100.), px(y));
+            vcx.simulate_mouse_move(point, None, gpui::Modifiers::default());
+            vcx.simulate_mouse_down(point, gpui::MouseButton::Left, gpui::Modifiers::default());
+            vcx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::default());
+            vcx.run_until_parked();
+        };
+        let mut header_y = None;
+        for y in (80..600).step_by(4) {
+            click(&mut vcx, y as f32);
+            if expanded(cx) {
+                header_y = Some(y as f32);
+                break;
+            }
+        }
+        let header_y = header_y.expect("the resolved one-line stub must be clickable");
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        click(&mut vcx, header_y);
+        assert!(!expanded(cx), "a second click collapses the thread");
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    /// Read-only end-to-end demo: real fetch → snapshot → install → GFM draw
+    /// and scroll through the entire busy discussion, then expand every stub.
+    #[gpui::test]
+    #[ignore = "requires authenticated gh and network; read-only public PR demo"]
+    fn busy_real_pr_discussion_draws_end_to_end(cx: &mut gpui::TestAppContext) {
+        let client: Arc<dyn github::GitHubClient> = Arc::new(github::gh_cli::GhCliClient::new());
+        let loc = client.resolve_pr("zed-industries/zed#26893").unwrap();
+        let loaded = fetch_item(client, &Source::Pr(loc.clone()), ViewMode::Split, 0).unwrap();
+        let discussion = loaded.discussion.as_ref().unwrap();
+        assert!(discussion.comments.len() > 100, "a busy merged discussion");
+        assert!(discussion.threads.iter().any(|t| t.comments.len() > 1));
+        assert!(discussion.threads.iter().any(|t| t.is_resolved));
+        assert!(discussion.comments.iter().any(|c| !c.reactions.is_empty()));
+        let snapshot = loaded.snapshot.as_ref().unwrap();
+        assert_eq!(
+            serde_json::from_value::<github::PrDiscussion>(snapshot.discussion.clone().unwrap())
+                .unwrap(),
+            *discussion
+        );
+        assert!(snapshot.threads.iter().any(|t| t.resolved));
+        let entries = conversation::timeline(discussion);
+        let count = entries.len();
+        eprintln!(
+            "Real PR: {} chronological entries, {} thread comments",
+            count,
+            discussion
+                .threads
+                .iter()
+                .map(|t| t.comments.len())
+                .sum::<usize>()
+        );
+
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (window, app) = queue_window(cx, fake);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(Vec::new());
+        item.source = Source::Pr(loc);
+        item.install(loaded);
+        item.pane = ItemPane::Conversation;
+        install_item(&app, item, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let offset = |cx: &gpui::TestAppContext| {
+            cx.update(|cx| {
+                let ItemState::Ready(data) = &app.read(cx).items[0].state else {
+                    unreachable!()
+                };
+                data.conv_scroll.offset().y
+            })
+        };
+        let mut pages = 0;
+        loop {
+            let before = offset(cx);
+            vcx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::point(px(1100.), px(500.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-800.))),
+                ..Default::default()
+            });
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            if offset(cx) == before {
+                break;
+            }
+            pages += 1;
+            assert!(pages < 1000, "scroll must reach the end");
+        }
+        assert!(pages > 1);
+        eprintln!("Drew the entire conversation across {pages} scroll steps");
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                let ItemState::Ready(data) = &mut this.items[0].state else {
+                    unreachable!()
+                };
+                data.expanded_threads = data
+                    .discussion
+                    .as_ref()
+                    .unwrap()
+                    .threads
+                    .iter()
+                    .filter(|t| t.is_resolved)
+                    .map(|t| t.id.clone())
+                    .collect();
+                cx.notify();
+            })
+        });
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
     /// The conversation pane scrolls from anywhere the cursor is — the
     /// pane is the scroll container, not the 760px reading column inside
     /// it, so the gutters wheel-scroll too (and the scrollbar rides the
@@ -7167,6 +7358,7 @@ mod tests {
             base_ref: "main".into(),
             head_ref: "feature".into(),
             threads: Vec::new(),
+            discussion: None,
             is_draft: false,
             fetched_at_ms: 1_700_000_000_000,
         });
@@ -7873,12 +8065,52 @@ mod tests {
             assert_eq!(review.id, 91);
             let comment = github::PendingComment {
                 id: 12,
+                in_reply_to_id: None,
                 node_id: "draft_node".into(),
                 path: anchor.path.clone(),
                 side: anchor.side,
                 line: Some(anchor.line),
                 start_line: anchor.start_line,
                 body: body.into(),
+            };
+            self.pending
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .comments
+                .push(comment.clone());
+            Ok(comment)
+        }
+
+        fn add_pending_reply(
+            &self,
+            _loc: &github::PrLocator,
+            review: &github::PendingReview,
+            comment_id: u64,
+            body: &str,
+        ) -> Result<github::PendingComment, github::ClientError> {
+            assert_eq!(review.id, 91);
+            let parent = self
+                .comments
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|comment| comment.id == comment_id)
+                .unwrap()
+                .clone();
+            let comment = github::PendingComment {
+                id: self
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 100,
+                node_id: "draft_reply_node".into(),
+                path: parent.path,
+                side: CommentSide::Right,
+                line: parent.line,
+                start_line: parent.start_line,
+                body: body.into(),
+                in_reply_to_id: Some(comment_id),
             };
             self.pending
                 .lock()
@@ -8005,6 +8237,11 @@ mod tests {
             line: u64,
             body: &str,
         ) -> Result<(), github::ClientError> {
+            if self.pending.lock().unwrap().is_some() {
+                return Err(github::ClientError::Failed(
+                    "pending review already exists".into(),
+                ));
+            }
             self.posted.lock().unwrap().push(Post::Comment {
                 commit_id: commit_id.to_string(),
                 path: path.to_string(),
@@ -8038,6 +8275,11 @@ mod tests {
             comment_id: u64,
             body: &str,
         ) -> Result<(), github::ClientError> {
+            if self.pending.lock().unwrap().is_some() {
+                return Err(github::ClientError::Failed(
+                    "pending review already exists".into(),
+                ));
+            }
             self.posted.lock().unwrap().push(Post::Reply {
                 comment_id,
                 body: body.to_string(),
@@ -8374,6 +8616,145 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn pending_review_hides_single_comment_and_collects_replies_as_drafts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "published root",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        *fake.pending.lock().unwrap() = Some(github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: "web review".into(),
+            comments: vec![],
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(
+            &app,
+            loop_pr_item(fake.comments.lock().unwrap().clone()),
+            cx,
+        );
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                // Open before the server's pending review has arrived. The same
+                // composer must switch to draft-only actions when resume finishes.
+                this.open_composer(None, "a.rs".into(), CommentSide::Right, 1, 1, window, cx);
+                assert_eq!(
+                    this.composer_submit_label(this.composer.as_ref().unwrap()),
+                    "Add single comment"
+                );
+                this.composer
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |state, cx| state.set_value("new draft", window, cx));
+                this.resume_session(0, cx);
+                this.submit_composer(window, cx);
+                assert!(
+                    !this.composer.as_ref().unwrap().in_flight,
+                    "keyboard submit waits for reconciliation"
+                );
+            })
+        });
+        cx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                let composer = this.composer.as_ref().unwrap();
+                assert!(!composer.pending, "no manual draft toggle is necessary");
+                assert!(this.composer_uses_pending_review(composer));
+                assert_eq!(this.composer_submit_label(composer), "Add to review");
+                composer
+                    .input
+                    .update(cx, |state, cx| state.set_value("new draft", window, cx));
+                this.submit_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                assert!(this.composer.is_none());
+                assert_eq!(this.sessions[&0].state.count(), 1);
+                this.open_composer(
+                    Some(11),
+                    "a.rs".into(),
+                    CommentSide::Right,
+                    1,
+                    1,
+                    window,
+                    cx,
+                );
+                let composer = this.composer.as_ref().unwrap();
+                assert_eq!(this.composer_submit_label(composer), "Add to review");
+                composer
+                    .input
+                    .update(cx, |state, cx| state.set_value("draft reply", window, cx));
+                this.submit_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            app.update(cx, |this, _| {
+                assert!(
+                    this.composer.is_none(),
+                    "reply succeeded without an immediate-post error"
+                );
+                assert_eq!(this.sessions[&0].state.count(), 2);
+                let review = this.sessions[&0].state.pending.as_ref().unwrap();
+                assert_eq!(review.body, "web review");
+                assert_eq!(review.comments[1].in_reply_to_id, Some(11));
+                assert_eq!(
+                    this.store
+                        .review_session(&loop_loc())
+                        .pending
+                        .unwrap()
+                        .comments[1]
+                        .in_reply_to_id,
+                    Some(11)
+                );
+                let threads = &this
+                    .active_data()
+                    .unwrap()
+                    .comments
+                    .as_ref()
+                    .unwrap()
+                    .threads["a.rs"][&(CommentSide::Right, 1)];
+                let thread = threads.iter().find(|t| t.root.id == 11).unwrap();
+                assert_eq!(thread.replies.len(), 1);
+                assert_eq!(thread.replies[0].body, "draft reply");
+                assert_eq!(thread.replies[0].time, CommentTime::Pending);
+            })
+        });
+        assert!(
+            fake.posts().is_empty(),
+            "neither comments nor replies publish while a review is pending"
+        );
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        // Reconciliation/restart retains the reply relationship too.
+        cx.update(|cx| app.update(cx, |this, cx| this.resume_session(0, cx)));
+        cx.run_until_parked();
+        assert_eq!(
+            fake.pending
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .comments
+                .len(),
+            2
+        );
+    }
+
     /// ⌘↵'s dialog: approve / request changes / comment with an optional
     /// body. A bodyless non-approve verdict with no pending comments is
     /// rejected inline after reconciliation, without posting a review;
@@ -8558,6 +8939,7 @@ mod tests {
             body: "from web".into(),
             comments: vec![github::PendingComment {
                 id: 13,
+                in_reply_to_id: None,
                 node_id: "old_draft_node".into(),
                 path: "old.rs".into(),
                 side: CommentSide::Left,

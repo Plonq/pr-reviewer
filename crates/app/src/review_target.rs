@@ -53,6 +53,7 @@ pub(crate) struct Loaded {
     pub(crate) file_ix: usize,
     /// Some (possibly empty) for PR items, None for local ones.
     pub(crate) comments: Option<CommentIndex>,
+    pub(crate) discussion: Option<github::PrDiscussion>,
     /// The snapshot of a PR's fetch, for the local store: what the app
     /// saw of the PR, and when. None for local items.
     pub(crate) snapshot: Option<local_store::StoredPrSnapshot>,
@@ -60,7 +61,7 @@ pub(crate) struct Loaded {
 
 /// Blocking fetch + parse + row building for one item; runs on the background
 /// executor, so subprocess waits and tree-sitter work stay off the main thread.
-/// PR items fetch meta, patch, and review comments concurrently — three
+/// PR items fetch meta, patch, and the complete discussion concurrently — three
 /// facade calls, one error vocabulary.
 ///
 /// A PR's fetch also produces the snapshot the local store keeps: what the
@@ -73,7 +74,7 @@ pub(crate) fn fetch_item(
     mode: ViewMode,
     file_ix: usize,
 ) -> anyhow::Result<Loaded> {
-    let (meta, patch, comments, snapshot) = match source {
+    let (meta, patch, comments, discussion, snapshot) = match source {
         Source::Pr(loc) => {
             let meta_client = github.clone();
             let meta_loc = loc.clone();
@@ -81,30 +82,32 @@ pub(crate) fn fetch_item(
             let comments_client = github.clone();
             let comments_loc = loc.clone();
             let comments_thread =
-                std::thread::spawn(move || comments_client.review_comments(&comments_loc));
+                std::thread::spawn(move || comments_client.pr_discussion(&comments_loc));
             let patch = github.pr_patch(loc)?;
             let meta = meta_thread
                 .join()
                 .map_err(|_| anyhow!("GitHub metadata fetch panicked"))??;
-            let comments = comments_thread
+            let discussion = comments_thread
                 .join()
                 .map_err(|_| anyhow!("GitHub comments fetch panicked"))??;
-            // Persistence walks raw parent relationships independently of UI
-            // timestamp ordering and early-parent dropping; snapshot before consuming.
-            let snapshot = pr_snapshot(loc, &meta, &comments);
+            // Both the timeline and inline index derive from this discussion;
+            // never fetch a second, potentially inconsistent comment collection.
+            let comments = discussion.review_comments();
+            let snapshot = discussion_snapshot(loc, &meta, &discussion)?;
             (
                 LoadedMeta::Pr(meta),
                 patch,
                 Some(group_comments(
                     comments.into_iter().map(ReviewComment::from).collect(),
                 )),
+                Some(discussion),
                 Some(snapshot),
             )
         }
         Source::Local(src) => {
             let src = git::resolve_local_with_base(&src.repo_root, src.base_ref.as_deref())?;
             let patch = git::diff_patch(&src)?;
-            (LoadedMeta::Local(src), patch, None, None)
+            (LoadedMeta::Local(src), patch, None, None, None)
         }
     };
     let diff = diff_core::parse_patch(&patch);
@@ -126,8 +129,36 @@ pub(crate) fn fetch_item(
         mode,
         file_ix,
         comments,
+        discussion,
         snapshot,
     })
+}
+
+/// Shared by full fetches and post/reply refreshes, so the offline copy never
+/// lags behind a successful comment refresh. Preserve existing root-comment
+/// bookkeeping identities while carrying authoritative thread resolution.
+pub(crate) fn discussion_snapshot(
+    loc: &github::PrLocator,
+    meta: &github::PrMeta,
+    discussion: &github::PrDiscussion,
+) -> anyhow::Result<local_store::StoredPrSnapshot> {
+    let mut snapshot = pr_snapshot(loc, meta, &discussion.review_comments());
+    snapshot.discussion = Some(serde_json::to_value(discussion)?);
+    let resolved: std::collections::HashSet<_> = discussion
+        .threads
+        .iter()
+        .filter(|thread| thread.is_resolved)
+        .filter_map(|thread| {
+            thread
+                .comments
+                .first()
+                .map(|comment| comment.id.to_string())
+        })
+        .collect();
+    for seen in &mut snapshot.threads {
+        seen.resolved = resolved.contains(&seen.id);
+    }
+    Ok(snapshot)
 }
 
 /// The snapshot of a PR, as the local store keeps it: what the app saw
@@ -186,6 +217,7 @@ fn pr_snapshot(
         base_ref: meta.base_ref_name.clone(),
         head_ref: meta.head_ref_name.clone(),
         threads,
+        discussion: None,
         is_draft: false,
         fetched_at_ms: local_store::now_ms(),
     }

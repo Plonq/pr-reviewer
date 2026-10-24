@@ -49,6 +49,10 @@ pub struct PrSnapshot {
     /// was last seen — the novelty module's input.
     #[serde(default)]
     pub threads: Vec<ThreadSeen>,
+    /// Published conversation. Its domain shape belongs to the GitHub layer;
+    /// older snapshots without it still open with their description intact.
+    #[serde(default)]
+    pub discussion: Option<serde_json::Value>,
     /// Whether the PR was a draft when the snapshot was taken.
     #[serde(default)]
     pub is_draft: bool,
@@ -311,6 +315,7 @@ mod tests {
             head_sha: "abc123".into(),
             base_ref: "main".into(),
             head_ref: "feature/deactivation".into(),
+            discussion: Some(serde_json::json!({"comments": [], "threads": []})),
             threads: vec![ThreadSeen {
                 id: "T_1".into(),
                 updated_at: "2026-10-20T08:07:08Z".into(),
@@ -344,6 +349,15 @@ mod tests {
                 .unwrap(),
             Some(1_700_000_000_000)
         );
+    }
+
+    #[test]
+    fn pre_discussion_snapshots_remain_readable() {
+        let mut json = serde_json::to_value(sample()).unwrap();
+        json.as_object_mut().unwrap().remove("discussion");
+        let snapshot: PrSnapshot = serde_json::from_value(json).unwrap();
+        assert!(snapshot.discussion.is_none());
+        assert_eq!(snapshot.body, "Some **markdown**.");
     }
 
     /// A PR the app has never seen reads as no snapshot — not an error.

@@ -1,4 +1,4 @@
-//! The conversation pane's text pipe.
+//! The conversation timeline and its shared markdown text pipe.
 //!
 //! A PR description is GitHub-flavored markdown plus three GitHub-isms that
 //! plain GFM leaves as raw syntax: `:rocket:` emoji shortcodes, `@mentions`,
@@ -18,8 +18,7 @@
 //! eagerly. Task 12 reuses this pipe for comment bodies, where the same
 //! tradeoff holds.
 
-/// Expand the GitHub-isms in one body (the PR description now, comment
-/// bodies later) into plain GFM:
+/// Expand the GitHub-isms in a description or comment body into plain GFM:
 ///
 /// - `:shortcode:` → the emoji character, via the gemoji table,
 /// - `@login` → a link to the GitHub profile,
@@ -60,6 +59,261 @@ pub fn preprocess(body: &str, repo_slug: &str) -> String {
     // `foo\n` round-trips; a body without one (`foo`) gains a harmless
     // trailing newline that markdown ignores.
     out
+}
+
+/// A thread occupies one chronological slot at its first comment; replies
+/// remain inside it even when main-thread comments arrive between replies.
+pub(crate) enum Entry<'a> {
+    Comment(&'a github::DiscussionComment),
+    Thread(&'a github::ReviewThread),
+}
+
+impl Entry<'_> {
+    fn key(&self) -> (&str, u8, u64, &str) {
+        match self {
+            Self::Comment(c) => (&c.created_at, u8::from(c.review_state.is_some()), c.id, ""),
+            Self::Thread(t) => (&t.comments[0].created_at, 2, 0, &t.id),
+        }
+    }
+}
+
+pub(crate) fn timeline(discussion: &github::PrDiscussion) -> Vec<Entry<'_>> {
+    let mut entries: Vec<_> = discussion
+        .comments
+        .iter()
+        .map(Entry::Comment)
+        .chain(
+            discussion
+                .threads
+                .iter()
+                .filter(|t| !t.comments.is_empty())
+                .map(Entry::Thread),
+        )
+        .collect();
+    entries.sort_by(|a, b| a.key().cmp(&b.key()));
+    entries
+}
+
+pub(crate) fn anchor(thread: &github::ReviewThread) -> String {
+    let (start, line) = if thread.line.is_some() {
+        (thread.start_line, thread.line)
+    } else {
+        (thread.original_start_line, thread.original_line)
+    };
+    let range = match (start, line) {
+        (Some(start), Some(end)) if start < end => format!(":{start}–{end}"),
+        (_, Some(line)) => format!(":{line}"),
+        _ => String::new(),
+    };
+    format!(
+        "{}{range} · {}{}",
+        thread.path,
+        if thread.side == "LEFT" { "old" } else { "new" },
+        if thread.is_outdated {
+            " · outdated"
+        } else {
+            ""
+        }
+    )
+}
+
+use crate::{text_size, theme, ItemData, ItemState, ReviewApp, ReviewItem, Source};
+use gpui::{
+    div, px, rems, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, Window,
+};
+use gpui_component::{
+    text::{TextView, TextViewStyle},
+    ActiveTheme,
+};
+
+impl ReviewApp {
+    pub(crate) fn render_discussion(
+        &self,
+        item: &ReviewItem,
+        data: &ItemData,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let (Some(discussion), Source::Pr(loc)) = (&data.discussion, &item.source) else {
+            return Vec::new();
+        };
+        let slug = loc.repo_slug();
+        let mut elements = Vec::new();
+        if discussion.comments.is_empty() && discussion.threads.is_empty() {
+            elements.push(
+                div()
+                    .mt_6()
+                    .text_color(theme::overlay0())
+                    .child("No comments yet.")
+                    .into_any_element(),
+            );
+        }
+        for entry in timeline(discussion) {
+            match entry {
+                Entry::Comment(comment) => elements.push(
+                    div()
+                        .mt_6()
+                        .border_1()
+                        .border_color(theme::surface0())
+                        .rounded_md()
+                        .p_4()
+                        .child(self.discussion_comment(item.id, "main", comment, &slug, window, cx))
+                        .into_any_element(),
+                ),
+                Entry::Thread(thread) => {
+                    let expanded =
+                        !thread.is_resolved || data.expanded_threads.contains(&thread.id);
+                    let item_id = item.id;
+                    let thread_id = thread.id.clone();
+                    let summary = format!(
+                        "{}{} · @{} · {} comment{}{}",
+                        if thread.is_resolved {
+                            if expanded {
+                                "▾ Resolved · "
+                            } else {
+                                "▸ Resolved · "
+                            }
+                        } else {
+                            "Review thread · "
+                        },
+                        anchor(thread),
+                        thread.comments[0].author,
+                        thread.comments.len(),
+                        if thread.comments.len() == 1 { "" } else { "s" },
+                        if thread.is_resolved {
+                            if expanded {
+                                " · collapse"
+                            } else {
+                                " · expand"
+                            }
+                        } else {
+                            ""
+                        }
+                    );
+                    let mut header = div()
+                        .id(SharedString::from(format!(
+                            "thread-{}-{}",
+                            item.id, thread.id
+                        )))
+                        .px_4()
+                        .py_2()
+                        .text_size(px(text_size() - 1.))
+                        .text_color(theme::subtext())
+                        .overflow_hidden()
+                        .child(div().truncate().child(summary));
+                    if thread.is_resolved {
+                        header =
+                            header
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let Some(item) =
+                                        this.items.iter_mut().find(|item| item.id == item_id)
+                                    else {
+                                        return;
+                                    };
+                                    let ItemState::Ready(data) = &mut item.state else {
+                                        return;
+                                    };
+                                    if !data.expanded_threads.remove(&thread_id) {
+                                        data.expanded_threads.insert(thread_id.clone());
+                                    }
+                                    cx.notify();
+                                }));
+                    }
+                    let mut card = div()
+                        .mt_6()
+                        .border_1()
+                        .border_color(theme::surface0())
+                        .rounded_md()
+                        .child(header);
+                    if expanded {
+                        for comment in &thread.comments {
+                            card = card.child(
+                                div()
+                                    .p_4()
+                                    .border_t_1()
+                                    .border_color(theme::surface0())
+                                    .child(self.discussion_comment(
+                                        item.id, "review", comment, &slug, window, cx,
+                                    )),
+                            );
+                        }
+                    }
+                    elements.push(card.into_any_element());
+                }
+            }
+        }
+        elements
+    }
+
+    fn discussion_comment(
+        &self,
+        item_id: u64,
+        kind: &str,
+        comment: &github::DiscussionComment,
+        slug: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let verdict = match comment.review_state.as_deref() {
+            Some("APPROVED") => " · approved",
+            Some("CHANGES_REQUESTED") => " · requested changes",
+            Some("DISMISSED") => " · review dismissed",
+            Some(_) => " · reviewed",
+            None => "",
+        };
+        let mut card = div().min_w_0().child(
+            div()
+                .mb_2()
+                .text_color(theme::subtext())
+                .text_size(px(text_size() - 1.))
+                .child(format!(
+                    "@{} · {}{verdict}",
+                    comment.author, comment.created_at
+                )),
+        );
+        if !comment.body.trim().is_empty() {
+            card = card.child(
+                TextView::markdown(
+                    SharedString::from(format!(
+                        "discussion-{item_id}-{kind}-{}-{}",
+                        comment.review_state.is_some(),
+                        comment.id
+                    )),
+                    SharedString::from(preprocess(&comment.body, slug)),
+                    window,
+                    cx,
+                )
+                .selectable(true)
+                .style(TextViewStyle {
+                    heading_base_font_size: px(text_size()),
+                    paragraph_gap: rems(0.75),
+                    highlight_theme: cx.theme().highlight_theme.clone(),
+                    is_dark: !theme::is_light(),
+                    ..Default::default()
+                }),
+            );
+        }
+        // Plain labels, deliberately not buttons: adding reactions is v0.2.
+        let reactions: Vec<_> = comment
+            .reactions
+            .iter()
+            .filter(|r| r.count > 0)
+            .map(|reaction| {
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme::surface0())
+                    .child(format!("{} {}", reaction.emoji(), reaction.count))
+            })
+            .collect();
+        if !reactions.is_empty() {
+            card = card.child(div().mt_3().flex().flex_wrap().gap_2().children(reactions));
+        }
+        card.into_any_element()
+    }
 }
 
 /// Whether a line opens a fenced code block, and with which marker. The
@@ -230,8 +484,87 @@ fn expand_text(text: &str, repo_slug: &str, out: &mut String) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn sample_discussion() -> github::PrDiscussion {
+        let comment = |id, time: &str| github::DiscussionComment {
+            id,
+            author: "alice".into(),
+            body: "Thanks @bob :tada: — see #12.\n\n```rust\nlet x = 1;\n```".into(),
+            created_at: time.into(),
+            review_state: None,
+            reactions: vec![github::Reaction {
+                content: "THUMBS_UP".into(),
+                count: 3,
+            }],
+        };
+        github::PrDiscussion {
+            comments: vec![
+                comment(1, "2026-01-02T00:00:00Z"),
+                comment(2, "2026-01-01T00:00:00Z"),
+            ],
+            threads: vec![github::ReviewThread {
+                id: "T1".into(),
+                is_resolved: true,
+                is_outdated: true,
+                path: "src/main.rs".into(),
+                side: "LEFT".into(),
+                line: None,
+                start_line: None,
+                original_line: Some(12),
+                original_start_line: Some(10),
+                comments: vec![
+                    comment(1, "2026-01-01T12:00:00Z"),
+                    comment(3, "2026-01-03T00:00:00Z"),
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn timeline_merges_comments_and_threads_without_ungrouping_replies() {
+        let discussion = sample_discussion();
+        let entries = timeline(&discussion);
+        assert_eq!(
+            entries.len(),
+            3,
+            "replies never become extra timeline entries"
+        );
+        assert!(matches!(entries[0], Entry::Comment(c) if c.id == 2));
+        assert!(
+            matches!(entries[1], Entry::Thread(t) if t.comments.len() == 2 && t.comments[1].id == 3)
+        );
+        assert!(matches!(entries[2], Entry::Comment(c) if c.id == 1));
+        assert_eq!(
+            anchor(&discussion.threads[0]),
+            "src/main.rs:10–12 · old · outdated"
+        );
+    }
+
+    #[test]
+    fn timeline_ties_are_deterministic_and_empty_threads_are_ignored() {
+        let mut discussion = sample_discussion();
+        let time = discussion.threads[0].comments[0].created_at.clone();
+        for comment in &mut discussion.comments {
+            comment.created_at = time.clone();
+        }
+        let mut empty = discussion.threads[0].clone();
+        empty.comments.clear();
+        discussion.threads.push(empty);
+        let ids = |d: &github::PrDiscussion| {
+            timeline(d)
+                .iter()
+                .map(|e| match e {
+                    Entry::Comment(c) => format!("comment-{}", c.id),
+                    Entry::Thread(t) => t.id.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&discussion), vec!["comment-1", "comment-2", "T1"]);
+        discussion.comments.reverse();
+        assert_eq!(ids(&discussion), vec!["comment-1", "comment-2", "T1"]);
+    }
 
     /// The three expansions, together as one description would mix them.
     #[test]

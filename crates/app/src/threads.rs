@@ -122,7 +122,7 @@ impl CommentIndex {
                     body: comment.body.clone(),
                     author: "you".into(),
                     time: CommentTime::Pending,
-                    in_reply_to_id: None,
+                    in_reply_to_id: comment.in_reply_to_id,
                 }
             }));
         }
@@ -438,6 +438,7 @@ mod tests {
             comments: vec![
                 github::PendingComment {
                     id: 12,
+                    in_reply_to_id: None,
                     node_id: "draft_node".into(),
                     path: "a.rs".into(),
                     side: CommentSide::Left,
@@ -447,6 +448,7 @@ mod tests {
                 },
                 github::PendingComment {
                     id: 13,
+                    in_reply_to_id: None,
                     node_id: "old_draft_node".into(),
                     path: "a.rs".into(),
                     side: CommentSide::Left,

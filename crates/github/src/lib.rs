@@ -13,7 +13,9 @@
 //! Error kinds are stable vocabulary for callers to match on; the `Display`
 //! text is the user-facing message and moves with the backend (it carries
 //! v0.1's `gh`-CLI wording today, including the `gh auth login` fix).
+pub mod discussion;
 pub mod gh_cli;
+pub use discussion::{DiscussionComment, PrDiscussion, Reaction, ReviewThread};
 pub mod review_session;
 pub use review_session::{CommentAnchor, CommentPosition, DiffSide, PendingComment, PendingReview};
 
@@ -497,6 +499,13 @@ impl std::error::Error for ClientError {}
 /// construct and synchronous — they run on background threads, never the UI
 /// thread — and may spawn subprocesses or make network calls inside a call.
 pub trait GitHubClient: Send + Sync {
+    /// Complete published conversation, with paginated replies and resolution
+    /// state. Pending review comments belong to the separate review session.
+    fn pr_discussion(&self, loc: &PrLocator) -> Result<PrDiscussion, ClientError> {
+        self.review_comments(loc)
+            .map(PrDiscussion::from_review_comments)
+    }
+
     /// The viewer's server-side draft, including drafts started on the web.
     fn pending_review(&self, _loc: &PrLocator) -> Result<Option<PendingReview>, ClientError> {
         Ok(None)
@@ -515,6 +524,18 @@ pub trait GitHubClient: Send + Sync {
     ) -> Result<PendingComment, ClientError> {
         Err(ClientError::Failed(
             "pending reviews are not supported by this backend".into(),
+        ))
+    }
+    /// Add a reply to the existing draft review without publishing or submitting it.
+    fn add_pending_reply(
+        &self,
+        _loc: &PrLocator,
+        _review: &PendingReview,
+        _comment_id: u64,
+        _body: &str,
+    ) -> Result<PendingComment, ClientError> {
+        Err(ClientError::Failed(
+            "pending review replies are not supported by this backend".into(),
         ))
     }
     fn edit_pending_comment(
@@ -634,7 +655,8 @@ pub trait GitHubClient: Send + Sync {
         body: &str,
     ) -> Result<(), ClientError>;
 
-    /// Reply to the review thread rooted at `comment_id`.
+    /// Publish an immediate reply to the review thread rooted at `comment_id`.
+    /// With a pending review, use `add_pending_reply` instead.
     fn post_reply(&self, loc: &PrLocator, comment_id: u64, body: &str) -> Result<(), ClientError>;
 
     /// Submit a top-level review with `verdict`. GitHub requires a

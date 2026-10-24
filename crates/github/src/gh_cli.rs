@@ -286,6 +286,82 @@ impl<P: GhProcess> GhCliClient<P> {
 }
 
 impl<P: GhProcess> GitHubClient for GhCliClient<P> {
+    fn pr_discussion(&self, loc: &PrLocator) -> Result<crate::PrDiscussion, ClientError> {
+        let mut discussion = crate::PrDiscussion::default();
+        // Paginate each connection independently: a busy PR can have >100
+        // comments, reviews, threads, AND replies within one thread.
+        for (name, fields) in [
+            ("comments", "id:fullDatabaseId author { login } body createdAt reactionGroups { content users { totalCount } }"),
+            ("reviews", "id:fullDatabaseId author { login } body createdAt submittedAt state"),
+        ] {
+            let mut after = None;
+            loop {
+                let value = self.review_graphql(format!(
+                    "query {{ repository(owner:{},name:{}) {{ pullRequest(number:{}) {{ {name}(first:100{}) {{ nodes {{ {fields} }} pageInfo {{ hasNextPage endCursor }} }} }} }} }}",
+                    json_string(&loc.owner), json_string(&loc.repo), loc.number, after_arg(after.as_deref())
+                ))?;
+                let connection = &value["data"]["repository"]["pullRequest"][name];
+                for raw in connection_nodes(connection)? {
+                    if name == "reviews" && raw["state"].as_str() == Some("PENDING") {
+                        continue;
+                    }
+                    let mut comment = discussion_comment(raw)?;
+                    if name == "reviews" {
+                        comment.review_state = Some(decode_value(raw["state"].clone())?);
+                        // Reviews created as drafts belong where they were
+                        // submitted, not where the draft was first started.
+                        comment.created_at = decode_value(raw["submittedAt"].clone())?;
+                    }
+                    discussion.comments.push(comment);
+                }
+                let next = next_cursor(connection)?;
+                if next.is_some() && next == after {
+                    return Err(ClientError::Failed("GitHub repeated a discussion cursor".into()));
+                }
+                after = next;
+                if after.is_none() { break; }
+            }
+        }
+        let mut thread_of = HashMap::new();
+        self.for_each_thread_comment(loc, |raw_thread, raw, head, base| {
+            if raw["pullRequestReview"]["state"].as_str() == Some("PENDING") {
+                return Ok(());
+            }
+            let id: String = decode_value(raw_thread["id"].clone())?;
+            let ix = match thread_of.get(&id) {
+                Some(&ix) => ix,
+                None => {
+                    let (start_line, line) = thread_position(raw_thread, head, base)?;
+                    let ix = discussion.threads.len();
+                    discussion.threads.push(crate::ReviewThread {
+                        id: id.clone(),
+                        is_resolved: decode_value(raw_thread["isResolved"].clone())?,
+                        is_outdated: decode_value(raw_thread["isOutdated"].clone())?,
+                        path: decode_value(raw_thread["path"].clone())?,
+                        side: decode_value(raw_thread["side"].clone())?,
+                        line,
+                        start_line,
+                        original_line: raw_thread["originalLine"].as_u64(),
+                        original_start_line: raw_thread["originalStartLine"].as_u64(),
+                        comments: Vec::new(),
+                    });
+                    thread_of.insert(id, ix);
+                    ix
+                }
+            };
+            discussion.threads[ix]
+                .comments
+                .push(discussion_comment(raw)?);
+            Ok(())
+        })?;
+        for thread in &mut discussion.threads {
+            thread
+                .comments
+                .sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        }
+        Ok(discussion)
+    }
+
     fn pending_review(&self, loc: &PrLocator) -> Result<Option<PendingReview>, ClientError> {
         let viewer = self.viewer()?;
         let value = self.review_api(&[
@@ -367,6 +443,51 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 .as_ref()
                 .and_then(|position| position.base_commit_id.as_deref()),
         )
+    }
+
+    fn add_pending_reply(
+        &self,
+        loc: &PrLocator,
+        review: &PendingReview,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<PendingComment, ClientError> {
+        // Use the real node identity and authoritative thread anchor, including
+        // preview-only/outdated positions. Never synthesize an opaque node id.
+        let mut target = None;
+        self.for_each_thread_comment(loc, |thread, comment, head, base| {
+            if database_id(&comment["id"])? == comment_id {
+                let node_id: String = decode_value(comment["node_id"].clone())?;
+                target = Some((
+                    thread.clone(),
+                    node_id,
+                    head.map(str::to_owned),
+                    base.map(str::to_owned),
+                ));
+            }
+            Ok(())
+        })?;
+        let (thread, node_id, head, base) = target.ok_or_else(|| {
+            ClientError::Invalid(
+                "this comment is no longer available; refresh and try again".into(),
+            )
+        })?;
+        let value = self.review_graphql(format!(
+            "mutation {{ addPullRequestReviewComment(input:{{pullRequestReviewId:{},inReplyTo:{},body:{}}}) {{ comment {{ id:fullDatabaseId node_id:id path body replyTo {{ id:fullDatabaseId }} }} }} }}",
+            json_string(&review.node_id), json_string(&node_id), json_string(body)
+        ))?;
+        let comment = pending_thread_comment(
+            &thread,
+            value["data"]["addPullRequestReviewComment"]["comment"].clone(),
+            head.as_deref(),
+            base.as_deref(),
+        )?;
+        if comment.in_reply_to_id != Some(comment_id) {
+            return Err(ClientError::Failed(
+                "GitHub returned no reply to the requested comment".into(),
+            ));
+        }
+        Ok(comment)
     }
 
     fn edit_pending_comment(
@@ -879,7 +1000,41 @@ fn after_arg(cursor: Option<&str>) -> String {
 }
 
 fn review_thread_fields(cursor: Option<&str>) -> String {
-    format!("id side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id path body pullRequestReview {{ id }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
+    format!("id path isResolved originalLine originalStartLine side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id path body createdAt author {{ login }} reactionGroups {{ content users {{ totalCount }} }} replyTo {{ id:fullDatabaseId }} pullRequestReview {{ id state }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
+}
+
+fn database_id(value: &serde_json::Value) -> Result<u64, ClientError> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.parse().ok())
+        .ok_or_else(|| ClientError::Failed("GitHub returned no comment id".into()))
+}
+
+fn discussion_comment(raw: &serde_json::Value) -> Result<crate::DiscussionComment, ClientError> {
+    let id = raw["id"]
+        .as_u64()
+        .or_else(|| raw["id"].as_str()?.parse().ok())
+        .ok_or_else(|| ClientError::Failed("GitHub returned no discussion comment id".into()))?;
+    let mut reactions = Vec::new();
+    if let Some(groups) = raw["reactionGroups"].as_array() {
+        for group in groups {
+            let count: u64 = decode_value(group["users"]["totalCount"].clone())?;
+            if count > 0 {
+                reactions.push(crate::Reaction {
+                    content: decode_value(group["content"].clone())?,
+                    count,
+                });
+            }
+        }
+    }
+    Ok(crate::DiscussionComment {
+        id,
+        author: raw["author"]["login"].as_str().unwrap_or("ghost").into(),
+        body: decode_value(raw["body"].clone())?,
+        created_at: decode_value(raw["createdAt"].clone())?,
+        reactions,
+        review_state: None,
+    })
 }
 
 const POSITIONING_FIELDS: &str = "positioning { __typename ... on LineComment { line commitOid headCommitOid baseCommitOid } ... on MultilineComment { startLine endLine startCommitOid endCommitOid headCommitOid baseCommitOid } }";
@@ -986,10 +1141,16 @@ fn pending_thread_comment(
 ) -> Result<PendingComment, ClientError> {
     let side: crate::DiffSide = decode_value(thread["side"].clone())?;
     let (start, line) = thread_position(thread, head, base)?;
+    let reply_to = if comment["replyTo"].is_null() {
+        None
+    } else {
+        Some(database_id(&comment["replyTo"]["id"])?)
+    };
     if let Some(comment) = comment.as_object_mut() {
         comment.insert("side".into(), serde_json::json!(side));
         comment.insert("line".into(), serde_json::json!(line));
         comment.insert("start_line".into(), serde_json::json!(start));
+        comment.insert("in_reply_to_id".into(), serde_json::json!(reply_to));
     }
     let mut comment: PendingComment = decode_value(comment)?;
     pending_node_id(&comment)?;
@@ -1468,6 +1629,146 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    #[test]
+    fn complete_discussion_paginates_all_connections_and_keeps_published_metadata() {
+        use serde_json::json;
+        let connection = |nodes: Vec<serde_json::Value>, cursor: Option<&str>| {
+            json!({
+                "nodes": nodes, "pageInfo": {"hasNextPage": cursor.is_some(), "endCursor": cursor}
+            })
+        };
+        let page = |name: &str, conn: serde_json::Value| {
+            json!({"data": {"repository": {"pullRequest": {
+                "headRefOid": "head", "baseRefOid": "base", name: conn
+            }}}})
+            .to_string()
+        };
+        let comment = |id: u64| {
+            json!({"id": id.to_string(), "body": "**hello**", "createdAt": "2026-01-01T00:00:00Z",
+                "author": null, "reactionGroups": [
+                    {"content": "HEART", "users": {"totalCount": 4}},
+                    {"content": "EYES", "users": {"totalCount": 0}}
+                ], "pullRequestReview": {"state": "COMMENTED"}
+            })
+        };
+        let mut review = comment(9);
+        review["state"] = json!("APPROVED");
+        review["body"] = json!("");
+        review["submittedAt"] = json!("2026-02-01T00:00:00Z");
+        let mut pending = review.clone();
+        pending["state"] = json!("PENDING");
+        pending["submittedAt"] = json!(null);
+        let thread = |id: &str, comments: serde_json::Value| {
+            json!({
+                "id": id, "path": "src/main.rs", "side": "LEFT", "line": null, "start_line": null,
+                "isResolved": true, "isOutdated": true, "originalLine": 42, "originalStartLine": 40,
+                "comments": comments
+            })
+        };
+        let mut draft = comment(8);
+        draft["pullRequestReview"]["state"] = json!("PENDING");
+        let responses = [
+            page(
+                "comments",
+                connection(vec![comment(u64::MAX)], Some("main-next")),
+            ),
+            page("comments", connection(vec![comment(2)], None)),
+            page("reviews", connection(vec![pending], Some("reviews-next"))),
+            page("reviews", connection(vec![review], None)),
+            page(
+                "reviewThreads",
+                connection(
+                    vec![thread(
+                        "T1",
+                        connection(vec![comment(3)], Some("reply-next")),
+                    )],
+                    Some("threads-next"),
+                ),
+            ),
+            json!({"data": {"node": thread("T1", connection(vec![comment(4)], None))}}).to_string(),
+            page(
+                "reviewThreads",
+                connection(
+                    vec![thread("T2", connection(vec![comment(5), draft], None))],
+                    None,
+                ),
+            ),
+        ];
+        let refs: Vec<_> = responses.iter().map(String::as_str).collect();
+        let (client, calls) = session_script(&refs);
+        let discussion = client.pr_discussion(&loc()).unwrap();
+        assert_eq!(discussion.comments.len(), 3);
+        assert_eq!(discussion.comments[0].id, u64::MAX);
+        assert_eq!(discussion.comments[0].author, "ghost");
+        assert_eq!(
+            discussion.comments[0].reactions,
+            vec![crate::Reaction {
+                content: "HEART".into(),
+                count: 4
+            }]
+        );
+        assert_eq!(discussion.comments[2].created_at, "2026-02-01T00:00:00Z");
+        assert_eq!(
+            discussion.comments[2].review_state.as_deref(),
+            Some("APPROVED")
+        );
+        assert!(discussion.comments[2].body.is_empty());
+        assert_eq!(discussion.threads.len(), 2);
+        assert_eq!(
+            discussion.threads[0]
+                .comments
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(
+            discussion.threads[1].comments.len(),
+            1,
+            "no pending comments in the published timeline"
+        );
+        assert!(discussion.threads[0].is_resolved);
+        assert_eq!(discussion.threads[0].original_line, Some(42));
+        let flat = discussion.review_comments();
+        assert_eq!(flat.len(), 3);
+        assert_eq!(
+            flat[0].line, None,
+            "historical anchors never reattach to current code"
+        );
+        assert_eq!(flat[1].in_reply_to_id, Some(3));
+        let calls = calls.lock().unwrap();
+        for (ix, cursor) in [
+            (1, "main-next"),
+            (3, "reviews-next"),
+            (5, "reply-next"),
+            (6, "threads-next"),
+        ] {
+            assert!(calls[ix].join(" ").contains(cursor));
+        }
+        assert!(calls
+            .iter()
+            .all(|call| !call.join(" ").contains("mutation")));
+    }
+
+    #[test]
+    fn discussion_errors_do_not_silently_turn_into_empty_conversations() {
+        let repeated = r#"{"data":{"repository":{"pullRequest":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"same"}}}}}}"#;
+        let (client, _) = session_script(&[repeated, repeated]);
+        assert!(client
+            .pr_discussion(&loc())
+            .unwrap_err()
+            .to_string()
+            .contains("repeated"));
+        let (client, _) = session_script(&[r#"{"data":{"repository":{"pullRequest":null}}}"#]);
+        assert!(client.pr_discussion(&loc()).is_err());
+        let (client, _) = session_script(&[r#"{"errors":[{"message":"rate limited"}]}"#]);
+        assert!(client
+            .pr_discussion(&loc())
+            .unwrap_err()
+            .to_string()
+            .contains("rate limited"));
+    }
+
     /// The fake `gh` backend: each invocation pops the next recorded outcome,
     /// and an invocation beyond what the test scripted fails — a stray
     /// subprocess would be a behavior change worth noticing. Every
@@ -1657,6 +1958,138 @@ mod tests {
             start_line: Some(5),
             position: None,
         }
+    }
+
+    #[test]
+    fn replies_join_the_reconciled_pending_review_and_resume_in_their_thread() {
+        use crate::review_session::{Command, ReviewSession};
+        let mut parent: serde_json::Value = serde_json::from_str(DRAFT).unwrap();
+        parent["id"] = serde_json::json!("11");
+        parent["node_id"] = serde_json::json!("PRRC_published");
+        let mut threads: serde_json::Value =
+            serde_json::from_str(&pending_threads(&[&parent.to_string()])).unwrap();
+        let nodes = &mut threads["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"];
+        nodes[0]["comments"]["nodes"][0]["pullRequestReview"]["id"] =
+            serde_json::json!("PRR_published");
+        let published = threads.to_string();
+        let reply = serde_json::json!({"id":"5000000000","node_id":"PRRC_reply","path":"a.rs",
+            "body":"quoted \"reply\"", "replyTo":{"id":"11"}, "pullRequestReview":{"id":"PRR_pending"}});
+        let response =
+            serde_json::json!({"data":{"addPullRequestReviewComment":{"comment":reply}}})
+                .to_string();
+        threads["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]["comments"]
+            ["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(reply);
+        let resumed = threads.to_string();
+        let (client, calls) = session_script(&[
+            SUCCESS, PENDING, &published, &published, &response, SUCCESS, PENDING, &resumed,
+        ]);
+        let mut session = ReviewSession::default();
+        session
+            .execute(
+                &client,
+                &loc(),
+                Command::Reply {
+                    comment_id: 11,
+                    body: "  quoted \"reply\"  ".into(),
+                },
+            )
+            .unwrap();
+        let draft = &session.pending.as_ref().unwrap().comments[0];
+        assert_eq!(draft.id, 5_000_000_000);
+        assert_eq!(draft.in_reply_to_id, Some(11));
+        assert_eq!(draft.line, Some(7));
+        assert_eq!(draft.start_line, Some(5));
+        session.execute(&client, &loc(), Command::Resume).unwrap();
+        assert_eq!(
+            session.pending.as_ref().unwrap().comments[0].in_reply_to_id,
+            Some(11)
+        );
+        let calls = calls.lock().unwrap();
+        let mutation = calls[4].join(" ");
+        assert!(mutation.contains("addPullRequestReviewComment"));
+        assert!(mutation.contains("pullRequestReviewId:\"PRR_pending\""));
+        assert!(mutation.contains("inReplyTo:\"PRRC_published\""));
+        assert!(mutation.contains(r#"body:"quoted \"reply\"""#));
+        assert!(!calls
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "POST")));
+        assert!(!calls
+            .iter()
+            .any(|call| call.join(" ").contains("submitPullRequestReview")));
+    }
+
+    #[test]
+    fn reply_after_external_review_submission_posts_immediately_instead_of_using_stale_draft() {
+        use crate::review_session::{Command, ReviewSession};
+        let (client, calls) = session_script(&[SUCCESS, "[]", "{}"]);
+        let mut session = ReviewSession {
+            pending: Some(PendingReview {
+                id: 91,
+                node_id: "stale".into(),
+                body: String::new(),
+                comments: vec![],
+            }),
+            verified: false,
+        };
+        session
+            .execute(
+                &client,
+                &loc(),
+                Command::Reply {
+                    comment_id: 11,
+                    body: "reply".into(),
+                },
+            )
+            .unwrap();
+        assert!(session.pending.is_none());
+        assert!(calls.lock().unwrap()[2]
+            .join(" ")
+            .contains("comments/11/replies"));
+    }
+
+    #[test]
+    fn failed_pending_reply_never_falls_back_to_posting_or_submitting() {
+        use crate::review_session::{Command, ReviewSession};
+        let target = pending_threads(&[DRAFT]);
+        let (client, calls) = session_script(&[
+            SUCCESS,
+            PENDING,
+            &target,
+            &target,
+            r#"{"errors":[{"message":"cannot reply"}]}"#,
+        ]);
+        let mut session = ReviewSession::default();
+        assert!(session
+            .execute(
+                &client,
+                &loc(),
+                Command::Reply {
+                    comment_id: 12,
+                    body: "reply".into()
+                }
+            )
+            .is_err());
+        assert_eq!(session.count(), 1, "original pending comments are retained");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            5,
+            "no retry as an immediate post"
+        );
+        let (client, calls) = session_script(&[]);
+        assert!(session
+            .execute(
+                &client,
+                &loc(),
+                Command::Reply {
+                    comment_id: 12,
+                    body: " \n".into()
+                }
+            )
+            .is_err());
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     fn positioned_anchor(side: crate::DiffSide, range: bool) -> CommentAnchor {

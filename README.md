@@ -55,6 +55,8 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
 - multi-item sidebar with file tree
 - cmd-k palette with fuzzy PR picker
+- PR conversation (`⇧⌘←`): GFM description, chronological comments and review
+  threads, expandable resolved stubs, and read-only reaction counts; cached offline
 - local repo diffs
 - minimap
 - inline GitHub review comments (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
@@ -64,7 +66,8 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
   on GitHub's rollout for the repository
 - pending reviews: start/add to a review without posting, resume drafts started
   on GitHub, and edit/delete them in the pending-review tray before submitting;
-  **Add single comment** still posts immediately
+   replies join the pending review too; **Add single comment** is available
+   only without a pending review and posts immediately
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
 - follows the system light/dark appearance
 
