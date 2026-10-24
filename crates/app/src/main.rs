@@ -7198,7 +7198,32 @@ mod tests {
             unreachable!()
         };
         let mut discussion = conversation::tests::sample_discussion();
+        let mut summary = discussion.comments[0].clone();
+        summary.body = "Review summary above the inline thread.".into();
+        summary.review_state = Some("CHANGES_REQUESTED".into());
+        summary.review_id = Some("R1".into());
         discussion.comments.clear();
+        discussion.comments.push(summary);
+        discussion.threads[0].comments[0].review_id = Some("R1".into());
+        // Outside-diff comments have no captured patch. Expanding the grouped
+        // stub must render their immutable blob excerpt through the same UI.
+        discussion.threads[0].diff_hunk.clear();
+        discussion.threads[0].code_context = Some(github::ReviewCodeContext {
+            commit_id: "captured-base".into(),
+            line: 12,
+            start_line: Some(10),
+            first_line: 9,
+            lines: vec![
+                "context".into(),
+                "first".into(),
+                "second".into(),
+                "third".into(),
+            ],
+        });
+        assert!(matches!(
+            &conversation::timeline(&discussion)[..],
+            [conversation::Entry::Review(_, threads)] if threads.len() == 1
+        ));
         data.discussion = Some(discussion);
         install_item(&app, item, cx);
         let expanded = |cx: &gpui::TestAppContext| {
@@ -7260,6 +7285,19 @@ mod tests {
         );
         assert!(snapshot.threads.iter().any(|t| t.resolved));
         let entries = conversation::timeline(discussion);
+        assert!(
+            entries.iter().any(|entry| matches!(entry,
+                conversation::Entry::Review(_, threads) if !threads.is_empty()
+            )),
+            "real inline threads are grouped under their submitted review"
+        );
+        assert!(
+            discussion
+                .threads
+                .iter()
+                .all(|thread| !thread.diff_hunk.is_empty() || thread.code_context.is_some()),
+            "captured code is available for each real inline thread"
+        );
         let count = entries.len();
         eprintln!(
             "Real PR: {} chronological entries, {} thread comments",

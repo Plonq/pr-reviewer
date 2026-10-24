@@ -55,8 +55,9 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
 - multi-item sidebar with file tree
 - cmd-k palette with fuzzy PR picker
-- PR conversation (`⇧⌘←`): GFM description, chronological comments and review
-  threads, expandable resolved stubs, and read-only reaction counts; cached offline
+- PR conversation (`⇧⌘←`): GFM description and chronological comments; reviews
+  group their inline threads beneath the summary, with captured code context,
+  expandable resolved stubs, and read-only reaction counts; cached offline
 - local repo diffs
 - minimap
 - inline GitHub review comments (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)

@@ -61,10 +61,11 @@ pub fn preprocess(body: &str, repo_slug: &str) -> String {
     out
 }
 
-/// A thread occupies one chronological slot at its first comment; replies
-/// remain inside it even when main-thread comments arrive between replies.
+/// Submitted reviews occupy one slot, with their summary before their inline
+/// threads. Unassociated threads (including old cached data) stand alone.
 pub(crate) enum Entry<'a> {
     Comment(&'a github::DiscussionComment),
+    Review(&'a github::DiscussionComment, Vec<&'a github::ReviewThread>),
     Thread(&'a github::ReviewThread),
 }
 
@@ -72,26 +73,145 @@ impl Entry<'_> {
     fn key(&self) -> (&str, u8, u64, &str) {
         match self {
             Self::Comment(c) => (&c.created_at, u8::from(c.review_state.is_some()), c.id, ""),
+            Self::Review(c, _) => (&c.created_at, 1, c.id, ""),
             Self::Thread(t) => (&t.comments[0].created_at, 2, 0, &t.id),
         }
     }
 }
 
 pub(crate) fn timeline(discussion: &github::PrDiscussion) -> Vec<Entry<'_>> {
+    let mut reviews = std::collections::HashMap::new();
     let mut entries: Vec<_> = discussion
         .comments
         .iter()
-        .map(Entry::Comment)
-        .chain(
-            discussion
-                .threads
-                .iter()
-                .filter(|t| !t.comments.is_empty())
-                .map(Entry::Thread),
-        )
+        .enumerate()
+        .map(|(ix, comment)| {
+            if comment.review_state.is_some() {
+                if let Some(id) = &comment.review_id {
+                    reviews.insert(id.as_str(), ix);
+                }
+                Entry::Review(comment, Vec::new())
+            } else {
+                Entry::Comment(comment)
+            }
+        })
         .collect();
+    let mut threads: Vec<_> = discussion
+        .threads
+        .iter()
+        .filter(|t| !t.comments.is_empty())
+        .collect();
+    threads.sort_by(|a, b| Entry::Thread(a).key().cmp(&Entry::Thread(b).key()));
+    for thread in threads {
+        let review = thread.comments[0]
+            .review_id
+            .as_deref()
+            .and_then(|id| reviews.get(id));
+        if let Some(Entry::Review(_, threads)) = review.and_then(|&ix| entries.get_mut(ix)) {
+            threads.push(thread);
+        } else {
+            entries.push(Entry::Thread(thread));
+        }
+    }
     entries.sort_by(|a, b| a.key().cmp(&b.key()));
     entries
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CodeLine<'a> {
+    old: Option<u64>,
+    new: Option<u64>,
+    kind: char,
+    text: &'a str,
+    selected: bool,
+}
+
+/// GitHub's captured hunk uses original coordinates, even if the current
+/// anchor has moved. Keep a little context and end at the commented line.
+fn code_excerpt(thread: &github::ReviewThread) -> Vec<CodeLine<'_>> {
+    if thread.diff_hunk.is_empty() {
+        return thread
+            .code_context
+            .as_ref()
+            .map(|context| {
+                context
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, text)| {
+                        let number = context.first_line + ix as u64;
+                        CodeLine {
+                            old: (thread.side == "LEFT").then_some(number),
+                            new: (thread.side != "LEFT").then_some(number),
+                            kind: ' ',
+                            text,
+                            selected: number >= context.start_line.unwrap_or(context.line)
+                                && number <= context.line,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    let end = thread.original_line.or(thread.line);
+    let start = if thread.original_line.is_some() {
+        thread.original_start_line
+    } else {
+        thread.start_line
+    }
+    .or(end);
+    let mut lines = Vec::new();
+    let (mut old, mut new) = (0, 0);
+    for line in thread.diff_hunk.lines() {
+        if line.starts_with("@@ ") {
+            let mut fields = line.split_whitespace().skip(1);
+            let number = |s: &str| s.get(1..)?.split(',').next()?.parse::<u64>().ok();
+            let position = fields
+                .next()
+                .and_then(number)
+                .zip(fields.next().and_then(number));
+            (old, new) = position.unwrap_or((0, 0));
+            continue;
+        }
+        if old == 0 && new == 0 {
+            continue;
+        }
+        let Some(kind @ (' ' | '+' | '-')) = line.chars().next() else {
+            continue;
+        };
+        let old_line = (kind != '+' && old > 0).then_some(old);
+        let new_line = (kind != '-' && new > 0).then_some(new);
+        let number = if thread.side == "LEFT" {
+            old_line
+        } else {
+            new_line
+        };
+        lines.push(CodeLine {
+            old: old_line,
+            new: new_line,
+            kind,
+            text: &line[1..],
+            selected: number
+                .zip(start.zip(end))
+                .is_some_and(|(n, (start, end))| n >= start && n <= end),
+        });
+        if kind != '+' {
+            old += 1;
+        }
+        if kind != '-' {
+            new += 1;
+        }
+    }
+    if let Some(last) = lines.iter().rposition(|line| line.selected) {
+        let first = lines.iter().position(|line| line.selected).unwrap_or(last);
+        let from = first.saturating_sub(3).max((last + 1).saturating_sub(20));
+        lines.truncate(last + 1);
+        lines.drain(..from);
+    } else if lines.len() > 6 {
+        // File-level/legacy anchors may have no line; still show captured code.
+        lines.drain(..lines.len() - 6);
+    }
+    lines
 }
 
 pub(crate) fn anchor(thread: &github::ReviewThread) -> String {
@@ -161,90 +281,171 @@ impl ReviewApp {
                         .child(self.discussion_comment(item.id, "main", comment, &slug, window, cx))
                         .into_any_element(),
                 ),
-                Entry::Thread(thread) => {
-                    let expanded =
-                        !thread.is_resolved || data.expanded_threads.contains(&thread.id);
-                    let item_id = item.id;
-                    let thread_id = thread.id.clone();
-                    let summary = format!(
-                        "{}{} · @{} · {} comment{}{}",
-                        if thread.is_resolved {
-                            if expanded {
-                                "▾ Resolved · "
-                            } else {
-                                "▸ Resolved · "
-                            }
-                        } else {
-                            "Review thread · "
-                        },
-                        anchor(thread),
-                        thread.comments[0].author,
-                        thread.comments.len(),
-                        if thread.comments.len() == 1 { "" } else { "s" },
-                        if thread.is_resolved {
-                            if expanded {
-                                " · collapse"
-                            } else {
-                                " · expand"
-                            }
-                        } else {
-                            ""
-                        }
-                    );
-                    let mut header = div()
-                        .id(SharedString::from(format!(
-                            "thread-{}-{}",
-                            item.id, thread.id
-                        )))
-                        .px_4()
-                        .py_2()
-                        .text_size(px(text_size() - 1.))
-                        .text_color(theme::subtext())
-                        .overflow_hidden()
-                        .child(div().truncate().child(summary));
-                    if thread.is_resolved {
-                        header =
-                            header
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let Some(item) =
-                                        this.items.iter_mut().find(|item| item.id == item_id)
-                                    else {
-                                        return;
-                                    };
-                                    let ItemState::Ready(data) = &mut item.state else {
-                                        return;
-                                    };
-                                    if !data.expanded_threads.remove(&thread_id) {
-                                        data.expanded_threads.insert(thread_id.clone());
-                                    }
-                                    cx.notify();
-                                }));
-                    }
-                    let mut card = div()
+                Entry::Review(comment, threads) => {
+                    let mut review = div()
                         .mt_6()
                         .border_1()
                         .border_color(theme::surface0())
                         .rounded_md()
-                        .child(header);
-                    if expanded {
-                        for comment in &thread.comments {
-                            card = card.child(
-                                div()
-                                    .p_4()
-                                    .border_t_1()
-                                    .border_color(theme::surface0())
-                                    .child(self.discussion_comment(
-                                        item.id, "review", comment, &slug, window, cx,
-                                    )),
-                            );
-                        }
+                        .child(div().p_4().child(
+                            self.discussion_comment(item.id, "main", comment, &slug, window, cx),
+                        ));
+                    if !threads.is_empty() {
+                        review =
+                            review.child(div().px_4().pb_4().flex().flex_col().gap_3().children(
+                                threads.into_iter().map(|thread| {
+                                    self.discussion_thread(item, data, thread, &slug, window, cx)
+                                }),
+                            ));
                     }
-                    elements.push(card.into_any_element());
+                    elements.push(review.into_any_element());
                 }
+                Entry::Thread(thread) => elements.push(
+                    div()
+                        .mt_6()
+                        .child(self.discussion_thread(item, data, thread, &slug, window, cx))
+                        .into_any_element(),
+                ),
             }
         }
         elements
+    }
+
+    fn discussion_thread(
+        &self,
+        item: &ReviewItem,
+        data: &ItemData,
+        thread: &github::ReviewThread,
+        slug: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let expanded = !thread.is_resolved || data.expanded_threads.contains(&thread.id);
+        let item_id = item.id;
+        let thread_id = thread.id.clone();
+        let summary = format!(
+            "{}{} · @{} · {} comment{}{}",
+            if thread.is_resolved {
+                if expanded {
+                    "▾ Resolved · "
+                } else {
+                    "▸ Resolved · "
+                }
+            } else {
+                "Review thread · "
+            },
+            anchor(thread),
+            thread.comments[0].author,
+            thread.comments.len(),
+            if thread.comments.len() == 1 { "" } else { "s" },
+            if thread.is_resolved {
+                if expanded {
+                    " · collapse"
+                } else {
+                    " · expand"
+                }
+            } else {
+                ""
+            }
+        );
+        let mut header = div()
+            .id(SharedString::from(format!(
+                "thread-{}-{}",
+                item.id, thread.id
+            )))
+            .px_4()
+            .py_2()
+            .text_size(px(text_size() - 1.))
+            .text_color(theme::subtext())
+            .overflow_hidden()
+            .child(div().truncate().child(summary));
+        if thread.is_resolved {
+            header = header
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let Some(item) = this.items.iter_mut().find(|item| item.id == item_id) else {
+                        return;
+                    };
+                    let ItemState::Ready(data) = &mut item.state else {
+                        return;
+                    };
+                    if !data.expanded_threads.remove(&thread_id) {
+                        data.expanded_threads.insert(thread_id.clone());
+                    }
+                    cx.notify();
+                }));
+        }
+        let mut card = div()
+            .min_w_0()
+            .border_1()
+            .border_color(theme::surface0())
+            .rounded_md()
+            .child(header);
+        if expanded {
+            let excerpt = code_excerpt(thread);
+            if !excerpt.is_empty() {
+                card = card.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "thread-code-{}-{}",
+                            item.id, thread.id
+                        )))
+                        .overflow_x_scroll()
+                        .border_t_1()
+                        .border_color(theme::surface0())
+                        .font_family(crate::MONO)
+                        .text_size(px(text_size() - 2.))
+                        .py_2()
+                        .children(excerpt.into_iter().map(|line| {
+                            let mut row = div().flex().px_2().gap_2();
+                            row = match line.kind {
+                                '+' => row.bg(theme::added_row_bg()),
+                                '-' => row.bg(theme::removed_row_bg()),
+                                _ => row,
+                            };
+                            if line.selected {
+                                row = row.border_l_2().border_color(theme::blue());
+                            } else {
+                                row = row.border_l_2().border_color(gpui::transparent_black());
+                            }
+                            row.child(div().flex_shrink_0().text_color(theme::overlay0()).child(
+                                format!(
+                                    "{:>4} {:>4} {}",
+                                    line.old.map(|n| n.to_string()).unwrap_or_default(),
+                                    line.new.map(|n| n.to_string()).unwrap_or_default(),
+                                    line.kind,
+                                ),
+                            ))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .whitespace_nowrap()
+                                    .child(line.text.to_owned()),
+                            )
+                        })),
+                );
+            } else {
+                card = card.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_color(theme::overlay0())
+                        .child("Code context unavailable for this thread."),
+                );
+            }
+            for comment in &thread.comments {
+                card = card.child(
+                    div()
+                        .p_4()
+                        .border_t_1()
+                        .border_color(theme::surface0())
+                        .child(
+                            self.discussion_comment(item.id, "review", comment, slug, window, cx),
+                        ),
+                );
+            }
+        }
+        card.into_any_element()
     }
 
     fn discussion_comment(
@@ -494,6 +695,7 @@ pub(crate) mod tests {
             body: "Thanks @bob :tada: — see #12.\n\n```rust\nlet x = 1;\n```".into(),
             created_at: time.into(),
             review_state: None,
+            review_id: None,
             reactions: vec![github::Reaction {
                 content: "THUMBS_UP".into(),
                 count: 3,
@@ -514,6 +716,8 @@ pub(crate) mod tests {
                 start_line: None,
                 original_line: Some(12),
                 original_start_line: Some(10),
+                diff_hunk: "@@ -9,5 +9,2 @@\n fn main() {\n-    old_one();\n-    old_two();\n-    old_three();\n }".into(),
+                code_context: None,
                 comments: vec![
                     comment(1, "2026-01-01T12:00:00Z"),
                     comment(3, "2026-01-03T00:00:00Z"),
@@ -557,6 +761,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|e| match e {
                     Entry::Comment(c) => format!("comment-{}", c.id),
+                    Entry::Review(c, _) => format!("review-{}", c.id),
                     Entry::Thread(t) => t.id.clone(),
                 })
                 .collect::<Vec<_>>()
@@ -564,6 +769,121 @@ pub(crate) mod tests {
         assert_eq!(ids(&discussion), vec!["comment-1", "comment-2", "T1"]);
         discussion.comments.reverse();
         assert_eq!(ids(&discussion), vec!["comment-1", "comment-2", "T1"]);
+    }
+
+    #[test]
+    fn reviews_group_roots_not_replies_at_submission_time() {
+        let mut discussion = sample_discussion();
+        let mut review = discussion.comments[0].clone();
+        review.id = 10;
+        review.review_id = Some("R1".into());
+        review.review_state = Some("CHANGES_REQUESTED".into());
+        review.created_at = "2026-01-04T00:00:00Z".into();
+        discussion.comments.push(review.clone());
+        discussion.threads[0].comments[0].review_id = Some("R1".into());
+        discussion.threads[0].comments[1].review_id = Some("R2".into());
+        let mut second = discussion.threads[0].clone();
+        second.id = "T2".into();
+        discussion.threads.push(second);
+        review.id = 11;
+        review.review_id = Some("R2".into());
+        discussion.comments.push(review);
+        let entries = timeline(&discussion);
+        assert_eq!(entries.len(), 4, "no duplicate standalone inline threads");
+        assert!(matches!(&entries[0], Entry::Comment(c) if c.id == 2));
+        assert!(matches!(&entries[1], Entry::Comment(c) if c.id == 1));
+        assert!(
+            matches!(&entries[2], Entry::Review(c, threads) if c.id == 10 && threads.iter().map(|t| t.id.as_str()).collect::<Vec<_>>() == ["T1", "T2"])
+        );
+        assert!(
+            matches!(&entries[3], Entry::Review(c, threads) if c.id == 11 && threads.is_empty())
+        );
+        discussion.comments.retain(|c| c.id != 10);
+        assert_eq!(
+            timeline(&discussion).len(),
+            5,
+            "missing reviews retain standalone threads"
+        );
+    }
+
+    #[test]
+    fn excerpts_use_historical_side_and_highlight_multiline_ranges() {
+        let mut thread = sample_discussion().threads.remove(0);
+        // The LEFT range is historical 10–12, not the shifted current anchor.
+        thread.line = Some(100);
+        thread.start_line = Some(98);
+        let excerpt = code_excerpt(&thread);
+        assert_eq!(excerpt.len(), 4);
+        assert_eq!(excerpt[0].old, Some(9));
+        assert_eq!(excerpt[0].new, Some(9));
+        assert!(!excerpt[0].selected);
+        assert!(excerpt[1..]
+            .iter()
+            .all(|line| line.selected && line.new.is_none()));
+        assert_eq!(excerpt.last().unwrap().text, "    old_three();");
+
+        thread.side = "RIGHT".into();
+        thread.original_start_line = None;
+        thread.start_line = None;
+        thread.original_line = Some(11);
+        thread.diff_hunk = "@@ -9,3 +9,4 @@\n context\n-old\n+new\n+    @literal #12 :rocket:\n tail\n\\ No newline at end of file".into();
+        let excerpt = code_excerpt(&thread);
+        let last = excerpt.last().unwrap();
+        assert_eq!(last.new, Some(11));
+        assert_eq!(last.old, None);
+        assert!(last.selected);
+        assert_eq!(last.text, "    @literal #12 :rocket:");
+        thread.diff_hunk.clear();
+        assert!(code_excerpt(&thread).is_empty());
+    }
+
+    #[test]
+    fn outside_diff_excerpts_show_only_the_captured_side_and_range() {
+        let mut thread = sample_discussion().threads.remove(0);
+        thread.diff_hunk.clear();
+        thread.code_context = Some(github::ReviewCodeContext {
+            commit_id: "captured-old-base".into(),
+            line: 88,
+            start_line: Some(87),
+            first_line: 86,
+            lines: vec![
+                "context".into(),
+                "    first();".into(),
+                "    @literal #12 :rocket:".into(),
+            ],
+        });
+        for side in ["LEFT", "RIGHT"] {
+            thread.side = side.into();
+            let excerpt = code_excerpt(&thread);
+            assert_eq!(excerpt.len(), 3);
+            assert!(!excerpt[0].selected);
+            assert!(excerpt[1..]
+                .iter()
+                .all(|line| line.selected && line.kind == ' '));
+            assert_eq!(excerpt[2].text, "    @literal #12 :rocket:");
+            assert_eq!(excerpt[2].old, (side == "LEFT").then_some(88));
+            assert_eq!(excerpt[2].new, (side == "RIGHT").then_some(88));
+        }
+    }
+
+    #[test]
+    fn excerpts_bound_large_hunks_and_handle_zero_count_and_multiple_headers() {
+        let mut thread = sample_discussion().threads.remove(0);
+        thread.side = "RIGHT".into();
+        thread.original_start_line = Some(1);
+        thread.original_line = Some(100);
+        thread.diff_hunk = format!("@@ -0,0 +1,100 @@\n{}", "+new\n".repeat(100));
+        let excerpt = code_excerpt(&thread);
+        assert_eq!(excerpt.len(), 20);
+        assert_eq!(excerpt[0].new, Some(81));
+        assert_eq!(excerpt.last().unwrap().new, Some(100));
+        assert!(excerpt
+            .iter()
+            .all(|line| line.old.is_none() && line.selected));
+        thread.original_start_line = None;
+        thread.original_line = Some(30);
+        thread.diff_hunk = "@@ -1 +1 @@\n a\n@@ -20 +30 @@\n b".into();
+        assert_eq!(code_excerpt(&thread).last().unwrap().new, Some(30));
     }
 
     /// The three expansions, together as one description would mix them.

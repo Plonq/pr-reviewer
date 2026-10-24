@@ -15,7 +15,7 @@
 //! v0.1's `gh`-CLI wording today, including the `gh auth login` fix).
 pub mod discussion;
 pub mod gh_cli;
-pub use discussion::{DiscussionComment, PrDiscussion, Reaction, ReviewThread};
+pub use discussion::{DiscussionComment, PrDiscussion, Reaction, ReviewCodeContext, ReviewThread};
 pub mod review_session;
 pub use review_session::{CommentAnchor, CommentPosition, DiffSide, PendingComment, PendingReview};
 

@@ -292,7 +292,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         // comments, reviews, threads, AND replies within one thread.
         for (name, fields) in [
             ("comments", "id:fullDatabaseId author { login } body createdAt reactionGroups { content users { totalCount } }"),
-            ("reviews", "id:fullDatabaseId author { login } body createdAt submittedAt state"),
+            ("reviews", "id:fullDatabaseId node_id:id author { login } body createdAt submittedAt state"),
         ] {
             let mut after = None;
             loop {
@@ -308,6 +308,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                     let mut comment = discussion_comment(raw)?;
                     if name == "reviews" {
                         comment.review_state = Some(decode_value(raw["state"].clone())?);
+                        comment.review_id = raw["node_id"].as_str().map(str::to_owned);
                         // Reviews created as drafts belong where they were
                         // submitted, not where the draft was first started.
                         comment.created_at = decode_value(raw["submittedAt"].clone())?;
@@ -323,6 +324,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             }
         }
         let mut thread_of = HashMap::new();
+        let mut code_blobs = HashMap::new();
         self.for_each_thread_comment(loc, |raw_thread, raw, head, base| {
             if raw["pullRequestReview"]["state"].as_str() == Some("PENDING") {
                 return Ok(());
@@ -332,17 +334,38 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 Some(&ix) => ix,
                 None => {
                     let (start_line, line) = thread_position(raw_thread, head, base)?;
+                    let path: String = decode_value(raw_thread["path"].clone())?;
+                    let diff_hunk = raw["diffHunk"].as_str().unwrap_or_default();
+                    let code_context = if diff_hunk.is_empty() {
+                        captured_code_position(raw_thread).and_then(|(commit, start, end)| {
+                            // Best effort: a missing/inaccessible blob must not hide the
+                            // discussion. Memoize failures too, for busy outside-diff reviews.
+                            let text = code_blobs
+                                .entry((commit.to_owned(), path.clone()))
+                                .or_insert_with(|| self.file_at(loc, commit, &path).ok().flatten());
+                            crate::ReviewCodeContext::from_blob(
+                                commit,
+                                start,
+                                end,
+                                text.as_deref()?,
+                            )
+                        })
+                    } else {
+                        None
+                    };
                     let ix = discussion.threads.len();
                     discussion.threads.push(crate::ReviewThread {
                         id: id.clone(),
                         is_resolved: decode_value(raw_thread["isResolved"].clone())?,
                         is_outdated: decode_value(raw_thread["isOutdated"].clone())?,
-                        path: decode_value(raw_thread["path"].clone())?,
+                        path,
                         side: decode_value(raw_thread["side"].clone())?,
                         line,
                         start_line,
                         original_line: raw_thread["originalLine"].as_u64(),
                         original_start_line: raw_thread["originalStartLine"].as_u64(),
+                        diff_hunk: diff_hunk.into(),
+                        code_context,
                         comments: Vec::new(),
                     });
                     thread_of.insert(id, ix);
@@ -1000,7 +1023,7 @@ fn after_arg(cursor: Option<&str>) -> String {
 }
 
 fn review_thread_fields(cursor: Option<&str>) -> String {
-    format!("id path isResolved originalLine originalStartLine side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id path body createdAt author {{ login }} reactionGroups {{ content users {{ totalCount }} }} replyTo {{ id:fullDatabaseId }} pullRequestReview {{ id state }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
+    format!("id path isResolved originalLine originalStartLine side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id path body diffHunk createdAt author {{ login }} reactionGroups {{ content users {{ totalCount }} }} replyTo {{ id:fullDatabaseId }} pullRequestReview {{ id state }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
 }
 
 fn database_id(value: &serde_json::Value) -> Result<u64, ClientError> {
@@ -1034,6 +1057,7 @@ fn discussion_comment(raw: &serde_json::Value) -> Result<crate::DiscussionCommen
         created_at: decode_value(raw["createdAt"].clone())?,
         reactions,
         review_state: None,
+        review_id: raw["pullRequestReview"]["id"].as_str().map(str::to_owned),
     })
 }
 
@@ -1109,6 +1133,40 @@ fn thread_position(
         start.filter(|start| *start > 0 && line.is_some_and(|line| *start < line)),
         line,
     ))
+}
+
+/// Unlike current diff-row anchors, historical previews must use the captured
+/// blob even when the PR has moved on. Never substitute the PR's current base
+/// or head, and don't flatten ranges spanning two different revisions.
+fn captured_code_position(thread: &serde_json::Value) -> Option<(&str, Option<u64>, u64)> {
+    let position = &thread["positioning"];
+    let (commit, start, line) = match position["__typename"].as_str()? {
+        "LineComment" => (
+            position["commitOid"].as_str()?,
+            None,
+            position["line"].as_u64()?,
+        ),
+        "MultilineComment" => {
+            let commit = position["endCommitOid"].as_str()?;
+            if position["startCommitOid"].as_str()? != commit {
+                return None;
+            }
+            (
+                commit,
+                Some(position["startLine"].as_u64()?),
+                position["endLine"].as_u64()?,
+            )
+        }
+        _ => return None,
+    };
+    if commit.is_empty()
+        || line == 0
+        || line > i32::MAX as u64
+        || start.is_some_and(|start| start == 0 || start > line)
+    {
+        return None;
+    }
+    Some((commit, start, line))
 }
 
 fn connection_nodes(
@@ -1648,11 +1706,13 @@ mod tests {
                 "author": null, "reactionGroups": [
                     {"content": "HEART", "users": {"totalCount": 4}},
                     {"content": "EYES", "users": {"totalCount": 0}}
-                ], "pullRequestReview": {"state": "COMMENTED"}
+                ], "pullRequestReview": {"id": "R9", "state": "COMMENTED"},
+                "diffHunk": "@@ -40,3 +40,0 @@\n-old one\n-old two\n-old three"
             })
         };
         let mut review = comment(9);
         review["state"] = json!("APPROVED");
+        review["node_id"] = json!("R9");
         review["body"] = json!("");
         review["submittedAt"] = json!("2026-02-01T00:00:00Z");
         let mut pending = review.clone();
@@ -1713,6 +1773,7 @@ mod tests {
             Some("APPROVED")
         );
         assert!(discussion.comments[2].body.is_empty());
+        assert_eq!(discussion.comments[2].review_id.as_deref(), Some("R9"));
         assert_eq!(discussion.threads.len(), 2);
         assert_eq!(
             discussion.threads[0]
@@ -1729,6 +1790,14 @@ mod tests {
         );
         assert!(discussion.threads[0].is_resolved);
         assert_eq!(discussion.threads[0].original_line, Some(42));
+        assert_eq!(
+            discussion.threads[0].comments[0].review_id.as_deref(),
+            Some("R9")
+        );
+        assert_eq!(
+            discussion.threads[0].diff_hunk,
+            "@@ -40,3 +40,0 @@\n-old one\n-old two\n-old three"
+        );
         let flat = discussion.review_comments();
         assert_eq!(flat.len(), 3);
         assert_eq!(
@@ -1737,6 +1806,8 @@ mod tests {
         );
         assert_eq!(flat[1].in_reply_to_id, Some(3));
         let calls = calls.lock().unwrap();
+        assert!(calls[2].join(" ").contains("node_id:id"));
+        assert!(calls[4].join(" ").contains("diffHunk"));
         for (ix, cursor) in [
             (1, "main-next"),
             (3, "reviews-next"),
@@ -1748,6 +1819,116 @@ mod tests {
         assert!(calls
             .iter()
             .all(|call| !call.join(" ").contains("mutation")));
+    }
+
+    #[test]
+    fn outside_diff_discussion_previews_use_captured_blobs_and_survive_blob_errors() {
+        use serde_json::json;
+        let unique = tempfile::tempdir().unwrap();
+        let path = format!(
+            "outside-{}/main.rs",
+            unique.path().file_name().unwrap().to_str().unwrap()
+        );
+        let connection =
+            |nodes| json!({"nodes": nodes, "pageInfo": {"hasNextPage": false, "endCursor": null}});
+        let page = |name: &str, nodes| {
+            json!({"data": {"repository": {"pullRequest": {
+                "headRefOid": "current-head", "baseRefOid": "current-base", name: connection(nodes)
+            }}}})
+            .to_string()
+        };
+        let thread = |id: u64, side, position| {
+            json!({
+                "id": format!("T{id}"), "path": path, "side": side,
+                "line": null, "start_line": null, "originalLine": 6, "originalStartLine": null,
+                "isResolved": false, "isOutdated": true, "positioning": position,
+                "comments": connection(vec![json!({"id": id, "body": "outside diff", "createdAt": "2026-10-24T00:00:00Z",
+                    "diffHunk": "", "pullRequestReview": {"id": "R1", "state": "COMMENTED"}})])
+            })
+        };
+        let left = json!({"__typename": "LineComment", "line": 6, "commitOid": "captured-left", "headCommitOid": "old-head", "baseCommitOid": "old-base"});
+        let right = json!({"__typename": "MultilineComment", "startLine": 4, "endLine": 6,
+            "startCommitOid": "captured-right", "endCommitOid": "captured-right", "headCommitOid": "old-head"});
+        let missing = json!({"__typename": "LineComment", "line": 6, "commitOid": "inaccessible"});
+        let main = page("comments", vec![]);
+        let reviews = page("reviews", vec![]);
+        let threads = page(
+            "reviewThreads",
+            vec![
+                thread(1, "LEFT", left.clone()),
+                thread(2, "RIGHT", right),
+                thread(3, "LEFT", left),
+                thread(4, "LEFT", missing.clone()),
+                thread(5, "LEFT", missing),
+            ],
+        );
+        let fake = FakeGh::many(vec![
+            ok(Some(0), &main, ""),
+            ok(Some(0), &reviews, ""),
+            ok(Some(0), &threads, ""),
+            ok(
+                Some(0),
+                "old 1\nold 2\nold 3\nold 4\nold 5\nold 6\nold 7\n",
+                "",
+            ),
+            ok(
+                Some(0),
+                "new 1\nnew 2\nnew 3\nnew 4\nnew 5\nnew 6\nnew 7\n",
+                "",
+            ),
+            ok(Some(1), "", "gh: Forbidden (HTTP 403)"),
+        ]);
+        let calls = fake.calls_handle();
+        let discussion = GhCliClient::with_process(fake)
+            .pr_discussion(&loc())
+            .unwrap();
+        assert_eq!(discussion.threads.len(), 5);
+        let left = discussion.threads[0].code_context.as_ref().unwrap();
+        assert_eq!(left.commit_id, "captured-left");
+        assert_eq!(left.first_line, 3);
+        assert_eq!(left.lines, ["old 3", "old 4", "old 5", "old 6"]);
+        assert!(
+            discussion.threads[0].line.is_none(),
+            "stale previews never become current diff anchors"
+        );
+        let right = discussion.threads[1].code_context.as_ref().unwrap();
+        assert_eq!(right.commit_id, "captured-right");
+        assert_eq!(right.first_line, 1);
+        assert_eq!(right.start_line, Some(4));
+        assert_eq!(right.lines.last().unwrap(), "new 6");
+        assert_eq!(discussion.threads[2].code_context.as_ref(), Some(left));
+        assert!(discussion.threads[3..]
+            .iter()
+            .all(|t| t.code_context.is_none()));
+        assert_eq!(
+            serde_json::from_value::<crate::PrDiscussion>(
+                serde_json::to_value(&discussion).unwrap()
+            )
+            .unwrap(),
+            discussion
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            6,
+            "one request per captured blob, including failures"
+        );
+        assert!(calls[3].last().unwrap().ends_with("?ref=captured-left"));
+        assert!(calls[4].last().unwrap().ends_with("?ref=captured-right"));
+        assert!(calls[5].last().unwrap().ends_with("?ref=inaccessible"));
+    }
+
+    #[test]
+    fn captured_code_positions_do_not_guess_missing_or_cross_commit_anchors() {
+        use serde_json::json;
+        for position in [
+            json!(null),
+            json!({"__typename": "LineComment", "line": 88}),
+            json!({"__typename": "LineComment", "line": 0, "commitOid": "old"}),
+            json!({"__typename": "MultilineComment", "startLine": 3, "endLine": 4, "startCommitOid": "old", "endCommitOid": "new"}),
+        ] {
+            assert!(captured_code_position(&json!({"positioning": position})).is_none());
+        }
     }
 
     #[test]
