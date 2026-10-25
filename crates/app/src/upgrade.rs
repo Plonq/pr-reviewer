@@ -191,8 +191,10 @@ fn upgrade_file(source: &dyn ContentSource, job: &UpgradeJob) -> Option<Upgraded
 
     let path = job.new_path.as_deref().or(job.old_path.as_deref())?;
     let lang = syntax::language_for_path(path);
+    let monster =
+        crate::presentation::auto_collapse(old_text.lines().count().max(new_text.lines().count()));
     let spans = |text: &str| match lang {
-        Some(lang) if !text.is_empty() => syntax::highlight_lines(lang, text),
+        Some(lang) if !text.is_empty() && !monster => syntax::highlight_lines(lang, text),
         _ => Vec::new(),
     };
     Some(UpgradedFile {
@@ -540,6 +542,22 @@ mod tests {
         assert!(result.hunks.is_empty());
         assert_eq!((result.additions, result.deletions), (0, 0));
         assert_eq!(lines(&result), ["a", "b"]);
+    }
+
+    #[test]
+    fn monster_blobs_skip_whole_file_syntax_even_with_a_tiny_patch() {
+        let old = "let x = 1;\n".repeat(crate::presentation::AUTO_COLLAPSE_LINES);
+        let new = old.replacen("let x = 1;", "let x = 2;", 1);
+        let source = FakeSource::new(&[("a.rs", Side::Old, &old), ("a.rs", Side::New, &new)]);
+        let result = upgrade_file(
+            &source,
+            &job(FileStatus::Modified, Some("a.rs"), Some("a.rs")),
+        )
+        .unwrap();
+        assert!(result.upgrade.old_spans.is_empty());
+        assert!(result.upgrade.new_spans.is_empty());
+        assert_eq!(result.upgrade.new_lines.len(), 20_000);
+        assert_eq!(result.hunks.len(), 1);
     }
 
     #[test]

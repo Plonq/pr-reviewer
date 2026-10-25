@@ -23,6 +23,7 @@
 //! every write is a single transaction.
 
 mod cache;
+mod diff_preferences;
 mod position;
 mod settings;
 mod snapshot;
@@ -33,6 +34,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 pub use cache::{CachedLabel, CachedQueue, CachedQueueRow, QueueCache};
+pub use diff_preferences::DiffPreferences;
 pub use position::{PositionStore, ReviewPosition};
 pub use settings::Settings;
 pub use snapshot::{PrSnapshot, SnapshotStore, ThreadSeen};

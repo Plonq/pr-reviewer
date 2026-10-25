@@ -23,6 +23,15 @@ pub(crate) enum ViewMode {
     Split,
 }
 
+/// Split panes stay viewport-sized; the list's horizontal offset scrolls code
+/// inside both panes, not the divider or line-number gutters.
+#[derive(Clone, Copy)]
+pub(crate) struct SplitLayout {
+    pub(crate) viewport: gpui::Pixels,
+    pub(crate) scroll_width: gpui::Pixels,
+    pub(crate) offset: gpui::Pixels,
+}
+
 /// One side of a split row: line number, kind, text, word-level highlights,
 /// and tree-sitter token spans.
 pub(crate) struct Cell {
@@ -47,6 +56,17 @@ pub(crate) enum Row {
         outdated: usize,
     },
     Binary,
+    /// Explicit context boundary; key is the first hidden new-side line.
+    Fold {
+        key: u32,
+        count: u32,
+    },
+    LargeFile {
+        lines: usize,
+        expanded: bool,
+    },
+    /// A visual continuation, not a new source line (copy must not add LF).
+    Continuation(Box<Row>),
     Line {
         old_no: Option<u32>,
         new_no: Option<u32>,
@@ -94,6 +114,13 @@ pub(crate) fn is_comment_row(row: &Row) -> bool {
     )
 }
 
+pub(crate) fn source_row(row: &Row) -> &Row {
+    match row {
+        Row::Continuation(row) => row,
+        row => row,
+    }
+}
+
 /// Display-row adapter only. Anchor validation and API positioning selection
 /// live in `comment_anchor`, which never imports these UI row types.
 pub(crate) fn comment_anchor(
@@ -101,7 +128,7 @@ pub(crate) fn comment_anchor(
     row_ix: usize,
     side: SelSide,
 ) -> Option<(CommentSide, u64)> {
-    let (side, line) = match (rows.get(row_ix)?, side) {
+    let (side, line) = match (source_row(rows.get(row_ix)?), side) {
         (
             Row::Line {
                 kind: LineKind::Removed,
@@ -123,7 +150,7 @@ pub(crate) fn comment_anchor(
 }
 
 pub(crate) fn cursor_anchor(rows: &[Row], row_ix: usize) -> Option<(CommentSide, u64)> {
-    let side = match rows.get(row_ix) {
+    let side = match rows.get(row_ix).map(source_row) {
         Some(Row::SplitLine { right: None, .. }) => SelSide::Left,
         _ => SelSide::Right,
     };
@@ -371,9 +398,8 @@ fn gap_span(hunks: &[Hunk], gap_ix: usize, total_new: u32) -> (u32, u32, u32) {
     (old_lo, new_lo, (new_hi + 1).saturating_sub(new_lo))
 }
 
-/// Emit gap `gap_ix` of an upgraded file into `rows` as plain context:
-/// nothing when no lines are hidden there — the whole file always renders,
-/// with no clickable `Gap` affordance.
+/// Emit gap `gap_ix` as plain context by default, or an explicit fold boundary
+/// when requested. Gaps with review threads keep their anchor lines visible.
 fn push_gap_rows(
     rows: &mut Vec<Row>,
     upgrade: &FileUpgrade,
@@ -384,9 +410,27 @@ fn push_gap_rows(
     anchors: Option<&FileAnchors>,
     now: i64,
     wrap: usize,
+    collapse: bool,
 ) {
     let (old_lo, new_lo, count) = gap_span(hunks, gap_ix, upgrade.new_lines.len() as u32);
     if count == 0 {
+        return;
+    }
+    // Do not allocate/display thousands of context rows just to fold them.
+    // Gaps containing visible threads are emitted, then folded around cards.
+    if collapse
+        && anchors.is_none_or(|anchors| {
+            !anchors.keys().any(|(side, no)| {
+                let start = if *side == CommentSide::Left {
+                    old_lo
+                } else {
+                    new_lo
+                } as u64;
+                *no >= start && *no < start + count as u64
+            })
+        })
+    {
+        rows.push(Row::Fold { key: new_lo, count });
         return;
     }
     for j in 0..count {
@@ -483,6 +527,20 @@ pub(crate) struct BuiltRows {
 /// `RowsView::options.file_ix` names the one file the build renders (file
 /// mode is the only presentation).
 pub(crate) fn build_rows(view: RowsView<'_>) -> BuiltRows {
+    build_presented_rows(
+        view,
+        store::DiffPreferences::default(),
+        &Default::default(),
+        80,
+    )
+}
+
+pub(crate) fn build_presented_rows(
+    view: RowsView<'_>,
+    prefs: store::DiffPreferences,
+    expanded: &std::collections::HashSet<(usize, u32)>,
+    wrap_cols: usize,
+) -> BuiltRows {
     let RowsView {
         diff,
         upgrades,
@@ -532,8 +590,27 @@ pub(crate) fn build_rows(view: RowsView<'_>) -> BuiltRows {
             rows.push(Row::Binary);
             continue;
         }
+        let lines = crate::presentation::file_lines(file, upgrade);
+        let monster = crate::presentation::auto_collapse(lines);
+        if monster {
+            let is_expanded = expanded.contains(&(file_ix, 0));
+            rows.push(Row::LargeFile {
+                lines,
+                expanded: is_expanded,
+            });
+            if !is_expanded {
+                continue;
+            }
+        }
+        let hidden_ws;
+        let hunks = if prefs.hide_whitespace.unwrap_or(false) {
+            hidden_ws = diff_core::without_whitespace(&file.hunks);
+            &hidden_ws
+        } else {
+            &file.hunks
+        };
         let lang = syntax::language_for_path(path);
-        for (hunk_ix, hunk) in file.hunks.iter().enumerate() {
+        for (hunk_ix, hunk) in hunks.iter().enumerate() {
             if let Some(upgrade) = upgrade {
                 push_gap_rows(
                     &mut rows,
@@ -545,11 +622,17 @@ pub(crate) fn build_rows(view: RowsView<'_>) -> BuiltRows {
                     anchors,
                     now,
                     wrap,
+                    prefs.collapse_unchanged.unwrap_or(false)
+                        && !expanded.contains(&(
+                            file_ix,
+                            gap_span(hunks, hunk_ix, upgrade.new_lines.len() as u32).1,
+                        )),
                 );
             }
             let syntax_spans = match upgrade {
                 Some(upgrade) => hunk.rows.iter().map(|row| upgrade.row_spans(row)).collect(),
-                None => hunk_syntax(lang, &hunk.rows),
+                None if !monster => hunk_syntax(lang, &hunk.rows),
+                None => vec![Vec::new(); hunk.rows.len()],
             };
             // The first row of the hunk — its `@@` marker is never rendered;
             // hunk boundaries read from the highlighting alone.
@@ -789,15 +872,26 @@ pub(crate) fn build_rows(view: RowsView<'_>) -> BuiltRows {
                 anchors,
                 now,
                 wrap,
+                prefs.collapse_unchanged.unwrap_or(false)
+                    && !expanded.contains(&(
+                        file_ix,
+                        gap_span(hunks, hunks.len(), upgrade.new_lines.len() as u32).1,
+                    )),
             );
         }
     }
 
-    BuiltRows {
-        rows,
-        file_rows,
-        hunk_rows,
-    }
+    crate::presentation::decorate(
+        BuiltRows {
+            rows,
+            file_rows,
+            hunk_rows,
+        },
+        prefs,
+        expanded,
+        focus,
+        wrap_cols,
+    )
 }
 
 /// Per-kind row tint, word-highlight tint, gutter marker, and marker color.
@@ -1028,10 +1122,83 @@ pub(crate) fn render_row(
     row: &Row,
     selection: Option<(SelSide, Range<usize>)>,
     active: Option<SelSide>,
+    split_layout: Option<SplitLayout>,
+    entity: &gpui::Entity<ReviewApp>,
+) -> gpui::AnyElement {
+    let inner = render_row_content(
+        ix,
+        row,
+        selection,
+        active,
+        split_layout.map(|layout| layout.offset),
+        entity,
+    );
+    if let Some(layout) = split_layout {
+        // uniform_list moves the entire row by offset.x. Counter that move for
+        // the viewport-sized panes; only their clipped code text moves sideways.
+        div()
+            .h(px(row_height()))
+            .w(layout.scroll_width)
+            .child(
+                div()
+                    .relative()
+                    .left(-layout.offset)
+                    .w(layout.viewport)
+                    .h_full()
+                    .child(inner),
+            )
+            .into_any_element()
+    } else {
+        inner
+    }
+}
+
+fn render_row_content(
+    ix: usize,
+    row: &Row,
+    selection: Option<(SelSide, Range<usize>)>,
+    active: Option<SelSide>,
+    horizontal_offset: Option<gpui::Pixels>,
     entity: &gpui::Entity<ReviewApp>,
 ) -> gpui::AnyElement {
     let row_height = px(row_height());
     match row {
+        Row::Continuation(row) => {
+            render_row_content(ix, row, selection, active, horizontal_offset, entity)
+        }
+        Row::Fold { key, count } => {
+            let key = *key;
+            let entity = entity.clone();
+            div()
+                .id(("fold", ix))
+                .h(row_height)
+                .w_full()
+                .px_3()
+                .bg(theme::mantle())
+                .border_y_1()
+                .border_color(theme::surface0())
+                .text_color(theme::blue())
+                .cursor_pointer()
+                .child(SharedString::from(format!(
+                    "⋯ {count} unchanged lines hidden · click to expand"
+                )))
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |this, cx| this.expand_region(key, cx));
+                })
+                .into_any_element()
+        }
+        Row::LargeFile { lines, expanded } => {
+            let entity = entity.clone();
+            div().id(("large-file", ix)).h(row_height).w_full().px_3()
+                .bg(theme::mantle()).text_color(theme::blue()).text_size(px(11.)).cursor_pointer()
+                .child(SharedString::from(if *expanded {
+                    format!("Large file ({lines} lines) · click to collapse")
+                } else {
+                    format!("Large file ({lines} lines): auto-collapsed for responsiveness · click to expand")
+                }))
+                .on_click(move |_, _, cx| { entity.update(cx, |this, cx| this.expand_region(0, cx)); })
+                .into_any_element()
+        }
         Row::CommentHeader {
             author,
             when,
@@ -1235,13 +1402,18 @@ pub(crate) fn render_row(
                     .text_color(marker_color)
                     .child(SharedString::from(marker)),
             )
-            .child(div().whitespace_nowrap().child(line_content(
-                text,
-                syntax,
-                intra,
-                word_bg,
-                selection.map(|(_, range)| range),
-            )))
+            .child(
+                div()
+                    .debug_selector(|| format!("diff-code-{ix}"))
+                    .whitespace_nowrap()
+                    .child(line_content(
+                        text,
+                        syntax,
+                        intra,
+                        word_bg,
+                        selection.map(|(_, range)| range),
+                    )),
+            )
             .into_any_element()
         }
         Row::SplitLine { left, right } => {
@@ -1250,7 +1422,10 @@ pub(crate) fn render_row(
                 Some((SelSide::Right, range)) => (None, Some(range)),
                 _ => (None, None),
             };
-            let cell = |cell: &Option<Cell>, sel: Option<Range<usize>>, active: bool| {
+            let cell = |cell: &Option<Cell>,
+                        sel: Option<Range<usize>>,
+                        active: bool,
+                        code_id: &'static str| {
                 let base = div()
                     .flex_1()
                     .min_w_0()
@@ -1281,13 +1456,31 @@ pub(crate) fn render_row(
                         .text_color(marker_color)
                         .child(SharedString::from(marker)),
                 )
-                .child(div().whitespace_nowrap().child(line_content(
-                    &cell.text,
-                    &cell.syntax,
-                    &cell.intra,
-                    word_bg,
-                    sel,
-                )))
+                .child(
+                    div()
+                        .debug_selector(|| format!("{code_id}-clip-{ix}"))
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_hidden()
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .debug_selector(|| format!("{code_id}-{ix}"))
+                                .relative()
+                                .left(horizontal_offset.unwrap_or(px(0.)))
+                                .flex_shrink_0()
+                                .whitespace_nowrap()
+                                .child(line_content(
+                                    &cell.text,
+                                    &cell.syntax,
+                                    &cell.intra,
+                                    word_bg,
+                                    sel,
+                                )),
+                        ),
+                )
             };
             // w_full is load-bearing: without a definite row width the row
             // sizes to fit-content and the flex_1 halves collapse to their
@@ -1296,7 +1489,12 @@ pub(crate) fn render_row(
                 .h(row_height)
                 .w_full()
                 .flex()
-                .child(cell(left, left_sel, active == Some(SelSide::Left)))
+                .child(cell(
+                    left,
+                    left_sel,
+                    active == Some(SelSide::Left),
+                    "diff-code-left",
+                ))
                 .child(
                     div()
                         .w(px(6.))
@@ -1307,7 +1505,12 @@ pub(crate) fn render_row(
                         .border_r_1()
                         .border_color(theme::surface0()),
                 )
-                .child(cell(right, right_sel, active == Some(SelSide::Right)))
+                .child(cell(
+                    right,
+                    right_sel,
+                    active == Some(SelSide::Right),
+                    "diff-code-right",
+                ))
                 .into_any_element()
         }
     }

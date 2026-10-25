@@ -290,6 +290,91 @@ pub fn diff_texts(old: &str, new: &str, context: u32) -> Vec<Hunk> {
     hunks
 }
 
+/// Re-align each patch hunk ignoring whitespace, retaining real source line
+/// numbers and new-side text. Works even before full blobs are available.
+pub fn without_whitespace(hunks: &[Hunk]) -> Vec<Hunk> {
+    hunks
+        .iter()
+        .map(|hunk| {
+            let mut old = Vec::new();
+            let mut new = Vec::new();
+            for row in &hunk.rows {
+                match row {
+                    DiffRow::Context {
+                        old_no,
+                        new_no,
+                        text,
+                    } => {
+                        old.push((*old_no, text));
+                        new.push((*new_no, text));
+                    }
+                    DiffRow::Removed { old_no, text, .. } => old.push((*old_no, text)),
+                    DiffRow::Added { new_no, text, .. } => new.push((*new_no, text)),
+                }
+            }
+            let normalize = |text: &&String| {
+                text.chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .collect::<String>()
+            };
+            let before: Vec<_> = old.iter().map(|(_, text)| normalize(text)).collect();
+            let after: Vec<_> = new.iter().map(|(_, text)| normalize(text)).collect();
+            let mut input = InternedInput::default();
+            input.update_before(before.iter().map(String::as_str));
+            input.update_after(after.iter().map(String::as_str));
+            let mut changes = Vec::new();
+            imara_diff::diff(
+                Algorithm::Histogram,
+                &input,
+                |a: Range<u32>, b: Range<u32>| changes.push((a, b)),
+            );
+            let mut rows = Vec::new();
+            let (mut a, mut b) = (0, 0);
+            for (removed, added) in changes {
+                while a < removed.start as usize {
+                    rows.push(DiffRow::Context {
+                        old_no: old[a].0,
+                        new_no: new[b].0,
+                        text: new[b].1.clone(),
+                    });
+                    a += 1;
+                    b += 1;
+                }
+                for ix in removed.clone() {
+                    rows.push(DiffRow::Removed {
+                        old_no: old[ix as usize].0,
+                        text: old[ix as usize].1.clone(),
+                        intra: Vec::new(),
+                    });
+                }
+                for ix in added.clone() {
+                    rows.push(DiffRow::Added {
+                        new_no: new[ix as usize].0,
+                        text: new[ix as usize].1.clone(),
+                        intra: Vec::new(),
+                    });
+                }
+                a = removed.end as usize;
+                b = added.end as usize;
+            }
+            while a < old.len() && b < new.len() {
+                rows.push(DiffRow::Context {
+                    old_no: old[a].0,
+                    new_no: new[b].0,
+                    text: new[b].1.clone(),
+                });
+                a += 1;
+                b += 1;
+            }
+            compute_intra_line(&mut rows);
+            Hunk {
+                rows,
+                ..hunk.clone()
+            }
+        })
+        .collect()
+}
+
 /// `a/old b/new`, possibly with `"`-quoted paths. Best-effort: the definitive
 /// paths come from `---`/`+++`/`rename` lines when present.
 fn parse_git_paths(rest: &str) -> (Option<String>, Option<String>) {
@@ -537,6 +622,55 @@ index 6666666..7777777 100644
 -x
 +y
 ";
+
+    #[test]
+    fn whitespace_filter_realigns_runs_without_changing_source_coordinates() {
+        let hunks = diff_texts(
+            "a\n  same();\nold();\nz\n",
+            "a\n\tsame ( );  \ninsert();\nnew();\nz\n",
+            3,
+        );
+        let filtered = without_whitespace(&hunks);
+        let h = &filtered[0];
+        assert_eq!((h.old_count, h.new_count), (4, 5));
+        assert!(
+            matches!(&h.rows[1], DiffRow::Context { old_no: 2, new_no: 2, text } if text == "\tsame ( );  ")
+        );
+        assert!(h
+            .rows
+            .iter()
+            .any(|r| matches!(r, DiffRow::Removed { old_no: 3, text, .. } if text == "old();")));
+        assert!(h
+            .rows
+            .iter()
+            .any(|r| matches!(r, DiffRow::Added { new_no: 4, text, .. } if text == "new();")));
+        assert!(matches!(
+            h.rows.last(),
+            Some(DiffRow::Context {
+                old_no: 4,
+                new_no: 5,
+                ..
+            })
+        ));
+        assert!(
+            matches!(&hunks[0].rows[1], DiffRow::Removed { .. }),
+            "the source diff is untouched"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_changes_become_context_but_insertions_and_deletions_survive() {
+        let h = without_whitespace(&diff_texts("a b\nc\n", "ab\n c \n", 3));
+        assert!(h[0]
+            .rows
+            .iter()
+            .all(|r| matches!(r, DiffRow::Context { .. })));
+        for (old, new) in [("", "added\n"), ("removed\n", "")] {
+            let h = without_whitespace(&diff_texts(old, new, 3));
+            assert_eq!(h[0].rows.len(), 1);
+            assert!(!matches!(h[0].rows[0], DiffRow::Context { .. }));
+        }
+    }
 
     #[test]
     fn parses_files_hunks_and_rows() {

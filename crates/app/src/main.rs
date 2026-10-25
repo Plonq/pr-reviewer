@@ -5,6 +5,7 @@ mod http;
 mod local_store;
 mod minimap;
 mod position;
+mod presentation;
 mod queue;
 mod review_target;
 mod rows;
@@ -183,6 +184,9 @@ actions!(
         ScrollLeft,
         ScrollRight,
         ToggleView,
+        ToggleWhitespace,
+        ToggleUnchanged,
+        ToggleSoftWrap,
         Quit,
         ToggleSidebar,
         OpenInput,
@@ -327,6 +331,7 @@ fn main() {
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
             theme::apply_ui_theme(None, cx);
+            cx.bind_keys(presentation::keybindings());
             cx.bind_keys([
                 KeyBinding::new("]", NextFile, Some("ReviewApp")),
                 KeyBinding::new("[", PrevFile, Some("ReviewApp")),
@@ -334,7 +339,7 @@ fn main() {
                 KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
-                // Sideways through long lines in the unified diff. Inputs
+                // Sideways through long lines in either diff mode. Inputs
                 // deeper in the tree (a focused palette/filter input) keep
                 // their own left/right for caret movement.
                 KeyBinding::new("left", ScrollLeft, Some("ReviewApp")),
@@ -510,6 +515,7 @@ pub(crate) struct ItemData {
     /// (gpui measures a single item; row 0 is always the file header,
     /// which would leave that range at zero). Recomputed in `set_rows`.
     wide_row: usize,
+    split_columns: usize,
     /// Minimap model, index-aligned with `rows`; rebuilt with them.
     minimap: Vec<MinimapRow>,
     /// Coalesced minimap quad runs for one pane height, computed lazily on
@@ -552,6 +558,10 @@ pub(crate) struct ItemData {
     /// bodies, which changes the row count, so render rebuilds the rows when
     /// the pane resizes past a column boundary.
     comment_wrap: usize,
+    preferences: store::DiffPreferences,
+    preference_overrides: store::DiffPreferences,
+    expanded_regions: HashSet<(usize, u32)>,
+    code_wrap: usize,
     /// Users offered by the composer's `@`-mention autocomplete. Shared live
     /// with any open `MentionProvider`; seeded from PR participants, then
     /// filled from the repo's mentionable set (see `mentions_fetched`).
@@ -594,6 +604,7 @@ impl ItemData {
             file_rows: Vec::new(),
             hunk_rows: Vec::new(),
             wide_row: 0,
+            split_columns: 0,
             minimap: Vec::new(),
             minimap_cache: RefCell::new(None),
             cursor: 0,
@@ -614,6 +625,10 @@ impl ItemData {
             local_review,
             comments_visible: true,
             comment_wrap: COMMENT_WRAP_CHARS,
+            preferences: Default::default(),
+            preference_overrides: Default::default(),
+            expanded_regions: HashSet::new(),
+            code_wrap: 80,
             mentions: Rc::new(RefCell::new(Vec::new())),
             mentions_fetched: false,
             tree: Vec::new(),
@@ -639,7 +654,27 @@ impl ItemData {
         } = built_rows;
         self.minimap = minimap_rows(&rows);
         self.minimap_cache.replace(None);
-        self.wide_row = widest_row_ix(&rows);
+        self.wide_row = match self.mode {
+            ViewMode::Unified => widest_row_ix(&rows),
+            ViewMode::Split => rows
+                .iter()
+                .position(|row| matches!(row, Row::SplitLine { .. }))
+                .unwrap_or(0),
+        };
+        self.split_columns = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::SplitLine { left, right } => Some(
+                    left.iter()
+                        .chain(right.iter())
+                        .map(|cell| cell.text.chars().count())
+                        .max()
+                        .unwrap_or(0),
+                ),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
         self.rows = rows;
         self.file_rows = file_rows;
         self.hunk_rows = hunk_rows;
@@ -647,17 +682,22 @@ impl ItemData {
 
     /// Rebuild the display rows for the displayed file and mode.
     fn row_build(&self) -> BuiltRows {
-        build_rows(RowsView {
-            diff: &self.diff,
-            upgrades: &self.upgrades,
-            comments: self.comments.as_ref(),
-            options: RowOptions {
-                mode: self.mode,
-                file_ix: self.file_ix,
-                comments_visible: self.comments_visible,
-                comment_wrap: self.comment_wrap,
+        rows::build_presented_rows(
+            RowsView {
+                diff: &self.diff,
+                upgrades: &self.upgrades,
+                comments: self.comments.as_ref(),
+                options: RowOptions {
+                    mode: self.mode,
+                    file_ix: self.file_ix,
+                    comments_visible: self.comments_visible,
+                    comment_wrap: self.comment_wrap,
+                },
             },
-        })
+            self.preferences,
+            &self.expanded_regions,
+            self.code_wrap,
+        )
     }
 
     /// Put `hunk_ix`-th hunk (the first when None) on screen: cursor + scroll
@@ -910,6 +950,7 @@ impl ReviewItem {
         data.commits = snapshot
             .commits
             .and_then(|value| serde_json::from_value(value).ok());
+        data.load_preferences(store, Some(loc));
         self.state = ItemState::Ready(data);
         true
     }
@@ -967,6 +1008,7 @@ impl ReviewItem {
                 // Fresh patch-derived data: any previous upgrade is stale —
                 // the upgrade re-runs from scratch.
                 data.upgrades.clear();
+                data.expanded_regions.clear();
                 data.discussion = discussion;
                 data.commits = commits;
                 data.comments = match &data.local_review {
@@ -2098,11 +2140,21 @@ impl ReviewApp {
             return; // Not painted yet; keep the default until it is.
         }
         let wrap = comment_wrap_cols(list_width, data.mode, char_width);
-        if wrap == data.comment_wrap {
+        let code_width = match data.mode {
+            ViewMode::Unified => list_width - UNIFIED_GUTTER,
+            ViewMode::Split => (list_width - SPLIT_DIVIDER) / 2. - SPLIT_GUTTER,
+        };
+        let code_wrap = ((code_width / char_width).floor() as usize).max(1);
+        let code_changed =
+            code_wrap != data.code_wrap && data.preferences.soft_wrap.unwrap_or(false);
+        data.code_wrap = code_wrap;
+        if wrap == data.comment_wrap && !code_changed {
             return;
         }
         data.comment_wrap = wrap;
-        if has_threads {
+        if code_changed {
+            data.rebuild_presentation();
+        } else if has_threads {
             data.rebuild_rows_anchored();
         }
     }
@@ -2206,8 +2258,7 @@ impl ReviewApp {
         let row = ((y / row_height()).floor().max(0.) as usize).min(data.rows.len() - 1);
         let rel_x = f32::from(position.x - bounds.left());
         let (side, text_x) = match data.mode {
-            // offset.x is negative when scrolled right (unified mode only;
-            // split uses FitList and never scrolls horizontally).
+            // offset.x is negative when scrolled right in either mode.
             ViewMode::Unified => (
                 SelSide::Unified,
                 rel_x - f32::from(offset.x) - UNIFIED_GUTTER,
@@ -2223,7 +2274,7 @@ impl ReviewApp {
                     SelSide::Right => rel_x - half - SPLIT_DIVIDER,
                     _ => rel_x,
                 };
-                (side, cell_x - SPLIT_GUTTER)
+                (side, cell_x - SPLIT_GUTTER - f32::from(offset.x))
             }
         };
         Some((side, row, px(text_x)))
@@ -2316,6 +2367,13 @@ impl ReviewApp {
                             None
                         };
                         let snapshot = item.install(loaded);
+                        if let ItemState::Ready(data) = &mut item.state {
+                            let loc = match &item.source {
+                                Source::Pr(loc) => Some(loc),
+                                _ => None,
+                            };
+                            data.load_preferences(&app.store, loc);
+                        }
                         if let (Some(position), ItemState::Ready(data)) =
                             (position, &mut item.state)
                         {
@@ -2996,16 +3054,14 @@ impl ReviewApp {
     }
 
     /// `left`/`right`: nudge the diff's horizontal scroll by ten columns.
-    /// Split mode never scrolls horizontally (FitList sizes the list to the
-    /// viewport and each cell clips its own overflow), so the nudge only
-    /// applies to the unified list; the paint-time clamp pins x to
+    /// Both modes scroll unless soft wrap is enabled. The paint-time clamp pins x to
     /// [-max_offset, 0], so overshooting the ends is harmless.
     fn scroll_horizontal(&mut self, direction: i32, window: &mut Window, cx: &mut Context<Self>) {
         let step = f32::from(self.char_width(window)) * 10.;
         let Some(data) = self.active_data_mut() else {
             return;
         };
-        if data.mode != ViewMode::Unified {
+        if data.preferences.soft_wrap.unwrap_or(false) {
             return;
         }
         let (offset, max_x) = {
@@ -5727,153 +5783,193 @@ impl ReviewApp {
                 }
                 ItemState::Ready(data) => div()
                     .size_full()
-                    .relative()
                     .flex()
-                    .font_family(MONO)
-                    .text_size(px(text_size()))
-                    .line_height(px(row_height()))
-                    // Selection mouse listeners live on the diff pane only.
-                    // While the palette is open its occluding backdrop keeps
-                    // this hitbox from being hovered, so none of these fire;
-                    // the palette.is_none() guard documents (and backstops)
-                    // that. The Scrollbar stops propagation of its own
-                    // mouse-downs and thumb drags before they reach us.
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            if this.palette.is_some() {
-                                return;
-                            }
-                            window.focus(&this.focus_handle);
-                            let char_width = this.char_width(window);
-                            if event.modifiers.shift {
-                                let Some((side, head)) =
-                                    this.pane_hit(event.position, char_width, None)
-                                else {
-                                    return;
-                                };
-                                this.extend_comment_selection(side, head, window, cx);
-                                return;
-                            }
-                            this.drag_anchor = this.pane_hit(event.position, char_width, None);
-                            // A plain click also moves the keyboard cursor:
-                            // `C` and `n`/`p` follow the line the reviewer
-                            // last touched, mouse or keyboard alike.
-                            let hit = this.drag_anchor;
-                            if let Some(data) = this.active_data_mut() {
-                                let previous = (data.cursor, data.cursor_side);
-                                if let Some((side, hit)) = hit {
-                                    data.cursor = hit.row;
-                                    data.cursor_side = Some(side);
-                                }
-                                // Repaint even without a text selection: the
-                                // gutter cue follows a plain click immediately.
-                                let cleared_selection = data.selection.take().is_some();
-                                if cleared_selection || previous != (data.cursor, data.cursor_side)
-                                {
-                                    cx.notify();
-                                }
-                            }
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                        if !event.dragging() {
-                            return;
-                        }
-                        // A scrub drag that started on the minimap keeps
-                        // scrubbing wherever the pointer goes; it never
-                        // becomes a text selection (drag_anchor stays None).
-                        if this.minimap_scrub {
-                            this.minimap_scrub_to(event.position, cx);
-                            return;
-                        }
-                        let Some((side, anchor)) = this.drag_anchor else {
-                            return;
-                        };
-                        let char_width = this.char_width(window);
-                        let Some((_, head)) = this.pane_hit(event.position, char_width, Some(side))
-                        else {
-                            return;
-                        };
-                        let selection =
-                            (head != anchor).then_some(Selection { side, anchor, head });
-                        if let Some(data) = this.active_data_mut() {
-                            if data.selection != selection {
-                                data.selection = selection;
-                                cx.notify();
-                            }
-                        }
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, _| {
-                            this.drag_anchor = None;
-                            this.minimap_scrub = false;
-                        }),
-                    )
-                    // Releases outside the pane (drag ended over the sidebar,
-                    // footer, …) must still end the drag.
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, _| {
-                            this.drag_anchor = None;
-                            this.minimap_scrub = false;
-                        }),
-                    )
+                    .flex_col()
+                    .child(self.render_presentation_controls(data, cx))
                     .child(
-                        uniform_list("diff", data.rows.len(), move |range, _window, cx| {
-                            let this = entity.read(cx);
-                            match this.active_data() {
-                                Some(data) => {
-                                    let sel = data.selection;
-                                    range
-                                        .filter_map(|ix| data.rows.get(ix).map(|row| (ix, row)))
-                                        .map(|(ix, row)| {
-                                            let row_sel = sel.and_then(|sel| {
-                                                row_selection_range(&sel, ix, row)
-                                                    .filter(|range| !range.is_empty())
-                                                    .map(|range| (sel.side, range))
-                                            });
-                                            let active = (ix == data.cursor)
-                                                .then_some(data.cursor_side)
-                                                .flatten();
-                                            render_row(ix, row, row_sel, active, &entity)
-                                        })
-                                        .collect()
-                                }
-                                None => Vec::new(),
-                            }
-                        })
-                        .track_scroll(data.scroll.clone())
-                        .with_horizontal_sizing_behavior(match data.mode {
-                            ViewMode::Unified => ListHorizontalSizingBehavior::Unconstrained,
-                            ViewMode::Split => ListHorizontalSizingBehavior::FitList,
-                        })
-                        // Unconstrained sizing turns on horizontal overflow,
-                        // but gpui sizes the scroll range from one measured
-                        // item — row 0, the file header, which never exceeds
-                        // the viewport, so `offset.x` was clamped to zero and
-                        // long lines were unreachable. Measure the widest
-                        // row instead. Split mode sizes to the list and clips
-                        // per cell, so it keeps the default measurement.
-                        .with_width_from_item(match data.mode {
-                            ViewMode::Unified => Some(data.wide_row),
-                            ViewMode::Split => None,
-                        })
-                        .h_full()
-                        .flex_1()
-                        .min_w_0(),
+                        div()
+                            .size_full()
+                            .min_h_0()
+                            .relative()
+                            .flex()
+                            .font_family(MONO)
+                            .text_size(px(text_size()))
+                            .line_height(px(row_height()))
+                            // Selection mouse listeners live on the diff pane only.
+                            // While the palette is open its occluding backdrop keeps
+                            // this hitbox from being hovered, so none of these fire;
+                            // the palette.is_none() guard documents (and backstops)
+                            // that. The Scrollbar stops propagation of its own
+                            // mouse-downs and thumb drags before they reach us.
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    if this.palette.is_some() {
+                                        return;
+                                    }
+                                    window.focus(&this.focus_handle);
+                                    let char_width = this.char_width(window);
+                                    if event.modifiers.shift {
+                                        let Some((side, head)) =
+                                            this.pane_hit(event.position, char_width, None)
+                                        else {
+                                            return;
+                                        };
+                                        this.extend_comment_selection(side, head, window, cx);
+                                        return;
+                                    }
+                                    this.drag_anchor =
+                                        this.pane_hit(event.position, char_width, None);
+                                    // A plain click also moves the keyboard cursor:
+                                    // `C` and `n`/`p` follow the line the reviewer
+                                    // last touched, mouse or keyboard alike.
+                                    let hit = this.drag_anchor;
+                                    if let Some(data) = this.active_data_mut() {
+                                        let previous = (data.cursor, data.cursor_side);
+                                        if let Some((side, hit)) = hit {
+                                            data.cursor = hit.row;
+                                            data.cursor_side = Some(side);
+                                        }
+                                        // Repaint even without a text selection: the
+                                        // gutter cue follows a plain click immediately.
+                                        let cleared_selection = data.selection.take().is_some();
+                                        if cleared_selection
+                                            || previous != (data.cursor, data.cursor_side)
+                                        {
+                                            cx.notify();
+                                        }
+                                    }
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(
+                                |this, event: &MouseMoveEvent, window, cx| {
+                                    if !event.dragging() {
+                                        return;
+                                    }
+                                    // A scrub drag that started on the minimap keeps
+                                    // scrubbing wherever the pointer goes; it never
+                                    // becomes a text selection (drag_anchor stays None).
+                                    if this.minimap_scrub {
+                                        this.minimap_scrub_to(event.position, cx);
+                                        return;
+                                    }
+                                    let Some((side, anchor)) = this.drag_anchor else {
+                                        return;
+                                    };
+                                    let char_width = this.char_width(window);
+                                    let Some((_, head)) =
+                                        this.pane_hit(event.position, char_width, Some(side))
+                                    else {
+                                        return;
+                                    };
+                                    let selection = (head != anchor).then_some(Selection {
+                                        side,
+                                        anchor,
+                                        head,
+                                    });
+                                    if let Some(data) = this.active_data_mut() {
+                                        if data.selection != selection {
+                                            data.selection = selection;
+                                            cx.notify();
+                                        }
+                                    }
+                                },
+                            ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                                    this.drag_anchor = None;
+                                    this.minimap_scrub = false;
+                                }),
+                            )
+                            // Releases outside the pane (drag ended over the sidebar,
+                            // footer, …) must still end the drag.
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                                    this.drag_anchor = None;
+                                    this.minimap_scrub = false;
+                                }),
+                            )
+                            .child(
+                                uniform_list("diff", data.rows.len(), move |range, _window, cx| {
+                                    let this = entity.read(cx);
+                                    match this.active_data() {
+                                        Some(data) => {
+                                            let sel = data.selection;
+                                            range
+                                                .filter_map(|ix| {
+                                                    data.rows.get(ix).map(|row| (ix, row))
+                                                })
+                                                .map(|(ix, row)| {
+                                                    let row_sel = sel.and_then(|sel| {
+                                                        row_selection_range(&sel, ix, row)
+                                                            .filter(|range| !range.is_empty())
+                                                            .map(|range| (sel.side, range))
+                                                    });
+                                                    let active = (ix == data.cursor)
+                                                        .then_some(data.cursor_side)
+                                                        .flatten();
+                                                    let split_layout = (data.mode
+                                                        == ViewMode::Split
+                                                        && !data
+                                                            .preferences
+                                                            .soft_wrap
+                                                            .unwrap_or(false))
+                                                    .then(|| {
+                                                        data.split_layout(
+                                                            this.char_width
+                                                                .unwrap_or(px(text_size() * 0.6)),
+                                                        )
+                                                    });
+                                                    render_row(
+                                                        ix,
+                                                        row,
+                                                        row_sel,
+                                                        active,
+                                                        split_layout,
+                                                        &entity,
+                                                    )
+                                                })
+                                                .collect()
+                                        }
+                                        None => Vec::new(),
+                                    }
+                                })
+                                .track_scroll(data.scroll.clone())
+                                .with_horizontal_sizing_behavior(
+                                    if data.preferences.soft_wrap.unwrap_or(false) {
+                                        ListHorizontalSizingBehavior::FitList
+                                    } else {
+                                        ListHorizontalSizingBehavior::Unconstrained
+                                    },
+                                )
+                                // Unconstrained sizing turns on horizontal overflow,
+                                // but gpui sizes the scroll range from one measured
+                                // item — row 0, the file header, which never exceeds
+                                // the viewport, so `offset.x` was clamped to zero and
+                                // long lines were unreachable. Measure the widest
+                                // row instead. Split rows expose their scroll
+                                // extent without widening the visible panes.
+                                .with_width_from_item(
+                                    (!data.preferences.soft_wrap.unwrap_or(false))
+                                        .then_some(data.wide_row),
+                                )
+                                .h_full()
+                                .flex_1()
+                                .min_w_0(),
+                            )
+                            // Between the list and the Scrollbar, which paints over
+                            // the column's right edge. Nothing is mounted when hidden
+                            // — zero cost.
+                            .when(self.minimap_visible, |pane| {
+                                pane.child(self.render_minimap(cx))
+                            })
+                            .child(Scrollbar::new(&data.scroll))
+                            // Hover "+" (add comment) overlay, absolutely positioned
+                            // at the hovered row's y like the minimap viewport.
+                            .children(self.render_plus(cx)),
                     )
-                    // Between the list and the Scrollbar, which paints over
-                    // the column's right edge. Nothing is mounted when hidden
-                    // — zero cost.
-                    .when(self.minimap_visible, |pane| {
-                        pane.child(self.render_minimap(cx))
-                    })
-                    .child(Scrollbar::new(&data.scroll))
-                    // Hover "+" (add comment) overlay, absolutely positioned
-                    // at the hovered row's y like the minimap viewport.
-                    .children(self.render_plus(cx))
                     .into_any_element(),
             },
         }
@@ -5991,6 +6087,15 @@ impl Render for ReviewApp {
                 this.scroll_horizontal(1, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleView, _, cx| this.toggle_view(cx)))
+            .on_action(cx.listener(|this, _: &ToggleWhitespace, _, cx| {
+                this.toggle_presentation(presentation::Preference::Whitespace, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleUnchanged, _, cx| {
+                this.toggle_presentation(presentation::Preference::Collapse, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSoftWrap, _, cx| {
+                this.toggle_presentation(presentation::Preference::Wrap, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleMinimap, _, cx| {
                 this.minimap_visible = !this.minimap_visible;
                 cx.notify();
@@ -8823,6 +8928,197 @@ mod tests {
                 this.active = 0;
                 this.next_id = 1;
             });
+        });
+    }
+
+    #[gpui::test]
+    fn horizontal_scroll_is_default_and_wrap_fits_both_views(cx: &mut gpui::TestAppContext) {
+        let long = "abcdefghij".repeat(60);
+        let client = Arc::new(FakePr {
+            patch: Some(format!(
+                "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+{long}\n"
+            )),
+            ..Default::default()
+        });
+        let (window, app) = queue_window(cx, client);
+        cx.update(|cx| app.update(cx, |this, cx| this.open_item(Source::Pr(loop_loc()), cx)));
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            vcx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    let data = this.active_data_mut().unwrap();
+                    data.mode = mode;
+                    data.preferences.soft_wrap = Some(false);
+                    data.rebuild_presentation();
+                    cx.notify();
+                });
+                let _ = window.draw(cx);
+                let data = app.read(cx).active_data().unwrap();
+                assert!(
+                    data.scroll.0.borrow().base_handle.max_offset().width > px(0.),
+                    "long lines must be reachable without wrapping"
+                );
+            });
+            let code = match mode {
+                ViewMode::Unified => "diff-code-2",
+                ViewMode::Split => "diff-code-right-1",
+            };
+            let code_bounds = vcx.debug_bounds(code).expect("added code is laid out");
+            vcx.update(|_, cx| {
+                let data = app.read(cx).active_data().unwrap();
+                let viewport = data.scroll.0.borrow().base_handle.bounds();
+                assert!(code_bounds.left() < viewport.right() && code_bounds.right() > viewport.left(), "added code must start inside the viewport: {code_bounds:?}, viewport {viewport:?}");
+                assert!(code_bounds.size.height > px(0.));
+            });
+            if mode == ViewMode::Split {
+                let left_clip = vcx.debug_bounds("diff-code-left-clip-1").unwrap();
+                let right_clip = vcx.debug_bounds("diff-code-right-clip-1").unwrap();
+                vcx.update(|_, cx| {
+                    let viewport = app
+                        .read(cx)
+                        .active_data()
+                        .unwrap()
+                        .scroll
+                        .0
+                        .borrow()
+                        .base_handle
+                        .bounds();
+                    for clip in [left_clip, right_clip] {
+                        assert!(
+                            clip.size.width > px(0.),
+                            "code must have a nonzero visible clip, not just a nonzero text layout"
+                        );
+                        assert!(clip.left() >= viewport.left() && clip.right() <= viewport.right());
+                    }
+                });
+                vcx.update(|window, cx| {
+                    app.update(cx, |this, cx| {
+                        let data = this.active_data_mut().unwrap();
+                        let handle = &data.scroll.0.borrow().base_handle;
+                        let offset = handle.offset();
+                        handle.set_offset(point(px(-150.), offset.y));
+                        cx.notify();
+                    });
+                    let _ = window.draw(cx);
+                });
+                assert_eq!(
+                    vcx.debug_bounds("diff-code-right-clip-1").unwrap(),
+                    right_clip,
+                    "horizontal scrolling must not move the split panes"
+                );
+                let scrolled_code = vcx.debug_bounds("diff-code-right-1").unwrap();
+                assert_eq!(scrolled_code.left(), code_bounds.left() - px(150.));
+                vcx.update(|_, cx| {
+                    let hit = app
+                        .read(cx)
+                        .pane_text_hit(right_clip.center(), None)
+                        .unwrap();
+                    assert_eq!(
+                        hit.0,
+                        SelSide::Right,
+                        "hit testing must follow the stationary divider"
+                    );
+                });
+            }
+            vcx.dispatch_action(ToggleSoftWrap);
+            for _ in 0..2 {
+                vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+            }
+            vcx.update(|_, cx| {
+                let data = app.read(cx).active_data().unwrap();
+                assert_eq!(
+                    data.scroll.0.borrow().base_handle.max_offset().width,
+                    px(0.)
+                );
+                assert!(data
+                    .rows
+                    .iter()
+                    .any(|row| matches!(row, Row::Continuation(_))));
+            });
+            vcx.dispatch_action(ToggleSoftWrap);
+            for _ in 0..2 {
+                vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+            }
+            let unwrapped = vcx
+                .debug_bounds(code)
+                .expect("code survives wrapping being turned off again");
+            assert!(unwrapped.size.width > px(0.) && unwrapped.size.height > px(0.));
+            if mode == ViewMode::Split {
+                assert!(
+                    vcx.debug_bounds("diff-code-right-clip-1")
+                        .unwrap()
+                        .size
+                        .width
+                        > px(0.)
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn presentation_actions_persist_through_refresh_and_a_new_app(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.bind_keys(presentation::keybindings()));
+        let client = Arc::new(FakePr::default());
+        let store = local_store::LocalStore::in_memory();
+        store.save_diff_preferences(
+            None,
+            store::DiffPreferences {
+                hide_whitespace: Some(true),
+                collapse_unchanged: Some(true),
+                soft_wrap: Some(true),
+            },
+        );
+        let (window, app) = queue_window_with_store(cx, client.clone(), store.clone());
+        cx.update(|cx| app.update(cx, |this, cx| this.open_item(Source::Pr(loop_loc()), cx)));
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let data = app.read(cx).active_data().unwrap();
+            assert_eq!(data.preferences, store::DiffPreferences::OFF);
+            assert_eq!(data.preference_overrides.hide_whitespace, None);
+        });
+        vcx.simulate_keystrokes("shift-w shift-k alt-z");
+        let wanted = store::DiffPreferences {
+            hide_whitespace: Some(true),
+            collapse_unchanged: Some(true),
+            soft_wrap: Some(true),
+        };
+        assert_eq!(store.diff_preferences(Some(&loop_loc())), wanted);
+        cx.update(|cx| app.update(cx, |this, cx| this.refresh(cx)));
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(app.read(cx).active_data().unwrap().preferences, wanted));
+        let (second_window, second) = queue_window_with_store(cx, client, store.clone());
+        cx.update(|cx| second.update(cx, |this, cx| this.open_item(Source::Pr(loop_loc()), cx)));
+        cx.run_until_parked();
+        let mut second_vcx = gpui::VisualTestContext::from_window(second_window, cx);
+        second_vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let data = second.read(cx).active_data().unwrap();
+            assert_eq!(data.preferences, wanted);
+            assert_eq!(data.minimap.len(), data.rows.len());
+        });
+        let mut new_pr = loop_loc();
+        new_pr.number += 1;
+        cx.update(|cx| second.update(cx, |this, cx| this.open_item(Source::Pr(new_pr), cx)));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let data = second.read(cx).active_data().unwrap();
+            assert_eq!(
+                data.preferences,
+                store::DiffPreferences::OFF,
+                "new PRs must not inherit another PR's toggles or legacy global settings"
+            );
+            assert_eq!(
+                store.diff_preferences(Some(&loop_loc())),
+                wanted,
+                "opening a new PR must not reset saved choices"
+            );
         });
     }
 

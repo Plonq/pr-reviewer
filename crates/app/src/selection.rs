@@ -45,7 +45,7 @@ impl Selection {
 /// that aren't text (headers, spacers, binary) and absent split cells yield
 /// None: they're selectable-through but contribute nothing.
 pub(crate) fn row_side_text(row: &Row, side: SelSide) -> Option<&str> {
-    match (row, side) {
+    match (crate::rows::source_row(row), side) {
         (Row::Line { text, .. }, SelSide::Unified) => Some(text.as_ref()),
         (Row::SplitLine { left, .. }, SelSide::Left) => left.as_ref().map(|c| c.text.as_ref()),
         (Row::SplitLine { right, .. }, SelSide::Right) => right.as_ref().map(|c| c.text.as_ref()),
@@ -97,14 +97,19 @@ pub(crate) fn row_selection_range(
 /// (no blank line for them).
 pub(crate) fn selection_text(sel: &Selection, rows: &[Row]) -> String {
     let (start, end) = sel.ordered();
-    let mut parts = Vec::new();
+    let mut text_out = String::new();
+    let mut has_text = false;
     for ix in start.row..=end.row.min(rows.len().saturating_sub(1)) {
         if let Some(range) = row_selection_range(sel, ix, &rows[ix]) {
             let text = row_side_text(&rows[ix], sel.side).unwrap_or_default();
-            parts.push(&text[range]);
+            if has_text && !matches!(&rows[ix], Row::Continuation(_)) {
+                text_out.push('\n');
+            }
+            text_out.push_str(&text[range]);
+            has_text = true;
         }
     }
-    parts.join("\n")
+    text_out
 }
 
 #[cfg(test)]

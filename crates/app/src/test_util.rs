@@ -203,6 +203,9 @@ pub(crate) fn row_name(row: &Row) -> &'static str {
     match row {
         Row::FileHeader { .. } => "FileHeader",
         Row::Binary => "Binary",
+        Row::Fold { .. } => "Fold",
+        Row::LargeFile { .. } => "LargeFile",
+        Row::Continuation(_) => "Continuation",
         Row::Line { .. } => "Line",
         Row::SplitLine { .. } => "SplitLine",
         Row::CommentHeader { .. } => "CommentHeader",

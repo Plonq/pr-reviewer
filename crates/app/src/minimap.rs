@@ -49,10 +49,13 @@ fn line_frac(text: &str) -> f32 {
 /// Reduce display rows to minimap rows, one per row, index-aligned.
 pub(crate) fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
     rows.iter()
-        .map(|row| match row {
+        .map(|row| match crate::rows::source_row(row) {
             // Comment rows stay blank in the minimap: threads are short and
             // already flagged by the file-header counts.
             Row::Binary
+            | Row::Continuation(_)
+            | Row::Fold { .. }
+            | Row::LargeFile { .. }
             | Row::CommentHeader { .. }
             | Row::CommentBody { .. }
             | Row::CommentActions { .. } => MinimapRow {

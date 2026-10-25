@@ -13,7 +13,7 @@ pub(crate) struct PositionRestore {
 }
 
 fn line_numbers(row: &Row) -> (Option<u32>, Option<u32>) {
-    match row {
+    match crate::rows::source_row(row) {
         Row::Line { old_no, new_no, .. } => (*old_no, *new_no),
         Row::SplitLine { left, right } => (
             left.as_ref().map(|cell| cell.no),

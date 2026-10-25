@@ -39,6 +39,36 @@ impl std::fmt::Debug for LocalStore {
 }
 
 impl LocalStore {
+    pub fn diff_preferences(&self, loc: Option<&github::PrLocator>) -> store::DiffPreferences {
+        let Ok(store) = self.inner.lock() else {
+            return Default::default();
+        };
+        let slug = loc.map(|loc| loc.repo_slug());
+        store
+            .settings()
+            .diff_preferences(
+                loc.zip(slug.as_deref())
+                    .map(|(loc, slug)| (slug, loc.number)),
+            )
+            .unwrap_or_default()
+    }
+
+    pub fn save_diff_preferences(
+        &self,
+        loc: Option<&github::PrLocator>,
+        prefs: store::DiffPreferences,
+    ) {
+        let Ok(store) = self.inner.lock() else { return };
+        let slug = loc.map(|loc| loc.repo_slug());
+        if let Err(err) = store.settings().set_diff_preferences(
+            loc.zip(slug.as_deref())
+                .map(|(loc, slug)| (slug, loc.number)),
+            prefs,
+        ) {
+            eprintln!("gander: couldn't save diff preferences: {err}");
+        }
+    }
+
     pub fn position(&self, loc: &github::PrLocator) -> Option<ReviewPosition> {
         let store = self.inner.lock().ok()?;
         store

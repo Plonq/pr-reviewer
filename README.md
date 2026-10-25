@@ -51,6 +51,11 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
   `]`/`[` move between files and `n`/`p` between hunks (both wrap); returning
   to a PR resumes its last file and scroll position, even after restarting
 - unified + split views
+- diff presentation controls: `W` hides whitespace changes, `K` folds unchanged
+  regions, and `alt-z` toggles soft wrapping. All three start off for new PRs;
+  each PR remembers its own choices. Horizontal scrolling works in both views.
+  Fold boundaries expand on click. Files of 20,000+ lines open behind an
+  explanatory, click-to-expand safety banner, without whole-file highlighting.
 - tree-sitter highlighting (18 languages)
 - word-level intra-line diffs
 - whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
@@ -85,6 +90,7 @@ The app keeps its own memory in one SQLite database (WAL mode) at
 - **pending reviews** — a local mirror of server-side drafts, reconciled with
   GitHub on open, refresh, and before each review mutation,
 - **review positions** — the last file and scroll anchor for each PR,
+- **diff preferences** — each PR's whitespace, context-folding, and wrap choices,
 - **settings** — the queue's chips and sort, so the app opens the queue you left.
 
 GitHub data in the store is a cache, never a source of truth. Deleting the
@@ -103,6 +109,8 @@ directory forces a re-fetch and resets local settings and review positions.
 | `]` / `[` | next / previous file |
 | `n` / `p` | next / previous hunk |
 | `v` | unified ↔ split view |
+| `W` / `K` | hide whitespace / collapse unchanged (sticky per PR) |
+| `alt-z` | toggle soft wrap |
 | `/` | fuzzy file filter |
 | `m` | toggle minimap |
 | `c` | toggle inline comments |
