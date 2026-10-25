@@ -125,6 +125,19 @@ const UNIFIED_GUTTER: f32 = 44. + 44. + 28.;
 const SPLIT_GUTTER: f32 = 44. + 28.;
 const SPLIT_DIVIDER: f32 = 6.0;
 
+const DEFAULT_SIDEBAR_WIDTH: f32 = 260.;
+const MIN_SIDEBAR_WIDTH: f32 = 180.;
+const MAX_SIDEBAR_WIDTH: f32 = 600.;
+const MIN_MAIN_PANE_WIDTH: f32 = 320.;
+const SIDEBAR_WIDTH_SETTING: &str = "sidebar_width";
+
+fn sidebar_width(width: f32, window_width: f32) -> f32 {
+    let max = (window_width - MIN_MAIN_PANE_WIDTH)
+        .min(MAX_SIDEBAR_WIDTH)
+        .max(0.);
+    width.clamp(MIN_SIDEBAR_WIDTH.min(max), max)
+}
+
 /// How often the queue refreshes itself while the window is frontmost.
 ///
 /// GitHub's search costs a couple of GraphQL points, so a poll every few
@@ -1604,6 +1617,9 @@ pub(crate) struct ReviewApp {
     items: Vec<ReviewItem>,
     active: usize,
     sidebar_visible: bool,
+    sidebar_width: f32,
+    /// Pointer x and rendered width at the start of a sidebar resize.
+    sidebar_resize: Option<(Pixels, f32)>,
     open_input: gpui::Entity<InputState>,
     open_error: Option<SharedString>,
     /// Fuzzy filter over the active item's file tree (`/` focuses it).
@@ -1758,6 +1774,12 @@ impl ReviewApp {
             // both open it); several sources or CLI errors still start it
             // open, the way they always did.
             sidebar_visible: !errors.is_empty() || sources.len() > 1,
+            sidebar_width: store
+                .setting(SIDEBAR_WIDTH_SETTING)
+                .and_then(|value| value.as_f64())
+                .map(|width| width.clamp(MIN_SIDEBAR_WIDTH as f64, MAX_SIDEBAR_WIDTH as f64) as f32)
+                .unwrap_or(DEFAULT_SIDEBAR_WIDTH),
+            sidebar_resize: None,
             open_input,
             open_error: errors.first().cloned().map(SharedString::from),
             tree_filter_input,
@@ -4789,7 +4811,16 @@ impl ReviewApp {
         }
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn finish_sidebar_resize(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_resize.take().is_some() {
+            self.store
+                .set_setting(SIDEBAR_WIDTH_SETTING, serde_json::json!(self.sidebar_width));
+            cx.notify();
+        }
+    }
+
+    fn render_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let width = sidebar_width(self.sidebar_width, window.viewport_size().width.into());
         // Item counts are small: a plain scrollable div capped at ~40% of the
         // sidebar leaves the rest for the active item's file tree.
         let mut list = div()
@@ -4969,7 +5000,10 @@ impl ReviewApp {
         };
 
         div()
-            .w(px(260.))
+            .id("sidebar")
+            .debug_selector(|| "sidebar".to_string())
+            .relative()
+            .w(px(width))
             .flex_shrink_0()
             .h_full()
             .flex()
@@ -5012,6 +5046,29 @@ impl ReviewApp {
                             .child(Input::new(&self.tree_filter_input).small()),
                     )
                     .child(div().flex_1().min_h_0().child(tree_list)),
+            )
+            .child(
+                div()
+                    .id("sidebar-resize")
+                    .debug_selector(|| "sidebar-resize".to_string())
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .w(px(6.))
+                    .h_full()
+                    .cursor_col_resize()
+                    .hover(|style| style.bg(theme::blue()))
+                    .when(self.sidebar_resize.is_some(), |handle| {
+                        handle.bg(theme::blue())
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.sidebar_resize = Some((event.position.x, width));
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
             )
     }
 
@@ -6155,6 +6212,51 @@ impl Render for ReviewApp {
                     cx.notify();
                 }
             }))
+            .when(self.sidebar_resize.is_some(), |root| {
+                let entity = cx.entity();
+                root.cursor_col_resize().child(
+                    // Capture moves even outside the window, not just while
+                    // the root's hitbox is hovered.
+                    canvas(
+                        |_, _, _| (),
+                        move |_, _, window, _| {
+                            window.on_mouse_event(
+                                move |event: &MouseMoveEvent, phase, window, cx| {
+                                    if phase != gpui::DispatchPhase::Capture {
+                                        return;
+                                    }
+                                    entity.update(cx, |this, cx| {
+                                        let Some((start_x, start_width)) = this.sidebar_resize
+                                        else {
+                                            return;
+                                        };
+                                        if event.dragging() {
+                                            this.sidebar_width = sidebar_width(
+                                                start_width + f32::from(event.position.x - start_x),
+                                                window.viewport_size().width.into(),
+                                            );
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        } else {
+                                            this.finish_sidebar_resize(cx);
+                                        }
+                                    });
+                                },
+                            );
+                        },
+                    )
+                    .size(px(0.)),
+                )
+            })
+            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                if event.button == MouseButton::Left {
+                    this.finish_sidebar_resize(cx);
+                }
+            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_sidebar_resize(cx)),
+            )
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &QueueUp, _, cx| this.queue_move(-1, cx)))
             .on_action(cx.listener(|this, _: &QueueDown, _, cx| this.queue_move(1, cx)))
@@ -6198,6 +6300,7 @@ impl Render for ReviewApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.finish_sidebar_resize(cx);
                 this.sidebar_visible = !this.sidebar_visible;
                 cx.notify();
             }))
@@ -6244,7 +6347,7 @@ impl Render for ReviewApp {
                     .min_h_0()
                     .flex()
                     .when(self.sidebar_visible, |main| {
-                        main.child(self.render_sidebar(cx))
+                        main.child(self.render_sidebar(window, cx))
                     })
                     .child(
                         div()
@@ -6301,6 +6404,68 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    #[test]
+    fn sidebar_width_keeps_both_panes_usable() {
+        assert_eq!(sidebar_width(260., 1200.), 260.);
+        assert_eq!(sidebar_width(10., 1200.), MIN_SIDEBAR_WIDTH);
+        assert_eq!(sidebar_width(900., 1200.), MAX_SIDEBAR_WIDTH);
+        assert_eq!(sidebar_width(600., 800.), 480.);
+        assert_eq!(sidebar_width(260., 400.), 80.);
+        assert_eq!(sidebar_width(260., 300.), 0.);
+    }
+
+    #[gpui::test]
+    fn sidebar_drag_resizes_clamps_and_remembers_width(cx: &mut gpui::TestAppContext) {
+        let store = local_store::LocalStore::in_memory();
+        let (window, app) = queue_window_with_store(cx, Arc::new(FakePr::default()), store.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.dispatch_action(ToggleSidebar);
+        let draw = |vcx: &mut gpui::VisualTestContext| {
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        };
+        draw(&mut vcx);
+        assert_eq!(vcx.debug_bounds("sidebar").unwrap().size.width, px(260.));
+
+        for (delta, requested) in [
+            (100., 360.),
+            (-1000., MIN_SIDEBAR_WIDTH),
+            (2000., MAX_SIDEBAR_WIDTH),
+        ] {
+            let start = vcx.debug_bounds("sidebar-resize").unwrap().center();
+            let end = point(start.x + px(delta), start.y);
+            vcx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+            draw(&mut vcx);
+            vcx.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::default());
+            draw(&mut vcx);
+            vcx.update(|window, cx| {
+                let expected = sidebar_width(requested, window.viewport_size().width.into());
+                assert_eq!(app.read(cx).sidebar_width, expected);
+                assert!(app.read(cx).drag_anchor.is_none());
+            });
+            // The release can be outside both the handle and the app window.
+            vcx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+            vcx.update(|_, cx| assert!(app.read(cx).sidebar_resize.is_none()));
+            draw(&mut vcx);
+        }
+        let width = vcx.debug_bounds("sidebar").unwrap().size.width;
+        vcx.simulate_mouse_move(point(px(400.), px(200.)), None, gpui::Modifiers::default());
+        vcx.dispatch_action(ToggleSidebar);
+        draw(&mut vcx);
+        vcx.update(|_, cx| assert!(!app.read(cx).sidebar_visible));
+        vcx.dispatch_action(ToggleSidebar);
+        draw(&mut vcx);
+        assert_eq!(vcx.debug_bounds("sidebar").unwrap().size.width, width);
+        assert_eq!(
+            store.setting(SIDEBAR_WIDTH_SETTING),
+            Some(serde_json::json!(f32::from(width)))
+        );
+
+        let (_, restored) = queue_window_with_store(cx, Arc::new(FakePr::default()), store);
+        cx.update(|cx| assert_eq!(restored.read(cx).sidebar_width, f32::from(width)));
     }
 
     #[test]

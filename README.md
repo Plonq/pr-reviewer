@@ -63,7 +63,7 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - tree-sitter highlighting (18 languages)
 - word-level intra-line diffs
 - whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
-- multi-item sidebar with file tree
+- multi-item sidebar with file tree; drag its right edge to resize (width is remembered)
 - cmd-k palette with fuzzy PR picker
 - PR conversation (`⇧⌘←`): GFM description and chronological comments; reviews
   group their inline threads beneath the summary, with captured code context,
