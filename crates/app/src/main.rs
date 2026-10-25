@@ -9,6 +9,7 @@ mod presentation;
 mod queue;
 mod review_target;
 mod rows;
+mod search;
 mod selection;
 mod theme;
 mod threads;
@@ -332,6 +333,7 @@ fn main() {
             gpui_component::init(cx);
             theme::apply_ui_theme(None, cx);
             cx.bind_keys(presentation::keybindings());
+            cx.bind_keys(search::keybindings());
             cx.bind_keys([
                 KeyBinding::new("]", NextFile, Some("ReviewApp")),
                 KeyBinding::new("[", PrevFile, Some("ReviewApp")),
@@ -529,6 +531,7 @@ pub(crate) struct ItemData {
     scroll: UniformListScrollHandle,
     position_restore: Option<position::PositionRestore>,
     saved_position: Option<local_store::ReviewPosition>,
+    search: Option<search::Search>,
     /// The conversation pane's scroll position. A pane-level container (not
     /// the TextView's own), so the wheel scrolls from anywhere over the pane
     /// and the scrollbar paints at the pane's edge — like the diff pane's.
@@ -612,6 +615,7 @@ impl ItemData {
             scroll: UniformListScrollHandle::new(),
             position_restore: None,
             saved_position: None,
+            search: None,
             conv_scroll: ScrollHandle::new(),
             discussion: None,
             commits: None,
@@ -678,6 +682,7 @@ impl ItemData {
         self.rows = rows;
         self.file_rows = file_rows;
         self.hunk_rows = hunk_rows;
+        self.reindex_search();
     }
 
     /// Rebuild the display rows for the displayed file and mode.
@@ -694,7 +699,14 @@ impl ItemData {
                     comment_wrap: self.comment_wrap,
                 },
             },
-            self.preferences,
+            if self.search.is_some() {
+                store::DiffPreferences {
+                    collapse_unchanged: Some(false),
+                    ..self.preferences
+                }
+            } else {
+                self.preferences
+            },
             &self.expanded_regions,
             self.code_wrap,
         )
@@ -719,6 +731,7 @@ impl ItemData {
     /// Show `file_ix` alone in the pane, revealed at `hunk_ix` (its first
     /// hunk when None).
     fn open_file(&mut self, file_ix: usize, hunk_ix: Option<usize>) {
+        self.end_search();
         self.file_ix = file_ix;
         self.selection = None;
         self.set_rows(self.row_build());
@@ -5928,6 +5941,7 @@ impl ReviewApp {
                                                         row_sel,
                                                         active,
                                                         split_layout,
+                                                        data.search.as_ref(),
                                                         &entity,
                                                     )
                                                 })
@@ -6071,6 +6085,17 @@ impl Render for ReviewApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
+            .on_action(
+                cx.listener(|this, _: &search::OpenSearch, window, cx| {
+                    this.open_search(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &search::NextMatch, window, cx| {
+                this.step_search(1, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &search::PreviousMatch, window, cx| {
+                this.step_search(-1, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &PrevFile, _, cx| this.step_file(-1, cx)))
             .on_action(cx.listener(|this, _: &NextHunk, _, cx| this.step_hunk(1, cx)))
             .on_action(cx.listener(|this, _: &PrevHunk, _, cx| this.step_hunk(-1, cx)))
@@ -6145,6 +6170,9 @@ impl Render for ReviewApp {
             // diff pane has focus. With the palette open, focus sits in the
             // palette input, so its escape routing (PaletteBack) wins.
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
+                if this.close_search(window, cx) {
+                    return;
+                }
                 // With the composer open but focus back on the diff pane,
                 // escape closes the composer before touching the selection.
                 if this.composer.is_some() {
@@ -6237,6 +6265,7 @@ impl Render for ReviewApp {
             )
             .child(self.render_footer())
             .child(self.render_pending_tray(cx))
+            .child(self.render_search(cx))
             // Root-level so the composer's input escapes the "ReviewApp" key
             // context (plain letters must stay text, like the palette input).
             .when(self.composer.is_some(), |root| {
@@ -6616,6 +6645,210 @@ mod tests {
             None,
             None,
         ))
+    }
+
+    #[gpui::test]
+    fn diff_search_keyboard_cycle_wrap_and_escape_restore(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| cx.bind_keys(search::keybindings()));
+        let diff = diff_core::parse_patch(&format!(
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,200 +1,200 @@\n{}\ndiff --git a/other.txt b/other.txt\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-old\n+needle\n",
+            (1..=200).map(|n| if n == 20 || n == 150 { format!(" needle {n}\n") } else { format!(" line {n} {}\n", "x".repeat(2000)) }).collect::<String>().trim_end()
+        ));
+        let mut item = loop_pr_item(Vec::new());
+        item.state = ItemState::Ready(file_mode_data(diff));
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let prior = vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+            app.update(cx, |app, _| {
+                let data = app.active_data_mut().unwrap();
+                data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+                data.position_restore = None;
+                data.scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(point(px(-45.), px(-60.375 * row_height())));
+            });
+            let _ = window.draw(cx);
+            app.read(cx)
+                .active_data()
+                .unwrap()
+                .scroll
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+        });
+        vcx.simulate_keystrokes("cmd-f");
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("diff-search").is_some());
+        // Plain n/p remain text, rather than invoking the diff navigation keys.
+        vcx.simulate_input("needle");
+        let active_match = |cx: &App| {
+            let data = app.read(cx).active_data().unwrap();
+            let search = data.search.as_ref().unwrap();
+            let highlights: Vec<_> = (0..data.rows.len())
+                .flat_map(|row| {
+                    search
+                        .highlights(row, SelSide::Unified)
+                        .into_iter()
+                        .map(move |(_, color)| (row, color))
+                })
+                .collect();
+            assert_eq!(highlights.len(), 2, "the other file is not searched");
+            let active_color: gpui::Rgba = Hsla::from(theme::peach()).opacity(0.4).into();
+            highlights
+                .into_iter()
+                .find(|(_, color)| *color == active_color)
+                .unwrap()
+                .0
+        };
+        let first = vcx.update(|_, cx| active_match(cx));
+        vcx.simulate_keystrokes("enter");
+        let second = vcx.update(|_, cx| active_match(cx));
+        assert!(second > first);
+        vcx.simulate_keystrokes("enter");
+        assert_eq!(vcx.update(|_, cx| active_match(cx)), first);
+        vcx.simulate_keystrokes("shift-enter");
+        assert_eq!(vcx.update(|_, cx| active_match(cx)), second);
+        // Refocusing the existing search must not overwrite its original anchor.
+        vcx.simulate_keystrokes("cmd-f escape");
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let data = app.read(cx).active_data().unwrap();
+            assert!(data.search.is_none());
+            assert_eq!(data.scroll.0.borrow().base_handle.offset(), prior);
+            assert!(app.read(cx).focus_handle.is_focused(window));
+        });
+        // Restoring a wrapped continuation must not snap to the source line's
+        // first visual row. Keep the fractional row offset as well.
+        let wrapped_prior = vcx.update(|window, cx| {
+            app.update(cx, |app, _| {
+                let data = app.active_data_mut().unwrap();
+                data.preferences.soft_wrap = Some(true);
+                data.rebuild_presentation();
+            });
+            let _ = window.draw(cx);
+            app.update(cx, |app, _| {
+                let data = app.active_data_mut().unwrap();
+                let row = data
+                    .rows
+                    .iter()
+                    .position(|r| matches!(r, Row::Continuation(_)))
+                    .unwrap();
+                data.position_restore = None;
+                data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+                data.scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(point(px(0.), px(-(row as f32 + 0.375) * row_height())));
+                data.scroll.0.borrow().base_handle.offset()
+            })
+        });
+        vcx.simulate_keystrokes("cmd-f");
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        vcx.simulate_input("needle");
+        vcx.simulate_keystrokes("escape");
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert_eq!(
+                app.read(cx)
+                    .active_data()
+                    .unwrap()
+                    .scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .offset(),
+                wrapped_prior
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn diff_search_restores_folds_and_does_not_leak_across_files_or_panes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| cx.bind_keys(search::keybindings()));
+        let mut item = loop_pr_item(Vec::new());
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        let other = diff_core::parse_patch("diff --git a/other.rs b/other.rs\n--- a/other.rs\n+++ b/other.rs\n@@ -1 +1 @@\n-old\n+new\n").files.pop().unwrap();
+        data.diff.files.push(other);
+        let lines: Vec<SharedString> = (1..=100).map(|n| format!("line {n}").into()).collect();
+        data.upgrades.insert(
+            0,
+            FileUpgrade {
+                new_lines: lines,
+                old_spans: vec![],
+                new_spans: vec![],
+            },
+        );
+        data.preferences.collapse_unchanged = Some(true);
+        data.rebuild_presentation();
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        vcx.simulate_keystrokes("cmd-f");
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        vcx.simulate_input("line 90");
+        vcx.update(|_, cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert!(data.preferences.collapse_unchanged.unwrap());
+            assert!(!data.rows.iter().any(|r| matches!(r, Row::Fold { .. })));
+            assert!((0..data.rows.len()).any(|row| !data
+                .search
+                .as_ref()
+                .unwrap()
+                .highlights(row, SelSide::Unified)
+                .is_empty()));
+        });
+        vcx.simulate_keystrokes("escape");
+        vcx.update(|_, cx| {
+            assert!(app
+                .read(cx)
+                .active_data()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Fold { .. })));
+        });
+        vcx.simulate_keystrokes("cmd-f");
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        vcx.simulate_input("line");
+        vcx.update(|_, cx| {
+            app.update(cx, |app, _| {
+                let data = app.active_data_mut().unwrap();
+                data.open_file(1, None);
+                assert!(data.search.is_none());
+            })
+        });
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                window.focus(&app.focus_handle);
+                app.flip_pane(ItemPane::Conversation, cx);
+            })
+        });
+        vcx.simulate_keystrokes("cmd-f");
+        vcx.update(|_, cx| assert!(app.read(cx).active_data().unwrap().search.is_none()));
+        vcx.update(|_, cx| app.update(cx, |app, cx| app.back_to_queue(cx)));
+        vcx.simulate_keystrokes("cmd-f");
+        vcx.update(|_, cx| assert!(app.read(cx).active_data().unwrap().search.is_none()));
     }
 
     #[test]

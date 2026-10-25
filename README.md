@@ -51,6 +51,10 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
   `]`/`[` move between files and `n`/`p` between hunks (both wrap); returning
   to a PR resumes its last file and scroll position, even after restarting
 - unified + split views
+- `cmd-f` searches the current file's diff (literal, case-sensitive); Enter cycles
+  highlighted matches, Shift-Enter goes back, and Esc restores the prior scroll
+  position. Folded context is temporarily revealed; large-file safety banners
+  still require explicit expansion.
 - diff presentation controls: `W` hides whitespace changes, `K` folds unchanged
   regions, and `alt-z` toggles soft wrapping. All three start off for new PRs;
   each PR remembers its own choices. Horizontal scrolling works in both views.
@@ -111,6 +115,7 @@ directory forces a re-fetch and resets local settings and review positions.
 | `v` | unified ↔ split view |
 | `W` / `K` | hide whitespace / collapse unchanged (sticky per PR) |
 | `alt-z` | toggle soft wrap |
+| `cmd-f` | search current diff; Enter / Shift-Enter cycle, Esc restores position |
 | `/` | fuzzy file filter |
 | `m` | toggle minimap |
 | `c` | toggle inline comments |

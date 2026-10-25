@@ -933,6 +933,16 @@ fn merge_highlights(
     word_bg: Option<gpui::Rgba>,
     selection: Option<Range<usize>>,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
+    merge_search_highlights(syntax, intra, word_bg, selection, &[])
+}
+
+fn merge_search_highlights(
+    syntax: &[(Range<usize>, syntax::Token)],
+    intra: &[Range<usize>],
+    word_bg: Option<gpui::Rgba>,
+    selection: Option<Range<usize>>,
+    search: &[(Range<usize>, gpui::Rgba)],
+) -> Vec<(Range<usize>, HighlightStyle)> {
     let mut bounds = Vec::with_capacity(2 * (syntax.len() + intra.len() + 1));
     for (range, _) in syntax {
         bounds.push(range.start);
@@ -946,11 +956,15 @@ fn merge_highlights(
         bounds.push(sel.start);
         bounds.push(sel.end);
     }
+    for (range, _) in search {
+        bounds.push(range.start);
+        bounds.push(range.end);
+    }
     bounds.sort_unstable();
     bounds.dedup();
 
     let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-    let (mut si, mut ii) = (0, 0);
+    let (mut si, mut ii, mut qi) = (0, 0, 0);
     for seg in bounds.windows(2) {
         let (start, end) = (seg[0], seg[1]);
         while si < syntax.len() && syntax[si].0.end <= start {
@@ -959,17 +973,24 @@ fn merge_highlights(
         while ii < intra.len() && intra[ii].end <= start {
             ii += 1;
         }
+        while qi < search.len() && search[qi].0.end <= start {
+            qi += 1;
+        }
+        let search_bg = (qi < search.len() && search[qi].0.start <= start).then(|| search[qi].1);
         let token = (si < syntax.len() && syntax[si].0.start <= start).then(|| syntax[si].1);
         let in_intra = ii < intra.len() && intra[ii].start <= start;
         let in_sel = selection
             .as_ref()
             .is_some_and(|sel| sel.start <= start && start < sel.end);
-        if token.is_none() && !in_intra && !in_sel {
+        if token.is_none() && !in_intra && !in_sel && search_bg.is_none() {
             continue;
         }
         let mut style = token.map(theme::token_style).unwrap_or_default();
         if in_intra {
             style.background_color = word_bg.map(Into::into);
+        }
+        if let Some(bg) = search_bg {
+            style.background_color = Some(bg.into());
         }
         if in_sel {
             style.background_color = Some(theme::selection_bg().into());
@@ -991,8 +1012,13 @@ fn line_content(
     intra: &[Range<usize>],
     word_bg: Option<gpui::Rgba>,
     selection: Option<Range<usize>>,
+    search: &[(Range<usize>, gpui::Rgba)],
 ) -> gpui::AnyElement {
-    let highlights = merge_highlights(syntax, intra, word_bg, selection);
+    let highlights = if search.is_empty() {
+        merge_highlights(syntax, intra, word_bg, selection)
+    } else {
+        merge_search_highlights(syntax, intra, word_bg, selection, search)
+    };
     if highlights.is_empty() {
         div().child(text.clone()).into_any_element()
     } else {
@@ -1123,6 +1149,7 @@ pub(crate) fn render_row(
     selection: Option<(SelSide, Range<usize>)>,
     active: Option<SelSide>,
     split_layout: Option<SplitLayout>,
+    search: Option<&crate::search::Search>,
     entity: &gpui::Entity<ReviewApp>,
 ) -> gpui::AnyElement {
     let inner = render_row_content(
@@ -1131,6 +1158,7 @@ pub(crate) fn render_row(
         selection,
         active,
         split_layout.map(|layout| layout.offset),
+        search,
         entity,
     );
     if let Some(layout) = split_layout {
@@ -1159,13 +1187,20 @@ fn render_row_content(
     selection: Option<(SelSide, Range<usize>)>,
     active: Option<SelSide>,
     horizontal_offset: Option<gpui::Pixels>,
+    search: Option<&crate::search::Search>,
     entity: &gpui::Entity<ReviewApp>,
 ) -> gpui::AnyElement {
     let row_height = px(row_height());
     match row {
-        Row::Continuation(row) => {
-            render_row_content(ix, row, selection, active, horizontal_offset, entity)
-        }
+        Row::Continuation(row) => render_row_content(
+            ix,
+            row,
+            selection,
+            active,
+            horizontal_offset,
+            search,
+            entity,
+        ),
         Row::Fold { key, count } => {
             let key = *key;
             let entity = entity.clone();
@@ -1412,6 +1447,9 @@ fn render_row_content(
                         intra,
                         word_bg,
                         selection.map(|(_, range)| range),
+                        &search
+                            .map(|s| s.highlights(ix, SelSide::Unified))
+                            .unwrap_or_default(),
                     )),
             )
             .into_any_element()
@@ -1425,7 +1463,12 @@ fn render_row_content(
             let cell = |cell: &Option<Cell>,
                         sel: Option<Range<usize>>,
                         active: bool,
-                        code_id: &'static str| {
+                        text_side: SelSide| {
+                let code_id = if text_side == SelSide::Left {
+                    "diff-code-left"
+                } else {
+                    "diff-code-right"
+                };
                 let base = div()
                     .flex_1()
                     .min_w_0()
@@ -1478,6 +1521,9 @@ fn render_row_content(
                                     &cell.intra,
                                     word_bg,
                                     sel,
+                                    &search
+                                        .map(|s| s.highlights(ix, text_side))
+                                        .unwrap_or_default(),
                                 )),
                         ),
                 )
@@ -1493,7 +1539,7 @@ fn render_row_content(
                     left,
                     left_sel,
                     active == Some(SelSide::Left),
-                    "diff-code-left",
+                    SelSide::Left,
                 ))
                 .child(
                     div()
@@ -1509,7 +1555,7 @@ fn render_row_content(
                     right,
                     right_sel,
                     active == Some(SelSide::Right),
-                    "diff-code-right",
+                    SelSide::Right,
                 ))
                 .into_any_element()
         }
@@ -1971,6 +2017,39 @@ mod tests {
                 (0..2, style(Token::Keyword)),
                 (3..7, style(Token::Function))
             ]
+        );
+    }
+
+    #[test]
+    fn search_background_preserves_syntax_and_yields_to_text_selection() {
+        let highlights = merge_search_highlights(
+            &[(0..8, Token::Keyword)],
+            &[0..8],
+            Some(theme::added_word_bg()),
+            Some(4..6),
+            &[(2..7, theme::yellow())],
+        );
+        assert_eq!(
+            highlights
+                .iter()
+                .map(|(range, _)| range.clone())
+                .collect::<Vec<_>>(),
+            vec![0..2, 2..4, 4..6, 6..7, 7..8]
+        );
+        for (_, style) in &highlights {
+            assert_eq!(style.color, theme::token_style(Token::Keyword).color);
+        }
+        assert_eq!(
+            highlights[1].1.background_color,
+            Some(theme::yellow().into())
+        );
+        assert_eq!(
+            highlights[2].1.background_color,
+            Some(theme::selection_bg().into())
+        );
+        assert_eq!(
+            highlights[4].1.background_color,
+            Some(theme::added_word_bg().into())
         );
     }
 

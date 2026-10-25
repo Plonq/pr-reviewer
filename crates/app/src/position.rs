@@ -167,7 +167,12 @@ impl ReviewApp {
             let (Source::Pr(loc), ItemState::Ready(data)) = (&item.source, &mut item.state) else {
                 continue;
             };
-            let Some(position) = data.review_position() else {
+            let Some(position) = data
+                .search
+                .as_ref()
+                .map(|search| search.prior.clone())
+                .or_else(|| data.review_position())
+            else {
                 continue;
             };
             if data.saved_position.as_ref() != Some(&position)
