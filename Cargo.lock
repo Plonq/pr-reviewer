@@ -2098,12 +2098,16 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui_http_client",
+ "html5ever",
+ "image",
  "libc",
  "lsp-types",
  "markdown",
  "serde_json",
+ "sha2 0.10.9",
  "store",
  "syntax",
+ "tempfile",
  "ureq",
 ]
 

@@ -32,6 +32,10 @@ markdown = "1"
 http_client = { version = "0.2", package = "gpui_http_client" }
 futures = "0.3"
 ureq = "2"
+sha2 = { workspace = true }
+tempfile = "3"
+html5ever = "0.27"
+image = { version = "0.25", default-features = false }
 serde_json = { workspace = true }
 libc = "0.2"
 

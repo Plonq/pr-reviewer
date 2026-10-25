@@ -3,24 +3,37 @@
 //! markers also shrink to zero width. Explicit, nonshrinking marker columns and
 //! vertically stacked blocks avoid both overlapping text and clipped content.
 
+use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 
 use ::markdown::{mdast::Node, ParseOptions};
 use gpui::{
-    div, px, rems, Context, InteractiveElement, IntoElement, ParentElement, SharedString, Styled,
-    Window,
+    div, px, rems, App, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+    Styled, Window,
 };
 use gpui_component::{
     text::{TextView, TextViewStyle},
     ActiveTheme,
 };
 
+use super::media::{self, Media};
 use crate::{text_size, theme, ReviewApp};
 
 struct Document {
     source: String,
     root: Option<Node>,
     definitions: String,
+    media: Vec<Media>,
+}
+
+/// Extract before soft wrapping inline diff comments: wrapping an image URL
+/// into fixed-width text rows would destroy both Markdown and HTML embeds.
+pub(crate) fn inline_images(source: &str) -> Vec<Media> {
+    if !source.contains("![") && !source.to_ascii_lowercase().contains("<img") {
+        return Vec::new();
+    }
+    Document::new(source.into()).media
 }
 
 impl Document {
@@ -43,10 +56,15 @@ impl Document {
         if let Some(root) = &root {
             collect(root, &source, &mut definitions);
         }
+        let mut media = Vec::new();
+        if let Some(root) = &root {
+            collect_media(root, &source, &mut media);
+        }
         Self {
             source,
             root,
             definitions,
+            media,
         }
     }
 
@@ -70,7 +88,14 @@ impl Document {
         let Some(pos) = node.position() else {
             return String::new();
         };
-        let raw = &self.source[pos.start.offset..pos.end.offset];
+        self.fragment(pos.start.offset..pos.end.offset, node)
+    }
+
+    fn fragment(&self, range: Range<usize>, node: &Node) -> String {
+        let raw = &self.source[range];
+        let Some(pos) = node.position() else {
+            return raw.into();
+        };
         let indent = pos.start.column.saturating_sub(1);
         let mut lines = raw.lines();
         let mut text = lines.next().unwrap_or_default().to_owned();
@@ -87,6 +112,59 @@ impl Document {
         text.push_str(&self.definitions);
         text
     }
+
+    fn images_in<'a>(&'a self, node: &Node) -> impl Iterator<Item = &'a Media> {
+        let range = node.position().map(|pos| pos.start.offset..pos.end.offset);
+        self.media.iter().filter(move |image| {
+            range.as_ref().is_some_and(|range| {
+                image.range.start >= range.start && image.range.end <= range.end
+            })
+        })
+    }
+}
+
+fn collect_media(root: &Node, source: &str, out: &mut Vec<Media>) {
+    fn definitions<'a>(node: &'a Node, out: &mut HashMap<&'a str, &'a str>) {
+        if let Node::Definition(def) = node {
+            out.entry(&def.identifier).or_insert(&def.url);
+        }
+        for child in node.children().into_iter().flatten() {
+            definitions(child, out);
+        }
+    }
+    fn walk(node: &Node, source: &str, defs: &HashMap<&str, &str>, out: &mut Vec<Media>) {
+        let Some(pos) = node.position() else { return };
+        let range = pos.start.offset..pos.end.offset;
+        let image = match node {
+            Node::Image(image) => Some((image.url.as_str(), image.alt.as_str())),
+            Node::ImageReference(image) => defs
+                .get(image.identifier.as_str())
+                .map(|url| (*url, image.alt.as_str())),
+            _ => None,
+        };
+        if let Some((url, alt)) = image.filter(|(url, _)| media::is_remote_image(url)) {
+            out.push(Media::new(range, url.into(), alt.into()));
+        } else if let Node::Html(_) = node {
+            out.extend(media::html_images(&source[range.clone()], range.start));
+        } else if let Node::Link(link) = node {
+            let start = out.len();
+            for child in &link.children {
+                walk(child, source, defs, out);
+            }
+            if link.children.len() == 1 && out.len() == start + 1 {
+                // A clickable image, not dangling markdown around the control.
+                out[start].range = range;
+                out[start].link = Some(link.url.clone());
+            }
+        } else {
+            for child in node.children().into_iter().flatten() {
+                walk(child, source, defs, out);
+            }
+        }
+    }
+    let mut defs = HashMap::new();
+    definitions(root, &mut defs);
+    walk(root, source, &defs, out);
 }
 
 fn contains_list(node: &Node) -> bool {
@@ -129,7 +207,9 @@ pub(crate) fn render(
     });
     match &document.root {
         // Leave ordinary bodies intact, including cross-paragraph selection.
-        Some(root) if !contains_list(root) => text_view(id, document.source.clone(), window, cx),
+        Some(root) if !contains_list(root) && document.media.is_empty() => {
+            text_view(id, document.source.clone(), window, cx)
+        }
         Some(root) => render_node(root, &document, id, window, cx),
         None => text_view(id, document.source.clone(), window, cx),
     }
@@ -202,15 +282,74 @@ fn render_node(
             }
             block.into_any_element()
         }
-        _ => text_view(id, doc.leaf_source(node), window, cx),
+        Node::Table(table) if doc.images_in(node).next().is_some() => {
+            // Splitting the table's markdown around an image would leave raw
+            // pipes/half a table. Keep media in its cell and rows width-safe.
+            let mut block = column().gap_0().border_1().border_color(theme::surface0());
+            for (row_ix, row) in table.children.iter().enumerate() {
+                let mut line = div().w_full().min_w_0().flex();
+                if row_ix == 0 {
+                    line = line.font_weight(gpui::FontWeight::SEMIBOLD);
+                }
+                for (cell_ix, cell) in row.children().into_iter().flatten().enumerate() {
+                    line = line.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .p_2()
+                            .border_1()
+                            .border_color(theme::surface0())
+                            .child(render_node(
+                                cell,
+                                doc,
+                                &format!("{id}-{row_ix}-{cell_ix}"),
+                                window,
+                                cx,
+                            )),
+                    );
+                }
+                block = block.child(line);
+            }
+            block.into_any_element()
+        }
+        _ => {
+            let images: Vec<_> = doc.images_in(node).collect();
+            if images.is_empty() {
+                return text_view(id, doc.leaf_source(node), window, cx);
+            }
+            let mut block = column();
+            let pos = node.position().unwrap();
+            let mut cursor = pos.start.offset;
+            for (ix, image) in images.iter().enumerate() {
+                if !doc.source[cursor..image.range.start].trim().is_empty() {
+                    block = block.child(text_view(
+                        &format!("{id}-before-{ix}"),
+                        doc.fragment(cursor..image.range.start, node),
+                        window,
+                        cx,
+                    ));
+                }
+                block = block.child(media::render(&format!("{id}-{ix}"), image, window, cx));
+                cursor = image.range.end;
+            }
+            if !doc.source[cursor..pos.end.offset].trim().is_empty() {
+                block = block.child(text_view(
+                    &format!("{id}-after"),
+                    doc.fragment(cursor..pos.end.offset, node),
+                    window,
+                    cx,
+                ));
+            }
+            block.into_any_element()
+        }
     }
 }
 
-fn text_view(
+pub(super) fn text_view(
     id: &str,
     source: String,
     window: &mut Window,
-    cx: &mut Context<ReviewApp>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     div()
         .w_full()
@@ -239,6 +378,41 @@ fn text_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_in_markdown_references_links_lists_and_html_has_exact_source_ranges() {
+        let source = "Before café ![screenshot](https://github.com/user-attachments/assets/private) after.\n\n- [![diagram][svg]](https://example.com/full)\n\n  <img\n    width='320' src='https://example.com/screen.png' alt='screen'>\n\n[svg]: https://example.com/diagram.svg\n";
+        let doc = Document::new(source.into());
+        assert_eq!(doc.media.len(), 3);
+        assert_eq!(
+            &source[doc.media[0].range.clone()],
+            "![screenshot](https://github.com/user-attachments/assets/private)"
+        );
+        assert_eq!(
+            &source[doc.media[1].range.clone()],
+            "[![diagram][svg]](https://example.com/full)"
+        );
+        assert_eq!(
+            doc.media[1].link.as_deref(),
+            Some("https://example.com/full")
+        );
+        assert_eq!(doc.media[1].url, "https://example.com/diagram.svg");
+        assert!(source[doc.media[2].range.clone()].starts_with("<img\n"));
+        assert_eq!(doc.media[2].width, Some(320.));
+    }
+
+    #[test]
+    fn text_only_and_image_syntax_in_code_never_enter_the_media_path() {
+        for source in [
+            "Plain **text**, [a link](https://example.com/image.svg) and a table:\n\n| A | B |\n| - | - |\n| a | b |",
+            "`![literal](https://example.com/a.svg)`\n\n```html\n<img src='https://example.com/b.svg'>\n```",
+            "<!-- <img src='https://example.com/hidden.png'> -->",
+        ] {
+            let doc = Document::new(source.into());
+            assert!(doc.media.is_empty(), "{source}");
+            assert!(!contains_list(doc.root.as_ref().unwrap()));
+        }
+    }
 
     #[test]
     fn metadata_only_reviews_are_empty_but_code_and_visible_html_are_not() {

@@ -9,6 +9,10 @@ use gpui::{div, prelude::*, px, HighlightStyle, Hsla, SharedString, StyledText};
 use gpui_component::{tag::Tag, Sizable as _};
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
+
+/// Reserve a bounded media card without changing the diff's uniform row height.
+pub(crate) const COMMENT_MEDIA_ROWS: usize = 14;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum LineKind {
@@ -96,6 +100,15 @@ pub(crate) enum Row {
         line: SharedString,
         half: Option<CommentSide>,
     },
+    /// One slot in an inline image reservation. The list decoration paints the
+    /// whole card once, including when its first slot has scrolled offscreen.
+    CommentMedia {
+        comment_id: u64,
+        image_ix: usize,
+        media: Arc<crate::conversation::Media>,
+        slot: usize,
+        half: Option<CommentSide>,
+    },
     /// The "↳ reply" affordance closing a thread; clicking opens the
     /// composer targeting `post_reply` on the thread's root comment.
     CommentActions {
@@ -110,7 +123,10 @@ pub(crate) enum Row {
 pub(crate) fn is_comment_row(row: &Row) -> bool {
     matches!(
         row,
-        Row::CommentHeader { .. } | Row::CommentBody { .. } | Row::CommentActions { .. }
+        Row::CommentHeader { .. }
+            | Row::CommentBody { .. }
+            | Row::CommentMedia { .. }
+            | Row::CommentActions { .. }
     )
 }
 
@@ -193,7 +209,7 @@ pub(crate) fn nth_noncomment_row(rows: &[Row], n: usize) -> usize {
 }
 
 /// Append the display rows of every thread anchored at (side, no) — comment
-/// headers, wrapped body lines, and one reply-affordance row per thread.
+/// headers, wrapped body lines, media reservations, and a reply-affordance row.
 /// No-op when comments are hidden/absent (`anchors` None) or the row has no
 /// number on that side.
 fn push_thread_rows(
@@ -232,11 +248,40 @@ fn push_thread_rows(
                 // the actions row, so those two carry the card's edges.
                 top: ix == 0,
             });
-            for line in wrap_body(&comment.body, wrap) {
-                rows.push(Row::CommentBody {
-                    line: line.into(),
-                    half,
-                });
+            let push_text = |rows: &mut Vec<Row>, text: &str| {
+                for line in wrap_body(text, wrap) {
+                    rows.push(Row::CommentBody {
+                        line: line.into(),
+                        half,
+                    });
+                }
+            };
+            let images = crate::conversation::inline_images(&comment.body);
+            if images.is_empty() {
+                push_text(rows, &comment.body);
+            } else {
+                let mut cursor = 0;
+                for (image_ix, media) in images.into_iter().enumerate() {
+                    let text = &comment.body[cursor..media.range.start];
+                    if !text.trim().is_empty() {
+                        push_text(rows, text.trim_matches(['\r', '\n']));
+                    }
+                    cursor = media.range.end;
+                    let media = Arc::new(media);
+                    for slot in 0..COMMENT_MEDIA_ROWS {
+                        rows.push(Row::CommentMedia {
+                            comment_id: comment.id,
+                            image_ix,
+                            media: media.clone(),
+                            slot,
+                            half,
+                        });
+                    }
+                }
+                let text = &comment.body[cursor..];
+                if !text.trim().is_empty() {
+                    push_text(rows, text.trim_matches(['\r', '\n']));
+                }
             }
         }
         // Pending threads are edited/deleted in the review tray, not replied
@@ -1283,6 +1328,9 @@ fn render_row_content(
             false,
             CardEdge::Middle,
         ),
+        Row::CommentMedia { half, .. } => {
+            comment_row(div().into_any_element(), *half, false, CardEdge::Middle)
+        }
         Row::CommentActions {
             root_id,
             path,
@@ -2418,6 +2466,91 @@ mod tests {
         }
         assert!(threads > 0, "fixture should have threads");
         assert_eq!(tops, threads, "one top edge per thread");
+    }
+
+    #[test]
+    fn inline_media_reserves_comment_slots_without_changing_anchors_or_wrapping_urls() {
+        let body = "Before café.\n\n![private screenshot](https://github.com/user-attachments/assets/very-long-private-attachment-url)\n\nAfter.";
+        let index = group_comments(vec![
+            rc(
+                1,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                body,
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                2,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "<img src='https://example.com/a.svg'>",
+                "bob",
+                "2026-01-02T00:00:00Z",
+                Some(1),
+            ),
+        ]);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let rows = build_rows(RowsView {
+                diff: &sample_diff(),
+                upgrades: &HashMap::new(),
+                comments: Some(&index),
+                options: RowOptions {
+                    mode,
+                    file_ix: 0,
+                    comments_visible: true,
+                    comment_wrap: 24,
+                },
+            })
+            .rows;
+            let media: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| matches!(row, Row::CommentMedia { .. }))
+                .collect();
+            assert_eq!(media.len(), 2 * COMMENT_MEDIA_ROWS);
+            for (ix, row) in media {
+                assert!(is_comment_row(row));
+                assert_eq!(cursor_anchor(&rows, ix), None);
+                let Row::CommentMedia {
+                    comment_id,
+                    slot,
+                    media,
+                    half,
+                    ..
+                } = row
+                else {
+                    unreachable!()
+                };
+                assert!(*slot < COMMENT_MEDIA_ROWS);
+                assert_eq!(
+                    *half,
+                    (mode == ViewMode::Split).then_some(CommentSide::Right)
+                );
+                assert_eq!(
+                    media.url,
+                    if *comment_id == 1 {
+                        "https://github.com/user-attachments/assets/very-long-private-attachment-url"
+                    } else {
+                        "https://example.com/a.svg"
+                    }
+                );
+            }
+            let bodies: Vec<_> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    Row::CommentBody { line, .. } => Some(line.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(bodies, ["Before café.", "After."]);
+            assert!(rows
+                .iter()
+                .any(|row| matches!(row, Row::CommentActions { root_id: 1, .. })));
+        }
     }
 
     #[test]

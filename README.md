@@ -68,6 +68,9 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - PR conversation (`⇧⌘←`): GFM description and chronological comments; reviews
   group their inline threads beneath the summary, with captured code context,
   expandable resolved stubs, and read-only reaction counts; cached offline
+- inline images and screenshots in conversations and diff comment threads,
+  including private GitHub attachments using `gh auth token`; each SVG switches
+  between rendered and source views
 - local repo diffs
 - minimap
 - inline GitHub review comments (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
@@ -99,6 +102,10 @@ The app keeps its own memory in one SQLite database (WAL mode) at
 
 GitHub data in the store is a cache, never a source of truth. Deleting the
 directory forces a re-fetch and resets local settings and review positions.
+
+Conversation images and avatars cache separately in `~/.cache/gander/images/`
+for offline re-opens. This includes private attachments; cache files are readable
+only by your account. Delete that directory to clear downloaded images.
 
 ## Keymap
 

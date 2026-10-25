@@ -210,6 +210,7 @@ pub(crate) fn row_name(row: &Row) -> &'static str {
         Row::SplitLine { .. } => "SplitLine",
         Row::CommentHeader { .. } => "CommentHeader",
         Row::CommentBody { .. } => "CommentBody",
+        Row::CommentMedia { .. } => "CommentMedia",
         Row::CommentActions { .. } => "CommentActions",
     }
 }
