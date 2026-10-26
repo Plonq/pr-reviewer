@@ -4765,6 +4765,35 @@ impl ReviewApp {
         // keeps the item note beside the account chip instead of stranded
         // mid-bar.
         let mut right = div().flex().items_center().flex_shrink_0().h_full().gap_2();
+        if let Some(item) = self.active_item().filter(|item| {
+            !self.show_queue
+                && matches!(item.source, Source::Pr(_))
+                && matches!(item.state, ItemState::Ready(_))
+        }) {
+            let (target, label, tooltip) = match item.pane {
+                ItemPane::Changes => (
+                    ItemPane::Conversation,
+                    "Conversation",
+                    "Show conversation (⇧⌘←)",
+                ),
+                ItemPane::Conversation => (ItemPane::Changes, "Changes", "Show changes (⇧⌘→)"),
+            };
+            right = right.child(
+                div()
+                    .id("pane-toggle-container")
+                    .debug_selector(|| "pane-toggle".to_string())
+                    .child(
+                        Button::new("pane-toggle")
+                            .small()
+                            .label(label)
+                            .tooltip(tooltip)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                window.focus(&this.focus_handle);
+                                this.flip_pane(target, cx);
+                            })),
+                    ),
+            );
+        }
         if let Some(note) = note {
             right = right.child(
                 div()
@@ -8439,6 +8468,101 @@ mod tests {
             1,
             "re-opening forwards the item, never a duplicate"
         );
+    }
+
+    #[gpui::test]
+    fn titlebar_pane_toggle_switches_both_ways_with_real_clicks(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut item = loop_pr_item(Vec::new());
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.open_file(1, None);
+        let position = data.review_position();
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.sidebar_visible = false;
+                app.open_input
+                    .update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+        });
+
+        for expected in [ItemPane::Conversation, ItemPane::Changes] {
+            let point = vcx.debug_bounds("pane-toggle").unwrap().center();
+            vcx.simulate_mouse_move(point, None, gpui::Modifiers::default());
+            vcx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
+            vcx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
+            vcx.run_until_parked();
+            vcx.update(|window, cx| {
+                let app = app.read(cx);
+                assert_eq!(app.active_item().unwrap().pane, expected);
+                assert!(app.focus_handle.is_focused(window));
+                let data = app.active_data().unwrap();
+                assert_eq!(data.review_position(), position);
+                assert!(data.mode == ViewMode::Unified);
+                let _ = window.draw(cx);
+            });
+        }
+
+        // Mouse navigation shares the keyboard actions' state, in both directions.
+        vcx.dispatch_action(ShowConversation);
+        vcx.update(|window, cx| {
+            assert_eq!(
+                app.read(cx).active_item().unwrap().pane,
+                ItemPane::Conversation
+            );
+            let _ = window.draw(cx);
+        });
+        let point = vcx.debug_bounds("pane-toggle").unwrap().center();
+        vcx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
+        vcx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        cx.update(|cx| assert_eq!(app.read(cx).active_item().unwrap().pane, ItemPane::Changes));
+    }
+
+    #[gpui::test]
+    fn titlebar_pane_toggle_only_appears_for_visible_ready_prs(cx: &mut gpui::TestAppContext) {
+        let mut loading = loop_pr_item(Vec::new());
+        loading.state = ItemState::Loading;
+        let mut failed = loop_pr_item(Vec::new());
+        failed.state = ItemState::Failed("failed".into());
+        let mut local = loop_pr_item(Vec::new());
+        local.source = Source::Local(git::LocalSource {
+            repo_root: PathBuf::from("/repo"),
+            branch: "feature".into(),
+            base_ref: Some("main".into()),
+            base_label: "main".into(),
+            base_oid: None,
+        });
+        // Fresh windows avoid gpui's debug-bounds map retaining removed selectors.
+        for (item, show_queue, visible) in [
+            (None, false, false),
+            (Some(loop_pr_item(Vec::new())), true, false),
+            (Some(loading), false, false),
+            (Some(failed), false, false),
+            (Some(local), false, false),
+            (Some(loop_pr_item(Vec::new())), false, true),
+        ] {
+            let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+            if let Some(item) = item {
+                install_item(&app, item, cx);
+            }
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            vcx.update(|_, cx| {
+                app.update(cx, |app, cx| {
+                    app.show_queue = show_queue;
+                    cx.notify();
+                });
+            });
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            assert_eq!(vcx.debug_bounds("pane-toggle").is_some(), visible);
+        }
     }
 
     #[gpui::test]
