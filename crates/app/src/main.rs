@@ -578,11 +578,12 @@ pub(crate) struct ItemData {
     local_review: Option<LocalReview>,
     /// `c` toggles the comment rows; the file-header counts always show.
     comments_visible: bool,
-    /// Columns comment bodies are currently wrapped at, derived from the
+    /// Columns used for initial comment-height estimates, derived from the
     /// measured pane width (see `comment_wrap_cols`). Changing it re-wraps the
-    /// bodies, which changes the row count, so render rebuilds the rows when
+    /// estimates, which changes the row count, so render rebuilds the rows when
     /// the pane resizes past a column boundary.
     comment_wrap: usize,
+    comment_text_layouts: diff_media::TextLayouts,
     preferences: store::DiffPreferences,
     preference_overrides: store::DiffPreferences,
     expanded_regions: HashSet<(usize, u32)>,
@@ -653,6 +654,7 @@ impl ItemData {
             local_review,
             comments_visible: true,
             comment_wrap: COMMENT_WRAP_CHARS,
+            comment_text_layouts: HashMap::new(),
             preferences: Default::default(),
             preference_overrides: Default::default(),
             expanded_regions: HashSet::new(),
@@ -674,7 +676,8 @@ impl ItemData {
 
     /// Install freshly built display rows, keeping the minimap model in sync
     /// (every row rebuild goes through here).
-    fn set_rows(&mut self, built_rows: BuiltRows) {
+    fn set_rows(&mut self, mut built_rows: BuiltRows) {
+        diff_media::resize_text_rows(&mut built_rows, &self.comment_text_layouts);
         let BuiltRows {
             rows,
             file_rows,
@@ -822,6 +825,10 @@ impl ItemData {
         let top_row =
             ((top_px / row_height()).floor() as usize).min(self.rows.len().saturating_sub(1));
         let frac = top_px - top_row as f32 * row_height();
+        let top_text = match self.rows.get(top_row) {
+            Some(Row::CommentBody { text, slot, .. }) => Some((text.clone(), *slot)),
+            _ => None,
+        };
         let count_noncomment =
             |rows: &[Row]| rows.iter().filter(|row| !is_comment_row(row)).count();
         let top_base = count_noncomment(&self.rows[..top_row]);
@@ -829,7 +836,27 @@ impl ItemData {
         self.set_rows(self.row_build());
         self.selection = None;
         self.cursor = nth_noncomment_row(&self.rows, cursor_base);
-        let new_top = nth_noncomment_row(&self.rows, top_base);
+        let new_top = top_text
+            .and_then(|(text, slot)| {
+                self.rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, row)| match row {
+                        Row::CommentBody {
+                            text: next,
+                            slot: next_slot,
+                            ..
+                        } if text.comment_id == next.comment_id
+                            && text.part == next.part
+                            && *next_slot <= slot =>
+                        {
+                            Some(ix)
+                        }
+                        _ => None,
+                    })
+                    .last()
+            })
+            .unwrap_or_else(|| nth_noncomment_row(&self.rows, top_base));
         self.scroll
             .0
             .borrow()
@@ -6193,6 +6220,7 @@ impl ReviewApp {
                                                         || matches!(
                                                             row,
                                                             Row::CommentMedia { .. }
+                                                                | Row::CommentBody { .. }
                                                         ))
                                                         && !data
                                                             .preferences
@@ -6220,6 +6248,7 @@ impl ReviewApp {
                                     }
                                 })
                                 .with_decoration(diff_media::InlineMedia(cx.entity()))
+                                .with_decoration(diff_media::InlineText(cx.entity()))
                                 .track_scroll(data.scroll.clone())
                                 .with_horizontal_sizing_behavior(
                                     if data.preferences.soft_wrap.unwrap_or(false) {
@@ -6368,6 +6397,7 @@ impl ReviewApp {
 impl Render for ReviewApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.resync_comment_wrap(window);
+        self.resync_inline_text(window, cx);
         let pane: gpui::AnyElement = if self.show_queue {
             self.render_queue(cx)
         } else {
@@ -7167,6 +7197,207 @@ mod tests {
     }
 
     #[gpui::test]
+    fn inline_comments_render_markdown_without_clipping_in_both_views(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let body = "- **Bold** and *emphasis*, `inline code`, [a link](https://example.com).\n\n  Another paragraph, café @octocat :tada: #12.\n\n  ```rust\n  fn demo() {}\n  ```\n\n- [x] A task\n\n> A quote\n\n| area | state |\n|---|---|\n| api | done |";
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut item = loop_pr_item(vec![
+            rc(
+                11,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                body,
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                12,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "A **formatted** reply.",
+                "bob",
+                "2026-01-02T00:00:00Z",
+                Some(11),
+            ),
+            rc(
+                13,
+                "a.rs",
+                Some("LEFT"),
+                Some(1),
+                "Left-side `code`.",
+                "carol",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+        ]);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n tail\n");
+        data.set_rows(data.row_build());
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let draw = |vcx: &mut gpui::VisualTestContext| {
+            for _ in 0..3 {
+                vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+                vcx.run_until_parked();
+            }
+        };
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            for width in [1500., 850.] {
+                vcx.simulate_resize(size(px(width), px(2400.)));
+                cx.update(|cx| {
+                    app.update(cx, |this, _| {
+                        let data = this.active_data_mut().unwrap();
+                        data.mode = mode;
+                        data.set_rows(data.row_build());
+                        let mut scroll = data.scroll.0.borrow_mut();
+                        scroll.deferred_scroll_to_item = None;
+                        scroll.base_handle.set_offset(point(px(0.), px(0.)));
+                    })
+                });
+                draw(&mut vcx);
+                // List markers exist only through the Markdown block renderer,
+                // never through the old raw-string row path.
+                assert!(vcx.debug_bounds("inline-text-0-11-0-0-0-marker").is_some());
+                let root = vcx.debug_bounds("inline-text-0-11-0-card").unwrap();
+                let content = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
+                assert!(content.size.height > px(row_height() * 5.));
+                assert!(content.bottom() <= root.bottom());
+                let reply = vcx.debug_bounds("inline-text-0-12-0-card").unwrap();
+                assert!(reply.top() >= root.bottom());
+                let left = vcx.debug_bounds("inline-text-0-13-0-card").unwrap();
+                let (viewport, rows) = cx.update(|cx| {
+                    let data = app.read(cx).active_data().unwrap();
+                    let source = data
+                        .rows
+                        .iter()
+                        .find_map(|row| match row {
+                            Row::CommentBody { text, slot: 0, .. } if text.comment_id == 11 => {
+                                Some(&text.source)
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(source, body, "wrapping must not alter Markdown source");
+                    (data.scroll.0.borrow().base_handle.bounds(), data.rows.len())
+                });
+                if mode == ViewMode::Split {
+                    assert!(root.left() > viewport.center().x);
+                    assert!(left.right() <= viewport.center().x);
+                }
+                assert!(
+                    root.right() <= viewport.right(),
+                    "Markdown stays inside the viewport"
+                );
+                draw(&mut vcx);
+                assert_eq!(
+                    rows,
+                    cx.update(|cx| app.read(cx).active_data().unwrap().rows.len()),
+                    "layout settles without growing reservations"
+                );
+            }
+        }
+        let cursor = cx.update(|cx| app.read(cx).active_data().unwrap().cursor);
+        let marker = vcx
+            .debug_bounds("inline-text-0-11-0-0-0-marker")
+            .unwrap()
+            .center();
+        vcx.simulate_mouse_down(marker, MouseButton::Left, gpui::Modifiers::default());
+        vcx.simulate_mouse_up(marker, MouseButton::Left, gpui::Modifiers::default());
+        vcx.run_until_parked();
+        assert_eq!(
+            cursor,
+            cx.update(|cx| app.read(cx).active_data().unwrap().cursor),
+            "comment interactions must not select diff code"
+        );
+
+        // Scrolling past a block's first slot must not unmount its Markdown.
+        vcx.simulate_resize(size(px(850.), px(450.)));
+        let first = cx.update(|cx| {
+            let data = app.read(cx).active_data().unwrap();
+            let first = data
+                .rows
+                .iter()
+                .position(|row| {
+                    matches!(row,
+                Row::CommentBody { text, slot: 0, .. } if text.comment_id == 11)
+                })
+                .unwrap();
+            data.scroll
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(point(px(0.), px(-((first + 2) as f32) * row_height())));
+            first
+        });
+        draw(&mut vcx);
+        let card = vcx.debug_bounds("inline-text-0-11-0-card").unwrap();
+        let viewport = cx.update(|cx| {
+            app.read(cx)
+                .active_data()
+                .unwrap()
+                .scroll
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+        });
+        assert!(card.top() < viewport.top() && card.bottom() > viewport.top());
+        assert!(cx.update(|cx| matches!(
+            &app.read(cx).active_data().unwrap().rows[first],
+            Row::CommentBody { slot: 0, .. }
+        )));
+
+        vcx.simulate_resize(size(px(1100.), px(450.)));
+        draw(&mut vcx);
+        let card = vcx.debug_bounds("inline-text-0-11-0-card").unwrap();
+        assert!(
+            card.top() < viewport.top() && card.bottom() > viewport.top(),
+            "remeasuring keeps a partially visible comment anchored"
+        );
+
+        // Editing a body invalidates the measured source and rendered blocks.
+        cx.update(|cx| {
+            app.update(cx, |this, _| {
+                let data = this.active_data_mut().unwrap();
+                data.comments = Some(group_comments(vec![rc(
+                    11,
+                    "a.rs",
+                    Some("RIGHT"),
+                    Some(1),
+                    "Edited **body**.",
+                    "alice",
+                    "2026-01-01T00:00:00Z",
+                    None,
+                )
+                .into()]));
+                data.set_rows(data.row_build());
+                data.scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(point(px(0.), px(0.)));
+            })
+        });
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("inline-text-0-11-0-text").is_some());
+        assert!(
+            vcx.debug_bounds("inline-text-0-11-0-content")
+                .unwrap()
+                .size
+                .height
+                < px(row_height() * 3.)
+        );
+    }
+
+    #[gpui::test]
     fn inline_diff_media_renders_in_both_halves_and_survives_partial_virtualization(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -7190,7 +7421,7 @@ mod tests {
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
         vcx.simulate_resize(size(px(1500.), px(2000.)));
         let mut item = loop_pr_item(vec![
-            rc(11, "a.rs", Some("RIGHT"), Some(1), "Before\n\n![screen](https://github.com/user-attachments/assets/screen)\n\n![diagram](https://github.com/user-attachments/assets/diagram)\n\nAfter", "alice", "2026-01-01T00:00:00Z", None),
+            rc(11, "a.rs", Some("RIGHT"), Some(1), "Before **screen**\n\n![screen](https://github.com/user-attachments/assets/screen)\n\n![diagram](https://github.com/user-attachments/assets/diagram)\n\nAfter `code`.", "alice", "2026-01-01T00:00:00Z", None),
             rc(12, "a.rs", Some("RIGHT"), Some(1), "<img src='https://github.com/user-attachments/assets/diagram'>", "bob", "2026-01-02T00:00:00Z", Some(11)),
             rc(13, "a.rs", Some("LEFT"), Some(1), "![old](https://github.com/user-attachments/assets/old-screen)", "carol", "2026-01-01T00:00:00Z", None),
         ]);
@@ -7223,6 +7454,16 @@ mod tests {
             assert!(screenshot.size.height > px(0.));
             let card = vcx.debug_bounds("inline-comment-0-11-0-card").unwrap();
             assert!(screenshot.bottom() <= card.bottom());
+            let before = vcx.debug_bounds("inline-text-0-11-0-text").unwrap();
+            let after = vcx.debug_bounds("inline-text-0-11-2-text").unwrap();
+            assert!(before.bottom() <= card.top());
+            assert!(
+                after.top()
+                    >= vcx
+                        .debug_bounds("inline-comment-0-11-1-card")
+                        .unwrap()
+                        .bottom()
+            );
             assert!(
                 vcx.debug_bounds("inline-comment-0-12-0-rendered").is_some(),
                 "reply media"
@@ -12078,7 +12319,7 @@ mod tests {
                 data.mode = mode;
                 data.rebuild_rows_anchored();
                 assert!(data.rows.iter().any(|row| matches!(row,
-                    Row::CommentBody { line, half } if line.as_ref() == "removed draft"
+                    Row::CommentBody { line, half, .. } if line.as_ref() == "removed draft"
                         && *half == if mode == ViewMode::Split { Some(CommentSide::Left) } else { None }
                 )));
                 assert!(data.rows.iter().any(|row| matches!(row,

@@ -81,7 +81,7 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
   between rendered and source views
 - local repo diffs
 - minimap
-- inline GitHub review comments (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
+- inline GitHub review comments with GFM formatting (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
 - multi-line comments: click then shift-click a line, or drag a selection and
   press `C` (ranges stay on one side); comments outside a patch hunk, including
   cross-hunk ranges, use GitHub's experimental positioning API and may depend
