@@ -16,6 +16,7 @@ mod theme;
 mod threads;
 mod tree;
 mod upgrade;
+mod viewed;
 
 #[cfg(test)]
 mod test_util;
@@ -199,6 +200,7 @@ actions!(
         ScrollLeft,
         ScrollRight,
         ToggleView,
+        ToggleViewed,
         ToggleWhitespace,
         ToggleUnchanged,
         ToggleSoftWrap,
@@ -361,6 +363,7 @@ fn main() {
                 KeyBinding::new("left", ScrollLeft, Some("ReviewApp")),
                 KeyBinding::new("right", ScrollRight, Some("ReviewApp")),
                 KeyBinding::new("v", ToggleView, Some("ReviewApp")),
+                KeyBinding::new("shift-v", ToggleViewed, Some("ReviewApp")),
                 KeyBinding::new("m", ToggleMinimap, Some("ReviewApp")),
                 KeyBinding::new("c", ToggleComments, Some("ReviewApp")),
                 // `C` (shift-c) opens the inline composer on the selected
@@ -554,6 +557,7 @@ pub(crate) struct ItemData {
     posts: conversation::posting::Posts,
     commits: Option<github::PrCommits>,
     commits_expanded: bool,
+    viewed: viewed::Viewed,
     expanded_threads: HashSet<String>,
     additions: u32,
     deletions: u32,
@@ -636,6 +640,7 @@ impl ItemData {
             posts: Default::default(),
             commits: None,
             commits_expanded: false,
+            viewed: Default::default(),
             expanded_threads: HashSet::new(),
             additions: 0,
             deletions: 0,
@@ -1016,6 +1021,7 @@ impl ReviewItem {
             comments,
             discussion,
             commits,
+            viewed,
             snapshot,
         } = loaded;
         let (additions, deletions) = diff
@@ -1043,6 +1049,7 @@ impl ReviewItem {
                     data.posts.reconcile(discussion);
                 }
                 data.commits = commits;
+                data.viewed.install(viewed);
                 data.comments = match &data.local_review {
                     Some(local) => Some(local.index()),
                     None => comments,
@@ -1109,6 +1116,7 @@ impl ReviewItem {
                 ));
                 data.discussion = discussion;
                 data.commits = commits;
+                data.viewed.install(viewed);
                 self.state = ItemState::Ready(data);
             }
         }
@@ -3058,6 +3066,9 @@ impl ReviewApp {
         if matches!(item.state, ItemState::Loading) || item.reloading {
             return;
         }
+        if matches!(&item.state, ItemState::Ready(data) if !data.viewed.pending.is_empty()) {
+            return;
+        }
         let mode = match &item.state {
             ItemState::Ready(data) => data.mode,
             _ => ViewMode::Split,
@@ -4901,6 +4912,10 @@ impl ReviewApp {
                     item.refresh_error
                         .as_ref()
                         .map(|err| SharedString::from(format!("refresh failed: {err}")))
+                        .or_else(|| match &item.state {
+                            ItemState::Ready(data) => data.viewed.error.clone(),
+                            _ => None,
+                        })
                 }
             })
         };
@@ -5155,7 +5170,14 @@ impl ReviewApp {
                     range
                         .filter_map(|pos| tree_rows.get(pos).map(|row| (pos, *row)))
                         .map(|(pos, row)| {
-                            render_tree_row(row, pos, current_row == Some(pos), data, &entity)
+                            render_tree_row(
+                                row,
+                                pos,
+                                current_row == Some(pos),
+                                data,
+                                &entity,
+                                this.active_item().is_some_and(|item| item.reloading),
+                            )
                         })
                         .collect()
                 })
@@ -5217,6 +5239,20 @@ impl ReviewApp {
                         div()
                             .p_2()
                             .child(Input::new(&self.tree_filter_input).small()),
+                    )
+                    .when_some(
+                        self.active_data()
+                            .and_then(|data| data.viewed.error.clone()),
+                        |area, error| {
+                            area.child(
+                                div()
+                                    .px_2()
+                                    .pb_2()
+                                    .text_size(px(11.))
+                                    .text_color(theme::red())
+                                    .child(error),
+                            )
+                        },
                     )
                     .child(div().flex_1().min_h_0().child(tree_list)),
             )
@@ -6380,6 +6416,7 @@ impl Render for ReviewApp {
                 this.scroll_horizontal(1, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleView, _, cx| this.toggle_view(cx)))
+            .on_action(cx.listener(|this, _: &ToggleViewed, _, cx| this.toggle_current_viewed(cx)))
             .on_action(cx.listener(|this, _: &ToggleWhitespace, _, cx| {
                 this.toggle_presentation(presentation::Preference::Whitespace, cx)
             }))
@@ -6731,6 +6768,238 @@ mod tests {
                     .load(std::sync::atomic::Ordering::SeqCst),
                 1
             );
+        }
+    }
+
+    #[test]
+    fn viewed_detail_fetch_round_trips_server_states_and_survives_failure() {
+        use github::FileViewedState::*;
+        let fake = Arc::new(FakePr::default());
+        let mut item = loop_pr_item(Vec::new());
+        for state in [Viewed, Unviewed, Dismissed] {
+            fake.viewed_files
+                .lock()
+                .unwrap()
+                .insert("a.rs".into(), state);
+            let loaded = fetch_item(fake.clone(), &item.source, ViewMode::Unified, 0).unwrap();
+            assert_eq!(
+                loaded.viewed.as_ref().unwrap().as_ref().unwrap().files["a.rs"],
+                state
+            );
+            item.install(loaded);
+            let ItemState::Ready(data) = &item.state else {
+                panic!()
+            };
+            assert_eq!(data.viewed.state("a.rs"), Some(state));
+            assert!(data.viewed.error.is_none());
+        }
+        fake.fail_viewed_fetch
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let loaded = fetch_item(fake, &item.source, ViewMode::Unified, 0).unwrap();
+        assert!(!loaded.diff.files.is_empty());
+        item.install(loaded);
+        let ItemState::Ready(data) = &item.state else {
+            panic!()
+        };
+        assert!(data.viewed.state("a.rs").is_none());
+        assert!(data
+            .viewed
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("viewed fetch failed"));
+    }
+
+    #[gpui::test]
+    fn viewed_keyboard_and_far_right_checkboxes_sync_without_opening_files(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use github::FileViewedState::*;
+        let fake = Arc::new(FakePr {
+            patch: Some("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-old\n+new\n".into()),
+            ..Default::default()
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.sidebar_visible = true;
+                this.open_item(Source::Pr(loop_loc()), cx);
+            })
+        });
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|_, cx| {
+            cx.bind_keys([
+                KeyBinding::new("v", ToggleView, Some("ReviewApp")),
+                KeyBinding::new("shift-v", ToggleViewed, Some("ReviewApp")),
+            ])
+        });
+        vcx.simulate_keystrokes("shift-v");
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert_eq!(data.viewed.state("a.rs"), Some(Viewed));
+            assert!(
+                data.mode == ViewMode::Split,
+                "uppercase V must not switch diff layouts"
+            );
+            let _ = window.draw(cx);
+        });
+        let sidebar = vcx.debug_bounds("sidebar").unwrap();
+        let checkbox = vcx.debug_bounds("viewed-1").unwrap();
+        assert_eq!(
+            checkbox.right(),
+            sidebar.right() - px(9.), // 8px row padding + 1px sidebar border
+            "checkbox is the far-right row child"
+        );
+        vcx.simulate_mouse_down(
+            checkbox.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vcx.simulate_mouse_up(
+            checkbox.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert_eq!(data.file_ix, 0, "checkbox must not also open b.rs");
+            assert_eq!(data.viewed.state("b.rs"), Some(Viewed));
+            app.update(cx, |this, cx| {
+                this.tree_filter_input
+                    .update(cx, |input, cx| input.set_value("b.rs", window, cx))
+            });
+            let _ = window.draw(cx);
+        });
+        let checkbox = vcx.debug_bounds("viewed-1").unwrap();
+        vcx.simulate_mouse_down(
+            checkbox.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vcx.simulate_mouse_up(
+            checkbox.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert_eq!(data.file_ix, 0);
+            assert_eq!(data.viewed.state("b.rs"), Some(Unviewed));
+        });
+        assert_eq!(
+            *fake.viewed_writes.lock().unwrap(),
+            [
+                ("a.rs".into(), true),
+                ("b.rs".into(), true),
+                ("b.rs".into(), false)
+            ]
+        );
+        fake.viewed_files
+            .lock()
+            .unwrap()
+            .insert("a.rs".into(), Dismissed);
+        vcx.update(|_, cx| app.update(cx, |this, cx| this.refresh(cx)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert_eq!(
+                app.read(cx).active_data().unwrap().viewed.state("a.rs"),
+                Some(Dismissed)
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn viewed_toggles_are_optimistic_serialized_and_reconcile_failures(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use github::FileViewedState::*;
+        use std::sync::atomic::Ordering::SeqCst;
+        for (previous, committed, fetch_failed) in [
+            (Unviewed, false, false),
+            (Unviewed, true, false),
+            (Unviewed, false, true),
+            (Viewed, false, false),
+            (Viewed, true, false),
+            (Viewed, false, true),
+        ] {
+            let fake = Arc::new(FakePr::default());
+            fake.viewed_files
+                .lock()
+                .unwrap()
+                .insert("a.rs".into(), previous);
+            let desired = if previous == Viewed { Unviewed } else { Viewed };
+            let (_, app) = queue_window(cx, fake.clone());
+            let mut item = loop_pr_item(Vec::new());
+            item.install(fetch_item(fake.clone(), &item.source, ViewMode::Unified, 0).unwrap());
+            install_item(&app, item, cx);
+            fake.fail.store(true, SeqCst);
+            fake.viewed_commit_then_fail.store(committed, SeqCst);
+            fake.fail_viewed_fetch.store(fetch_failed, SeqCst);
+            cx.update(|cx| {
+                app.update(cx, |this, cx| {
+                    this.toggle_current_viewed(cx);
+                    let data = this.active_data().unwrap();
+                    assert_eq!(
+                        data.viewed.state("a.rs"),
+                        Some(desired),
+                        "optimistic before network returns"
+                    );
+                    assert!(data.viewed.pending.contains("a.rs"));
+                    this.toggle_current_viewed(cx); // ignored while in flight
+                    this.refresh(cx); // cannot install a pre-mutation snapshot
+                    assert!(!this.active_item().unwrap().reloading);
+                })
+            });
+            cx.run_until_parked();
+            cx.update(|cx| {
+                let data = app.read(cx).active_data().unwrap();
+                assert_eq!(
+                    data.viewed.state("a.rs"),
+                    Some(if committed { desired } else { previous })
+                );
+                assert!(data.viewed.pending.is_empty());
+                assert!(data
+                    .viewed
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("viewed mutation failed"));
+                assert_eq!(data.viewed.uncertain.contains("a.rs"), fetch_failed);
+            });
+            assert_eq!(fake.viewed_writes.lock().unwrap().len(), 1);
+            if fetch_failed {
+                cx.update(|cx| app.update(cx, |this, cx| this.toggle_current_viewed(cx)));
+                cx.run_until_parked();
+                assert_eq!(
+                    fake.viewed_writes.lock().unwrap().len(),
+                    1,
+                    "uncertain state is disabled"
+                );
+            }
+            fake.fail.store(false, SeqCst);
+            fake.viewed_commit_then_fail.store(false, SeqCst);
+            fake.fail_viewed_fetch.store(false, SeqCst);
+            cx.update(|cx| {
+                app.update(cx, |this, cx| {
+                    this.refresh(cx);
+                    assert!(this.active_item().unwrap().reloading);
+                    this.toggle_current_viewed(cx);
+                    assert!(
+                        this.active_data().unwrap().viewed.pending.is_empty(),
+                        "toggles cannot race an in-flight refresh"
+                    );
+                })
+            });
+            cx.run_until_parked();
+            cx.update(|cx| {
+                let data = app.read(cx).active_data().unwrap();
+                assert!(data.viewed.error.is_none());
+                assert!(data.viewed.uncertain.is_empty());
+            });
         }
     }
 
@@ -9634,6 +9903,10 @@ mod tests {
         commit_fetches: std::sync::atomic::AtomicUsize,
         patch: Option<String>,
         file_contents: HashMap<(String, String), String>,
+        viewed_files: std::sync::Mutex<HashMap<String, github::FileViewedState>>,
+        viewed_writes: std::sync::Mutex<Vec<(String, bool)>>,
+        fail_viewed_fetch: std::sync::atomic::AtomicBool,
+        viewed_commit_then_fail: std::sync::atomic::AtomicBool,
     }
 
     impl FakePr {
@@ -9650,6 +9923,64 @@ mod tests {
     }
 
     impl github::GitHubClient for FakePr {
+        fn viewed_files(
+            &self,
+            loc: &github::PrLocator,
+        ) -> Result<github::ViewedFiles, github::ClientError> {
+            if self
+                .fail_viewed_fetch
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(github::ClientError::Failed("viewed fetch failed".into()));
+            }
+            let mut files: HashMap<_, _> = diff_core::parse_patch(&self.pr_patch(loc).unwrap())
+                .files
+                .iter()
+                .map(|file| {
+                    (
+                        file.display_path().to_owned(),
+                        github::FileViewedState::Unviewed,
+                    )
+                })
+                .collect();
+            files.extend(self.viewed_files.lock().unwrap().clone());
+            Ok(github::ViewedFiles {
+                pull_request_id: "PR7".into(),
+                files,
+            })
+        }
+
+        fn set_file_viewed(
+            &self,
+            id: &str,
+            path: &str,
+            viewed: bool,
+        ) -> Result<(), github::ClientError> {
+            assert_eq!(id, "PR7");
+            self.viewed_writes
+                .lock()
+                .unwrap()
+                .push((path.into(), viewed));
+            let commit_then_fail = self
+                .viewed_commit_then_fail
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if !self.fail.load(std::sync::atomic::Ordering::SeqCst) || commit_then_fail {
+                self.viewed_files.lock().unwrap().insert(
+                    path.into(),
+                    if viewed {
+                        github::FileViewedState::Viewed
+                    } else {
+                        github::FileViewedState::Unviewed
+                    },
+                );
+            }
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) || commit_then_fail {
+                Err(github::ClientError::Failed("viewed mutation failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+
         fn pr_discussion(
             &self,
             _loc: &github::PrLocator,

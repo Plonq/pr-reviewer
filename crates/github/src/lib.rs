@@ -21,6 +21,23 @@ pub use discussion::{DiscussionComment, PrDiscussion, Reaction, ReviewCodeContex
 pub mod review_session;
 pub use review_session::{CommentAnchor, CommentPosition, DiffSide, PendingComment, PendingReview};
 
+/// Per-viewer file review state. DISMISSED means a previously viewed file
+/// changed again; it is not currently viewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FileViewedState {
+    Viewed,
+    Unviewed,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewedFiles {
+    /// Opaque GraphQL identity used by mark/unmark mutations.
+    pub pull_request_id: String,
+    pub files: std::collections::HashMap<String, FileViewedState>,
+}
+
 /// The signed-in GitHub user, as far as the app needs to know her: who she
 /// is, and how to draw her.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,6 +518,27 @@ impl std::error::Error for ClientError {}
 /// construct and synchronous — they run on background threads, never the UI
 /// thread — and may spawn subprocesses or make network calls inside a call.
 pub trait GitHubClient: Send + Sync {
+    /// Detail-only, paginated state for the authenticated viewer, never queue data.
+    fn viewed_files(&self, _loc: &PrLocator) -> Result<ViewedFiles, ClientError> {
+        Err(ClientError::Failed(
+            "viewed files are not supported by this backend".into(),
+        ))
+    }
+
+    /// Set one file's state for the authenticated viewer using the opaque PR
+    /// identity returned by `viewed_files`. Paths are GitHub's exact paths,
+    /// including the new path for renames and the old path for deletions.
+    fn set_file_viewed(
+        &self,
+        _pull_request_id: &str,
+        _path: &str,
+        _viewed: bool,
+    ) -> Result<(), ClientError> {
+        Err(ClientError::Failed(
+            "viewed files are not supported by this backend".into(),
+        ))
+    }
+
     /// Ordered PR commits and per-commit CI. Detail-only: queue searches must
     /// not call this. Unsupported backends report unavailable, not empty.
     fn pr_commits(&self, _loc: &PrLocator) -> Result<PrCommits, ClientError> {

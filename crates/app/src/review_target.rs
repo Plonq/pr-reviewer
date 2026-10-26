@@ -55,6 +55,7 @@ pub(crate) struct Loaded {
     pub(crate) comments: Option<CommentIndex>,
     pub(crate) discussion: Option<github::PrDiscussion>,
     pub(crate) commits: Option<github::PrCommits>,
+    pub(crate) viewed: Option<Result<github::ViewedFiles, github::ClientError>>,
     /// The snapshot of a PR's fetch, for the local store: what the app
     /// saw of the PR, and when. None for local items.
     pub(crate) snapshot: Option<local_store::StoredPrSnapshot>,
@@ -62,7 +63,7 @@ pub(crate) struct Loaded {
 
 /// Blocking fetch + parse + row building for one item; runs on the background
 /// executor, so subprocess waits and tree-sitter work stay off the main thread.
-/// PR items fetch meta, patch, discussion, and commits concurrently — four
+/// PR items fetch meta, patch, discussion, commits, and viewed state concurrently — five
 /// facade calls, one error vocabulary.
 ///
 /// A PR's fetch also produces the snapshot the local store keeps: what the
@@ -75,7 +76,7 @@ pub(crate) fn fetch_item(
     mode: ViewMode,
     file_ix: usize,
 ) -> anyhow::Result<Loaded> {
-    let (meta, patch, comments, discussion, commits, snapshot) = match source {
+    let (meta, patch, comments, discussion, commits, viewed, snapshot) = match source {
         Source::Pr(loc) => {
             let meta_client = github.clone();
             let meta_loc = loc.clone();
@@ -88,6 +89,9 @@ pub(crate) fn fetch_item(
             let commits_loc = loc.clone();
             let commits_thread =
                 std::thread::spawn(move || commits_client.pr_commits(&commits_loc));
+            let viewed_client = github.clone();
+            let viewed_loc = loc.clone();
+            let viewed_thread = std::thread::spawn(move || viewed_client.viewed_files(&viewed_loc));
             let patch = github.pr_patch(loc)?;
             let meta = meta_thread
                 .join()
@@ -100,6 +104,11 @@ pub(crate) fn fetch_item(
             let comments = discussion.review_comments();
             // Optional detail data must never make a usable diff fail to open.
             let commits = commits_thread.join().ok().and_then(Result::ok);
+            let viewed = viewed_thread.join().unwrap_or_else(|_| {
+                Err(github::ClientError::Failed(
+                    "viewed-state fetch panicked".into(),
+                ))
+            });
             let snapshot = discussion_snapshot(loc, &meta, &discussion, commits.as_ref())?;
             (
                 LoadedMeta::Pr(meta),
@@ -109,13 +118,14 @@ pub(crate) fn fetch_item(
                 )),
                 Some(discussion),
                 commits,
+                Some(viewed),
                 Some(snapshot),
             )
         }
         Source::Local(src) => {
             let src = git::resolve_local_with_base(&src.repo_root, src.base_ref.as_deref())?;
             let patch = git::diff_patch(&src)?;
-            (LoadedMeta::Local(src), patch, None, None, None, None)
+            (LoadedMeta::Local(src), patch, None, None, None, None, None)
         }
     };
     let diff = diff_core::parse_patch(&patch);
@@ -139,6 +149,7 @@ pub(crate) fn fetch_item(
         comments,
         discussion,
         commits,
+        viewed,
         snapshot,
     })
 }

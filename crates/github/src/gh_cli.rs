@@ -286,6 +286,71 @@ impl<P: GhProcess> GhCliClient<P> {
 }
 
 impl<P: GhProcess> GitHubClient for GhCliClient<P> {
+    fn viewed_files(&self, loc: &PrLocator) -> Result<crate::ViewedFiles, ClientError> {
+        let mut files = HashMap::new();
+        let mut after = None;
+        let mut cursors = std::collections::HashSet::new();
+        let mut pull_request_id = None;
+        loop {
+            let value = self.review_graphql(format!(
+                "query {{ repository(owner:{},name:{}) {{ pullRequest(number:{}) {{ id files(first:100{}) {{ nodes {{ path viewerViewedState }} pageInfo {{ hasNextPage endCursor }} }} }} }} }}",
+                json_string(&loc.owner), json_string(&loc.repo), loc.number, after_arg(after.as_deref())
+            ))?;
+            let pr = &value["data"]["repository"]["pullRequest"];
+            let id: String = decode_value(pr["id"].clone())?;
+            if pull_request_id
+                .as_ref()
+                .is_some_and(|previous| previous != &id)
+            {
+                return Err(ClientError::Failed(
+                    "GitHub changed the PR identity during file fetch".into(),
+                ));
+            }
+            pull_request_id = Some(id);
+            let connection = &pr["files"];
+            for file in connection_nodes(connection)? {
+                files.insert(
+                    decode_value(file["path"].clone())?,
+                    decode_value(file["viewerViewedState"].clone())?,
+                );
+            }
+            after = next_cursor(connection)?;
+            let Some(cursor) = &after else { break };
+            if !cursors.insert(cursor.clone()) {
+                return Err(ClientError::Failed(
+                    "GitHub repeated a viewed-file cursor".into(),
+                ));
+            }
+        }
+        Ok(crate::ViewedFiles {
+            pull_request_id: pull_request_id.unwrap(),
+            files,
+        })
+    }
+
+    fn set_file_viewed(
+        &self,
+        pull_request_id: &str,
+        path: &str,
+        viewed: bool,
+    ) -> Result<(), ClientError> {
+        let operation = if viewed {
+            "markFileAsViewed"
+        } else {
+            "unmarkFileAsViewed"
+        };
+        let value = self.review_graphql(format!(
+            "mutation {{ {operation}(input:{{pullRequestId:{},path:{}}}) {{ pullRequest {{ id }} }} }}",
+            json_string(pull_request_id), json_string(path)
+        ))?;
+        if value["data"][operation]["pullRequest"]["id"].as_str() != Some(pull_request_id) {
+            return Err(ClientError::Failed(
+                "GitHub returned no updated viewed-file state".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn pr_commits(&self, loc: &PrLocator) -> Result<crate::PrCommits, ClientError> {
         let mut result = crate::PrCommits::default();
         let mut after = None;
@@ -2185,6 +2250,109 @@ mod tests {
             repo: "Hello-World".into(),
             number: 4781,
         }
+    }
+
+    const VIEWED_PAGE1: &str = include_str!("../fixtures/gh_graphql_viewed_files_page1.json");
+    const VIEWED_PAGE2: &str = include_str!("../fixtures/gh_graphql_viewed_files_page2.json");
+
+    #[test]
+    fn viewed_files_fetches_all_pages_and_preserves_per_viewer_states() {
+        use crate::FileViewedState::*;
+        let fake = FakeGh::many(vec![
+            ok(Some(0), VIEWED_PAGE1, ""),
+            ok(Some(0), VIEWED_PAGE2, ""),
+        ]);
+        let calls = fake.calls_handle();
+        let files = GhCliClient::with_process(fake)
+            .viewed_files(&loc())
+            .unwrap();
+        assert_eq!(files.pull_request_id, "PR_kwDOExample");
+        assert_eq!(
+            files.files,
+            HashMap::from([
+                ("src/viewed.rs".into(), Viewed),
+                ("old-name.txt".into(), Unviewed),
+                ("src/new name\"λ.rs".into(), Dismissed),
+            ])
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(&calls[0][..3], ["api", "graphql", "-f"]);
+        assert_eq!(calls[0][3], "query=query { repository(owner:\"octocat\",name:\"Hello-World\") { pullRequest(number:4781) { id files(first:100) { nodes { path viewerViewedState } pageInfo { hasNextPage endCursor } } } } }");
+        assert!(calls[1][3].contains("files(first:100,after:\"files-next\")"));
+        assert!(calls.iter().all(|call| !call[3].contains("mutation")));
+    }
+
+    #[test]
+    fn viewed_mutations_mark_and_unmark_exact_paths_and_round_trip() {
+        let fake = FakeGh::many(vec![
+            ok(
+                Some(0),
+                include_str!("../fixtures/gh_graphql_mark_file_viewed.json"),
+                "",
+            ),
+            ok(
+                Some(0),
+                include_str!("../fixtures/gh_graphql_unmark_file_viewed.json"),
+                "",
+            ),
+            ok(Some(0), VIEWED_PAGE1, ""),
+            ok(Some(0), VIEWED_PAGE2, ""),
+        ]);
+        let calls = fake.calls_handle();
+        let client = GhCliClient::with_process(fake);
+        let path = "src/new name\"λ.rs";
+        client
+            .set_file_viewed("PR_kwDOExample", path, true)
+            .unwrap();
+        client
+            .set_file_viewed("PR_kwDOExample", path, false)
+            .unwrap();
+        assert_eq!(
+            client.viewed_files(&loc()).unwrap().files[path],
+            crate::FileViewedState::Dismissed
+        );
+        let calls = calls.lock().unwrap();
+        for (ix, operation) in ["markFileAsViewed", "unmarkFileAsViewed"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(&calls[ix][..3], ["api", "graphql", "-f"]);
+            assert_eq!(calls[ix][3], format!("query=mutation {{ {operation}(input:{{pullRequestId:\"PR_kwDOExample\",path:\"src/new name\\\"λ.rs\"}}) {{ pullRequest {{ id }} }} }}"));
+        }
+    }
+
+    #[test]
+    fn viewed_state_errors_are_never_silently_empty_or_successful() {
+        for response in [
+            r#"{"errors":[{"message":"Forbidden"}],"data":{}}"#,
+            r#"{"data":{"repository":{"pullRequest":null}}}"#,
+            r#"{"data":{"repository":{"pullRequest":{"id":"PR1","files":{"nodes":[{"path":"a","viewerViewedState":"UNKNOWN"}],"pageInfo":{"hasNextPage":false}}}}}}"#,
+        ] {
+            assert!(client(ok(Some(0), response, ""))
+                .viewed_files(&loc())
+                .is_err());
+        }
+        for response in [
+            "{}",
+            r#"{"data":{"markFileAsViewed":null}}"#,
+            r#"{"data":{"markFileAsViewed":{"pullRequest":{"id":"wrong"}}}}"#,
+            r#"{"errors":[{"message":"Forbidden"}]}"#,
+        ] {
+            assert!(client(ok(Some(0), response, ""))
+                .set_file_viewed("PR1", "a", true)
+                .is_err());
+        }
+        assert_eq!(
+            client(ok(Some(4), "", UNAUTHENTICATED)).set_file_viewed("PR1", "a", false),
+            Err(ClientError::Unauthenticated)
+        );
+        let repeated = FakeGh::many(vec![
+            ok(Some(0), VIEWED_PAGE1, ""),
+            ok(Some(0), VIEWED_PAGE1, ""),
+        ]);
+        assert!(GhCliClient::with_process(repeated)
+            .viewed_files(&loc())
+            .is_err());
     }
 
     /// The real `gh api user` payload (captured from gh 2.102, values swapped

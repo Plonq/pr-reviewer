@@ -64,6 +64,8 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - word-level intra-line diffs
 - whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
 - multi-item sidebar with file tree; drag its right edge to resize (width is remembered)
+- per-viewer viewed checkboxes at the right edge of the file tree; click or `V`
+  to mark/unmark on GitHub, with optimistic updates and visible sync failures
 - cmd-k palette with fuzzy PR picker
 - PR conversation (title-bar Conversation / Changes button, or `⇧⌘←` / `⇧⌘→`):
   GFM description and chronological comments; reviews
@@ -127,6 +129,7 @@ only by your account. Delete that directory to clear downloaded images.
 | `]` / `[` | next / previous file |
 | `n` / `p` | next / previous hunk |
 | `v` | unified ↔ split view |
+| `V` | toggle current file viewed on GitHub |
 | `W` / `K` | hide whitespace / collapse unchanged (sticky per PR) |
 | `alt-z` | toggle soft wrap |
 | `cmd-f` | search current diff; Enter / Shift-Enter cycle, Esc restores position |

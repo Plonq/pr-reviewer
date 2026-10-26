@@ -1,0 +1,15 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "id": "PR_kwDOExample",
+        "files": {
+          "nodes": [
+            { "path": "src/new name\"λ.rs", "viewerViewedState": "DISMISSED" }
+          ],
+          "pageInfo": { "hasNextPage": false, "endCursor": null }
+        }
+      }
+    }
+  }
+}
