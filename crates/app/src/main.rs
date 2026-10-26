@@ -6889,6 +6889,69 @@ mod tests {
     }
 
     #[gpui::test]
+    fn file_tree_comment_badges_survive_filtering_and_hidden_comments(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let comment = |id, line, parent| {
+            rc(
+                id,
+                "a.rs",
+                Some("RIGHT"),
+                line,
+                "body",
+                "alice",
+                "same",
+                parent,
+            )
+        };
+        // Use a fresh window per case: GPUI retains old debug bounds even
+        // after an element disappears, so absence checks need a clean frame.
+        for (query, has_comments, comments_visible) in [
+            ("", true, true),
+            ("", true, false),
+            ("a.rs", true, false),
+            ("b.rs", true, false),
+            ("", false, true),
+        ] {
+            let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+            install_item(
+                &app,
+                loop_pr_item(if has_comments {
+                    vec![
+                        comment(1, Some(1), None),
+                        comment(2, Some(1), Some(1)),
+                        comment(3, None, None),
+                    ]
+                } else {
+                    Vec::new()
+                }),
+                cx,
+            );
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            vcx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    this.sidebar_visible = true;
+                    let data = this.active_data_mut().unwrap();
+                    data.comments_visible = comments_visible;
+                    data.rebuild_rows_anchored();
+                    this.tree_filter_input
+                        .update(cx, |input, cx| input.set_value(query, window, cx));
+                    cx.notify();
+                });
+            });
+            vcx.run_until_parked();
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            assert_eq!(
+                vcx.debug_bounds("file-comments-0").is_some(),
+                has_comments && query != "b.rs"
+            );
+            assert!(vcx.debug_bounds("file-comments-1").is_none());
+        }
+    }
+
+    #[gpui::test]
     fn viewed_keyboard_and_far_right_checkboxes_sync_without_opening_files(
         cx: &mut gpui::TestAppContext,
     ) {
