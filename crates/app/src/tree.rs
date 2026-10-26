@@ -6,7 +6,7 @@ use crate::{theme, ItemData, ReviewApp};
 use diff_core::{FileDiff, FileStatus};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{div, prelude::*, px, Hsla, SharedString};
-use gpui_component::{checkbox::Checkbox, tag::Tag, Disableable as _, Sizable as _};
+use gpui_component::{checkbox::Checkbox, Disableable as _, Sizable as _};
 
 /// Row height of sidebar file-tree entries.
 const TREE_ROW_HEIGHT: f32 = 24.0;
@@ -128,7 +128,7 @@ pub(crate) fn fuzzy_file_matches(paths: &[&str], query: &str) -> Vec<usize> {
     scored.into_iter().map(|(_, ix)| ix).collect()
 }
 
-/// Status label and color, shared by file headers and tree entries.
+/// Status label for file headers and color shared with tree entries.
 pub(crate) fn status_style(status: FileStatus) -> (&'static str, gpui::Rgba) {
     match status {
         FileStatus::Added => ("added", theme::green()),
@@ -256,8 +256,7 @@ pub(crate) fn render_tree_row(
                 }
                 TreeEntryKind::File { file_ix } => {
                     let file = &data.diff.files[*file_ix];
-                    let (status_label, status_color) = status_style(file.status);
-                    let status: Hsla = status_color.into();
+                    let (_, status_color) = status_style(file.status);
                     base.child(div().w(px(12.)).flex_shrink_0()) // aligns with dir chevrons
                         .child(
                             div()
@@ -267,14 +266,6 @@ pub(crate) fn render_tree_row(
                                 .text_color(status_color)
                                 .child(entry.name.clone()),
                         )
-                        // The status tag mirrors the file header's — the
-                        // tree answers "what happened to this file" at a
-                        // glance, without reading colors alone.
-                        .child(
-                            Tag::custom(status.opacity(0.15), status, status.opacity(0.4))
-                                .xsmall()
-                                .child(SharedString::from(status_label)),
-                        )
                         .child(stats(file))
                         .when(data.pr_meta.is_some(), |row| row.child(checkbox(*file_ix)))
                         .into_any_element()
@@ -283,8 +274,7 @@ pub(crate) fn render_tree_row(
         }
         TreeListRow::FilteredFile(file_ix) => {
             let file = &data.diff.files[file_ix];
-            let (status_label, status_color) = status_style(file.status);
-            let status: Hsla = status_color.into();
+            let (_, status_color) = status_style(file.status);
             base.pl_2()
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| this.jump_to_file(file_ix, window, cx));
@@ -296,11 +286,6 @@ pub(crate) fn render_tree_row(
                         .truncate()
                         .text_color(status_color)
                         .child(SharedString::from(file.display_path().to_string())),
-                )
-                .child(
-                    Tag::custom(status.opacity(0.15), status, status.opacity(0.4))
-                        .xsmall()
-                        .child(SharedString::from(status_label)),
                 )
                 .child(stats(file))
                 .when(data.pr_meta.is_some(), |row| row.child(checkbox(file_ix)))
