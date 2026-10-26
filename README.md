@@ -65,7 +65,8 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
 - multi-item sidebar with file tree; drag its right edge to resize (width is remembered)
 - cmd-k palette with fuzzy PR picker
-- PR conversation (`⇧⌘←`): GFM description and chronological comments; reviews
+- PR conversation (title-bar Conversation / Changes button, or `⇧⌘←` / `⇧⌘→`):
+  GFM description and chronological comments; reviews
   group their inline threads beneath the summary, with captured code context,
   expandable resolved stubs, and read-only reaction counts; cached offline
 - comment from the conversation, or reply inside a review thread (including
@@ -121,6 +122,7 @@ only by your account. Delete that directory to clear downloaded images.
 | `ctrl-tab` | cycle open items |
 | `j` / `k` + `enter` | queue: move the selection, open the selected PR |
 | `u` | back to the queue (open PRs stay open) |
+| `shift-cmd-left` / `shift-cmd-right` | conversation / changes |
 | `cmd-+` / `cmd--` / `cmd-0` | diff font size: bigger / smaller / reset |
 | `]` / `[` | next / previous file |
 | `n` / `p` | next / previous hunk |
