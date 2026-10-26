@@ -275,12 +275,48 @@ impl ReviewApp {
         let placement = thread.map_or(ComposerPlacement::ConversationMain, |thread| {
             ComposerPlacement::ConversationThread(thread.id.clone())
         });
-        if self
+        if let Some(composer) = self
             .composer
             .as_ref()
-            .is_some_and(|composer| composer.item_id == item_id && composer.placement == placement)
+            .filter(|composer| composer.item_id == item_id && composer.placement == placement)
         {
-            return self.render_composer_card(cx);
+            let scroll = self
+                .active_data()
+                .expect("a ready conversation")
+                .conv_scroll
+                .clone();
+            let reveal = composer.reveal.clone();
+            return div()
+                .w_full()
+                .min_w_0()
+                .on_children_prepainted(move |bounds, window, cx| {
+                    let Some(card) = bounds.first() else {
+                        return;
+                    };
+                    if !reveal.replace(false) {
+                        return;
+                    }
+                    let viewport = scroll.bounds();
+                    let delta =
+                        if card.top() < viewport.top() || card.size.height > viewport.size.height {
+                            viewport.top() - card.top()
+                        } else if card.bottom() > viewport.bottom() {
+                            viewport.bottom() - card.bottom()
+                        } else {
+                            return;
+                        };
+                    let scroll = scroll.clone();
+                    let mut offset = scroll.offset();
+                    offset.y += delta;
+                    // Use the new card's full height, not the old button's
+                    // bounds, and repaint with the adjusted scroll offset.
+                    window.defer(cx, move |window, _| {
+                        scroll.set_offset(offset);
+                        window.refresh();
+                    });
+                })
+                .child(self.render_composer_card(cx))
+                .into_any_element();
         }
         let reply_to = thread
             .and_then(|thread| thread.comments.first())

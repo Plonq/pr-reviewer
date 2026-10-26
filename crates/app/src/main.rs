@@ -56,7 +56,7 @@ use rows::{
 };
 use selection::{row_selection_range, selection_text, RowCol, SelSide, Selection};
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -1482,6 +1482,8 @@ struct Composer {
     /// harmlessly if rows rebuild while it is open).
     row_ix: usize,
     input: gpui::Entity<InputState>,
+    /// Reveal an inline conversation composer once, after its card is laid out.
+    reveal: Rc<Cell<bool>>,
     error: Option<SharedString>,
     in_flight: bool,
     _subscription: Subscription,
@@ -3695,6 +3697,7 @@ impl ReviewApp {
             edit_id: None,
             row_ix,
             input,
+            reveal: Rc::new(Cell::new(true)),
             error: None,
             in_flight: false,
             _subscription,
@@ -4316,6 +4319,7 @@ impl ReviewApp {
             )
         };
         div()
+            .debug_selector(|| "composer-card".into())
             .w_full()
             .min_w_0()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -10376,6 +10380,115 @@ mod tests {
         vcx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
         vcx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
         vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn conversation_main_composer_scrolls_into_view(cx: &mut gpui::TestAppContext) {
+        conversation_composer_visibility(cx, false, true);
+    }
+
+    #[gpui::test]
+    fn conversation_reply_composer_scrolls_into_view(cx: &mut gpui::TestAppContext) {
+        conversation_composer_visibility(cx, true, true);
+    }
+
+    #[gpui::test]
+    fn visible_conversation_composer_does_not_scroll(cx: &mut gpui::TestAppContext) {
+        conversation_composer_visibility(cx, false, false);
+    }
+
+    fn conversation_composer_visibility(
+        cx: &mut gpui::TestAppContext,
+        reply: bool,
+        near_fold: bool,
+    ) {
+        let fake = FakePr::with_threads(if reply {
+            vec![rc(
+                11,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "question",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            )]
+        } else {
+            vec![]
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut item = commenting_item(&fake);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        if near_fold {
+            data.pr_meta.as_mut().unwrap().body = "A tall description.\n\n".repeat(100);
+        }
+        let scroll = data.conv_scroll.clone();
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let selector = if reply {
+            "conversation-compose-0-11"
+        } else {
+            "conversation-compose-0-0"
+        };
+        let button = vcx.debug_bounds(selector).expect("comment button");
+        let viewport = scroll.bounds();
+        // Put the button just above the fold: replacing it with the much
+        // taller composer must reveal the full card, not just its input.
+        // In the other case, the short conversation already has enough room.
+        if near_fold {
+            scroll.set_offset(point(px(0.), viewport.bottom() - button.bottom() - px(8.)));
+        }
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let before = scroll.offset();
+        click_commenting(&mut vcx, selector);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let card = vcx.debug_bounds("composer-card").expect("open composer");
+        let viewport = scroll.bounds();
+        assert!(
+            card.top() >= viewport.top(),
+            "composer header is visible: {card:?} in {viewport:?}"
+        );
+        assert!(
+            card.bottom() <= viewport.bottom(),
+            "composer actions are visible: {card:?} in {viewport:?}"
+        );
+        if near_fold {
+            assert!(
+                scroll.offset().y < before.y,
+                "opening the card scrolls down"
+            );
+        } else {
+            assert_eq!(
+                scroll.offset(),
+                before,
+                "an already-visible card does not move the viewport"
+            );
+        }
+        // Revealing is one-shot; later redraws must not fight manual scrolling.
+        scroll.set_offset(point(px(0.), px(0.)));
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(scroll.offset().y, px(0.));
     }
 
     #[gpui::test]
