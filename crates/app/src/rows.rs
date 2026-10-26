@@ -94,11 +94,13 @@ pub(crate) enum Row {
         /// First row of the whole thread, so it draws the card's top edge.
         top: bool,
     },
-    /// One soft-wrapped line of a comment body (wrapped at
-    /// [`COMMENT_WRAP_CHARS`] when the rows are built).
+    /// A reservation for a Markdown block. `line` is the initial plain-text
+    /// height estimate; the decoration renders the unwrapped source once.
     CommentBody {
         line: SharedString,
         half: Option<CommentSide>,
+        text: Arc<crate::diff_media::CommentText>,
+        slot: usize,
     },
     /// One slot in an inline image reservation. The list decoration paints the
     /// whole card once, including when its first slot has scrolled offscreen.
@@ -174,7 +176,8 @@ pub(crate) fn cursor_anchor(rows: &[Row], row_ix: usize) -> Option<(CommentSide,
 }
 
 /// Index of the row with the widest min-content: the longest no-wrap text
-/// (diff lines, comment bodies, file-header paths). `uniform_list` measures
+/// (diff lines and file-header paths). Comment Markdown fits the viewport.
+/// `uniform_list` measures
 /// exactly one item to derive its horizontal scroll range, so the list must
 /// be pointed at this row — its default, row 0 (the file header), is always
 /// narrower than the viewport, which pins `offset.x` to zero. See
@@ -184,7 +187,6 @@ pub(crate) fn widest_row_ix(rows: &[Row]) -> usize {
         .enumerate()
         .max_by_key(|(_, row)| match row {
             Row::Line { text, .. } => text.chars().count(),
-            Row::CommentBody { line, .. } => line.chars().count(),
             Row::FileHeader { path, .. } => path.chars().count(),
             _ => 0,
         })
@@ -248,23 +250,31 @@ fn push_thread_rows(
                 // the actions row, so those two carry the card's edges.
                 top: ix == 0,
             });
-            let push_text = |rows: &mut Vec<Row>, text: &str| {
-                for line in wrap_body(text, wrap) {
+            let push_text = |rows: &mut Vec<Row>, source: &str, part: usize| {
+                let text = Arc::new(crate::diff_media::CommentText {
+                    comment_id: comment.id,
+                    part,
+                    source: source.into(),
+                });
+                for (slot, line) in wrap_body(source, wrap).into_iter().enumerate() {
                     rows.push(Row::CommentBody {
                         line: line.into(),
                         half,
+                        text: text.clone(),
+                        slot,
                     });
                 }
             };
             let images = crate::conversation::inline_images(&comment.body);
             if images.is_empty() {
-                push_text(rows, &comment.body);
+                push_text(rows, &comment.body, 0);
             } else {
                 let mut cursor = 0;
+                let trailing_part = images.len();
                 for (image_ix, media) in images.into_iter().enumerate() {
                     let text = &comment.body[cursor..media.range.start];
                     if !text.trim().is_empty() {
-                        push_text(rows, text.trim_matches(['\r', '\n']));
+                        push_text(rows, text.trim_matches(['\r', '\n']), image_ix);
                     }
                     cursor = media.range.end;
                     let media = Arc::new(media);
@@ -280,7 +290,7 @@ fn push_thread_rows(
                 }
                 let text = &comment.body[cursor..];
                 if !text.trim().is_empty() {
-                    push_text(rows, text.trim_matches(['\r', '\n']));
+                    push_text(rows, text.trim_matches(['\r', '\n']), trailing_part);
                 }
             }
         }
@@ -1318,16 +1328,9 @@ fn render_row_content(
                 },
             )
         }
-        Row::CommentBody { line, half } => comment_row(
-            div()
-                .whitespace_nowrap()
-                .text_color(theme::subtext())
-                .child(line.clone())
-                .into_any_element(),
-            *half,
-            false,
-            CardEdge::Middle,
-        ),
+        Row::CommentBody { half, .. } => {
+            comment_row(div().into_any_element(), *half, false, CardEdge::Middle)
+        }
         Row::CommentMedia { half, .. } => {
             comment_row(div().into_any_element(), *half, false, CardEdge::Middle)
         }
