@@ -222,7 +222,14 @@ fn render_node(
     window: &mut Window,
     cx: &mut Context<ReviewApp>,
 ) -> gpui::AnyElement {
-    let column = || div().w_full().min_w_0().flex().flex_col().gap(rems(0.75));
+    // Tight lists need only a small row gap, not a full paragraph break.
+    // Keep blank-line-separated (spread) lists/items and ordinary blocks roomy.
+    let gap = match node {
+        Node::List(list) if !list.spread => rems(0.25),
+        Node::ListItem(item) if !item.spread => rems(0.25),
+        _ => rems(0.75),
+    };
+    let column = || div().w_full().min_w_0().flex().flex_col().gap(gap);
     match node {
         Node::Root(_) | Node::ListItem(_) | Node::Blockquote(_) => {
             let mut block = column();
