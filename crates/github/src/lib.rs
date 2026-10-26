@@ -525,6 +525,42 @@ pub trait GitHubClient: Send + Sync {
             "pending reviews are not supported by this backend".into(),
         ))
     }
+    /// Persist a pending review's summary without submitting the review.
+    fn update_pending_body(
+        &self,
+        _loc: &PrLocator,
+        _review: &PendingReview,
+        _body: &str,
+    ) -> Result<(), ClientError> {
+        Err(ClientError::Failed(
+            "pending review summaries are not supported by this backend".into(),
+        ))
+    }
+    /// Publish a main PR conversation comment, not an anchored review comment.
+    fn post_conversation_comment(&self, _loc: &PrLocator, _body: &str) -> Result<(), ClientError> {
+        Err(ClientError::Failed(
+            "conversation comments are not supported by this backend".into(),
+        ))
+    }
+    /// As above, retaining the server identity for optimistic UI reconciliation.
+    /// Backends without a receipt may return None after a successful post.
+    fn post_conversation_comment_id(
+        &self,
+        loc: &PrLocator,
+        body: &str,
+    ) -> Result<Option<u64>, ClientError> {
+        self.post_conversation_comment(loc, body)?;
+        Ok(None)
+    }
+    fn post_reply_id(
+        &self,
+        loc: &PrLocator,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<Option<u64>, ClientError> {
+        self.post_reply(loc, comment_id, body)?;
+        Ok(None)
+    }
     fn add_pending_comment(
         &self,
         _loc: &PrLocator,

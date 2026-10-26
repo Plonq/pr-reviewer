@@ -68,6 +68,11 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - PR conversation (`⇧⌘←`): GFM description and chronological comments; reviews
   group their inline threads beneath the summary, with captured code context,
   expandable resolved stubs, and read-only reaction counts; cached offline
+- comment from the conversation, or reply inside a review thread (including
+  resolved/outdated threads); post immediately or start/add to a review.
+  Main-thread drafts append to the pending review summary; replies stay in-thread.
+  Posted comments appear immediately as placeholders and update in place when
+  the refreshed discussion arrives.
 - inline images and screenshots in conversations and diff comment threads,
   including private GitHub attachments using `gh auth token`; each SVG switches
   between rendered and source views

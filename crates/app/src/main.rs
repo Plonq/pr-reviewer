@@ -551,6 +551,7 @@ pub(crate) struct ItemData {
     /// and the scrollbar paints at the pane's edge — like the diff pane's.
     conv_scroll: ScrollHandle,
     discussion: Option<github::PrDiscussion>,
+    posts: conversation::posting::Posts,
     commits: Option<github::PrCommits>,
     commits_expanded: bool,
     expanded_threads: HashSet<String>,
@@ -632,6 +633,7 @@ impl ItemData {
             search: None,
             conv_scroll: ScrollHandle::new(),
             discussion: None,
+            posts: Default::default(),
             commits: None,
             commits_expanded: false,
             expanded_threads: HashSet::new(),
@@ -1037,6 +1039,9 @@ impl ReviewItem {
                 data.upgrades.clear();
                 data.expanded_regions.clear();
                 data.discussion = discussion;
+                if let Some(discussion) = &data.discussion {
+                    data.posts.reconcile(discussion);
+                }
                 data.commits = commits;
                 data.comments = match &data.local_review {
                     Some(local) => Some(local.index()),
@@ -1449,13 +1454,21 @@ fn seed_mentions(cell: &Rc<RefCell<Vec<github::Mention>>>, data: &ItemData) {
     }
 }
 
-/// The floating comment/reply composer. One at a time, targeting a specific
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ComposerPlacement {
+    Diff,
+    ConversationMain,
+    ConversationThread(String),
+}
+
+/// The comment/reply composer. One at a time, targeting a specific
 /// anchor of a specific item (it survives item switches but only renders —
 /// and can only post — for the item it was opened on).
 struct Composer {
     item_id: u64,
-    /// Some(root comment id) = reply to that thread; None = new top-level
-    /// comment at (path, side, line) against `commit_id`.
+    placement: ComposerPlacement,
+    /// Some(root comment id) = reply to that thread; None = a new anchored
+    /// comment, or a main-thread comment for ConversationMain placement.
     reply_to: Option<u64>,
     commit_id: String,
     path: String,
@@ -3408,7 +3421,7 @@ impl ReviewApp {
         item_id: u64,
         command: SessionCommand,
         cx: &mut Context<Self>,
-    ) -> Option<Task<(ReviewSession, Result<(), github::ClientError>)>> {
+    ) -> Option<Task<(ReviewSession, Result<Option<u64>, github::ClientError>)>> {
         let item = self.items.iter().find(|item| item.id == item_id)?;
         let Source::Pr(loc) = &item.source else {
             return None;
@@ -3425,7 +3438,7 @@ impl ReviewApp {
         let store = self.store.clone();
         cx.notify();
         Some(cx.background_spawn(async move {
-            let result = session.execute(github.as_ref(), &loc, command);
+            let result = session.execute_with_receipt(github.as_ref(), &loc, command);
             // Also mirror partial success (e.g. start succeeded, add failed).
             store.save_review_session(&loc, &session);
             (session, result)
@@ -3479,6 +3492,7 @@ impl ReviewApp {
         };
         cx.spawn(async move |this, cx| {
             let (session, result) = job.await;
+            let result = result.map(|_| ());
             this.update(cx, |app, cx| {
                 app.finish_session(item_id, session, &result, cx)
             })
@@ -3496,14 +3510,30 @@ impl ReviewApp {
         cx: &mut Context<Self>,
     ) {
         let submitted = matches!(command, SessionCommand::Submit { .. });
-        let replied = matches!(command, SessionCommand::Reply { .. });
+        let replied = matches!(
+            command,
+            SessionCommand::Reply { .. } | SessionCommand::ConversationReply { .. }
+        );
+        let commented = matches!(command, SessionCommand::Conversation { .. });
         let Some(job) = self.session_job(item_id, command, cx) else {
             return;
         };
         cx.spawn_in(window, async move |this, cx| {
             let (session, result) = job.await;
+            let receipt = result.as_ref().ok().copied().flatten();
+            let result = result.map(|_| ());
             this.update_in(cx, |app, window, cx| {
                 app.finish_session(item_id, session, &result, cx);
+                if let SessionCompletion::Composer(gen) = completion {
+                    if let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) {
+                        if let ItemState::Ready(data) = &mut item.state {
+                            data.posts.complete(gen, receipt);
+                            if let Some(discussion) = &data.discussion {
+                                data.posts.reconcile(discussion);
+                            }
+                        }
+                    }
+                }
                 match completion {
                     SessionCompletion::Composer(gen) if app.composer_gen == gen => match &result {
                         Ok(()) => app.close_composer(window, cx),
@@ -3525,7 +3555,7 @@ impl ReviewApp {
                     },
                     _ => {}
                 }
-                if (submitted || replied) && result.is_ok() {
+                if (submitted || replied || commented) && result.is_ok() {
                     if let Some(Source::Pr(loc)) = app
                         .items
                         .iter()
@@ -3555,6 +3585,29 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_comment_composer(
+            ComposerPlacement::Diff,
+            reply_to,
+            path,
+            side,
+            line,
+            row_ix,
+            window,
+            cx,
+        );
+    }
+
+    fn open_comment_composer(
+        &mut self,
+        placement: ComposerPlacement,
+        reply_to: Option<u64>,
+        path: String,
+        side: CommentSide,
+        line: u64,
+        row_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(item) = self.items.get(self.active) else {
             return;
         };
@@ -3569,7 +3622,7 @@ impl ReviewApp {
             .map(|meta| meta.head_ref_oid.clone())
             .unwrap_or_default();
         let mut position = None;
-        if reply_to.is_none() {
+        if reply_to.is_none() && placement != ComposerPlacement::ConversationMain {
             match &item.source {
                 Source::Pr(_) if commit_id.is_empty() => return,
                 Source::Pr(_) | Source::Local(_) => {}
@@ -3630,6 +3683,7 @@ impl ReviewApp {
         }
         self.composer = Some(Composer {
             item_id,
+            placement,
             reply_to,
             commit_id,
             path,
@@ -3717,6 +3771,8 @@ impl ReviewApp {
             "Add to review"
         } else if composer.reply_to.is_some() {
             "Reply"
+        } else if composer.placement == ComposerPlacement::ConversationMain {
+            "Comment"
         } else {
             "Add single comment"
         }
@@ -3745,6 +3801,55 @@ impl ReviewApp {
         // disabled button, including while pending-review reconciliation runs.
         if matches!(source, Source::Pr(_)) && self.sessions.get(&item_id).is_some_and(|ui| ui.busy)
         {
+            return;
+        }
+        if matches!(source, Source::Pr(_)) && composer.placement != ComposerPlacement::Diff {
+            let pending = self.composer_uses_pending_review(composer);
+            let reply_to = composer.reply_to;
+            let placement = composer.placement.clone();
+            let optimistic_body = body.clone();
+            let command = if let Some(comment_id) = composer.reply_to {
+                SessionCommand::ConversationReply {
+                    comment_id,
+                    commit_id: composer.commit_id.clone(),
+                    body,
+                    pending: composer.pending,
+                }
+            } else if pending {
+                SessionCommand::AddSummary {
+                    commit_id: composer.commit_id.clone(),
+                    body,
+                }
+            } else {
+                SessionCommand::Conversation { body }
+            };
+            let composer = self.composer.as_mut().unwrap();
+            composer.in_flight = true;
+            composer.error = None;
+            if !pending {
+                let author = match &self.account {
+                    AccountStatus::SignedIn(viewer) => viewer.login.clone(),
+                    _ => "you".into(),
+                };
+                if let Some(ItemState::Ready(data)) = self
+                    .items
+                    .iter_mut()
+                    .find(|item| item.id == item_id)
+                    .map(|item| &mut item.state)
+                {
+                    data.posts.begin(gen, reply_to, author, optimistic_body);
+                    if let ComposerPlacement::ConversationThread(id) = placement {
+                        data.expanded_threads.insert(id);
+                    }
+                }
+            }
+            self.run_session(
+                item_id,
+                command,
+                SessionCompletion::Composer(gen),
+                window,
+                cx,
+            );
             return;
         }
         let anchor = github::CommentAnchor {
@@ -3893,6 +3998,14 @@ impl ReviewApp {
                 };
                 match fetched {
                     Ok(discussion) => {
+                        data.posts.reconcile(&discussion);
+                        if item
+                            .refresh_error
+                            .as_ref()
+                            .is_some_and(|error| error.starts_with("comment refresh failed:"))
+                        {
+                            item.refresh_error = None;
+                        }
                         if let (Source::Pr(loc), Some(meta)) = (&item.source, &data.pr_meta) {
                             if let Ok(snapshot) = review_target::discussion_snapshot(
                                 loc,
@@ -4136,6 +4249,9 @@ impl ReviewApp {
         let Some(composer) = &self.composer else {
             return empty();
         };
+        if composer.placement != ComposerPlacement::Diff || self.show_queue {
+            return empty();
+        }
         // Only render for the item it was opened on, and only while active.
         if self.items.get(self.active).map(|item| item.id) != Some(composer.item_id) {
             return empty();
@@ -4156,33 +4272,52 @@ impl ReviewApp {
             data.mode,
             composer.side,
         );
-        let pending = self.composer_uses_pending_review(composer);
-        let session_busy = self
-            .sessions
-            .get(&composer.item_id)
-            .is_some_and(|ui| ui.busy);
-        let action = self.composer_submit_label(composer);
-        let target = format!(
-            "{}{}:{}{} ({})",
-            if composer.reply_to.is_some() {
-                "reply · "
-            } else {
-                ""
-            },
-            composer.path,
-            composer
-                .start_line
-                .map(|start| format!("{start}–"))
-                .unwrap_or_default(),
-            composer.line,
-            composer.side.api_str()
-        );
         div()
             .absolute()
             .left(px(x))
             .top(px(y))
             .w(px(520.))
             .occlude()
+            .shadow_lg()
+            .child(self.render_composer_card(cx))
+            .into_any_element()
+    }
+
+    fn render_composer_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let composer = self.composer.as_ref().expect("an open composer");
+        let pending = self.composer_uses_pending_review(composer);
+        let session_busy = self
+            .sessions
+            .get(&composer.item_id)
+            .is_some_and(|ui| ui.busy);
+        let action = self.composer_submit_label(composer);
+        let target = if composer.placement == ComposerPlacement::ConversationMain {
+            if pending {
+                "PR conversation · saved in your review summary"
+            } else {
+                "PR conversation"
+            }
+            .to_owned()
+        } else {
+            format!(
+                "{}{}:{}{} ({})",
+                if composer.reply_to.is_some() {
+                    "reply · "
+                } else {
+                    ""
+                },
+                composer.path,
+                composer
+                    .start_line
+                    .map(|start| format!("{start}–"))
+                    .unwrap_or_default(),
+                composer.line,
+                composer.side.api_str()
+            )
+        };
+        div()
+            .w_full()
+            .min_w_0()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             // The input propagates Escape when it has nothing of its own to
             // dismiss; catch it here (before the root's handler) to cancel.
@@ -4193,7 +4328,6 @@ impl ReviewApp {
             .border_1()
             .border_color(theme::surface0())
             .bg(theme::mantle())
-            .shadow_lg()
             .p_2()
             .flex()
             .flex_col()
@@ -4242,7 +4376,8 @@ impl ReviewApp {
                             })),
                     )
                     .when(
-                        composer.reply_to.is_none()
+                        (composer.reply_to.is_none()
+                            || composer.placement != ComposerPlacement::Diff)
                             && composer.edit_id.is_none()
                             && !pending
                             && matches!(
@@ -4251,16 +4386,20 @@ impl ReviewApp {
                             ),
                         |row| {
                             row.child(
-                                Button::new("composer-add-to-review")
-                                    .label("Start review")
-                                    .small()
-                                    .disabled(composer.in_flight || session_busy)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        if let Some(composer) = &mut this.composer {
-                                            composer.pending = true;
-                                        }
-                                        this.submit_composer(window, cx);
-                                    })),
+                                div()
+                                    .debug_selector(|| "composer-start-review".into())
+                                    .child(
+                                        Button::new("composer-add-to-review")
+                                            .label("Start review")
+                                            .small()
+                                            .disabled(composer.in_flight || session_busy)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                if let Some(composer) = &mut this.composer {
+                                                    composer.pending = true;
+                                                }
+                                                this.submit_composer(window, cx);
+                                            })),
+                                    ),
                             )
                         },
                     ),
@@ -6117,7 +6256,40 @@ impl ReviewApp {
                             .py_6()
                             .child(content)
                             .child(self.render_commits(item, data, cx))
-                            .children(self.render_discussion(item, data, window, cx)),
+                            .children(self.render_discussion(item, data, window, cx))
+                            .when_some(
+                                self.sessions
+                                    .get(&item.id)
+                                    .and_then(|ui| ui.state.pending.as_ref())
+                                    .filter(|review| !review.body.trim().is_empty()),
+                                |column, review| {
+                                    column.child(
+                                        div()
+                                            .mt_6()
+                                            .p_4()
+                                            .border_1()
+                                            .border_color(theme::surface0())
+                                            .rounded_md()
+                                            .child(div().mb_2().text_color(theme::yellow()).child(
+                                                "Pending review summary · only you can see this",
+                                            ))
+                                            .child(conversation::render_markdown(
+                                                &format!("conversation-summary-{}", item.id),
+                                                conversation::preprocess(
+                                                    &review.body,
+                                                    &loc.repo_slug(),
+                                                ),
+                                                window,
+                                                cx,
+                                            )),
+                                    )
+                                },
+                            )
+                            .child(
+                                div()
+                                    .mt_6()
+                                    .child(self.conversation_composer(item.id, None, cx)),
+                            ),
                     ),
             )
             .child(Scrollbar::vertical(&data.conv_scroll))
@@ -6365,6 +6537,16 @@ impl Render for ReviewApp {
                             // quiet and the queue's (j/k, r) fire instead.
                             .key_context(if self.show_queue {
                                 "Queue"
+                            } else if self.composer.as_ref().is_some_and(|composer| {
+                                composer.placement != ComposerPlacement::Diff
+                                    && self.active_item().is_some_and(|item| {
+                                        item.id == composer.item_id
+                                            && item.pane == ItemPane::Conversation
+                                    })
+                            }) {
+                                // Inline conversation inputs must not inherit
+                                // the diff's single-letter shortcuts.
+                                "ConversationComposer"
                             } else {
                                 "ReviewApp"
                             })
@@ -9295,6 +9477,9 @@ mod tests {
             comment_id: u64,
             body: String,
         },
+        Conversation {
+            body: String,
+        },
         Review {
             verdict: github::ReviewVerdict,
             body: String,
@@ -9308,9 +9493,12 @@ mod tests {
     #[derive(Default)]
     struct FakePr {
         comments: std::sync::Mutex<Vec<github::ReviewComment>>,
+        conversation: std::sync::Mutex<Vec<github::DiscussionComment>>,
         posted: std::sync::Mutex<Vec<Post>>,
         /// While set, posting a new comment fails — the inline-error path.
         fail: std::sync::atomic::AtomicBool,
+        stale_discussion: std::sync::atomic::AtomicBool,
+        fail_discussion: std::sync::atomic::AtomicBool,
         /// The id the next posted comment gets.
         next_id: std::sync::atomic::AtomicU64,
         pending: std::sync::Mutex<Option<github::PendingReview>>,
@@ -9334,6 +9522,105 @@ mod tests {
     }
 
     impl github::GitHubClient for FakePr {
+        fn pr_discussion(
+            &self,
+            _loc: &github::PrLocator,
+        ) -> Result<github::PrDiscussion, github::ClientError> {
+            if self
+                .fail_discussion
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(github::ClientError::Failed(
+                    "discussion refresh failed".into(),
+                ));
+            }
+            let mut discussion =
+                github::PrDiscussion::from_review_comments(self.comments.lock().unwrap().clone());
+            discussion.comments = self.conversation.lock().unwrap().clone();
+            if self
+                .stale_discussion
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                discussion.comments.retain(|comment| comment.id < 100);
+                for thread in &mut discussion.threads {
+                    thread.comments.retain(|comment| comment.id < 100);
+                }
+            }
+            Ok(discussion)
+        }
+
+        fn post_conversation_comment_id(
+            &self,
+            loc: &github::PrLocator,
+            body: &str,
+        ) -> Result<Option<u64>, github::ClientError> {
+            self.post_conversation_comment(loc, body)?;
+            Ok(self
+                .conversation
+                .lock()
+                .unwrap()
+                .last()
+                .map(|comment| comment.id))
+        }
+
+        fn post_reply_id(
+            &self,
+            loc: &github::PrLocator,
+            comment_id: u64,
+            body: &str,
+        ) -> Result<Option<u64>, github::ClientError> {
+            self.post_reply(loc, comment_id, body)?;
+            Ok(self
+                .comments
+                .lock()
+                .unwrap()
+                .last()
+                .map(|comment| comment.id))
+        }
+
+        fn post_conversation_comment(
+            &self,
+            _loc: &github::PrLocator,
+            body: &str,
+        ) -> Result<(), github::ClientError> {
+            self.posted
+                .lock()
+                .unwrap()
+                .push(Post::Conversation { body: body.into() });
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(github::ClientError::Failed("comment rejected".into()));
+            }
+            self.conversation
+                .lock()
+                .unwrap()
+                .push(github::DiscussionComment {
+                    id: self
+                        .next_id
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 100,
+                    author: "tester".into(),
+                    body: body.into(),
+                    created_at: "2026-10-25T00:00:00Z".into(),
+                    reactions: vec![],
+                    review_state: None,
+                    review_id: None,
+                });
+            Ok(())
+        }
+
+        fn update_pending_body(
+            &self,
+            _loc: &github::PrLocator,
+            _review: &github::PendingReview,
+            body: &str,
+        ) -> Result<(), github::ClientError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(github::ClientError::Failed("summary rejected".into()));
+            }
+            self.pending.lock().unwrap().as_mut().unwrap().body = body.into();
+            Ok(())
+        }
+
         fn pr_commits(
             &self,
             _loc: &github::PrLocator,
@@ -10062,6 +10349,478 @@ mod tests {
             8.
         );
         assert_eq!(composer_x(0., 480., ViewMode::Split, CommentSide::Left), 8.);
+    }
+
+    fn commenting_item(fake: &FakePr) -> ReviewItem {
+        let comments = fake.comments.lock().unwrap().clone();
+        let mut item = loop_pr_item(comments.clone());
+        item.pane = ItemPane::Conversation;
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.pr_meta.as_mut().unwrap().body.clear();
+        data.commits = Some(github::PrCommits { commits: vec![] });
+        data.discussion = Some(github::PrDiscussion::from_review_comments(comments));
+        item
+    }
+
+    fn click_commenting(vcx: &mut gpui::VisualTestContext, selector: &'static str) {
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        let point = bounds.center();
+        vcx.simulate_mouse_move(point, None, gpui::Modifiers::default());
+        vcx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
+        vcx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn conversation_main_comment_posts_and_refreshes_timeline(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, commenting_item(&fake), cx);
+        // Include conflicting diff shortcuts: normal text must stay text.
+        cx.update(|cx| {
+            cx.bind_keys([
+                KeyBinding::new("c", ToggleComments, Some("ReviewApp")),
+                KeyBinding::new("r", Refresh, Some("ReviewApp")),
+                KeyBinding::new("cmd-enter", SubmitReview, Some("ReviewApp")),
+            ])
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        click_commenting(&mut vcx, "conversation-compose-0-0");
+        vcx.simulate_input("conversation feedback");
+        vcx.simulate_keystrokes("c r");
+        cx.update(|cx| {
+            let composer = app.read(cx).composer.as_ref().unwrap();
+            assert_eq!(composer.placement, ComposerPlacement::ConversationMain);
+            assert_eq!(
+                composer.input.read(cx).value().as_str(),
+                "conversation feedbackcr"
+            );
+        });
+        vcx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Conversation {
+                body: "conversation feedbackcr".into()
+            }]
+        );
+        cx.update(|cx| {
+            let app = app.read(cx);
+            assert!(app.composer.is_none());
+            let discussion = app.active_data().unwrap().discussion.as_ref().unwrap();
+            assert!(matches!(&conversation::timeline(discussion)[..], [conversation::Entry::Comment(c)] if c.body == "conversation feedbackcr"));
+            assert!(discussion.threads.is_empty());
+            assert_eq!(app.store.snapshot("acme/widgets", 7).unwrap().discussion.unwrap()["comments"][0]["body"], "conversation feedbackcr");
+        });
+    }
+
+    #[gpui::test]
+    fn conversation_replies_target_outdated_resolved_thread_roots(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "deleted.rs",
+            Some("LEFT"),
+            None,
+            "historical question",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut item = commenting_item(&fake);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.discussion.as_mut().unwrap().threads[0].is_resolved = true;
+        data.expanded_threads.insert("11".into());
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        click_commenting(&mut vcx, "conversation-compose-0-11");
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                let composer = this.composer.as_ref().unwrap();
+                assert_eq!(
+                    composer.placement,
+                    ComposerPlacement::ConversationThread("11".into())
+                );
+                assert_eq!(composer.reply_to, Some(11));
+                assert_eq!(composer.line, 0, "no current line is required to reply");
+                composer
+                    .input
+                    .update(cx, |state, cx| state.set_value("answered here", window, cx));
+                this.submit_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Reply {
+                comment_id: 11,
+                body: "answered here".into()
+            }]
+        );
+        cx.update(|cx| {
+            let app = app.read(cx);
+            let discussion = app.active_data().unwrap().discussion.as_ref().unwrap();
+            assert!(
+                discussion.comments.is_empty(),
+                "a reply never becomes a main-thread comment"
+            );
+            assert_eq!(discussion.threads[0].comments.len(), 2);
+            assert_eq!(discussion.threads[0].comments[1].body, "answered here");
+            assert!(app.composer.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn conversation_drafts_preserve_web_summary_and_reply_thread(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "question",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        *fake.pending.lock().unwrap() = Some(github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: "web summary".into(),
+            comments: vec![],
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, commenting_item(&fake), cx);
+        cx.update(|cx| app.update(cx, |this, cx| this.resume_session(0, cx)));
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open_comment_composer(
+                    ComposerPlacement::ConversationMain,
+                    None,
+                    String::new(),
+                    CommentSide::Right,
+                    0,
+                    0,
+                    window,
+                    cx,
+                );
+                let composer = this.composer.as_ref().unwrap();
+                assert_eq!(this.composer_submit_label(composer), "Add to review");
+                composer
+                    .input
+                    .update(cx, |state, cx| state.set_value("extra summary", window, cx));
+                this.submit_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                assert!(this.composer.is_none());
+                assert_eq!(
+                    this.sessions[&0].state.pending.as_ref().unwrap().body,
+                    "web summary\n\nextra summary"
+                );
+                this.open_comment_composer(
+                    ComposerPlacement::ConversationThread("11".into()),
+                    Some(11),
+                    "a.rs".into(),
+                    CommentSide::Right,
+                    1,
+                    0,
+                    window,
+                    cx,
+                );
+                let composer = this.composer.as_ref().unwrap();
+                assert_eq!(this.composer_submit_label(composer), "Add to review");
+                composer
+                    .input
+                    .update(cx, |state, cx| state.set_value("draft reply", window, cx));
+                this.submit_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(fake.posts().is_empty());
+        cx.update(|cx| {
+            let app = app.read(cx);
+            let review = app.store.review_session(&loop_loc()).pending.unwrap();
+            assert_eq!(review.body, "web summary\n\nextra summary");
+            assert_eq!(review.comments[0].in_reply_to_id, Some(11));
+            assert_eq!(review.comments[0].body, "draft reply");
+            assert!(
+                app.active_data()
+                    .unwrap()
+                    .discussion
+                    .as_ref()
+                    .unwrap()
+                    .threads[0]
+                    .comments
+                    .len()
+                    == 1
+            );
+        });
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        // The summary is prefilled and submitted by the existing finish-review flow.
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open_review(window, cx);
+                assert_eq!(
+                    this.review
+                        .as_ref()
+                        .unwrap()
+                        .input
+                        .read(cx)
+                        .value()
+                        .as_str(),
+                    "web summary\n\nextra summary"
+                );
+                this.submit_review(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Review {
+                verdict: github::ReviewVerdict::Approve,
+                body: "web summary\n\nextra summary".into()
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn conversation_main_can_start_a_review(cx: &mut gpui::TestAppContext) {
+        conversation_start_review(cx, false);
+    }
+
+    #[gpui::test]
+    fn conversation_reply_can_start_a_review(cx: &mut gpui::TestAppContext) {
+        conversation_start_review(cx, true);
+    }
+
+    fn conversation_start_review(cx: &mut gpui::TestAppContext, reply: bool) {
+        let fake = FakePr::with_threads(if reply {
+            vec![rc(
+                11,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "question",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            )]
+        } else {
+            vec![]
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, commenting_item(&fake), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        click_commenting(
+            &mut vcx,
+            if reply {
+                "conversation-compose-0-11"
+            } else {
+                "conversation-compose-0-0"
+            },
+        );
+        cx.update(|cx| {
+            let app = app.read(cx);
+            assert_eq!(
+                app.composer_submit_label(app.composer.as_ref().unwrap()),
+                if reply { "Reply" } else { "Comment" }
+            );
+        });
+        vcx.simulate_input("draft feedback");
+        click_commenting(&mut vcx, "composer-start-review");
+        assert!(fake.posts().is_empty(), "Start review never publishes");
+        cx.update(|cx| {
+            let app = app.read(cx);
+            assert!(app.composer.is_none(), "the draft was saved");
+            let review = app.store.review_session(&loop_loc()).pending.unwrap();
+            if reply {
+                assert_eq!(review.comments.len(), 1);
+                assert_eq!(review.comments[0].in_reply_to_id, Some(11));
+                assert_eq!(review.comments[0].body, "draft feedback");
+            } else {
+                assert_eq!(review.body, "draft feedback");
+                assert!(review.comments.is_empty());
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn conversation_main_placeholder_updates_in_place_after_delayed_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        conversation_placeholder(cx, false);
+    }
+
+    #[gpui::test]
+    fn conversation_reply_placeholder_stays_in_thread_until_loaded(cx: &mut gpui::TestAppContext) {
+        conversation_placeholder(cx, true);
+    }
+
+    fn conversation_placeholder(cx: &mut gpui::TestAppContext, reply: bool) {
+        let fake = FakePr::with_threads(if reply {
+            vec![rc(
+                11,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "question",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            )]
+        } else {
+            vec![]
+        });
+        fake.stale_discussion
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, commenting_item(&fake), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        click_commenting(
+            &mut vcx,
+            if reply {
+                "conversation-compose-0-11"
+            } else {
+                "conversation-compose-0-0"
+            },
+        );
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.composer
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |state, cx| {
+                        state.set_value("visible immediately", window, cx)
+                    });
+                this.submit_composer(window, cx);
+                let data = this.active_data().unwrap();
+                assert_eq!(
+                    data.posts.pending.len(),
+                    1,
+                    "the placeholder exists before any network response"
+                );
+                let post = &data.posts.pending[0];
+                assert_eq!(post.token, 1);
+                assert_eq!(post.reply_to, reply.then_some(11));
+                assert_eq!(post.comment.body, "visible immediately");
+                assert_eq!(post.comment.created_at, "Posting…");
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app.read(cx);
+            assert!(app.composer.is_none());
+            let data = app.active_data().unwrap();
+            assert_eq!(
+                data.posts.pending.len(),
+                1,
+                "a successful POST plus a stale GET must not make the comment disappear"
+            );
+            assert_eq!(
+                data.posts.pending[0].comment.created_at,
+                "Posted · syncing…"
+            );
+            assert!(data.discussion.as_ref().unwrap().comments.is_empty());
+            assert_eq!(
+                app.store
+                    .snapshot("acme/widgets", 7)
+                    .unwrap()
+                    .discussion
+                    .unwrap()["comments"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0,
+                "placeholders are not cached as published comments"
+            );
+        });
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let placeholder_bounds = vcx
+            .debug_bounds("discussion-0-post-1")
+            .expect("placeholder rendered in the conversation");
+        // A failed GET must retain the already-posted placeholder too, without
+        // retrying the write or reopening the composer.
+        fake.fail_discussion
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        cx.update(|cx| app.update(cx, |this, cx| this.refetch_comments(0, loop_loc(), cx)));
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(app.read(cx).active_data().unwrap().posts.pending.len(), 1));
+        fake.fail_discussion
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        fake.stale_discussion
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        cx.update(|cx| app.update(cx, |this, cx| this.refetch_comments(0, loop_loc(), cx)));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app.read(cx);
+            let data = app.active_data().unwrap();
+            assert!(data.posts.pending.is_empty());
+            let discussion = data.discussion.as_ref().unwrap();
+            if reply {
+                assert!(discussion.comments.is_empty());
+                assert_eq!(discussion.threads[0].comments.len(), 2);
+            } else {
+                assert_eq!(discussion.comments.len(), 1);
+                assert!(discussion.threads.is_empty());
+            }
+        });
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let loaded_bounds = vcx
+            .debug_bounds("discussion-0-post-1")
+            .expect("loaded comment reuses the placeholder identity");
+        assert_eq!(
+            loaded_bounds.origin, placeholder_bounds.origin,
+            "the loaded comment replaces the placeholder in place"
+        );
+        assert_eq!(fake.posts().len(), 1, "refreshing must never repost");
+    }
+
+    #[gpui::test]
+    fn conversation_failed_comment_keeps_text_and_escape_cancels(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(vec![]);
+        fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, commenting_item(&fake), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        click_commenting(&mut vcx, "conversation-compose-0-0");
+        vcx.simulate_input("keep this text");
+        vcx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app.read(cx);
+            let composer = app.composer.as_ref().unwrap();
+            assert!(!composer.in_flight);
+            assert!(composer.error.is_some());
+            assert_eq!(composer.input.read(cx).value().trim(), "keep this text");
+            assert!(
+                app.active_data().unwrap().posts.pending.is_empty(),
+                "a failed post does not leave a fake published comment"
+            );
+        });
+        vcx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|cx| assert!(app.read(cx).composer.is_none()));
+        assert_eq!(fake.posts().len(), 1);
     }
 
     /// The loop's first leg: `C` opens the composer on the selected line,

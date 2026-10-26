@@ -20,6 +20,7 @@
 
 mod markdown;
 mod media;
+pub(crate) mod posting;
 pub(crate) use markdown::inline_images;
 pub(crate) use markdown::render as render_markdown;
 pub(crate) use media::{render_inline, Media};
@@ -254,13 +255,82 @@ pub(crate) fn anchor(thread: &github::ReviewThread) -> String {
     )
 }
 
-use crate::{text_size, theme, ItemData, ItemState, ReviewApp, ReviewItem, Source};
+use crate::{
+    text_size, theme, CommentSide, ComposerPlacement, ItemData, ItemState, ReviewApp, ReviewItem,
+    Source,
+};
 use gpui::{
     div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window,
 };
+use gpui_component::{button::Button, Disableable, Sizable};
 
 impl ReviewApp {
+    pub(crate) fn conversation_composer(
+        &self,
+        item_id: u64,
+        thread: Option<&github::ReviewThread>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let placement = thread.map_or(ComposerPlacement::ConversationMain, |thread| {
+            ComposerPlacement::ConversationThread(thread.id.clone())
+        });
+        if self
+            .composer
+            .as_ref()
+            .is_some_and(|composer| composer.item_id == item_id && composer.placement == placement)
+        {
+            return self.render_composer_card(cx);
+        }
+        let reply_to = thread
+            .and_then(|thread| thread.comments.first())
+            .map(|c| c.id);
+        let path = thread.map_or(String::new(), |thread| thread.path.clone());
+        let side = if thread.is_some_and(|thread| thread.side == "LEFT") {
+            CommentSide::Left
+        } else {
+            CommentSide::Right
+        };
+        // A reply addresses the root identity, even for resolved/outdated
+        // threads whose file or line no longer exists in the current diff.
+        let line = thread
+            .and_then(|thread| thread.line.or(thread.original_line))
+            .unwrap_or(0);
+        div()
+            .debug_selector(move || {
+                format!("conversation-compose-{item_id}-{}", reply_to.unwrap_or(0))
+            })
+            .child(
+                Button::new(SharedString::from(format!(
+                    "conversation-compose-{item_id}-{}",
+                    reply_to.unwrap_or(0)
+                )))
+                .label(if thread.is_some() {
+                    "Reply"
+                } else {
+                    "Leave a comment"
+                })
+                .small()
+                .disabled(self.composer.is_some() || self.review.is_some())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.active_item().map(|item| item.id) != Some(item_id) {
+                        return;
+                    }
+                    this.open_comment_composer(
+                        placement.clone(),
+                        reply_to,
+                        path.clone(),
+                        side,
+                        line,
+                        0,
+                        window,
+                        cx,
+                    );
+                })),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn render_commits(
         &self,
         item: &ReviewItem,
@@ -397,13 +467,21 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
-        let (Some(discussion), Source::Pr(loc)) = (&data.discussion, &item.source) else {
+        let Source::Pr(loc) = &item.source else {
             return Vec::new();
         };
+        let empty = github::PrDiscussion::default();
+        let discussion = data.discussion.as_ref().unwrap_or(&empty);
         let slug = loc.repo_slug();
         let mut elements = Vec::new();
         let entries = timeline(discussion);
-        if entries.is_empty() {
+        if entries.is_empty()
+            && !data
+                .posts
+                .pending
+                .iter()
+                .any(|post| post.reply_to.is_none())
+        {
             elements.push(
                 div()
                     .mt_6()
@@ -462,6 +540,32 @@ impl ReviewApp {
                 ),
             }
         }
+        for post in data
+            .posts
+            .pending
+            .iter()
+            .filter(|post| post.reply_to.is_none())
+        {
+            elements.push(
+                div()
+                    .mt_6()
+                    .w_full()
+                    .min_w_0()
+                    .border_1()
+                    .border_color(theme::surface0())
+                    .rounded_md()
+                    .p_4()
+                    .child(self.discussion_comment(
+                        item.id,
+                        "optimistic",
+                        &post.comment,
+                        &slug,
+                        window,
+                        cx,
+                    ))
+                    .into_any_element(),
+            );
+        }
         elements
     }
 
@@ -474,7 +578,12 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let expanded = !thread.is_resolved || data.expanded_threads.contains(&thread.id);
+        let composing = self.composer.as_ref().is_some_and(|composer| {
+            composer.item_id == item.id
+                && composer.placement == ComposerPlacement::ConversationThread(thread.id.clone())
+        });
+        let expanded =
+            composing || !thread.is_resolved || data.expanded_threads.contains(&thread.id);
         let item_id = item.id;
         let thread_id = thread.id.clone();
         let summary = format!(
@@ -492,7 +601,7 @@ impl ReviewApp {
             thread.comments[0].author,
             thread.comments.len(),
             if thread.comments.len() == 1 { "" } else { "s" },
-            if thread.is_resolved {
+            if thread.is_resolved && !composing {
                 if expanded {
                     " · collapse"
                 } else {
@@ -515,7 +624,7 @@ impl ReviewApp {
             .text_color(theme::subtext())
             .overflow_hidden()
             .child(div().truncate().child(summary));
-        if thread.is_resolved {
+        if thread.is_resolved && !composing {
             header = header
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -602,6 +711,65 @@ impl ReviewApp {
                         ),
                 );
             }
+            for post in data
+                .posts
+                .pending
+                .iter()
+                .filter(|post| post.reply_to == Some(thread.comments[0].id))
+            {
+                card = card.child(
+                    div()
+                        .p_4()
+                        .border_t_1()
+                        .border_color(theme::surface0())
+                        .child(self.discussion_comment(
+                            item.id,
+                            "optimistic",
+                            &post.comment,
+                            slug,
+                            window,
+                            cx,
+                        )),
+                );
+            }
+            if let Some(review) = self
+                .sessions
+                .get(&item.id)
+                .and_then(|ui| ui.state.pending.as_ref())
+            {
+                let root_id = thread.comments[0].id;
+                for draft in review
+                    .comments
+                    .iter()
+                    .filter(|draft| draft.in_reply_to_id == Some(root_id))
+                {
+                    card = card.child(
+                        div()
+                            .p_4()
+                            .border_t_1()
+                            .border_color(theme::surface0())
+                            .child(
+                                div()
+                                    .mb_2()
+                                    .text_color(theme::yellow())
+                                    .child("Pending reply · only you can see this"),
+                            )
+                            .child(render_markdown(
+                                &format!("conversation-draft-{}-{}", item.id, draft.id),
+                                preprocess(&draft.body, slug),
+                                window,
+                                cx,
+                            )),
+                    );
+                }
+            }
+            card = card.child(
+                div()
+                    .p_4()
+                    .border_t_1()
+                    .border_color(theme::surface0())
+                    .child(self.conversation_composer(item.id, Some(thread), cx)),
+            );
         }
         card.into_any_element()
     }
@@ -622,23 +790,36 @@ impl ReviewApp {
             Some(_) => " · reviewed",
             None => "",
         };
-        let mut card = div().w_full().min_w_0().child(
-            div()
-                .mb_2()
-                .text_color(theme::subtext())
-                .text_size(px(text_size() - 1.))
-                .child(format!(
-                    "@{} · {}{verdict}",
-                    comment.author, comment.created_at
-                )),
-        );
+        let key = self
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .and_then(|item| {
+                if let ItemState::Ready(data) = &item.state {
+                    Some(data.posts.key(kind, comment))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| format!("{kind}-{}", comment.id));
+        let mut card = div()
+            .id(SharedString::from(format!("discussion-{item_id}-{key}")))
+            .debug_selector(|| format!("discussion-{item_id}-{key}"))
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .mb_2()
+                    .text_color(theme::subtext())
+                    .text_size(px(text_size() - 1.))
+                    .child(format!(
+                        "@{} · {}{verdict}",
+                        comment.author, comment.created_at
+                    )),
+            );
         if markdown::has_content(&comment.body) {
             card = card.child(render_markdown(
-                &format!(
-                    "discussion-{item_id}-{kind}-{}-{}",
-                    comment.review_state.is_some(),
-                    comment.id
-                ),
+                &format!("discussion-{item_id}-{key}"),
                 preprocess(&comment.body, slug),
                 window,
                 cx,

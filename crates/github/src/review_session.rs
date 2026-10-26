@@ -133,6 +133,22 @@ pub enum Command {
         comment_id: u64,
         body: String,
     },
+    /// Append a main-thread draft to the review summary, preserving web drafts.
+    AddSummary {
+        commit_id: String,
+        body: String,
+    },
+    /// Reply immediately unless reconciliation finds an existing review.
+    /// An explicit start-review choice also creates a draft when necessary.
+    ConversationReply {
+        comment_id: u64,
+        commit_id: String,
+        body: String,
+        pending: bool,
+    },
+    Conversation {
+        body: String,
+    },
     Edit {
         id: u64,
         body: String,
@@ -176,18 +192,38 @@ impl ReviewSession {
         loc: &PrLocator,
         command: Command,
     ) -> Result<(), ClientError> {
+        self.execute_with_receipt(client, loc, command).map(|_| ())
+    }
+
+    /// Returns the published comment's identity when the backend supplies it.
+    /// Pending-review mutations return None: their drafts are already in state.
+    pub fn execute_with_receipt(
+        &mut self,
+        client: &dyn GitHubClient,
+        loc: &PrLocator,
+        command: Command,
+    ) -> Result<Option<u64>, ClientError> {
         // Immediate comments never start, resume, modify, or submit a draft.
         if let Command::Immediate { anchor, body } = command {
             anchor.validate()?;
             nonempty(&body)?;
-            return client.post_anchored_comment(loc, &anchor, body.trim());
+            return client
+                .post_anchored_comment(loc, &anchor, body.trim())
+                .map(|_| None);
+        }
+        if let Command::Conversation { body } = command {
+            nonempty(&body)?;
+            return client.post_conversation_comment_id(loc, body.trim());
         }
         match &command {
             Command::Add { anchor, body } => {
                 anchor.validate()?;
                 nonempty(body)?;
             }
-            Command::Edit { body, .. } | Command::Reply { body, .. } => nonempty(body)?,
+            Command::Edit { body, .. }
+            | Command::Reply { body, .. }
+            | Command::AddSummary { body, .. }
+            | Command::ConversationReply { body, .. } => nonempty(body)?,
             _ => {}
         }
         self.verified = false;
@@ -224,6 +260,41 @@ impl ReviewSession {
                     client.post_reply(loc, comment_id, body.trim())?;
                 }
             }
+            Command::ConversationReply {
+                comment_id,
+                commit_id,
+                body,
+                pending,
+            } => {
+                if pending && self.pending.is_none() {
+                    if commit_id.is_empty() {
+                        return Err(ClientError::Invalid("missing head commit".into()));
+                    }
+                    self.pending = Some(client.start_review(loc, &commit_id)?);
+                }
+                if let Some(review) = &mut self.pending {
+                    let comment = client.add_pending_reply(loc, review, comment_id, body.trim())?;
+                    review.comments.push(comment);
+                } else {
+                    return client.post_reply_id(loc, comment_id, body.trim());
+                }
+            }
+            Command::AddSummary { commit_id, body } => {
+                if self.pending.is_none() {
+                    if commit_id.is_empty() {
+                        return Err(ClientError::Invalid("missing head commit".into()));
+                    }
+                    self.pending = Some(client.start_review(loc, &commit_id)?);
+                }
+                let review = self.pending.as_mut().unwrap();
+                let summary = if review.body.trim().is_empty() {
+                    body.trim().to_owned()
+                } else {
+                    format!("{}\n\n{}", review.body, body.trim())
+                };
+                client.update_pending_body(loc, review, &summary)?;
+                review.body = summary;
+            }
             Command::Delete { id } => {
                 let comment = self.comment_mut(id)?;
                 client.delete_pending_comment(loc, comment)?;
@@ -243,9 +314,9 @@ impl ReviewSession {
                 }
                 self.pending = None;
             }
-            Command::Immediate { .. } => unreachable!(),
+            Command::Immediate { .. } | Command::Conversation { .. } => unreachable!(),
         }
-        Ok(())
+        Ok(None)
     }
 
     fn comment_mut(&mut self, id: u64) -> Result<&mut PendingComment, ClientError> {
