@@ -7483,6 +7483,78 @@ mod tests {
     }
 
     #[gpui::test]
+    fn conversation_lists_use_compact_gaps_without_compressing_paragraphs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let first = "A long list item that wraps onto multiple lines. ".repeat(8);
+        for (list, loose, nested) in [
+            (format!("- {first}\n- Second."), false, false),
+            (format!("10. {first}\n11. Second."), false, false),
+            (format!("- [x] {first}\n- [ ] Second."), false, false),
+            (
+                format!("- {first}\n  - Nested first.\n  - Nested second.\n- Second."),
+                false,
+                true,
+            ),
+            (
+                format!("- {first}\n\n  Another paragraph.\n\n- Second."),
+                true,
+                false,
+            ),
+        ] {
+            let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            let mut item = loop_pr_item(Vec::new());
+            item.pane = ItemPane::Conversation;
+            let ItemState::Ready(data) = &mut item.state else {
+                unreachable!()
+            };
+            data.pr_meta.as_mut().unwrap().body = format!("Before.\n\n{list}\n\nAfter.");
+            install_item(&app, item, cx);
+            for width in [1400., 1000.] {
+                vcx.simulate_resize(size(px(width), px(2200.)));
+                let rem = vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                    window.rem_size()
+                });
+                let before = vcx.debug_bounds("conversation-0-0-text").unwrap();
+                let first = vcx.debug_bounds("conversation-0-1-0-body").unwrap();
+                let second = vcx.debug_bounds("conversation-0-1-1-body").unwrap();
+                let after = vcx.debug_bounds("conversation-0-2-text").unwrap();
+                let paragraph_gap = rem * 0.75;
+                let compact_gap = rem * 0.25;
+                let expected = if loose { paragraph_gap } else { compact_gap };
+                let assert_gap = |actual: gpui::Pixels, expected: gpui::Pixels| {
+                    assert!(
+                        (actual - expected).abs() <= px(1.),
+                        "expected gap {expected:?}, got {actual:?} in {list:?}"
+                    );
+                };
+                assert_gap(second.top() - first.bottom(), expected);
+                assert_gap(first.top() - before.bottom(), paragraph_gap);
+                assert_gap(after.top() - second.bottom(), paragraph_gap);
+                let paragraph = vcx.debug_bounds("conversation-0-1-0-0-text").unwrap();
+                assert!(
+                    paragraph.size.height > second.size.height,
+                    "the first item wraps rather than clipping to one line"
+                );
+                if loose {
+                    let next = vcx.debug_bounds("conversation-0-1-0-1-text").unwrap();
+                    assert_gap(next.top() - paragraph.bottom(), paragraph_gap);
+                }
+                if nested {
+                    let nested_first = vcx.debug_bounds("conversation-0-1-0-1-0-body").unwrap();
+                    let nested_second = vcx.debug_bounds("conversation-0-1-0-1-1-body").unwrap();
+                    assert_gap(nested_first.top() - paragraph.bottom(), compact_gap);
+                    assert_gap(nested_second.top() - nested_first.bottom(), compact_gap);
+                    assert!(nested_first.left() > first.left(), "nested lists indent");
+                    assert!(first.bottom() >= nested_second.bottom());
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
     fn conversation_list_paragraphs_and_thread_headers_have_nonoverlapping_bounds(
         cx: &mut gpui::TestAppContext,
     ) {
