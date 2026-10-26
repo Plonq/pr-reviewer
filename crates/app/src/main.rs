@@ -38,7 +38,10 @@ use gpui::{
 use gpui_component::{
     avatar::Avatar,
     button::{Button, ButtonVariants as _},
-    input::{CompletionProvider, Escape as InputEscape, Input, InputEvent, InputState},
+    input::{
+        CompletionProvider, Enter as InputEnter, Escape as InputEscape, Input, InputEvent,
+        InputState,
+    },
     kbd::Kbd,
     scroll::Scrollbar,
     tag::Tag,
@@ -1494,7 +1497,6 @@ struct Composer {
     reveal: Rc<Cell<bool>>,
     error: Option<SharedString>,
     in_flight: bool,
-    _subscription: Subscription,
 }
 
 /// The "submit review" modal: a verdict (approve / request changes /
@@ -1505,7 +1507,6 @@ struct ReviewDialog {
     input: gpui::Entity<InputState>,
     error: Option<SharedString>,
     in_flight: bool,
-    _subscription: Subscription,
 }
 
 fn local_review_prompt(src: &git::LocalSource, review: &LocalReview) -> String {
@@ -3671,15 +3672,6 @@ impl ReviewApp {
                 .auto_grow(3, 8)
                 .placeholder("leave a comment…")
         });
-        // cmd-enter: the input's own `secondary-enter` binding emits
-        // PressEnter { secondary: true } (after inserting a newline, which
-        // submit trims away).
-        let _subscription =
-            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { secondary: true }) {
-                    this.submit_composer(window, cx);
-                }
-            });
         input.update(cx, |state, cx| state.focus(window, cx));
         // Wire up @-mention autocomplete for PR items: seed the pool with known
         // participants now, attach the provider, then fetch the full list once.
@@ -3711,7 +3703,6 @@ impl ReviewApp {
             reveal: Rc::new(Cell::new(true)),
             error: None,
             in_flight: false,
-            _subscription,
         });
         cx.notify();
     }
@@ -4084,12 +4075,6 @@ impl ReviewApp {
                 state.set_value(pending.body.clone(), window, cx)
             });
         }
-        let _subscription =
-            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { secondary: true }) {
-                    this.submit_review(window, cx);
-                }
-            });
         input.update(cx, |state, cx| state.focus(window, cx));
         self.review = Some(ReviewDialog {
             item_id,
@@ -4097,7 +4082,6 @@ impl ReviewApp {
             input,
             error: None,
             in_flight: false,
-            _subscription,
         });
         cx.notify();
     }
@@ -4334,6 +4318,14 @@ impl ReviewApp {
             .w_full()
             .min_w_0()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // The multiline input inserts a newline before emitting PressEnter.
+            // Capture Cmd+Enter first; leave plain Enter to the input.
+            .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
+                if action.secondary {
+                    cx.stop_propagation();
+                    this.submit_composer(window, cx);
+                }
+            }))
             // The input propagates Escape when it has nothing of its own to
             // dismiss; catch it here (before the root's handler) to cancel.
             .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
@@ -4693,6 +4685,12 @@ impl ReviewApp {
                 div()
                     .w(px(560.))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
+                        if action.secondary {
+                            cx.stop_propagation();
+                            this.submit_review(window, cx);
+                        }
+                    }))
                     // The input propagates Escape when it has nothing of its
                     // own to dismiss; catch it here to cancel the dialog.
                     .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
@@ -6435,8 +6433,8 @@ impl Render for ReviewApp {
                 this.open_composer_on_selection(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SubmitReview, window, cx| {
-                // Backstop: with the dialog open, focus sits in its input,
-                // whose own secondary-enter handles submission.
+                // Backstop: with the dialog open, its card captures the
+                // input's secondary-enter action to handle submission.
                 if this.review.is_some() {
                     this.submit_review(window, cx);
                 } else if matches!(
@@ -11364,6 +11362,84 @@ mod tests {
     }
 
     #[gpui::test]
+    fn cmd_enter_submits_diff_comment_without_a_newline(cx: &mut gpui::TestAppContext) {
+        composer_cmd_enter(cx, ComposerPlacement::Diff);
+    }
+
+    #[gpui::test]
+    fn cmd_enter_submits_conversation_comment_without_a_newline(cx: &mut gpui::TestAppContext) {
+        composer_cmd_enter(cx, ComposerPlacement::ConversationMain);
+    }
+
+    #[gpui::test]
+    fn cmd_enter_submits_conversation_reply_without_a_newline(cx: &mut gpui::TestAppContext) {
+        composer_cmd_enter(cx, ComposerPlacement::ConversationThread("11".into()));
+    }
+
+    fn composer_cmd_enter(cx: &mut gpui::TestAppContext, placement: ComposerPlacement) {
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "question",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut item = commenting_item(&fake);
+        if placement == ComposerPlacement::Diff {
+            item.pane = ItemPane::Changes;
+        }
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let input = vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open_comment_composer(
+                    placement.clone(),
+                    matches!(placement, ComposerPlacement::ConversationThread(_)).then_some(11),
+                    "a.rs".into(),
+                    CommentSide::Right,
+                    1,
+                    1,
+                    window,
+                    cx,
+                );
+                this.composer.as_ref().unwrap().input.clone()
+            })
+        });
+        vcx.simulate_input("beforeafter");
+        // Plain Enter still inserts a newline in the middle of the comment.
+        vcx.simulate_keystrokes("left left left left left enter");
+        cx.update(|cx| assert_eq!(input.read(cx).value().as_str(), "before\nafter"));
+        assert!(fake.posts().is_empty());
+        vcx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(input.read(cx).value().as_str(), "before\nafter");
+            assert!(app.read(cx).composer.is_none());
+            assert!(app.read(cx).review.is_none());
+        });
+        let body = "before\nafter".into();
+        let expected = match placement {
+            ComposerPlacement::Diff => Post::Comment {
+                commit_id: "dead10cc".into(),
+                path: "a.rs".into(),
+                side: "RIGHT".into(),
+                line: 1,
+                body,
+            },
+            ComposerPlacement::ConversationMain => Post::Conversation { body },
+            ComposerPlacement::ConversationThread(_) => Post::Reply {
+                comment_id: 11,
+                body,
+            },
+        };
+        assert_eq!(fake.posts(), vec![expected]);
+    }
+
+    #[gpui::test]
     fn conversation_failed_comment_keeps_text_and_escape_cancels(cx: &mut gpui::TestAppContext) {
         let fake = FakePr::with_threads(vec![]);
         fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -11379,7 +11455,7 @@ mod tests {
             let composer = app.composer.as_ref().unwrap();
             assert!(!composer.in_flight);
             assert!(composer.error.is_some());
-            assert_eq!(composer.input.read(cx).value().trim(), "keep this text");
+            assert_eq!(composer.input.read(cx).value().as_str(), "keep this text");
             assert!(
                 app.active_data().unwrap().posts.pending.is_empty(),
                 "a failed post does not leave a fake published comment"
@@ -11768,6 +11844,37 @@ mod tests {
                 );
             });
         });
+    }
+
+    #[gpui::test]
+    fn cmd_enter_submits_review_without_a_newline(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, loop_pr_item(vec![]), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let input = vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.open_review(window, cx);
+                this.review.as_ref().unwrap().input.clone()
+            })
+        });
+        vcx.simulate_input("beforeafter");
+        vcx.simulate_keystrokes("left left left left left enter");
+        cx.update(|cx| assert_eq!(input.read(cx).value().as_str(), "before\nafter"));
+        assert!(fake.posts().is_empty());
+        vcx.simulate_keystrokes("cmd-enter");
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(input.read(cx).value().as_str(), "before\nafter");
+            assert!(app.read(cx).review.is_none());
+        });
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Review {
+                verdict: github::ReviewVerdict::Approve,
+                body: "before\nafter".into(),
+            }]
+        );
     }
 
     fn range_pr_item() -> ReviewItem {
