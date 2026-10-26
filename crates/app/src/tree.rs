@@ -212,6 +212,7 @@ pub(crate) fn render_tree_row(
     let entity = entity.clone();
     let base = div()
         .id(("tree-row", pos))
+        .debug_selector(move || format!("tree-row-{pos}"))
         .h(px(TREE_ROW_HEIGHT))
         .w_full()
         .flex()
