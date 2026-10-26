@@ -203,7 +203,8 @@ const MIN_COMMENT_WRAP_CHARS: usize = 24;
 
 /// Chrome around a comment body inside its card: the gutter indent, the accent
 /// border, and the horizontal padding (see `comment_row`).
-const COMMENT_CARD_CHROME: f32 = 72. + 2. + 24.;
+pub(crate) const COMMENT_TEXT_INSET: f32 = 72. + 2. + 12.;
+const COMMENT_CARD_CHROME: f32 = COMMENT_TEXT_INSET + 12.;
 
 /// Columns a comment body can use given the measured list width — the whole
 /// width in unified, one half in split. Wrapping is then only as narrow as the
@@ -223,24 +224,37 @@ pub(crate) fn comment_wrap_cols(list_width: f32, mode: ViewMode, char_width: f32
 /// Soft-wrap `text` at `width` chars: explicit newlines are preserved, wraps
 /// prefer the last space in range (the space is consumed), and a word longer
 /// than the width hard-breaks on a char boundary.
-pub(crate) fn wrap_body(text: &str, width: usize) -> Vec<String> {
+#[cfg(test)]
+fn wrap_body(text: &str, width: usize) -> Vec<String> {
+    wrap_body_with_separators(text, width)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect()
+}
+
+/// Keep the separator before each visual line so selections can reconstruct
+/// consumed wrapping spaces without inserting newlines into hard-broken words.
+pub(crate) fn wrap_body_with_separators(text: &str, width: usize) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     for line in text.split('\n') {
         let mut line = line.strip_suffix('\r').unwrap_or(line);
+        let mut separator = "\n";
         loop {
             // Byte offset of the (width+1)-th char; absent = the rest fits.
             let Some((cut, _)) = line.char_indices().nth(width) else {
-                out.push(line.to_string());
+                out.push((separator, line.to_string()));
                 break;
             };
             match line[..cut].rfind(' ') {
                 Some(space) if space > 0 => {
-                    out.push(line[..space].to_string());
+                    out.push((separator, line[..space].to_string()));
                     line = &line[space + 1..];
+                    separator = " ";
                 }
                 _ => {
-                    out.push(line[..cut].to_string());
+                    out.push((separator, line[..cut].to_string()));
                     line = &line[cut..];
+                    separator = "";
                 }
             }
         }

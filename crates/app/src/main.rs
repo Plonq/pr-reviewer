@@ -58,7 +58,9 @@ use rows::{
     render_row, widest_row_ix, BuiltRows, FileUpgrade, LineKind, Row, RowOptions, RowsView,
     ViewMode,
 };
-use selection::{row_selection_range, selection_text, RowCol, SelSide, Selection};
+use selection::{
+    row_selection_range, selection_text, word_selection, RowCol, SelSide, Selection, SelectionDrag,
+};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -1659,7 +1661,7 @@ pub(crate) struct ReviewApp {
     palette_scroll: UniformListScrollHandle,
     /// Where the current selection drag started (side locked at mouse-down);
     /// None when no drag is in progress.
-    drag_anchor: Option<(SelSide, RowCol)>,
+    drag_anchor: Option<SelectionDrag>,
     /// `m` toggles the minimap column for every item.
     minimap_visible: bool,
     /// A minimap scrub drag is in progress (mouse went down on the minimap).
@@ -2317,6 +2319,33 @@ impl ReviewApp {
         let y = f32::from(position.y - bounds.top() - offset.y);
         let row = ((y / row_height()).floor().max(0.) as usize).min(data.rows.len() - 1);
         let rel_x = f32::from(position.x - bounds.left());
+        if let Some(side @ SelSide::Comment { first, .. }) =
+            locked.or_else(|| SelSide::comment_at(&data.rows, row))
+        {
+            let Row::CommentBody { half, .. } = data.rows.get(first)? else {
+                return None;
+            };
+            let cell_x = match half {
+                None => rel_x - f32::from(offset.x),
+                Some(side) => {
+                    // Split cards stay fixed while code scrolls horizontally.
+                    let half = (f32::from(bounds.size.width) - SPLIT_DIVIDER) / 2.;
+                    if locked.is_none()
+                        && match side {
+                            CommentSide::Left => rel_x >= half,
+                            CommentSide::Right => rel_x < half + SPLIT_DIVIDER,
+                        }
+                    {
+                        return None;
+                    }
+                    match side {
+                        CommentSide::Left => rel_x,
+                        CommentSide::Right => rel_x - half - SPLIT_DIVIDER,
+                    }
+                }
+            };
+            return Some((side, row, px(cell_x - threads::COMMENT_TEXT_INSET)));
+        }
         let (side, text_x) = match data.mode {
             // offset.x is negative when scrolled right in either mode.
             ViewMode::Unified => (
@@ -3410,6 +3439,11 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Shift-click is a source-line comment action, not an action on the
+        // text of an existing comment.
+        if matches!(side, SelSide::Comment { .. }) {
+            return;
+        }
         let Some(data) = self.active_data_mut() else {
             return;
         };
@@ -6096,12 +6130,34 @@ impl ReviewApp {
                                         this.extend_comment_selection(side, head, window, cx);
                                         return;
                                     }
-                                    this.drag_anchor =
-                                        this.pane_hit(event.position, char_width, None);
+                                    let hit = this.pane_hit(event.position, char_width, None);
+                                    // Word selection uses the glyph under the pointer,
+                                    // not the nearest caret (which rounds right halfway
+                                    // through the last character of a word).
+                                    let word = (event.click_count == 2)
+                                        .then(|| {
+                                            let (side, row, x) =
+                                                this.pane_text_hit(event.position, None)?;
+                                            if x < px(0.) {
+                                                return None;
+                                            }
+                                            let col = (f32::from(x) / f32::from(char_width)).floor()
+                                                as usize;
+                                            word_selection(
+                                                &this.active_data()?.rows,
+                                                side,
+                                                RowCol { row, col },
+                                            )
+                                        })
+                                        .flatten();
+                                    this.drag_anchor = if event.click_count == 2 {
+                                        word.map(SelectionDrag::Words)
+                                    } else {
+                                        hit.map(|(side, hit)| SelectionDrag::Characters(side, hit))
+                                    };
                                     // A plain click also moves the keyboard cursor:
                                     // `C` and `n`/`p` follow the line the reviewer
                                     // last touched, mouse or keyboard alike.
-                                    let hit = this.drag_anchor;
                                     if let Some(data) = this.active_data_mut() {
                                         let previous = (data.cursor, data.cursor_side);
                                         if let Some((side, hit)) = hit {
@@ -6110,8 +6166,9 @@ impl ReviewApp {
                                         }
                                         // Repaint even without a text selection: the
                                         // gutter cue follows a plain click immediately.
-                                        let cleared_selection = data.selection.take().is_some();
-                                        if cleared_selection
+                                        let changed_selection = data.selection != word;
+                                        data.selection = word;
+                                        if changed_selection
                                             || previous != (data.cursor, data.cursor_side)
                                         {
                                             cx.notify();
@@ -6131,21 +6188,30 @@ impl ReviewApp {
                                         this.minimap_scrub_to(event.position, cx);
                                         return;
                                     }
-                                    let Some((side, anchor)) = this.drag_anchor else {
+                                    let Some(drag) = this.drag_anchor else {
                                         return;
                                     };
+                                    let side = drag.side();
                                     let char_width = this.char_width(window);
-                                    let Some((_, head)) =
-                                        this.pane_hit(event.position, char_width, Some(side))
-                                    else {
+                                    let hit = match drag {
+                                        SelectionDrag::Characters(..) => {
+                                            this.pane_hit(event.position, char_width, Some(side))
+                                        }
+                                        SelectionDrag::Words(_) => this
+                                            .pane_text_hit(event.position, Some(side))
+                                            .map(|(side, row, x)| {
+                                                let col = (f32::from(x) / f32::from(char_width))
+                                                    .floor()
+                                                    .max(0.)
+                                                    as usize;
+                                                (side, RowCol { row, col })
+                                            }),
+                                    };
+                                    let Some((_, head)) = hit else {
                                         return;
                                     };
-                                    let selection = (head != anchor).then_some(Selection {
-                                        side,
-                                        anchor,
-                                        head,
-                                    });
                                     if let Some(data) = this.active_data_mut() {
+                                        let selection = drag.selection(head, &data.rows);
                                         if data.selection != selection {
                                             data.selection = selection;
                                             cx.notify();
@@ -12078,7 +12144,7 @@ mod tests {
                 data.mode = mode;
                 data.rebuild_rows_anchored();
                 assert!(data.rows.iter().any(|row| matches!(row,
-                    Row::CommentBody { line, half } if line.as_ref() == "removed draft"
+                    Row::CommentBody { line, half, .. } if line.as_ref() == "removed draft"
                         && *half == if mode == ViewMode::Split { Some(CommentSide::Left) } else { None }
                 )));
                 assert!(data.rows.iter().any(|row| matches!(row,
@@ -12389,6 +12455,271 @@ mod tests {
                             "the cue must not select or recolour code"
                         );
                         assert!(app.composer.is_none());
+                    });
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn double_click_selects_and_copies_words_in_both_diff_modes(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(Vec::new());
+        let (window, app) = queue_window(cx, fake);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(Vec::new());
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let old_name = tail;\n+let new_name = tail;\n");
+        data.set_rows(data.row_build());
+        install_item(&app, item, cx);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            vcx.cx.update(|cx| {
+                app.update(cx, |this, cx| {
+                    let data = this.active_data_mut().unwrap();
+                    data.mode = mode;
+                    data.set_rows(data.row_build());
+                    cx.notify();
+                })
+            });
+            vcx.run_until_parked();
+            let cases = match mode {
+                ViewMode::Unified => vec![
+                    (1, SelSide::Unified, "old_name"),
+                    (2, SelSide::Unified, "new_name"),
+                ],
+                ViewMode::Split => vec![
+                    (1, SelSide::Left, "old_name"),
+                    (1, SelSide::Right, "new_name"),
+                ],
+            };
+            for (row, side, expected) in cases {
+                let at_col = |col: f32, vcx: &mut gpui::VisualTestContext| {
+                    vcx.update(|window, cx| {
+                        app.update(cx, |this, _| {
+                            let width = this.char_width(window);
+                            let data = this.active_data().unwrap();
+                            let scroll = data.scroll.0.borrow();
+                            let bounds = scroll.base_handle.bounds();
+                            let gutter = if side == SelSide::Unified {
+                                UNIFIED_GUTTER
+                            } else {
+                                SPLIT_GUTTER
+                            };
+                            let half = if side == SelSide::Right {
+                                (bounds.size.width - px(SPLIT_DIVIDER)) / 2. + px(SPLIT_DIVIDER)
+                            } else {
+                                px(0.)
+                            };
+                            point(
+                                bounds.left()
+                                    + half
+                                    + px(gutter)
+                                    + scroll.base_handle.offset().x
+                                    + width * col,
+                                bounds.top()
+                                    + scroll.base_handle.offset().y
+                                    + px((row as f32 + 0.5) * row_height()),
+                            )
+                        })
+                    })
+                };
+                // The right half of the final glyph must still select the word,
+                // rather than rounding to the following space as a caret does.
+                let at = at_col(11.8, &mut vcx);
+                vcx.simulate_click(at, gpui::Modifiers::default());
+                vcx.simulate_event(MouseDownEvent {
+                    position: at,
+                    button: MouseButton::Left,
+                    click_count: 2,
+                    ..Default::default()
+                });
+                // A small move while held must not collapse a double-click.
+                vcx.simulate_mouse_move(at, Some(MouseButton::Left), gpui::Modifiers::default());
+                vcx.simulate_mouse_up(at, MouseButton::Left, gpui::Modifiers::default());
+                vcx.run_until_parked();
+                vcx.cx.update(|cx| {
+                    let this = app.read(cx);
+                    let data = this.active_data().unwrap();
+                    let selection = data.selection.unwrap();
+                    assert_eq!(selection.side, side);
+                    assert_eq!(selection_text(&selection, &data.rows), expected);
+                    assert_eq!((data.cursor, data.cursor_side), (row, Some(side)));
+                    assert!(this.drag_anchor.is_none());
+                    assert!(this.composer.is_none());
+                });
+                vcx.dispatch_action(CopySelection);
+                vcx.cx.update(|cx| {
+                    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), expected)
+                });
+
+                // Holding the second click and dragging extends by whole words.
+                vcx.simulate_event(MouseDownEvent {
+                    position: at,
+                    button: MouseButton::Left,
+                    click_count: 2,
+                    ..Default::default()
+                });
+                let tail = at_col(18.8, &mut vcx);
+                vcx.simulate_mouse_move(tail, Some(MouseButton::Left), gpui::Modifiers::default());
+                vcx.simulate_mouse_up(tail, MouseButton::Left, gpui::Modifiers::default());
+                vcx.cx.update(|cx| {
+                    let data = app.read(cx).active_data().unwrap();
+                    assert_eq!(
+                        selection_text(&data.selection.unwrap(), &data.rows),
+                        format!("{expected} = tail")
+                    );
+                });
+                vcx.simulate_click(at, gpui::Modifiers::default());
+                vcx.cx
+                    .update(|cx| assert!(app.read(cx).active_data().unwrap().selection.is_none()));
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn inline_comment_words_select_copy_and_drag_in_both_diff_modes(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(Vec::new());
+        let (window, app) = queue_window(cx, fake);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1500.), px(1600.)));
+        let body = "Use café_name42 instead\nsecond line";
+        let mut item = loop_pr_item(vec![
+            rc(
+                1,
+                "a.rs",
+                Some("LEFT"),
+                Some(1),
+                body,
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                2,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                body,
+                "bob",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                3,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                body,
+                "carol",
+                "2026-01-02T00:00:00Z",
+                Some(2),
+            ),
+        ]);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff = diff_core::parse_patch(&format!(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+{}\n",
+            "long_code".repeat(100)
+        ));
+        data.set_rows(data.row_build());
+        install_item(&app, item, cx);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            vcx.cx.update(|cx| {
+                app.update(cx, |this, cx| {
+                    let data = this.active_data_mut().unwrap();
+                    data.mode = mode;
+                    data.set_rows(data.row_build());
+                    cx.notify();
+                })
+            });
+            vcx.run_until_parked();
+            for scrolled in [false, true] {
+                vcx.update(|window, cx| {
+                    app.update(cx, |this, cx| {
+                        let data = this.active_data_mut().unwrap();
+                        let handle = &data.scroll.0.borrow().base_handle;
+                        handle.set_offset(point(if scrolled { px(-40.) } else { px(0.) }, px(0.)));
+                        cx.notify();
+                    });
+                    let _ = window.draw(cx);
+                });
+                let (rows, width) = vcx.update(|window, cx| {
+                    app.update(cx, |this, _| {
+                        let width = this.char_width(window);
+                        let data = this.active_data().unwrap();
+                        let rows: Vec<_> = data.rows.iter().enumerate().filter_map(|(ix, row)| {
+                        matches!(row, Row::CommentBody { line, .. } if line.starts_with("Use "))
+                            .then_some(ix)
+                    }).collect();
+                        (rows, width)
+                    })
+                });
+                assert_eq!(rows.len(), 3, "both roots and the reply are selectable");
+                for row in rows {
+                    let selector: &'static str =
+                        Box::leak(format!("inline-comment-text-{row}").into_boxed_str());
+                    let bounds = vcx
+                        .debug_bounds(selector)
+                        .expect("comment body is rendered");
+                    let at = point(bounds.left() + width * 14.8, bounds.center().y);
+                    vcx.simulate_click(at, gpui::Modifiers::default());
+                    vcx.simulate_event(MouseDownEvent {
+                        position: at,
+                        button: MouseButton::Left,
+                        click_count: 2,
+                        ..Default::default()
+                    });
+                    vcx.simulate_mouse_move(
+                        at,
+                        Some(MouseButton::Left),
+                        gpui::Modifiers::default(),
+                    );
+                    vcx.simulate_mouse_up(at, MouseButton::Left, gpui::Modifiers::default());
+                    vcx.cx.update(|cx| {
+                        let this = app.read(cx);
+                        let data = this.active_data().unwrap();
+                        let selection = data.selection.expect("double-click selects comment text");
+                        assert!(matches!(selection.side, SelSide::Comment { .. }));
+                        assert_eq!(selection_text(&selection, &data.rows), "café_name42");
+                        assert_eq!(
+                            row_selection_range(&selection, row, &data.rows[row]),
+                            Some(4..16)
+                        );
+                        assert!(this.composer.is_none());
+                        assert!(this.drag_anchor.is_none());
+                    });
+                    vcx.dispatch_action(CopySelection);
+                    vcx.cx.update(|cx| {
+                        assert_eq!(
+                            cx.read_from_clipboard().unwrap().text().unwrap(),
+                            "café_name42"
+                        )
+                    });
+                    vcx.simulate_event(MouseDownEvent {
+                        position: at,
+                        button: MouseButton::Left,
+                        click_count: 2,
+                        ..Default::default()
+                    });
+                    let tail = point(bounds.left() + width * 22.8, bounds.center().y);
+                    vcx.simulate_mouse_move(
+                        tail,
+                        Some(MouseButton::Left),
+                        gpui::Modifiers::default(),
+                    );
+                    vcx.simulate_mouse_up(tail, MouseButton::Left, gpui::Modifiers::default());
+                    vcx.cx.update(|cx| {
+                        let data = app.read(cx).active_data().unwrap();
+                        assert_eq!(
+                            selection_text(&data.selection.unwrap(), &data.rows),
+                            "café_name42 instead"
+                        );
+                    });
+                    vcx.simulate_click(at, gpui::Modifiers::default());
+                    vcx.cx.update(|cx| {
+                        assert!(app.read(cx).active_data().unwrap().selection.is_none())
                     });
                 }
             }

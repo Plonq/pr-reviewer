@@ -2108,6 +2108,7 @@ dependencies = [
  "store",
  "syntax",
  "tempfile",
+ "unicode-segmentation",
  "ureq",
 ]
 

@@ -62,6 +62,7 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
   explanatory, click-to-expand safety banner, without whole-file highlighting.
 - tree-sitter highlighting (18 languages)
 - word-level intra-line diffs
+- double-click a word in the diff or an inline comment to select it; drag to extend by whole words
 - whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
 - multi-item sidebar with file tree; drag its right edge to resize (width is remembered)
 - per-viewer viewed checkboxes at the right edge of the file tree; click or `V`

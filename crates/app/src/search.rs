@@ -86,7 +86,7 @@ impl Matches {
         }
         occurrences.sort_by_key(|spans| {
             let span = &spans[0];
-            (span.row, span.side as u8, span.range.start)
+            (span.row, span.side, span.range.start)
         });
         let mut by_row = vec![Vec::new(); rows.len()];
         for (ix, spans) in occurrences.iter().enumerate() {

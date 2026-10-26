@@ -38,6 +38,7 @@ html5ever = "0.27"
 image = { version = "0.25", default-features = false }
 serde_json = { workspace = true }
 libc = "0.2"
+unicode-segmentation = "1"
 
 [dev-dependencies]
 # TestAppContext + the #[gpui::test] harness — app-level behavior tests
