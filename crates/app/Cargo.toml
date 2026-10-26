@@ -14,7 +14,9 @@ git = { path = "../git" }
 github = { path = "../github" }
 store = { path = "../store" }
 syntax = { path = "../syntax" }
-gpui = "0.2"
+# runtime_shaders compiles gpui's Metal shaders at startup instead of in
+# build.rs, so building doesn't need full Xcode's `metal` compiler.
+gpui = { version = "0.2", features = ["runtime_shaders"] }
 # The conversation pane's markdown (gpui-component's TextView) renders
 # the PR description; the tree-sitter-languages feature registers the
 # grammars its code-block highlighter needs, the same set the diff's syntax
