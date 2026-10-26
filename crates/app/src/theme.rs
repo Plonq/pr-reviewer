@@ -180,7 +180,8 @@ pub fn apply_ui_theme(window: Option<&mut Window>, cx: &mut App) {
     theme.sidebar_border = surface0;
     theme.caret = text;
     theme.selection = blue.opacity(0.3);
-    theme.scrollbar = crust.opacity(0.6);
+    // Keep the track invisible when scrolling/hovering, just as it is when idle.
+    theme.scrollbar = Hsla::transparent_black();
     theme.scrollbar_thumb = overlay0.opacity(0.5);
     theme.scrollbar_thumb_hover = overlay0;
     theme.window_border = surface0;
@@ -306,5 +307,23 @@ pub fn removed_word_bg() -> Rgba {
         rgba(0xd20f3948)
     } else {
         rgba(0xf38ba848)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn scrollbar_track_is_transparent_but_thumbs_remain_visible(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            apply_ui_theme(None, cx);
+
+            let theme = Theme::global(cx);
+            assert_eq!(theme.scrollbar.a, 0.0);
+            assert!(theme.scrollbar_thumb.a > 0.0);
+            assert!(theme.scrollbar_thumb_hover.a > 0.0);
+        });
     }
 }
