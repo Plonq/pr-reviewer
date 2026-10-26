@@ -64,6 +64,7 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - word-level intra-line diffs
 - whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
 - multi-item sidebar with file tree; drag its right edge to resize (width is remembered)
+- file-tree comment badges count comments and replies, including outdated comments and drafts
 - per-viewer viewed checkboxes at the right edge of the file tree; click or `V`
   to mark/unmark on GitHub, with optimistic updates and visible sync failures
 - cmd-k palette with fuzzy PR picker
