@@ -3160,14 +3160,15 @@ impl ReviewApp {
         cx.notify();
     }
 
-    /// Show `file_ix` in the pane (revealed at its first change) and hand
-    /// focus to the diff pane — what clicking a sidebar item does.
+    /// Switch to changes, show `file_ix` (revealed at its first change),
+    /// and focus the diff pane — what clicking a sidebar file does.
     pub(crate) fn jump_to_file(
         &mut self,
         file_ix: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.flip_pane(ItemPane::Changes, cx);
         window.focus(&self.focus_handle);
         if let Some(data) = self.active_data_mut() {
             data.open_file(file_ix, None);
@@ -8708,6 +8709,76 @@ mod tests {
         vcx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
         vcx.run_until_parked();
         cx.update(|cx| assert_eq!(app.read(cx).active_item().unwrap().pane, ItemPane::Changes));
+    }
+
+    #[gpui::test]
+    fn sidebar_file_clicks_show_changes_from_conversation(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut item = loop_pr_item(Vec::new());
+        let mut diff = test_util::two_file_diff();
+        for file in &mut diff.files {
+            file.old_path = file.old_path.take().map(|path| format!("src/{path}"));
+            file.new_path = file.new_path.take().map(|path| format!("src/{path}"));
+        }
+        item.state = ItemState::Ready(file_mode_data(diff));
+        item.pane = ItemPane::Conversation;
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.dispatch_action(ToggleSidebar);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Directory clicks only toggle collapse, leaving the conversation visible.
+        for collapsed in [true, false] {
+            let point = vcx.debug_bounds("tree-row-0").unwrap().center();
+            vcx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
+            vcx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
+            vcx.run_until_parked();
+            vcx.update(|window, cx| {
+                let app = app.read(cx);
+                assert_eq!(app.active_item().unwrap().pane, ItemPane::Conversation);
+                assert_eq!(
+                    app.active_data().unwrap().collapsed.contains("src"),
+                    collapsed
+                );
+                let _ = window.draw(cx);
+            });
+        }
+
+        // Both the regular tree and fuzzy results open changes, including
+        // when the selected file is already the diff's current file.
+        for query in ["", "src/"] {
+            for file_ix in [0, 1, 1] {
+                vcx.update(|window, cx| {
+                    app.update(cx, |app, cx| {
+                        app.flip_pane(ItemPane::Conversation, cx);
+                        app.tree_filter_input.update(cx, |input, cx| {
+                            input.set_value(query, window, cx);
+                            input.focus(window, cx);
+                        });
+                        cx.notify();
+                    });
+                    let _ = window.draw(cx);
+                });
+                let selector = match (query.is_empty(), file_ix) {
+                    (true, 0) | (false, 1) => "tree-row-1",
+                    (true, _) => "tree-row-2",
+                    (false, _) => "tree-row-0",
+                };
+                let point = vcx.debug_bounds(selector).unwrap().center();
+                vcx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
+                vcx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
+                vcx.run_until_parked();
+                vcx.update(|window, cx| {
+                    let app = app.read(cx);
+                    assert_eq!(app.active_item().unwrap().pane, ItemPane::Changes);
+                    assert_eq!(app.active_data().unwrap().file_ix, file_ix);
+                    assert!(app.focus_handle.is_focused(window));
+                    let _ = window.draw(cx);
+                });
+            }
+        }
     }
 
     #[gpui::test]
