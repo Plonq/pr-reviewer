@@ -1520,7 +1520,9 @@ struct Composer {
     /// harmlessly if rows rebuild while it is open).
     row_ix: usize,
     input: gpui::Entity<InputState>,
-    /// Reveal an inline conversation composer once, after its card is laid out.
+    /// Space below the diff's last row, measured from the floating card.
+    height: Rc<Cell<gpui::Pixels>>,
+    /// Reveal a composer once, after its card is laid out.
     reveal: Rc<Cell<bool>>,
     error: Option<SharedString>,
     in_flight: bool,
@@ -3343,9 +3345,8 @@ impl ReviewApp {
         comment_anchor(&data.rows, hit.row, side).map(|_| (hit.row, side))
     }
 
-    /// `C`: open the composer on the selected line. The selected line is
-    /// the text selection's top row when a drag left one (the side it runs
-    /// through decides the anchor half), else the keyboard cursor's row —
+    /// `C`: open the composer below the selected range's last row (the side
+    /// it runs through decides the anchor half), else the keyboard cursor's row —
     /// which every way of moving (n/p, jump, a plain click) keeps on the
     /// line the reviewer is looking at. Only a real line comments: the
     /// anchor goes through `comment_anchor`/`cursor_anchor`, so headers,
@@ -3361,10 +3362,11 @@ impl ReviewApp {
             return;
         };
         let (row_ix, anchor) = match data.selection {
-            // A mouse selection names its line and side: anchor under it.
+            // Validate from the first line, but place the card below the last
+            // selected row so it doesn't cover the rest of the range.
             Some(sel) => {
-                let row = sel.ordered().0.row;
-                (row, comment_anchor(&data.rows, row, sel.side))
+                let (start, end) = sel.ordered();
+                (end.row, comment_anchor(&data.rows, start.row, sel.side))
             }
             // No selection: the keyboard cursor names the line; a split
             // row's side falls out of its shape.
@@ -3728,6 +3730,7 @@ impl ReviewApp {
             edit_id: None,
             row_ix,
             input,
+            height: Rc::new(Cell::new(px(250.))),
             reveal: Rc::new(Cell::new(true)),
             error: None,
             in_flight: false,
@@ -4269,7 +4272,8 @@ impl ReviewApp {
 
     /// The floating composer card: absolutely positioned at root level (so
     /// its input sits outside the "ReviewApp" key context and plain letters
-    /// stay text), anchored near the target line's y, clamped into the pane.
+    /// stay text), anchored below the target row. Reveal it by scrolling the
+    /// diff, never by moving the card upward over the selected source lines.
     fn render_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let empty = || div().into_any_element();
         let Some(composer) = &self.composer else {
@@ -4289,15 +4293,18 @@ impl ReviewApp {
             let state = data.scroll.0.borrow();
             (state.base_handle.bounds(), state.base_handle.offset())
         };
-        let pane_h = f32::from(bounds.size.height);
         let row_y = composer.row_ix as f32 * row_height() + f32::from(offset.y);
-        let y = f32::from(bounds.top()) + (row_y + row_height()).clamp(8., (pane_h - 250.).max(8.));
+        let y = f32::from(bounds.top()) + (row_y + row_height()).max(8.);
         let x = composer_x(
             f32::from(bounds.left()),
             f32::from(bounds.size.width),
             data.mode,
             composer.side,
         );
+        let scroll = data.scroll.clone();
+        let height = composer.height.clone();
+        let reveal = composer.reveal.clone();
+        let row_ix = composer.row_ix;
         div()
             .absolute()
             .left(px(x))
@@ -4305,6 +4312,32 @@ impl ReviewApp {
             .w(px(520.))
             .occlude()
             .shadow_lg()
+            .on_children_prepainted(move |bounds, window, cx| {
+                let Some(card) = bounds.first() else {
+                    return;
+                };
+                let height_changed =
+                    height.replace(card.size.height + px(8.)) != card.size.height + px(8.);
+                if !reveal.replace(false) && !height_changed {
+                    return;
+                }
+                let state = scroll.0.borrow();
+                let viewport = state.base_handle.bounds();
+                let handle = state.base_handle.clone();
+                let mut offset = handle.offset();
+                let row_bottom = offset.y + px((row_ix + 1) as f32 * row_height());
+                let latest_top = (viewport.size.height - height.get()).max(px(row_height()));
+                let delta = row_bottom.clamp(px(row_height()), latest_top) - row_bottom;
+                offset.y += delta;
+                if height_changed || delta != px(0.) {
+                    // The next layout reserves the measured tail space, so even
+                    // a comment on the file's final line has room to scroll.
+                    window.defer(cx, move |window, _| {
+                        handle.set_offset(offset);
+                        window.refresh();
+                    });
+                }
+            })
             .child(self.render_composer_card(cx))
             .into_any_element()
     }
@@ -6066,6 +6099,20 @@ impl ReviewApp {
     /// when the queue screen isn't up.
     fn render_item_pane(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entity = cx.entity();
+        // Blank tail rows make room to scroll a floating composer below EOF
+        // without changing source-row indices or the list's visible area.
+        let composer_rows = self
+            .composer
+            .as_ref()
+            .filter(|composer| {
+                self.active_item()
+                    .is_some_and(|item| item.id == composer.item_id)
+                    && composer.placement == ComposerPlacement::Diff
+            })
+            .map_or(0, |composer| {
+                (f32::from(composer.height.get()) / row_height()).ceil() as usize
+            });
+        let diff_rows = self.active_data().map_or(0, |data| data.rows.len()) + composer_rows;
         match self.active_item() {
             None => self.render_empty_pane(),
             Some(item) => match &item.state {
@@ -6197,16 +6244,18 @@ impl ReviewApp {
                                 }),
                             )
                             .child(
-                                uniform_list("diff", data.rows.len(), move |range, _window, cx| {
+                                uniform_list("diff", diff_rows, move |range, _window, cx| {
                                     let this = entity.read(cx);
                                     match this.active_data() {
                                         Some(data) => {
                                             let sel = data.selection;
                                             range
-                                                .filter_map(|ix| {
-                                                    data.rows.get(ix).map(|row| (ix, row))
-                                                })
-                                                .map(|(ix, row)| {
+                                                .map(|ix| {
+                                                    let Some(row) = data.rows.get(ix) else {
+                                                        return div()
+                                                            .h(px(row_height()))
+                                                            .into_any_element();
+                                                    };
                                                     let row_sel = sel.and_then(|sel| {
                                                         row_selection_range(&sel, ix, row)
                                                             .filter(|range| !range.is_empty())
@@ -12637,6 +12686,101 @@ mod tests {
     }
 
     #[gpui::test]
+    fn range_composer_sits_below_the_last_selected_row(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(Vec::new());
+        let (window, app) = queue_window(cx, fake);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = range_pr_item();
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        let context: String = (1..=100).map(|line| format!(" line {line}\n")).collect();
+        data.diff = diff_core::parse_patch(&format!("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,101 +1,101 @@\n{context}-old\n+new\n"));
+        data.anchor_hunks = vec![data.diff.files[0].hunks.clone()];
+        install_item(&app, item, cx);
+
+        for (mode, side, comment_side) in [
+            (ViewMode::Unified, SelSide::Unified, CommentSide::Right),
+            (ViewMode::Split, SelSide::Left, CommentSide::Left),
+            (ViewMode::Split, SelSide::Right, CommentSide::Right),
+        ] {
+            let eof = if mode == ViewMode::Unified { 102 } else { 101 };
+            for (anchor, head) in [(1, 3), (3, 1), (2, 2), (98, 100), (100, 98), (eof, eof)] {
+                vcx.update(|_, cx| {
+                    app.update(cx, |this, cx| {
+                        let data = this.active_data_mut().unwrap();
+                        data.mode = mode;
+                        data.set_rows(data.row_build());
+                        let mut scroll = data.scroll.0.borrow_mut();
+                        scroll.deferred_scroll_to_item = None;
+                        scroll.base_handle.set_offset(point(px(0.), px(0.)));
+                        drop(scroll);
+                        data.selection = Some(Selection {
+                            side,
+                            anchor: RowCol {
+                                row: anchor,
+                                col: 0,
+                            },
+                            head: RowCol { row: head, col: 1 },
+                        });
+                        cx.notify();
+                    })
+                });
+                vcx.run_until_parked();
+                vcx.dispatch_action(NewComment);
+                vcx.run_until_parked();
+                let initial_height = vcx.debug_bounds("composer-card").unwrap().size.height;
+                if anchor == eof {
+                    // Growing the card must reserve more space and reveal it
+                    // again, including when there are no source rows below it.
+                    vcx.update(|window, cx| {
+                        let input = app.read(cx).composer.as_ref().unwrap().input.clone();
+                        input.update(cx, |state, cx| {
+                            state.set_value("a long comment\n".repeat(8), window, cx)
+                        });
+                    });
+                    vcx.run_until_parked();
+                }
+                let card = vcx.debug_bounds("composer-card").unwrap();
+                if anchor == eof {
+                    assert!(
+                        card.size.height > initial_height,
+                        "the input must actually grow"
+                    );
+                }
+                vcx.update(|window, cx| {
+                    app.update(cx, |this, cx| {
+                        let composer = this.composer.as_ref().unwrap();
+                        let last = anchor.max(head);
+                        assert_eq!(composer.row_ix, last);
+                        assert_eq!(composer.line, last.min(101) as u64);
+                        assert_eq!(composer.side, comment_side);
+                        assert_eq!(
+                            composer.start_line,
+                            (anchor != head).then_some(anchor.min(head) as u64)
+                        );
+                        let scroll = this.active_data().unwrap().scroll.0.borrow();
+                        let line_bottom = scroll.base_handle.bounds().top()
+                            + scroll.base_handle.offset().y
+                            + px((last + 1) as f32 * row_height());
+                        assert_eq!(card.top(), line_bottom, "the card must not cover the range");
+                        assert!(
+                            card.bottom() <= scroll.base_handle.bounds().bottom(),
+                            "scroll the diff to leave room for the entire card"
+                        );
+                        if last <= 3 {
+                            assert_eq!(scroll.base_handle.offset().y, px(0.));
+                        }
+                        drop(scroll);
+                        this.close_composer(window, cx);
+                    })
+                });
+                vcx.run_until_parked();
+            }
+        }
+    }
+
+    #[gpui::test]
     fn shift_click_opens_a_range_composer_through_the_mouse_handlers(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -12676,6 +12820,10 @@ mod tests {
             assert_eq!(composer.start_line, Some(1));
             assert_eq!(composer.line, 3);
             assert_eq!(composer.side, CommentSide::Right);
+            assert_eq!(
+                composer.row_ix, 3,
+                "the card sits below the range's last row"
+            );
         });
     }
 }
