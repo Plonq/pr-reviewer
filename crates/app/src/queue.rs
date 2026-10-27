@@ -6,8 +6,8 @@ use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{div, prelude::*, px, Hsla, Rgba, SharedString};
 use gpui_component::{avatar::Avatar, tag::Tag, Icon, IconName, Sizable as _};
 
-/// Queue rows stay one line but a dense one — avatar, title, badges, size,
-/// counts, chips — so they sit a little taller than the palette's, with
+/// Queue rows stay compact — avatar, title, badges, size, counts, chips,
+/// and stacked timestamps — so they sit a little taller than the palette's, with
 /// the uniform list keeping scroll math simple and rows virtualized.
 const QUEUE_ROW_HEIGHT: f32 = 36.0;
 
@@ -330,10 +330,30 @@ pub(crate) fn queue_chips(
         .collect()
 }
 
+/// The PR's age and the age of the viewer's outstanding direct review request.
+/// Missing history and old caches stay unknown rather than using PR activity.
+fn queue_ages(pr: &github::QueueItem, now: i64) -> [String; 2] {
+    [
+        ("Opened", pr.created_at.as_str()),
+        (
+            "Requested",
+            pr.review_requested_at.as_deref().unwrap_or_default(),
+        ),
+    ]
+    .map(|(label, timestamp)| {
+        let age = if timestamp.is_empty() {
+            "unknown".to_string()
+        } else {
+            short_age(timestamp, now)
+        };
+        format!("{label} {age}")
+    })
+}
+
 /// One review-queue row, carrying everything needed to triage without
 /// opening anything: CI verdict as a colored dot, author avatar, `#number`
 /// and title (drafts badged and muted), review state, diff size,
-/// conversation count, label chips, repository, and age. Clicking selects
+/// conversation count, label chips, repository, and opened/requested ages. Clicking selects
 /// the row (opening from the queue arrives with the PR screen).
 pub(crate) fn queue_row(
     pr: &github::QueueItem,
@@ -467,8 +487,13 @@ pub(crate) fn queue_row(
         .child(
             div()
                 .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .items_end()
+                .text_size(px(10.))
+                .line_height(px(14.))
                 .text_color(theme::overlay0())
-                .child(SharedString::from(short_age(&pr.updated_at, now))),
+                .children(queue_ages(pr, now).map(|age| div().child(SharedString::from(age)))),
         )
         .into_any_element()
 }
@@ -477,6 +502,27 @@ pub(crate) fn queue_row(
 mod tests {
     use super::*;
     use crate::test_util::{pr, queued};
+
+    #[test]
+    fn queue_ages_use_the_viewers_request_not_last_activity() {
+        let mut pr = queued(1, "acme/repo", "alice");
+        pr.created_at = "1970-01-01T12:00:00Z".into();
+        pr.review_requested_at = Some("1970-01-04T11:15:00Z".into());
+        pr.updated_at = "1970-01-04T11:59:00Z".into();
+        let now = 3 * 86400 + 12 * 3600; // 1970-01-04T12:00:00Z
+        assert_eq!(queue_ages(&pr, now), ["Opened 3d ago", "Requested 45m ago"]);
+    }
+
+    #[test]
+    fn queue_ages_do_not_invent_times_for_old_caches_or_team_requests() {
+        let mut pr = queued(1, "acme/repo", "alice");
+        pr.updated_at = "1970-01-04T11:15:00Z".into();
+        let now = 3 * 86400 + 12 * 3600;
+        assert_eq!(
+            queue_ages(&pr, now),
+            ["Opened unknown", "Requested unknown"]
+        );
+    }
 
     #[test]
     fn pr_filter_empty_query_keeps_original_order() {

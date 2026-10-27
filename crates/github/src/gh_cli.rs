@@ -8,7 +8,7 @@
 //! `fixtures/`, each byte-real captured output, so tests fail when the CLI's
 //! reality drifts).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
@@ -240,9 +240,80 @@ impl<P: GhProcess> GhCliClient<P> {
             let Ok(stdout) = out.text() else {
                 continue; // same: an undecodable batch is not a failed queue
             };
-            apply_enrichment(&mut items, &plan, stdout);
+            apply_enrichment(self, &mut items, &plan, stdout);
         }
         Ok(items)
+    }
+
+    /// Only an outstanding *direct* request to the authenticated viewer counts.
+    /// Old requests on team-only queue entries must not look like pending ones.
+    fn queue_review_requested_at(
+        &self,
+        item: &QueueItem,
+        viewer: &str,
+        mut requests: serde_json::Value,
+        mut events: serde_json::Value,
+    ) -> Result<Option<String>, ClientError> {
+        let mut seen = HashSet::new();
+        loop {
+            if connection_nodes(&requests)?
+                .iter()
+                .any(|node| requested_from_viewer(node, viewer))
+            {
+                break;
+            }
+            let Some(cursor) = next_cursor(&requests)? else {
+                return Ok(None);
+            };
+            if !seen.insert(cursor.clone()) {
+                return Err(ClientError::Failed("repeated review request cursor".into()));
+            }
+            requests =
+                self.queue_pr_field(item, "reviewRequests", queue_review_requests(Some(&cursor)))?;
+        }
+
+        // Walk backwards, stopping at the latest request for this viewer. A
+        // re-request resets the age; requests for other reviewers never do.
+        seen.clear();
+        loop {
+            if let Some(event) = connection_nodes(&events)?
+                .iter()
+                .rev()
+                .find(|node| requested_from_viewer(node, viewer))
+            {
+                return Ok(event["createdAt"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned));
+            }
+            let has_previous: bool = decode_value(events["pageInfo"]["hasPreviousPage"].clone())?;
+            if !has_previous {
+                return Ok(None);
+            }
+            let cursor: String = decode_value(events["pageInfo"]["startCursor"].clone())?;
+            if cursor.is_empty() || !seen.insert(cursor.clone()) {
+                return Err(ClientError::Failed("invalid review timeline cursor".into()));
+            }
+            events =
+                self.queue_pr_field(item, "timelineItems", queue_review_events(Some(&cursor)))?;
+        }
+    }
+
+    fn queue_pr_field(
+        &self,
+        item: &QueueItem,
+        field: &str,
+        selection: String,
+    ) -> Result<serde_json::Value, ClientError> {
+        let (owner, repo) = item
+            .repository
+            .split_once('/')
+            .ok_or_else(|| ClientError::Failed("invalid queue repository".into()))?;
+        let value = self.review_graphql(format!(
+            "query {{ repository(owner:{},name:{}) {{ pullRequest(number:{}) {{ {selection} }} }} }}",
+            json_string(owner), json_string(repo), item.number,
+        ))?;
+        Ok(value["data"]["repository"]["pullRequest"][field].clone())
     }
 
     /// A bare PR number needs a repository: ask `gh` which repo the current
@@ -1532,12 +1603,11 @@ const SEARCH_LIMIT: &str = "1000";
 /// from, no more. The check-sized fields (review decision, CI, diff size,
 /// avatar) ride the enrichment pass instead — a search can't carry them.
 const QUEUE_JSON_FIELDS: &str =
-    "number,title,author,repository,isDraft,updatedAt,commentsCount,labels";
+    "number,title,author,repository,isDraft,createdAt,updatedAt,commentsCount,labels";
 
 /// How many queued PRs one enrichment query carries. gh's search caps at
-/// 1000 results, so batches of 100 mean at most ten extra round trips for
-/// the fullest queue — a "dozens of PRs" queue stays exactly one — while
-/// no single query grows unbounded.
+/// 1000 results, so batches of 100 mean at most ten initial enrichment calls.
+/// Review requests and their history are paginated further only when needed.
 const ENRICH_BATCH: usize = 100;
 
 /// One repository an enrichment query asks about, under the alias the
@@ -1628,9 +1698,9 @@ fn enrich_plans(items: &[QueueItem]) -> Vec<EnrichPlan> {
 /// repo, one aliased pullRequest per queued PR, each asking for the fields
 /// a search can't carry — the check rollup summarized by GitHub itself
 /// (`statusCheckRollup { state }`), the review decision, the diff size,
-/// and the author's avatar.
+/// the author's avatar, and the viewer's review-request history.
 fn enrich_query(plan: &EnrichPlan) -> String {
-    let mut query = String::from("query {");
+    let mut query = String::from("query { viewer { login }");
     for repo in &plan.repos {
         query.push_str(&format!(
             " {alias}: repository(owner: \"{owner}\", name: \"{name}\") {{",
@@ -1644,9 +1714,11 @@ fn enrich_query(plan: &EnrichPlan) -> String {
                     " {alias}: pullRequest(number: {number}) \
                      {{ additions deletions reviewDecision \
                      statusCheckRollup {{ state }} \
-                     author {{ avatarUrl(size: 64) }} }}",
+                     author {{ avatarUrl(size: 64) }} {requests} {events} }}",
                     alias = pr.pr_alias,
-                    number = pr.number
+                    number = pr.number,
+                    requests = queue_review_requests(None),
+                    events = queue_review_events(None),
                 ));
             }
         }
@@ -1654,6 +1726,26 @@ fn enrich_query(plan: &EnrichPlan) -> String {
     }
     query.push_str(" }");
     query
+}
+
+fn queue_review_requests(after: Option<&str>) -> String {
+    format!("reviewRequests(first:100{}) {{ nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(after))
+}
+
+fn queue_review_events(before: Option<&str>) -> String {
+    let before = before
+        .map(|cursor| format!(",before:{}", json_string(cursor)))
+        .unwrap_or_default();
+    format!("timelineItems(last:100,itemTypes:[REVIEW_REQUESTED_EVENT]{before}) {{ nodes {{ ... on ReviewRequestedEvent {{ createdAt requestedReviewer {{ __typename ... on User {{ login }} }} }} }} pageInfo {{ hasPreviousPage startCursor }} }}")
+}
+
+fn requested_from_viewer(node: &serde_json::Value, viewer: &str) -> bool {
+    let reviewer = &node["requestedReviewer"];
+    !viewer.is_empty()
+        && reviewer["__typename"] == "User"
+        && reviewer["login"]
+            .as_str()
+            .is_some_and(|login| login.eq_ignore_ascii_case(viewer))
 }
 
 /// The fields of the enrichment response the facade consumes. Repo and PR
@@ -1666,7 +1758,16 @@ struct EnrichJson {
 }
 
 #[derive(serde::Deserialize)]
-struct EnrichDataJson(HashMap<String, Option<EnrichRepoJson>>);
+struct EnrichDataJson {
+    viewer: Option<EnrichViewerJson>,
+    #[serde(flatten)]
+    repos: HashMap<String, Option<EnrichRepoJson>>,
+}
+
+#[derive(serde::Deserialize)]
+struct EnrichViewerJson {
+    login: String,
+}
 
 #[derive(serde::Deserialize)]
 struct EnrichRepoJson(HashMap<String, Option<EnrichPrJson>>);
@@ -1680,6 +1781,10 @@ struct EnrichPrJson {
     #[serde(rename = "statusCheckRollup")]
     status_check_rollup: Option<EnrichRollupJson>,
     author: Option<EnrichAuthorJson>,
+    #[serde(rename = "reviewRequests", default)]
+    review_requests: serde_json::Value,
+    #[serde(rename = "timelineItems", default)]
+    timeline_items: serde_json::Value,
 }
 
 #[derive(serde::Deserialize)]
@@ -1698,7 +1803,12 @@ struct EnrichAuthorJson {
 /// that vanished between the search and this query answers `null`, drift
 /// degrades the whole payload — leaves the item on its defaults: the
 /// queue degrades per PR rather than failing wholesale.
-fn apply_enrichment(items: &mut [QueueItem], plan: &EnrichPlan, stdout: &str) {
+fn apply_enrichment<P: GhProcess>(
+    client: &GhCliClient<P>,
+    items: &mut [QueueItem],
+    plan: &EnrichPlan,
+    stdout: &str,
+) {
     let Ok(parsed) = serde_json::from_str::<EnrichJson>(stdout) else {
         return;
     };
@@ -1710,7 +1820,7 @@ fn apply_enrichment(items: &mut [QueueItem], plan: &EnrichPlan, stdout: &str) {
             continue;
         };
         let Some(answer) = data
-            .0
+            .repos
             .get(&slot.repo_alias)
             .and_then(|repo| repo.as_ref())
             .and_then(|repo| repo.0.get(&slot.pr_alias))
@@ -1731,6 +1841,17 @@ fn apply_enrichment(items: &mut [QueueItem], plan: &EnrichPlan, stdout: &str) {
             .author
             .as_ref()
             .and_then(|author| author.avatar_url.clone());
+        if let Some(viewer) = &data.viewer {
+            item.review_requested_at = client
+                .queue_review_requested_at(
+                    item,
+                    &viewer.login,
+                    answer.review_requests.clone(),
+                    answer.timeline_items.clone(),
+                )
+                .ok()
+                .flatten();
+        }
     }
 }
 
@@ -1836,6 +1957,8 @@ struct QueueItemJson {
     repository: RepositoryJson,
     #[serde(rename = "isDraft")]
     is_draft: bool,
+    #[serde(rename = "createdAt")]
+    created_at: String,
     #[serde(rename = "updatedAt")]
     updated_at: String,
     /// `default`: a gh that stops emitting the count degrades to zero
@@ -1893,6 +2016,8 @@ fn parse_queue(stdout: &str) -> Result<Vec<QueueItem>, ClientError> {
                             color: label.color,
                         })
                         .collect(),
+                    created_at: hit.created_at,
+                    review_requested_at: None,
                     updated_at: hit.updated_at,
                 })
                 .collect()
@@ -3775,6 +3900,7 @@ mod tests {
         assert_eq!(first.author, "octocat");
         assert_eq!(first.repository, "octocat/Hello-World");
         assert!(first.is_draft);
+        assert_eq!(first.created_at, "2026-10-15T10:00:00Z");
         assert_eq!(first.updated_at, "2026-10-20T08:07:08Z");
         // Rich search fields: conversation count, labels as GitHub paints them.
         assert_eq!(first.comments, 2);
@@ -3784,6 +3910,7 @@ mod tests {
         let second = &queue[1];
         assert_eq!(second.repository, "octocat/Spoon-Knife");
         assert!(!second.is_draft);
+        assert_eq!(second.created_at, "2026-10-10T09:00:00Z");
         assert_eq!(second.comments, 1);
         assert_eq!(second.labels.len(), 3);
         assert_eq!(second.labels[2].name, "migrations");
@@ -3797,6 +3924,7 @@ mod tests {
             assert_eq!(item.additions, None);
             assert_eq!(item.deletions, None);
             assert_eq!(item.author_avatar_url, None);
+            assert_eq!(item.review_requested_at, None);
         }
     }
 
@@ -3860,7 +3988,7 @@ mod tests {
             calls[0].join(" "),
             "search prs is:pr is:open review-requested:@me \
              --sort updated --order desc --limit 1000 \
-             --json number,title,author,repository,isDraft,updatedAt,commentsCount,labels"
+             --json number,title,author,repository,isDraft,createdAt,updatedAt,commentsCount,labels"
         );
     }
 
@@ -3887,7 +4015,7 @@ mod tests {
             calls[0].join(" "),
             "search prs is:pr is:open review-requested:@me org:acme repo:acme/widgets \
              author:octocat --sort updated --order asc --limit 1000 \
-             --json number,title,author,repository,isDraft,updatedAt,commentsCount,labels"
+             --json number,title,author,repository,isDraft,createdAt,updatedAt,commentsCount,labels"
         );
     }
 
@@ -3944,14 +4072,145 @@ mod tests {
         );
         assert_eq!(
             calls[1].join(" "),
-            "api graphql -f query=query { \
+             "api graphql -f query=query { viewer { login } \
              r0: repository(owner: \"octocat\", name: \"Hello-World\") { \
              p4781: pullRequest(number: 4781) { additions deletions reviewDecision \
-             statusCheckRollup { state } author { avatarUrl(size: 64) } } } \
+             statusCheckRollup { state } author { avatarUrl(size: 64) } \
+             reviewRequests(first:100) { nodes { requestedReviewer { __typename ... on User { login } } } pageInfo { hasNextPage endCursor } } \
+             timelineItems(last:100,itemTypes:[REVIEW_REQUESTED_EVENT]) { nodes { ... on ReviewRequestedEvent { createdAt requestedReviewer { __typename ... on User { login } } } } pageInfo { hasPreviousPage startCursor } } } } \
              r1: repository(owner: \"octocat\", name: \"Spoon-Knife\") { \
              p4761: pullRequest(number: 4761) { additions deletions reviewDecision \
-             statusCheckRollup { state } author { avatarUrl(size: 64) } } } }"
+             statusCheckRollup { state } author { avatarUrl(size: 64) } \
+             reviewRequests(first:100) { nodes { requestedReviewer { __typename ... on User { login } } } pageInfo { hasNextPage endCursor } } \
+             timelineItems(last:100,itemTypes:[REVIEW_REQUESTED_EVENT]) { nodes { ... on ReviewRequestedEvent { createdAt requestedReviewer { __typename ... on User { login } } } } pageInfo { hasPreviousPage startCursor } } } } }"
         );
+    }
+
+    fn queue_request_node(login: &str, created_at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "requestedReviewer": {"__typename": "User", "login": login},
+            "createdAt": created_at,
+        })
+    }
+
+    fn queue_request_enrichment(requests: serde_json::Value, events: serde_json::Value) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(ENRICH_SUCCESS).unwrap();
+        value["data"]["viewer"] = serde_json::json!({"login": "octocat"});
+        value["data"]["r0"]["p4781"]["reviewRequests"] = requests;
+        value["data"]["r0"]["p4781"]["timelineItems"] = events;
+        value.to_string()
+    }
+
+    fn queue_requests(nodes: Vec<serde_json::Value>, after: Option<&str>) -> serde_json::Value {
+        serde_json::json!({"nodes": nodes, "pageInfo": {
+            "hasNextPage": after.is_some(), "endCursor": after,
+        }})
+    }
+
+    fn queue_request_events(
+        nodes: Vec<serde_json::Value>,
+        before: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({"nodes": nodes, "pageInfo": {
+            "hasPreviousPage": before.is_some(), "startCursor": before,
+        }})
+    }
+
+    #[test]
+    fn queue_request_age_is_the_latest_request_for_the_authenticated_viewer() {
+        let old = queue_request_node("octocat", "2026-10-16T00:00:00Z");
+        let mine = queue_request_node("OctoCat", "2026-10-18T00:00:00Z");
+        let other = queue_request_node("hubot", "2026-10-19T00:00:00Z");
+        let enrichment = queue_request_enrichment(
+            queue_requests(vec![mine.clone(), other.clone()], None),
+            queue_request_events(vec![old, mine, other], None),
+        );
+        let (client, calls) = rich_client(
+            ok(Some(0), QUEUE_SUCCESS, ""),
+            vec![ok(Some(0), &enrichment, "")],
+        );
+        let queue = client.search_prs(&QueueSearch::review_requested()).unwrap();
+        assert_eq!(
+            queue[0].review_requested_at.as_deref(),
+            Some("2026-10-18T00:00:00Z")
+        );
+        assert_eq!(queue[1].review_requested_at, None);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn queue_request_age_does_not_reuse_removed_or_completed_direct_requests() {
+        let old = queue_request_node("octocat", "2026-10-16T00:00:00Z");
+        let other = queue_request_node("hubot", "2026-10-19T00:00:00Z");
+        let team = serde_json::json!({"requestedReviewer": {"__typename": "Team"}});
+        for nodes in [vec![], vec![other], vec![team]] {
+            let enrichment = queue_request_enrichment(
+                queue_requests(nodes, None),
+                queue_request_events(vec![old.clone()], None),
+            );
+            let (client, _) = rich_client(
+                ok(Some(0), QUEUE_SUCCESS, ""),
+                vec![ok(Some(0), &enrichment, "")],
+            );
+            let queue = client.search_prs(&QueueSearch::review_requested()).unwrap();
+            assert_eq!(queue[0].review_requested_at, None);
+            assert_eq!(queue[0].additions, Some(151));
+        }
+    }
+
+    #[test]
+    fn queue_request_age_paginates_pending_requests_and_filtered_history() {
+        let mine = queue_request_node("octocat", "2026-10-16T00:00:00Z");
+        let other = queue_request_node("hubot", "2026-10-19T00:00:00Z");
+        let enrichment = queue_request_enrichment(
+            queue_requests(vec![other.clone()], Some("more-requests")),
+            queue_request_events(vec![other], Some("older-events")),
+        );
+        let requests = serde_json::json!({"data":{"repository":{"pullRequest":{
+            "reviewRequests": queue_requests(vec![mine.clone()], None),
+        }}}})
+        .to_string();
+        let events = serde_json::json!({"data":{"repository":{"pullRequest":{
+            "timelineItems": queue_request_events(vec![mine], None),
+        }}}})
+        .to_string();
+        let (client, calls) = rich_client(
+            ok(Some(0), QUEUE_SUCCESS, ""),
+            vec![
+                ok(Some(0), &enrichment, ""),
+                ok(Some(0), &requests, ""),
+                ok(Some(0), &events, ""),
+            ],
+        );
+        let queue = client.search_prs(&QueueSearch::review_requested()).unwrap();
+        assert_eq!(
+            queue[0].review_requested_at.as_deref(),
+            Some("2026-10-16T00:00:00Z")
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[2][3].contains("reviewRequests(first:100,after:\"more-requests\")"));
+        assert!(calls[3][3].contains("itemTypes:[REVIEW_REQUESTED_EVENT],before:\"older-events\""));
+    }
+
+    #[test]
+    fn queue_request_age_stays_unknown_when_history_is_missing_or_unavailable() {
+        let mine = queue_request_node("octocat", "2026-10-16T00:00:00Z");
+        for events in [
+            serde_json::Value::Null,
+            queue_request_events(vec![], None),
+            queue_request_events(vec![], Some("older")),
+        ] {
+            let enrichment =
+                queue_request_enrichment(queue_requests(vec![mine.clone()], None), events);
+            let (client, _) = rich_client(
+                ok(Some(0), QUEUE_SUCCESS, ""),
+                vec![ok(Some(0), &enrichment, ""), ok(Some(1), "", NETWORK_DOWN)],
+            );
+            let queue = client.search_prs(&QueueSearch::review_requested()).unwrap();
+            assert_eq!(queue[0].review_requested_at, None);
+            assert_eq!(queue[0].additions, Some(151));
+        }
     }
 
     #[test]
@@ -4014,7 +4273,8 @@ mod tests {
                     "{{\"author\":{{\"login\":\"octocat\"}},\"isDraft\":false,\
                      \"labels\":[],\"number\":{number},\
                      \"repository\":{{\"nameWithOwner\":\"{repo}\"}},\
-                     \"title\":\"pr\",\"updatedAt\":\"2026-10-20T00:00:00Z\"}}"
+                     \"title\":\"pr\",\"createdAt\":\"2026-10-15T00:00:00Z\",\
+                     \"updatedAt\":\"2026-10-20T00:00:00Z\"}}"
                 )
             })
             .collect();
@@ -4072,6 +4332,8 @@ mod tests {
                 deletions: None,
                 comments: 0,
                 labels: Vec::new(),
+                created_at: String::new(),
+                review_requested_at: None,
                 updated_at: String::new(),
             })
             .collect();

@@ -98,6 +98,12 @@ pub struct CachedQueueRow {
     pub comments: u64,
     #[serde(default)]
     pub labels: Vec<CachedLabel>,
+    /// Empty for queues cached before the PR's creation time was stored.
+    #[serde(default)]
+    pub created_at: String,
+    /// The signed-in viewer's direct review request, not another reviewer's.
+    #[serde(default)]
+    pub review_requested_at: Option<String>,
     pub updated_at: String,
 }
 
@@ -206,6 +212,8 @@ mod tests {
                     name: "api".into(),
                     color: "1D76DB".into(),
                 }],
+                created_at: "2026-10-15T10:00:00Z".into(),
+                review_requested_at: Some("2026-10-19T09:00:00Z".into()),
                 updated_at: "2026-10-20T08:07:08Z".into(),
             }],
             search: "is:pr is:open review-requested:@me".into(),
@@ -225,6 +233,29 @@ mod tests {
         cache.write(&queue).expect("the write must succeed");
         let read = cache.read().expect("the read must succeed");
         assert_eq!(read, queue);
+    }
+
+    #[test]
+    fn older_cached_rows_without_creation_time_still_load() {
+        let store = crate::Store::open_in_memory().unwrap();
+        let mut queue = sample();
+        let mut rows = serde_json::to_value(&queue.prs).unwrap();
+        rows[0].as_object_mut().unwrap().remove("created_at");
+        rows[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("review_requested_at");
+        store
+            .conn
+            .execute(
+                "INSERT INTO queue_cache (id, rows) VALUES (1, ?1)",
+                [rows.to_string()],
+            )
+            .unwrap();
+        let read = store.queue_cache().read().unwrap();
+        queue.prs[0].created_at.clear();
+        queue.prs[0].review_requested_at = None;
+        assert_eq!(read.prs, queue.prs);
     }
 
     /// A store that was never written to reads an empty cache, not an

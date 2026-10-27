@@ -148,6 +148,14 @@ pub struct QueueItem {
     pub comments: u64,
     /// The PR's labels, as GitHub paints them.
     pub labels: Vec<QueueLabel>,
+    /// When the PR was opened, ISO 8601 (GitHub's format).
+    /// Empty when reading an older serialized queue without this field.
+    #[serde(default)]
+    pub created_at: String,
+    /// When the viewer's outstanding direct review request was made.
+    /// Unknown for team-only requests or unavailable timeline data.
+    #[serde(default)]
+    pub review_requested_at: Option<String>,
     /// When the PR last saw activity, ISO 8601 (GitHub's format).
     pub updated_at: String,
 }
