@@ -18,8 +18,10 @@
   contract prevents retaining the application's old 0.25 runtime alongside Kit.
 - `cargo tree -e features -i image` shows stock raster decoding (PNG/JPEG/GIF,
   WebP, TIFF, BMP, ICO, DDS, EXR, farbfeld, HDR, PNM, QOI, TGA) on image 0.25.10.
-  AVIF is **not** enabled by the new GPUI defaults; this needs an explicit
-  capability decision rather than assuming old defaults carry forward.
+  AVIF is **not** enabled by the new GPUI defaults. The old graph contained
+  `ravif`/`rav1e` (encoding), but no `dav1d`/`mp4parse` decoder. No working AVIF
+  decoding capability is being claimed or lost; no system decoder dependency
+  is added just to preserve an unused encoder feature.
 - GPUI Fast may appear in the lockfile as upstream optional dependencies; it
   must not appear in the active target's compiled dependency graph.
 

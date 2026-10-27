@@ -86,9 +86,8 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   Main-thread drafts append to the pending review summary; replies stay in-thread.
   Posted comments appear immediately as placeholders and update in place when
   the refreshed discussion arrives.
-- inline images and screenshots in conversations and diff comment threads,
-  including private GitHub attachments using `gh auth token`; each SVG switches
-  between rendered and source views
+- stock Markdown and images in conversations and diff comment threads,
+  including cached private GitHub attachments using the secure HTTP bridge
 - local repo diffs
 - minimap
 - inline GitHub review comments with GFM formatting (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
@@ -104,6 +103,15 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
    only without a pending review and posts immediately
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
 - follows the system light/dark appearance
+
+### Stock Markdown differences
+
+Kit's TextView owns Markdown layout and media. GitHub mention/issue links and
+emoji preprocessing remain. Reference-style images are omitted; unlinked images
+do not open on click; SVG source toggles and custom image loading/error messages
+are gone. Inline images can be smaller than the former media cards, and narrow
+tables may clip. These are intentional stock-renderer tradeoffs, not custom
+rendering features to restore.
 
 ## Where its state lives
 

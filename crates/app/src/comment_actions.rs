@@ -69,7 +69,7 @@ pub(crate) fn reserve_editor_rows(built: &mut BuiltRows, id: u64, count: usize) 
     let end = start
         + built.rows[start..]
             .iter()
-            .take_while(|row| matches!(row, Row::CommentBody { .. } | Row::CommentMedia { .. }))
+            .take_while(|row| matches!(row, Row::CommentBody { .. }))
             .count();
     let count = count.max(1);
     for ix in built.file_rows.iter_mut().chain(&mut built.hunk_rows) {

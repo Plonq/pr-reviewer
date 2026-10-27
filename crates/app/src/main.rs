@@ -5715,8 +5715,7 @@ impl ReviewApp {
                                                         == ViewMode::Split
                                                         || matches!(
                                                             row,
-                                                            Row::CommentMedia { .. }
-                                                                | Row::CommentBody { .. }
+                                                            Row::CommentBody { .. }
                                                                 | Row::CommentHeader { .. }
                                                                 | Row::CommentEditor { .. }
                                                         ))
@@ -5763,7 +5762,6 @@ impl ReviewApp {
                                         None => Vec::new(),
                                     }
                                 })
-                                .with_decoration(diff_media::InlineMedia(cx.entity()))
                                 .with_decoration(diff_media::InlineText(cx.entity()))
                                 .track_scroll(&data.scroll)
                                 .with_horizontal_sizing_behavior(
@@ -6178,6 +6176,77 @@ impl Render for ReviewApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn file_mode_data(diff: PrDiff) -> Box<ItemData> {
+        let built_rows = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
+        Box::new(ItemData::new(
+            None,
+            diff,
+            ViewMode::Unified,
+            0,
+            built_rows,
+            None,
+            None,
+        ))
+    }
+
+    fn mention(login: &str, name: Option<&str>) -> github::Mention {
+        github::Mention {
+            login: login.to_string(),
+            name: name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn mention_prefix_detects_at_tokens_at_word_boundaries() {
+        let at = |s: &str, off: usize| mention_prefix(&Rope::from(s), off);
+        // Bare `@` with the cursor right after it: empty prefix.
+        assert_eq!(at("hi @", 4), Some((3, String::new())));
+        // Mid-token cursor returns only what's typed so far.
+        assert_eq!(at("hi @oct", 7), Some((3, "oct".to_string())));
+        assert_eq!(at("hi @oct", 5), Some((3, "o".to_string())));
+        // Start of text counts as a boundary.
+        assert_eq!(at("@oct", 4), Some((0, "oct".to_string())));
+        // Hyphens are valid login characters.
+        assert_eq!(at("@foo-bar", 8), Some((0, "foo-bar".to_string())));
+        // Not a boundary (looks like an email) — no completion.
+        assert_eq!(at("foo@bar", 7), None);
+        // No `@` at all.
+        assert_eq!(at("hello", 5), None);
+        // Cursor before the `@`.
+        assert_eq!(at("hi @oct", 3), None);
+    }
+
+    #[test]
+    fn mention_rank_orders_login_prefix_first() {
+        let octocat = mention("octocat", Some("The Octocat"));
+        // Login prefix is the strongest match.
+        assert_eq!(mention_rank(&octocat, "oct"), Some(0));
+        // Empty query matches everything at the top rank.
+        assert_eq!(mention_rank(&octocat, ""), Some(0));
+        // Name-word prefix beats a login substring.
+        assert_eq!(
+            mention_rank(&mention("xyz", Some("Bob Jones")), "bob"),
+            Some(1)
+        );
+        assert_eq!(mention_rank(&mention("abobc", None), "bob"), Some(2));
+        // Case-insensitive, and no match returns None.
+        assert_eq!(mention_rank(&octocat, "OCT"), Some(0));
+        assert_eq!(mention_rank(&octocat, "zzz"), None);
+    }
+
+    mod markdown_hosts {
+        include!("markdown_tests.rs");
+    }
     use crate::test_util::{
         add, hunk, queued, rc, row_name, sample_comments, sample_diff, two_file_diff,
     };
@@ -6832,9 +6901,8 @@ mod tests {
                     })
                 });
                 draw(&mut vcx);
-                // List markers exist only through the Markdown block renderer,
-                // never through the old raw-string row path.
-                assert!(vcx.debug_bounds("inline-text-0-11-0-0-0-marker").is_some());
+                // Stock Markdown owns list markers; assert the host's measured
+                // content and anchor geometry, not a private block widget tree.
                 let root = vcx.debug_bounds("inline-text-0-11-0-card").unwrap();
                 let content = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
                 assert!(content.size.height > px(row_height() * 5.));
@@ -6874,10 +6942,8 @@ mod tests {
             }
         }
         let cursor = cx.update(|cx| app.read(cx).active_data().unwrap().cursor);
-        let marker = vcx
-            .debug_bounds("inline-text-0-11-0-0-0-marker")
-            .unwrap()
-            .center();
+        let content = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
+        let marker = point(content.left() + px(8.), content.top() + px(8.));
         vcx.simulate_mouse_down(marker, MouseButton::Left, gpui::Modifiers::default());
         vcx.simulate_mouse_up(marker, MouseButton::Left, gpui::Modifiers::default());
         vcx.run_until_parked();
@@ -7070,539 +7136,6 @@ mod tests {
                 });
             });
         }
-    }
-
-    #[gpui::test]
-    fn inline_diff_media_renders_in_both_halves_and_survives_partial_virtualization(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = requests.clone();
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(240, 160)
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let png = png.into_inner();
-        cx.update(|cx| cx.set_http_client(http_client::FakeHttpClient::create(move |req| {
-            let url = req.uri().to_string();
-            seen.lock().unwrap().push(url.clone());
-            let svg = url.ends_with("diagram"); // extensionless private SVG
-            let bytes = if svg { br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80"><rect width="200" height="80"/></svg>"#.to_vec() } else { png.clone() };
-            async move { Ok(http_client::http::Response::builder().status(200)
-                .header("content-type", if svg { "image/svg+xml" } else { "image/png" })
-                .body(http_client::AsyncBody::from(bytes)).unwrap()) }
-        })));
-        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
-        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
-        vcx.simulate_resize(size(px(1500.), px(2000.)));
-        let mut item = loop_pr_item(vec![
-            rc(11, "a.rs", Some("RIGHT"), Some(1), "Before **screen**\n\n![screen](https://github.com/user-attachments/assets/screen)\n\n![diagram](https://github.com/user-attachments/assets/diagram)\n\nAfter `code`.", "alice", "2026-01-01T00:00:00Z", None),
-            rc(12, "a.rs", Some("RIGHT"), Some(1), "<img src='https://github.com/user-attachments/assets/diagram'>", "bob", "2026-01-02T00:00:00Z", Some(11)),
-            rc(13, "a.rs", Some("LEFT"), Some(1), "![old](https://github.com/user-attachments/assets/old-screen)", "carol", "2026-01-01T00:00:00Z", None),
-        ]);
-        let ItemState::Ready(data) = &mut item.state else {
-            unreachable!()
-        };
-        data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n tail\n");
-        data.set_rows(data.row_build());
-        install_item(&app, item, cx);
-        for mode in [ViewMode::Unified, ViewMode::Split] {
-            cx.update(|cx| {
-                app.update(cx, |this, _| {
-                    let data = this.active_data_mut().unwrap();
-                    data.mode = mode;
-                    data.set_rows(data.row_build());
-                    let mut scroll = data.scroll.0.borrow_mut();
-                    scroll.deferred_scroll_to_item = None;
-                    scroll.base_handle.set_offset(point(px(0.), px(0.)));
-                })
-            });
-            for _ in 0..5 {
-                vcx.update(|window, cx| {
-                    let _ = window.draw(cx);
-                });
-                vcx.run_until_parked();
-            }
-            let screenshot = vcx
-                .debug_bounds("inline-comment-0-11-0-rendered")
-                .expect("root screenshot");
-            assert!(screenshot.size.height > px(0.));
-            let card = vcx.debug_bounds("inline-comment-0-11-0-card").unwrap();
-            assert!(screenshot.bottom() <= card.bottom());
-            let before = vcx.debug_bounds("inline-text-0-11-0-text").unwrap();
-            let after = vcx.debug_bounds("inline-text-0-11-2-text").unwrap();
-            assert!(before.bottom() <= card.top());
-            assert!(
-                after.top()
-                    >= vcx
-                        .debug_bounds("inline-comment-0-11-1-card")
-                        .unwrap()
-                        .bottom()
-            );
-            assert!(
-                vcx.debug_bounds("inline-comment-0-12-0-rendered").is_some(),
-                "reply media"
-            );
-            if mode == ViewMode::Split {
-                let viewport = cx.update(|cx| {
-                    app.read(cx)
-                        .active_data()
-                        .unwrap()
-                        .scroll
-                        .0
-                        .borrow()
-                        .base_handle
-                        .bounds()
-                });
-                assert!(card.left() > viewport.center().x);
-                assert!(
-                    vcx.debug_bounds("inline-comment-0-13-0-card")
-                        .unwrap()
-                        .right()
-                        <= viewport.center().x
-                );
-            }
-            let count = requests.lock().unwrap().len();
-            let cursor = cx.update(|cx| app.read(cx).active_data().unwrap().cursor);
-            let click_point = vcx
-                .debug_bounds("inline-comment-0-11-1-svg-toggle")
-                .unwrap()
-                .center();
-            vcx.simulate_mouse_move(click_point, None, gpui::Modifiers::default());
-            vcx.simulate_mouse_down(
-                click_point,
-                gpui::MouseButton::Left,
-                gpui::Modifiers::default(),
-            );
-            vcx.simulate_mouse_up(
-                click_point,
-                gpui::MouseButton::Left,
-                gpui::Modifiers::default(),
-            );
-            vcx.run_until_parked();
-            vcx.update(|window, cx| {
-                let _ = window.draw(cx);
-            });
-            assert!(vcx
-                .debug_bounds("inline-comment-0-11-1-svg-source")
-                .is_some());
-            assert!(
-                vcx.debug_bounds("inline-comment-0-12-0-rendered").is_some(),
-                "same URL has independent toggle"
-            );
-            assert_eq!(
-                requests.lock().unwrap().len(),
-                count,
-                "source toggle does not fetch"
-            );
-            assert_eq!(
-                cx.update(|cx| app.read(cx).active_data().unwrap().cursor),
-                cursor,
-                "image controls never move the code cursor"
-            );
-            // Shrink the viewport and scroll into the middle of an image. The
-            // first reserved slot is no longer in the list's visible range.
-            vcx.simulate_resize(size(px(1500.), px(450.)));
-            cx.update(|cx| {
-                app.update(cx, |this, _| {
-                    let data = this.active_data_mut().unwrap();
-                    let first = data
-                        .rows
-                        .iter()
-                        .position(|row| {
-                            matches!(
-                                row,
-                                Row::CommentMedia {
-                                    comment_id: 11,
-                                    image_ix: 0,
-                                    ..
-                                }
-                            )
-                        })
-                        .unwrap();
-                    data.scroll
-                        .0
-                        .borrow()
-                        .base_handle
-                        .set_offset(point(px(0.), px(-((first + 2) as f32) * row_height())));
-                })
-            });
-            for _ in 0..3 {
-                vcx.update(|window, cx| {
-                    let _ = window.draw(cx);
-                });
-                vcx.run_until_parked();
-            }
-            assert!(
-                vcx.debug_bounds("inline-comment-0-11-0-rendered").is_some(),
-                "partially scrolled image remains mounted"
-            );
-            let (viewport, offset, first) = cx.update(|cx| {
-                let data = app.read(cx).active_data().unwrap();
-                let scroll = data.scroll.0.borrow();
-                let first = data
-                    .rows
-                    .iter()
-                    .position(|row| {
-                        matches!(
-                            row,
-                            Row::CommentMedia {
-                                comment_id: 11,
-                                image_ix: 0,
-                                ..
-                            }
-                        )
-                    })
-                    .unwrap();
-                (
-                    scroll.base_handle.bounds(),
-                    scroll.base_handle.offset(),
-                    first,
-                )
-            });
-            let partial = vcx.debug_bounds("inline-comment-0-11-0-card").unwrap();
-            assert_eq!(
-                partial.top(),
-                viewport.top() + offset.y + px(first as f32 * row_height())
-            );
-            assert!(partial.top() < viewport.top() && partial.bottom() > viewport.top());
-            vcx.simulate_resize(size(px(1500.), px(2000.)));
-        }
-        cx.update(|cx| app.update(cx, |this, cx| this.toggle_comments(cx)));
-        vcx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-        assert!(cx.update(|cx| app
-            .read(cx)
-            .active_data()
-            .unwrap()
-            .rows
-            .iter()
-            .all(|row| !matches!(row, Row::CommentMedia { .. }))));
-    }
-
-    #[gpui::test]
-    fn conversation_media_renders_in_bodies_and_comments_and_svg_toggles_are_per_image(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = requests.clone();
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(24, 16)
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let png = png.into_inner();
-        let client = http_client::FakeHttpClient::create(move |req| {
-            let url = req.uri().to_string();
-            seen.lock().unwrap().push(url.clone());
-            let is_svg = url.ends_with("diagram.svg") || url.ends_with("/comment-diagram");
-            let bytes = if is_svg {
-                br##"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="24"><rect width="80" height="24" fill="#8899aa"/></svg>"##.to_vec()
-            } else {
-                png.clone()
-            };
-            async move {
-                Ok(http_client::http::Response::builder()
-                    .status(200)
-                    .header(
-                        "Content-Type",
-                        if is_svg { "image/svg+xml" } else { "image/png" },
-                    )
-                    .body(http_client::AsyncBody::from(bytes))
-                    .unwrap())
-            }
-        });
-        cx.update(|cx| cx.set_http_client(client));
-        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
-        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
-        vcx.simulate_resize(size(px(1400.), px(1800.)));
-        let mut item = loop_pr_item(Vec::new());
-        item.pane = ItemPane::Conversation;
-        let ItemState::Ready(data) = &mut item.state else {
-            unreachable!()
-        };
-        data.pr_meta.as_mut().unwrap().body = "Before the screenshot.\n\n<img width='240' alt='private screenshot' src='https://github.com/user-attachments/assets/private-screen'>\n\n![diagram](https://example.com/diagram.svg)\n\n![same diagram](https://example.com/diagram.svg)\n\nAfter the images.\n\n| Before | After |\n| --- | --- |\n| text | ![public screenshot](https://github.com/user-attachments/assets/public-screen) |".into();
-        let mut discussion = conversation::tests::sample_discussion();
-        discussion.threads.clear();
-        discussion.comments.truncate(1);
-        discussion.comments[0].body =
-            "![comment diagram](https://github.com/user-attachments/assets/comment-diagram)".into();
-        data.discussion = Some(discussion);
-        install_item(&app, item, cx);
-        for _ in 0..4 {
-            vcx.update(|window, cx| {
-                let _ = window.draw(cx);
-            });
-            vcx.run_until_parked();
-        }
-        assert!(
-            vcx.debug_bounds("conversation-0-1-0-rendered").is_some(),
-            "private PR-body screenshot is inline"
-        );
-        let screenshot = vcx.debug_bounds("conversation-0-1-0-rendered").unwrap();
-        assert_eq!(screenshot.size.width, px(240.));
-        assert!(
-            screenshot.size.height > px(0.),
-            "the native loader decoded the screenshot"
-        );
-        assert!(vcx.debug_bounds("conversation-0-2-0-rendered").is_some());
-        assert!(
-            vcx.debug_bounds("conversation-0-2-0-rendered")
-                .unwrap()
-                .size
-                .height
-                > px(0.)
-        );
-        assert!(vcx.debug_bounds("conversation-0-3-0-rendered").is_some());
-        assert!(
-            vcx.debug_bounds("conversation-0-5-1-1-0-rendered")
-                .is_some(),
-            "table images stay inside their cell"
-        );
-        assert!(
-            vcx.debug_bounds("discussion-0-main-false-1-0-0-svg-toggle")
-                .is_some(),
-            "extensionless comment attachment is detected as SVG by content type"
-        );
-        let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
-            let point = vcx.debug_bounds(selector).unwrap().center();
-            vcx.simulate_mouse_move(point, None, gpui::Modifiers::default());
-            vcx.simulate_mouse_down(point, gpui::MouseButton::Left, gpui::Modifiers::default());
-            vcx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::default());
-            vcx.run_until_parked();
-            vcx.update(|window, cx| {
-                let _ = window.draw(cx);
-            });
-        };
-        let before = requests.lock().unwrap().len();
-        click(&mut vcx, "conversation-0-2-0-svg-toggle");
-        assert!(vcx.debug_bounds("conversation-0-2-0-svg-source").is_some());
-        assert!(
-            vcx.debug_bounds("conversation-0-3-0-rendered").is_some(),
-            "same URL, independent mode"
-        );
-        assert!(vcx
-            .debug_bounds("discussion-0-main-false-1-0-0-rendered")
-            .is_some());
-        click(&mut vcx, "conversation-0-2-0-svg-toggle");
-        assert!(vcx.debug_bounds("conversation-0-2-0-rendered").is_some());
-        assert_eq!(
-            requests.lock().unwrap().len(),
-            before,
-            "toggles never refetch"
-        );
-        assert!(requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|url| url.ends_with("/private-screen")));
-    }
-
-    #[gpui::test]
-    fn conversation_lists_use_compact_gaps_without_compressing_paragraphs(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let first = "A long list item that wraps onto multiple lines. ".repeat(8);
-        for (list, loose, nested) in [
-            (format!("- {first}\n- Second."), false, false),
-            (format!("10. {first}\n11. Second."), false, false),
-            (format!("- [x] {first}\n- [ ] Second."), false, false),
-            (
-                format!("- {first}\n  - Nested first.\n  - Nested second.\n- Second."),
-                false,
-                true,
-            ),
-            (
-                format!("- {first}\n\n  Another paragraph.\n\n- Second."),
-                true,
-                false,
-            ),
-        ] {
-            let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
-            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
-            let mut item = loop_pr_item(Vec::new());
-            item.pane = ItemPane::Conversation;
-            let ItemState::Ready(data) = &mut item.state else {
-                unreachable!()
-            };
-            data.pr_meta.as_mut().unwrap().body = format!("Before.\n\n{list}\n\nAfter.");
-            install_item(&app, item, cx);
-            for width in [1400., 1000.] {
-                vcx.simulate_resize(size(px(width), px(2200.)));
-                let rem = vcx.update(|window, cx| {
-                    let _ = window.draw(cx);
-                    window.rem_size()
-                });
-                let before = vcx.debug_bounds("conversation-0-0-text").unwrap();
-                let first = vcx.debug_bounds("conversation-0-1-0-body").unwrap();
-                let second = vcx.debug_bounds("conversation-0-1-1-body").unwrap();
-                let after = vcx.debug_bounds("conversation-0-2-text").unwrap();
-                let paragraph_gap = rem * 0.75;
-                let compact_gap = rem * 0.25;
-                let expected = if loose { paragraph_gap } else { compact_gap };
-                let assert_gap = |actual: gpui::Pixels, expected: gpui::Pixels| {
-                    assert!(
-                        (actual - expected).abs() <= px(1.),
-                        "expected gap {expected:?}, got {actual:?} in {list:?}"
-                    );
-                };
-                assert_gap(second.top() - first.bottom(), expected);
-                assert_gap(first.top() - before.bottom(), paragraph_gap);
-                assert_gap(after.top() - second.bottom(), paragraph_gap);
-                let paragraph = vcx.debug_bounds("conversation-0-1-0-0-text").unwrap();
-                assert!(
-                    paragraph.size.height > second.size.height,
-                    "the first item wraps rather than clipping to one line"
-                );
-                if loose {
-                    let next = vcx.debug_bounds("conversation-0-1-0-1-text").unwrap();
-                    assert_gap(next.top() - paragraph.bottom(), paragraph_gap);
-                }
-                if nested {
-                    let nested_first = vcx.debug_bounds("conversation-0-1-0-1-0-body").unwrap();
-                    let nested_second = vcx.debug_bounds("conversation-0-1-0-1-1-body").unwrap();
-                    assert_gap(nested_first.top() - paragraph.bottom(), compact_gap);
-                    assert_gap(nested_second.top() - nested_first.bottom(), compact_gap);
-                    assert!(nested_first.left() > first.left(), "nested lists indent");
-                    assert!(first.bottom() >= nested_second.bottom());
-                }
-            }
-        }
-    }
-
-    #[gpui::test]
-    fn conversation_list_paragraphs_and_thread_headers_have_nonoverlapping_bounds(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
-        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
-        let mut item = loop_pr_item(Vec::new());
-        item.pane = ItemPane::Conversation;
-        let ItemState::Ready(data) = &mut item.state else {
-            unreachable!()
-        };
-        data.pr_meta.as_mut().unwrap().body = format!(
-            "1. {}\n\n   {}\n\n   {}\n\n2. Next item.\n\nAfter the list.",
-            "The HTTP reply lands: `handoffVersion` changes. ".repeat(6),
-            "The ACTIVE branch has the mirror-image failure. ".repeat(6),
-            "Routing both branches through `isNewerHandoffState` fixes this. ".repeat(6),
-        );
-        let mut discussion = conversation::tests::sample_discussion();
-        let mut review = discussion.comments[0].clone();
-        review.id = 100;
-        review.body.clear();
-        review.review_state = Some("COMMENTED".into());
-        review.review_id = Some("R1".into());
-        discussion.comments.push(review);
-        discussion.threads[0].comments[0].review_id = Some("R1".into());
-        data.discussion = Some(discussion);
-        install_item(&app, item, cx);
-        for width in [1400., 1000.] {
-            vcx.simulate_resize(size(px(width), px(2200.)));
-            vcx.update(|window, cx| {
-                let _ = window.draw(cx);
-            });
-            let marker = vcx.debug_bounds("conversation-0-0-0-marker").unwrap();
-            let body = vcx.debug_bounds("conversation-0-0-0-body").unwrap();
-            assert!(marker.size.width >= px(15.));
-            assert!(body.left() > marker.right(), "marker cannot overlap text");
-            assert!(body.size.width > px(150.), "no character-wide columns");
-            let first = vcx.debug_bounds("conversation-0-0-0-0-text").unwrap();
-            let second = vcx.debug_bounds("conversation-0-0-0-1-text").unwrap();
-            let third = vcx.debug_bounds("conversation-0-0-0-2-text").unwrap();
-            assert!(
-                second.top() >= first.bottom(),
-                "paragraphs stack vertically"
-            );
-            assert!(third.top() >= second.bottom());
-            assert!(
-                body.bottom() >= third.bottom(),
-                "text stays inside its list row"
-            );
-            let after = vcx.debug_bounds("conversation-0-1-text").unwrap();
-            assert!(
-                after.top() >= body.bottom(),
-                "following content starts below the entire item"
-            );
-            let header = vcx.debug_bounds("thread-header-0-T1").unwrap();
-            assert!(
-                header.size.width > px(150.),
-                "resolved thread label must not be an empty ellipsis"
-            );
-            assert!(header.top() >= after.bottom());
-        }
-    }
-
-    fn mention(login: &str, name: Option<&str>) -> github::Mention {
-        github::Mention {
-            login: login.to_string(),
-            name: name.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn mention_prefix_detects_at_tokens_at_word_boundaries() {
-        let at = |s: &str, off: usize| mention_prefix(&Rope::from(s), off);
-        // Bare `@` with the cursor right after it: empty prefix.
-        assert_eq!(at("hi @", 4), Some((3, String::new())));
-        // Mid-token cursor returns only what's typed so far.
-        assert_eq!(at("hi @oct", 7), Some((3, "oct".to_string())));
-        assert_eq!(at("hi @oct", 5), Some((3, "o".to_string())));
-        // Start of text counts as a boundary.
-        assert_eq!(at("@oct", 4), Some((0, "oct".to_string())));
-        // Hyphens are valid login characters.
-        assert_eq!(at("@foo-bar", 8), Some((0, "foo-bar".to_string())));
-        // Not a boundary (looks like an email) — no completion.
-        assert_eq!(at("foo@bar", 7), None);
-        // No `@` at all.
-        assert_eq!(at("hello", 5), None);
-        // Cursor before the `@`.
-        assert_eq!(at("hi @oct", 3), None);
-    }
-
-    #[test]
-    fn mention_rank_orders_login_prefix_first() {
-        let octocat = mention("octocat", Some("The Octocat"));
-        // Login prefix is the strongest match.
-        assert_eq!(mention_rank(&octocat, "oct"), Some(0));
-        // Empty query matches everything at the top rank.
-        assert_eq!(mention_rank(&octocat, ""), Some(0));
-        // Name-word prefix beats a login substring.
-        assert_eq!(
-            mention_rank(&mention("xyz", Some("Bob Jones")), "bob"),
-            Some(1)
-        );
-        assert_eq!(mention_rank(&mention("abobc", None), "bob"), Some(2));
-        // Case-insensitive, and no match returns None.
-        assert_eq!(mention_rank(&octocat, "OCT"), Some(0));
-        assert_eq!(mention_rank(&octocat, "zzz"), None);
-    }
-
-    // --- File mode (user stories 28–31) --------------------------------
-
-    /// ItemData exactly as a fresh load builds it: file mode on the first
-    /// file (unified, no comments), revealed at its first change.
-    fn file_mode_data(diff: PrDiff) -> Box<ItemData> {
-        let built_rows = build_rows(RowsView {
-            diff: &diff,
-            upgrades: &HashMap::new(),
-            comments: None,
-            options: RowOptions {
-                mode: ViewMode::Unified,
-                file_ix: 0,
-                comments_visible: true,
-                comment_wrap: COMMENT_WRAP_CHARS,
-            },
-        });
-        Box::new(ItemData::new(
-            None,
-            diff,
-            ViewMode::Unified,
-            0,
-            built_rows,
-            None,
-            None,
-        ))
     }
 
     #[gpui::test]

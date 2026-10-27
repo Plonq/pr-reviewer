@@ -19,11 +19,8 @@
 //! tradeoff holds.
 
 mod markdown;
-mod media;
 pub(crate) mod posting;
-pub(crate) use markdown::inline_images;
 pub(crate) use markdown::render as render_markdown;
-pub(crate) use media::{render_inline, Media};
 
 /// Expand the GitHub-isms in a description or comment body into plain GFM:
 ///

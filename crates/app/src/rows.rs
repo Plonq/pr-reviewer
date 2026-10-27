@@ -11,9 +11,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Reserve a bounded media card without changing the diff's uniform row height.
-pub(crate) const COMMENT_MEDIA_ROWS: usize = 14;
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum LineKind {
     Context,
@@ -103,15 +100,6 @@ pub(crate) enum Row {
         text: Arc<crate::diff_media::CommentText>,
         slot: usize,
     },
-    /// One slot in an inline image reservation. The list decoration paints the
-    /// whole card once, including when its first slot has scrolled offscreen.
-    CommentMedia {
-        comment_id: u64,
-        image_ix: usize,
-        media: Arc<crate::conversation::Media>,
-        slot: usize,
-        half: Option<CommentSide>,
-    },
     /// Space for the root-level editor, replacing this comment's body in place.
     CommentEditor {
         half: Option<CommentSide>,
@@ -132,7 +120,6 @@ pub(crate) fn is_comment_row(row: &Row) -> bool {
         row,
         Row::CommentHeader { .. }
             | Row::CommentBody { .. }
-            | Row::CommentMedia { .. }
             | Row::CommentEditor { .. }
             | Row::CommentActions { .. }
     )
@@ -272,34 +259,7 @@ fn push_thread_rows(
                     });
                 }
             };
-            let images = crate::conversation::inline_images(&comment.body);
-            if images.is_empty() {
-                push_text(rows, &comment.body, 0);
-            } else {
-                let mut cursor = 0;
-                let trailing_part = images.len();
-                for (image_ix, media) in images.into_iter().enumerate() {
-                    let text = &comment.body[cursor..media.range.start];
-                    if !text.trim().is_empty() {
-                        push_text(rows, text.trim_matches(['\r', '\n']), image_ix);
-                    }
-                    cursor = media.range.end;
-                    let media = Arc::new(media);
-                    for slot in 0..COMMENT_MEDIA_ROWS {
-                        rows.push(Row::CommentMedia {
-                            comment_id: comment.id,
-                            image_ix,
-                            media: media.clone(),
-                            slot,
-                            half,
-                        });
-                    }
-                }
-                let text = &comment.body[cursor..];
-                if !text.trim().is_empty() {
-                    push_text(rows, text.trim_matches(['\r', '\n']), trailing_part);
-                }
-            }
+            push_text(rows, &comment.body, 0);
         }
         // Pending threads are edited/deleted in the review tray, not replied
         // to through the immediate-comment endpoint. Local drafts still reply.
@@ -1368,9 +1328,6 @@ fn render_row_content(
             )
         }
         Row::CommentBody { half, .. } => {
-            comment_row(div().into_any_element(), *half, false, CardEdge::Middle, cx)
-        }
-        Row::CommentMedia { half, .. } => {
             comment_row(div().into_any_element(), *half, false, CardEdge::Middle, cx)
         }
         Row::CommentEditor { half } => {
@@ -2563,7 +2520,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_media_reserves_comment_slots_without_changing_anchors_or_wrapping_urls() {
+    fn markdown_reservations_keep_complete_source_and_comment_anchors() {
         let body = "Before café.\n\n![private screenshot](https://github.com/user-attachments/assets/very-long-private-attachment-url)\n\nAfter.";
         let index = group_comments(vec![
             rc(
@@ -2600,47 +2557,33 @@ mod tests {
                 },
             })
             .rows;
-            let media: Vec<_> = rows
-                .iter()
-                .enumerate()
-                .filter(|(_, row)| matches!(row, Row::CommentMedia { .. }))
-                .collect();
-            assert_eq!(media.len(), 2 * COMMENT_MEDIA_ROWS);
-            for (ix, row) in media {
-                assert!(is_comment_row(row));
-                assert_eq!(cursor_anchor(&rows, ix), None);
-                let Row::CommentMedia {
-                    comment_id,
-                    slot,
-                    media,
-                    half,
-                    ..
-                } = row
-                else {
-                    unreachable!()
-                };
-                assert!(*slot < COMMENT_MEDIA_ROWS);
-                assert_eq!(
-                    *half,
-                    (mode == ViewMode::Split).then_some(CommentSide::Right)
-                );
-                assert_eq!(
-                    media.url,
-                    if *comment_id == 1 {
-                        "https://github.com/user-attachments/assets/very-long-private-attachment-url"
-                    } else {
-                        "https://example.com/a.svg"
-                    }
-                );
-            }
             let bodies: Vec<_> = rows
                 .iter()
-                .filter_map(|row| match row {
-                    Row::CommentBody { line, .. } => Some(line.as_ref()),
-                    _ => None,
+                .enumerate()
+                .filter_map(|(ix, row)| {
+                    if let Row::CommentBody {
+                        text,
+                        slot: 0,
+                        half,
+                        ..
+                    } = row
+                    {
+                        assert!(is_comment_row(row));
+                        assert_eq!(cursor_anchor(&rows, ix), None);
+                        assert_eq!(
+                            *half,
+                            (mode == ViewMode::Split).then_some(CommentSide::Right)
+                        );
+                        Some((text.comment_id, text.source.as_str()))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
-            assert_eq!(bodies, ["Before café.", "After."]);
+            assert_eq!(
+                bodies,
+                [(1, body), (2, "<img src='https://example.com/a.svg'>")]
+            );
             assert!(rows
                 .iter()
                 .any(|row| matches!(row, Row::CommentActions { root_id: 1, .. })));
