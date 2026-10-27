@@ -2,11 +2,11 @@
 
 use std::collections::HashSet;
 
-use crate::{theme, ItemData, ReviewApp};
+use crate::{theme, threads::CommentIndex, ItemData, ReviewApp};
 use diff_core::{FileDiff, FileStatus};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{div, prelude::*, px, Hsla, SharedString};
-use gpui_component::{checkbox::Checkbox, tag::Tag, Disableable as _, Sizable as _};
+use gpui_component::{checkbox::Checkbox, Disableable as _, Icon, Sizable as _};
 
 /// Row height of sidebar file-tree entries.
 const TREE_ROW_HEIGHT: f32 = 24.0;
@@ -128,7 +128,7 @@ pub(crate) fn fuzzy_file_matches(paths: &[&str], query: &str) -> Vec<usize> {
     scored.into_iter().map(|(_, ix)| ix).collect()
 }
 
-/// Status label and color, shared by file headers and tree entries.
+/// Status label for file headers and color shared with tree entries.
 pub(crate) fn status_style(status: FileStatus) -> (&'static str, gpui::Rgba) {
     match status {
         FileStatus::Added => ("added", theme::green()),
@@ -147,6 +147,13 @@ pub(crate) enum TreeListRow {
     FilteredFile(usize),
 }
 
+/// Count comments, not threads, including replies, outdated comments and drafts.
+fn file_comment_count(file: &FileDiff, comments: Option<&CommentIndex>) -> usize {
+    comments
+        .and_then(|index| index.counts.get(file.display_path()))
+        .map_or(0, |(anchored, outdated)| anchored + outdated)
+}
+
 /// `current` marks the file the diff viewport is showing (surface0, like the
 /// active sidebar item). Clicking a dir toggles collapse; clicking a file
 /// jumps the diff to its header.
@@ -158,6 +165,26 @@ pub(crate) fn render_tree_row(
     entity: &gpui::Entity<ReviewApp>,
     reloading: bool,
 ) -> gpui::AnyElement {
+    let comments = |file_ix: usize| {
+        let count = file_comment_count(&data.diff.files[file_ix], data.comments.as_ref());
+        (count > 0).then(|| {
+            div()
+                .debug_selector(move || format!("file-comments-{file_ix}"))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(px(10.))
+                .text_color(theme::subtext())
+                .child(
+                    Icon::default()
+                        .path("icons/gander/comment-16.svg")
+                        .xsmall()
+                        .text_color(theme::overlay0()),
+                )
+                .child(SharedString::from(count.to_string()))
+        })
+    };
     let checkbox = |file_ix: usize| {
         let path = data.diff.files[file_ix].display_path();
         let state = data.viewed.state(path);
@@ -256,8 +283,7 @@ pub(crate) fn render_tree_row(
                 }
                 TreeEntryKind::File { file_ix } => {
                     let file = &data.diff.files[*file_ix];
-                    let (status_label, status_color) = status_style(file.status);
-                    let status: Hsla = status_color.into();
+                    let (_, status_color) = status_style(file.status);
                     base.child(div().w(px(12.)).flex_shrink_0()) // aligns with dir chevrons
                         .child(
                             div()
@@ -267,14 +293,7 @@ pub(crate) fn render_tree_row(
                                 .text_color(status_color)
                                 .child(entry.name.clone()),
                         )
-                        // The status tag mirrors the file header's — the
-                        // tree answers "what happened to this file" at a
-                        // glance, without reading colors alone.
-                        .child(
-                            Tag::custom(status.opacity(0.15), status, status.opacity(0.4))
-                                .xsmall()
-                                .child(SharedString::from(status_label)),
-                        )
+                        .children(comments(*file_ix))
                         .child(stats(file))
                         .when(data.pr_meta.is_some(), |row| row.child(checkbox(*file_ix)))
                         .into_any_element()
@@ -283,8 +302,7 @@ pub(crate) fn render_tree_row(
         }
         TreeListRow::FilteredFile(file_ix) => {
             let file = &data.diff.files[file_ix];
-            let (status_label, status_color) = status_style(file.status);
-            let status: Hsla = status_color.into();
+            let (_, status_color) = status_style(file.status);
             base.pl_2()
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| this.jump_to_file(file_ix, window, cx));
@@ -297,11 +315,7 @@ pub(crate) fn render_tree_row(
                         .text_color(status_color)
                         .child(SharedString::from(file.display_path().to_string())),
                 )
-                .child(
-                    Tag::custom(status.opacity(0.15), status, status.opacity(0.4))
-                        .xsmall()
-                        .child(SharedString::from(status_label)),
-                )
+                .children(comments(file_ix))
                 .child(stats(file))
                 .when(data.pr_meta.is_some(), |row| row.child(checkbox(file_ix)))
                 .into_any_element()
@@ -312,6 +326,29 @@ pub(crate) fn render_tree_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_comment_counts_include_outdated_and_use_display_path() {
+        let mut file = crate::test_util::sample_diff().files.remove(0);
+        let mut index = CommentIndex::default();
+        index.counts.insert("a.rs".into(), (2, 3));
+        index.counts.insert("renamed.rs".into(), (4, 0));
+        assert_eq!(file_comment_count(&file, Some(&index)), 5);
+        assert_eq!(file_comment_count(&file, None), 0);
+
+        file.status = FileStatus::Renamed;
+        file.new_path = Some("renamed.rs".into());
+        assert_eq!(file_comment_count(&file, Some(&index)), 4);
+
+        file.status = FileStatus::Deleted;
+        file.new_path = None;
+        assert_eq!(file_comment_count(&file, Some(&index)), 5);
+
+        index.counts.insert("a.rs".into(), (0, 3));
+        assert_eq!(file_comment_count(&file, Some(&index)), 3);
+        index.counts.clear();
+        assert_eq!(file_comment_count(&file, Some(&index)), 0);
+    }
 
     /// (depth, display name, Some(file_ix) for files / None for dirs).
     fn flat(entries: &[TreeEntry]) -> Vec<(usize, &str, Option<usize>)> {
