@@ -13,25 +13,27 @@ const QUEUE_ROW_HEIGHT: f32 = 36.0;
 /// The CI dot's paint, per verdict: green opens without fear, red means
 /// expect breakage, yellow means checks still running, gray means no
 /// signal — no checks configured, or the enrichment couldn't see them.
-fn ci_dot_color(ci: github::CiState) -> Rgba {
+fn ci_dot_color(ci: github::CiState, cx: &gpui::App) -> Rgba {
     match ci {
-        github::CiState::Pass => theme::green(),
-        github::CiState::Fail => theme::red(),
-        github::CiState::Pending => theme::yellow(),
-        github::CiState::NoChecks => theme::overlay0(),
+        github::CiState::Pass => theme::green(cx),
+        github::CiState::Fail => theme::red(cx),
+        github::CiState::Pending => theme::yellow(cx),
+        github::CiState::NoChecks => theme::overlay0(cx),
     }
 }
 
 /// The review-state bit of a queue row: a green ✓ or red ✕ for the decided
 /// states, plain muted text for the queue's default "awaiting" posture —
 /// so the row never keeps quiet about where a PR stands.
-fn review_state_view(state: github::ReviewState) -> gpui::AnyElement {
+fn review_state_view(state: github::ReviewState, cx: &gpui::App) -> gpui::AnyElement {
     let (icon, label, color) = match state {
-        github::ReviewState::Approved => (Some(IconName::CircleCheck), "approved", theme::green()),
-        github::ReviewState::ChangesRequested => {
-            (Some(IconName::CircleX), "changes requested", theme::red())
+        github::ReviewState::Approved => {
+            (Some(IconName::CircleCheck), "approved", theme::green(cx))
         }
-        github::ReviewState::Awaiting => (None, "awaiting review", theme::subtext()),
+        github::ReviewState::ChangesRequested => {
+            (Some(IconName::CircleX), "changes requested", theme::red(cx))
+        }
+        github::ReviewState::Awaiting => (None, "awaiting review", theme::subtext(cx)),
     };
     div()
         .flex_shrink_0()
@@ -48,7 +50,11 @@ fn review_state_view(state: github::ReviewState) -> gpui::AnyElement {
 /// The diff size at a glance — `+151 −30`, additions in green, deletions
 /// in red, the "big vs small" triage signal. `None` until the enrichment
 /// has seen the diff, and rendered not at all rather than as a fake zero.
-fn size_view(additions: Option<u64>, deletions: Option<u64>) -> Option<gpui::AnyElement> {
+fn size_view(
+    additions: Option<u64>,
+    deletions: Option<u64>,
+    cx: &gpui::App,
+) -> Option<gpui::AnyElement> {
     let (additions, deletions) = (additions?, deletions?);
     Some(
         div()
@@ -59,12 +65,12 @@ fn size_view(additions: Option<u64>, deletions: Option<u64>) -> Option<gpui::Any
             .text_size(px(12.))
             .child(
                 div()
-                    .text_color(theme::green())
+                    .text_color(theme::green(cx))
                     .child(SharedString::from(format!("+{additions}"))),
             )
             .child(
                 div()
-                    .text_color(theme::red())
+                    .text_color(theme::red(cx))
                     .child(SharedString::from(format!("−{deletions}"))),
             )
             .into_any_element(),
@@ -73,7 +79,7 @@ fn size_view(additions: Option<u64>, deletions: Option<u64>) -> Option<gpui::Any
 
 /// The conversation count: a muted speech bubble beside the number, so
 /// "has discussion happened here?" reads at a glance.
-fn comment_count_view(comments: u64) -> impl IntoElement {
+fn comment_count_view(comments: u64, cx: &gpui::App) -> impl IntoElement {
     div()
         .flex_shrink_0()
         .flex()
@@ -83,12 +89,12 @@ fn comment_count_view(comments: u64) -> impl IntoElement {
             Icon::default()
                 .path("icons/gander/comment-16.svg")
                 .xsmall()
-                .text_color(theme::overlay0()),
+                .text_color(theme::overlay0(cx)),
         )
         .child(
             div()
                 .text_size(px(12.))
-                .text_color(theme::subtext())
+                .text_color(theme::subtext(cx))
                 .child(SharedString::from(comments.to_string())),
         )
 }
@@ -137,11 +143,15 @@ fn mix_hsla(a: Hsla, b: Hsla, t: f32) -> Hsla {
 /// lifted toward white in dark mode, deepened toward black in light, so
 /// GitHub's darker label colors stay readable on both. A missing color
 /// degrades to neutral grays, never breaks the row.
-pub(crate) fn label_chip_colors(color: Option<Hsla>, light: bool) -> (Hsla, Hsla, Hsla) {
+pub(crate) fn label_chip_colors(
+    color: Option<Hsla>,
+    light: bool,
+    cx: &gpui::App,
+) -> (Hsla, Hsla, Hsla) {
     let Some(color) = color else {
-        let bg = Hsla::from(theme::surface0()).opacity(0.4);
-        let text = Hsla::from(theme::subtext());
-        return (bg, text, Hsla::from(theme::surface0()));
+        let bg = Hsla::from(theme::surface0(cx)).opacity(0.4);
+        let text = Hsla::from(theme::subtext(cx));
+        return (bg, text, Hsla::from(theme::surface0(cx)));
     };
     let (text, toward) = if light {
         (
@@ -320,6 +330,7 @@ pub(crate) fn queue_row(
     selected: bool,
     now: i64,
     entity: gpui::Entity<ReviewApp>,
+    cx: &gpui::App,
 ) -> gpui::AnyElement {
     let (labels, overflow) = label_budget(&pr.labels);
     div()
@@ -332,9 +343,9 @@ pub(crate) fn queue_row(
         .items_center()
         .gap_2()
         .cursor_pointer()
-        .when(selected, |row| row.bg(theme::surface0()))
+        .when(selected, |row| row.bg(theme::surface0(cx)))
         .when(!selected, |row| {
-            row.hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+            row.hover(|style| style.bg(Hsla::from(theme::surface0(cx)).opacity(0.5)))
         })
         .on_click(move |_, window, cx| {
             entity.update(cx, |this, cx| {
@@ -351,11 +362,11 @@ pub(crate) fn queue_row(
                 .flex_shrink_0()
                 .size(px(8.))
                 .rounded_full()
-                .bg(ci_dot_color(pr.ci))
+                .bg(ci_dot_color(pr.ci, cx))
                 .when(pr.ci == github::CiState::Pending, |dot| {
                     dot.border_1()
-                        .border_color(theme::yellow())
-                        .bg(Hsla::from(theme::yellow()).opacity(0.35))
+                        .border_color(theme::yellow(cx))
+                        .bg(Hsla::from(theme::yellow(cx)).opacity(0.35))
                 }),
         )
         .child(
@@ -371,7 +382,7 @@ pub(crate) fn queue_row(
         .child(
             div()
                 .flex_shrink_0()
-                .text_color(theme::subtext())
+                .text_color(theme::subtext(cx))
                 .child(SharedString::from(format!("#{}", pr.number))),
         )
         .child(
@@ -382,9 +393,9 @@ pub(crate) fn queue_row(
                 // Drafts read muted with a badge beside them — visibly
                 // not-ready while still fully triageable.
                 .text_color(if pr.is_draft {
-                    theme::subtext()
+                    theme::subtext(cx)
                 } else {
-                    theme::text()
+                    theme::text(cx)
                 })
                 .child(SharedString::from(pr.title.clone())),
         )
@@ -395,18 +406,18 @@ pub(crate) fn queue_row(
                     .px_1p5()
                     .text_size(px(10.))
                     .rounded_sm()
-                    .bg(Hsla::from(theme::overlay0()).opacity(0.2))
+                    .bg(Hsla::from(theme::overlay0(cx)).opacity(0.2))
                     .border_1()
-                    .border_color(Hsla::from(theme::overlay0()).opacity(0.5))
-                    .text_color(theme::subtext())
+                    .border_color(Hsla::from(theme::overlay0(cx)).opacity(0.5))
+                    .text_color(theme::subtext(cx))
                     .child("Draft"),
             )
         })
-        .child(review_state_view(pr.review_state))
-        .when_some(size_view(pr.additions, pr.deletions), |row, size| {
+        .child(review_state_view(pr.review_state, cx))
+        .when_some(size_view(pr.additions, pr.deletions, cx), |row, size| {
             row.child(size)
         })
-        .child(comment_count_view(pr.comments))
+        .child(comment_count_view(pr.comments, cx))
         .when(!labels.is_empty(), |row| {
             row.child(
                 div()
@@ -418,7 +429,7 @@ pub(crate) fn queue_row(
                     .overflow_hidden()
                     .children(labels.iter().map(|label| {
                         let (bg, text, border) =
-                            label_chip_colors(label_color(&label.color), theme::is_light());
+                            label_chip_colors(label_color(&label.color), theme::is_light(cx), cx);
                         Tag::custom(bg, text, border)
                             .xsmall()
                             .max_w(px(120.))
@@ -429,7 +440,7 @@ pub(crate) fn queue_row(
                         chips.child(
                             div()
                                 .text_size(px(12.))
-                                .text_color(theme::overlay0())
+                                .text_color(theme::overlay0(cx))
                                 .child(SharedString::from(format!("+{overflow}"))),
                         )
                     }),
@@ -440,7 +451,7 @@ pub(crate) fn queue_row(
                 .flex_shrink_0()
                 .max_w(px(220.))
                 .truncate()
-                .text_color(theme::blue())
+                .text_color(theme::blue(cx))
                 .child(SharedString::from(pr.repository.clone())),
         )
         .child(
@@ -451,7 +462,7 @@ pub(crate) fn queue_row(
                 .items_end()
                 .text_size(px(10.))
                 .line_height(px(14.))
-                .text_color(theme::overlay0())
+                .text_color(theme::overlay0(cx))
                 .children(queue_ages(pr, now).map(|age| div().child(SharedString::from(age)))),
         )
         .into_any_element()
@@ -506,28 +517,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn queue_label_chips_stay_readable_in_both_palettes() {
-        // A GitHub label color, mid-tone blue.
-        let blue = label_color("1D76DB").unwrap();
-        // Dark mode: text lifts toward white, fill stays tinted.
-        let (bg, text, border) = label_chip_colors(Some(blue), false);
-        assert!(
-            text.l > blue.l,
-            "dark-mode text must be lighter than the base"
-        );
-        assert_eq!(bg.a, 0.12);
-        assert!(border.a > 0.0);
-        // Light mode: text deepens toward black instead.
-        let (_, text, _) = label_chip_colors(Some(blue), true);
-        assert!(
-            text.l < blue.l,
-            "light-mode text must be darker than the base"
-        );
-        // No color at all: neutral grays, so the chip still reads.
-        let (bg, text, _) = label_chip_colors(None, false);
-        assert_eq!(bg, Hsla::from(theme::surface0()).opacity(0.4));
-        assert_eq!(text, Hsla::from(theme::subtext()));
+    #[gpui::test]
+    fn queue_label_chips_stay_readable_in_both_palettes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            // A GitHub label color, mid-tone blue.
+            let blue = label_color("1D76DB").unwrap();
+            // Dark mode: text lifts toward white, fill stays tinted.
+            let (bg, text, border) = label_chip_colors(Some(blue), false, cx);
+            assert!(
+                text.l > blue.l,
+                "dark-mode text must be lighter than the base"
+            );
+            assert_eq!(bg.a, 0.12);
+            assert!(border.a > 0.0);
+            // Light mode: text deepens toward black instead.
+            let (_, text, _) = label_chip_colors(Some(blue), true, cx);
+            assert!(
+                text.l < blue.l,
+                "light-mode text must be darker than the base"
+            );
+            // No color at all: neutral grays, so the chip still reads.
+            let (bg, text, _) = label_chip_colors(None, false, cx);
+            assert_eq!(bg, Hsla::from(theme::surface0(cx)).opacity(0.4));
+            assert_eq!(text, Hsla::from(theme::subtext(cx)));
+        });
     }
 
     #[test]
@@ -581,22 +595,34 @@ mod tests {
 
     /// The CI dot's palette wiring: each verdict paints its own color —
     /// the acceptance "green vs red" rides on exactly these mappings.
-    #[test]
-    fn queue_ci_dots_paint_their_verdicts() {
-        assert_eq!(ci_dot_color(github::CiState::Pass), theme::green());
-        assert_eq!(ci_dot_color(github::CiState::Fail), theme::red());
-        assert_eq!(ci_dot_color(github::CiState::Pending), theme::yellow());
-        assert_eq!(ci_dot_color(github::CiState::NoChecks), theme::overlay0());
+    #[gpui::test]
+    fn queue_ci_dots_paint_their_verdicts(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            assert_eq!(ci_dot_color(github::CiState::Pass, cx), theme::green(cx));
+            assert_eq!(ci_dot_color(github::CiState::Fail, cx), theme::red(cx));
+            assert_eq!(
+                ci_dot_color(github::CiState::Pending, cx),
+                theme::yellow(cx)
+            );
+            assert_eq!(
+                ci_dot_color(github::CiState::NoChecks, cx),
+                theme::overlay0(cx)
+            );
+        });
     }
 
     /// Size stays absent until the enrichment has seen both halves — a
     /// half-known PR shows nothing rather than a misleading number.
-    #[test]
-    fn queue_size_waits_for_the_whole_diff() {
-        assert!(size_view(None, None).is_none());
-        assert!(size_view(Some(151), None).is_none());
-        assert!(size_view(None, Some(30)).is_none());
-        assert!(size_view(Some(151), Some(30)).is_some());
+    #[gpui::test]
+    fn queue_size_waits_for_the_whole_diff(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            assert!(size_view(None, None, cx).is_none());
+            assert!(size_view(Some(151), None, cx).is_none());
+            assert!(size_view(None, Some(30), cx).is_none());
+            assert!(size_view(Some(151), Some(30), cx).is_some());
+        });
     }
 
     /// The `kind` group from a derivation — the bar skips dimensions with

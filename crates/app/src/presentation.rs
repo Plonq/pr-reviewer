@@ -342,9 +342,9 @@ impl ReviewApp {
             .items_center()
             .gap_2()
             .px_2()
-            .bg(crate::theme::mantle())
+            .bg(crate::theme::mantle(cx))
             .border_b_1()
-            .border_color(crate::theme::surface0())
+            .border_color(crate::theme::surface0(cx))
             .child(
                 Button::new("hide-whitespace")
                     .ghost()

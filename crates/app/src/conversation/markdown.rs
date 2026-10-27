@@ -234,7 +234,7 @@ fn render_node(
         Node::Root(_) | Node::ListItem(_) | Node::Blockquote(_) => {
             let mut block = column();
             if matches!(node, Node::Blockquote(_)) {
-                block = block.border_l_2().border_color(theme::surface0()).pl_4();
+                block = block.border_l_2().border_color(theme::surface0(cx)).pl_4();
             }
             for (ix, child) in node.children().into_iter().flatten().enumerate() {
                 if !matches!(child, Node::Definition(_)) {
@@ -292,7 +292,10 @@ fn render_node(
         Node::Table(table) if doc.images_in(node).next().is_some() => {
             // Splitting the table's markdown around an image would leave raw
             // pipes/half a table. Keep media in its cell and rows width-safe.
-            let mut block = column().gap_0().border_1().border_color(theme::surface0());
+            let mut block = column()
+                .gap_0()
+                .border_1()
+                .border_color(theme::surface0(cx));
             for (row_ix, row) in table.children.iter().enumerate() {
                 let mut line = div().w_full().min_w_0().flex();
                 if row_ix == 0 {
@@ -305,7 +308,7 @@ fn render_node(
                             .min_w_0()
                             .p_2()
                             .border_1()
-                            .border_color(theme::surface0())
+                            .border_color(theme::surface0(cx))
                             .child(render_node(
                                 cell,
                                 doc,
@@ -375,7 +378,7 @@ pub(super) fn text_view(
                     heading_base_font_size: px(text_size()),
                     paragraph_gap: rems(0.75),
                     highlight_theme: cx.theme().highlight_theme.clone(),
-                    is_dark: !theme::is_light(),
+                    is_dark: !theme::is_light(cx),
                     ..Default::default()
                 }),
         )

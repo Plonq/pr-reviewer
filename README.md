@@ -19,8 +19,7 @@ Changes at the fork point relative to upstream lgtm:
   diff rendering, tree-sitter highlighting, word-level intra-line diffs,
    minimap, file tree, inline review comments, local repo diffs,
   and the blob disk cache (now under `~/.cache/gander/`),
-- the palette follows the system appearance: Catppuccin Mocha in dark mode,
-  Latte in light mode,
+- stock GPUI Kit appearance and syntax colors follow system light/dark mode,
 - builds target Apple Silicon only.
 
 ## Setup

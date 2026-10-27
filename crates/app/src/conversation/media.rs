@@ -154,12 +154,16 @@ impl Render for MediaView {
             Some(Err(())) => {
                 return block.child(
                     div()
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child(format!("Image unavailable: {}", self.media.alt)),
                 )
             }
             None => {
-                return block.child(div().text_color(theme::overlay0()).child("Loading image…"))
+                return block.child(
+                    div()
+                        .text_color(theme::overlay0(cx))
+                        .child("Loading image…"),
+                )
             }
         };
         if svg.is_some() {
@@ -171,7 +175,7 @@ impl Render for MediaView {
                         move || format!("{id}-svg-toggle")
                     })
                     .cursor_pointer()
-                    .text_color(theme::blue())
+                    .text_color(theme::blue(cx))
                     .child(if self.show_source {
                         "Show rendered SVG"
                     } else {

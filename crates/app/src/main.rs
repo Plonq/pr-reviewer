@@ -1011,18 +1011,18 @@ impl ReviewItem {
         true
     }
 
-    fn dot_color(&self) -> gpui::Rgba {
+    fn dot_color(&self, cx: &gpui::App) -> gpui::Rgba {
         match &self.source {
-            Source::Local(_) => theme::blue(),
+            Source::Local(_) => theme::blue(cx),
             Source::Pr(_) => match &self.state {
                 ItemState::Ready(data) => match data.pr_meta.as_ref().map(|m| m.state.as_str()) {
-                    Some("OPEN") => theme::green(),
-                    Some("MERGED") => theme::mauve(),
-                    Some("CLOSED") => theme::red(),
-                    _ => theme::overlay0(),
+                    Some("OPEN") => theme::green(cx),
+                    Some("MERGED") => theme::mauve(cx),
+                    Some("CLOSED") => theme::red(cx),
+                    _ => theme::overlay0(cx),
                 },
-                ItemState::Failed(_) => theme::red(),
-                ItemState::Loading => theme::overlay0(),
+                ItemState::Failed(_) => theme::red(cx),
+                ItemState::Loading => theme::overlay0(cx),
             },
         }
     }
@@ -1148,16 +1148,16 @@ impl ReviewItem {
 
 fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
     let (state_color, state_label) = match meta.state.as_str() {
-        "OPEN" => (theme::green(), "open"),
-        "MERGED" => (theme::mauve(), "merged"),
-        "CLOSED" => (theme::red(), "closed"),
-        other => (theme::overlay0(), other),
+        "OPEN" => (theme::green(cx), "open"),
+        "MERGED" => (theme::mauve(cx), "merged"),
+        "CLOSED" => (theme::red(cx), "closed"),
+        other => (theme::overlay0(cx), other),
     };
     let state: Hsla = state_color.into();
     // The PR's overall review decision, when it has one.
     let decision = match meta.review_decision.as_str() {
-        "APPROVED" => Some((theme::green(), "approved")),
-        "CHANGES_REQUESTED" => Some((theme::red(), "changes requested")),
+        "APPROVED" => Some((theme::green(cx), "approved")),
+        "CHANGES_REQUESTED" => Some((theme::red(cx), "changes requested")),
         _ => None,
     };
     let url = meta.url.clone();
@@ -1186,12 +1186,12 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                 )
                 .child(
                     div()
-                        .text_color(theme::subtext())
+                        .text_color(theme::subtext(cx))
                         .child(SharedString::from(format!("#{}", meta.number))),
                 )
                 .child(
                     div()
-                        .text_color(theme::subtext())
+                        .text_color(theme::subtext(cx))
                         .whitespace_nowrap()
                         .child(SharedString::from(format!("by {}", meta.author.login))),
                 )
@@ -1213,7 +1213,7 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                 .pr_3()
                 .child(
                     div()
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child(SharedString::from(format!(
                             "{} ← {}",
                             meta.base_ref_name, meta.head_ref_name
@@ -1221,12 +1221,12 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                 )
                 .child(
                     div()
-                        .text_color(theme::green())
+                        .text_color(theme::green(cx))
                         .child(SharedString::from(format!("+{}", meta.additions))),
                 )
                 .child(
                     div()
-                        .text_color(theme::red())
+                        .text_color(theme::red(cx))
                         .child(SharedString::from(format!("−{}", meta.deletions))),
                 )
                 .child(
@@ -1257,7 +1257,7 @@ fn local_titlebar_content(
     data: &ItemData,
     cx: &mut Context<ReviewApp>,
 ) -> gpui::AnyElement {
-    let blue: Hsla = theme::blue().into();
+    let blue: Hsla = theme::blue(cx).into();
     div()
         .flex()
         .items_center()
@@ -1292,7 +1292,7 @@ fn local_titlebar_content(
                 .child(
                     div()
                         .px_1()
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child(SharedString::from(format!(
                             "{} ← {}",
                             src.base_label, src.branch
@@ -1300,12 +1300,12 @@ fn local_titlebar_content(
                 )
                 .child(
                     div()
-                        .text_color(theme::green())
+                        .text_color(theme::green(cx))
                         .child(SharedString::from(format!("+{}", data.additions))),
                 )
                 .child(
                     div()
-                        .text_color(theme::red())
+                        .text_color(theme::red(cx))
                         .child(SharedString::from(format!("−{}", data.deletions))),
                 )
                 .child(
@@ -1392,7 +1392,7 @@ impl CompletionProvider for MentionProvider {
         offset: usize,
         _trigger: lsp_types::CompletionContext,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Task<anyhow::Result<lsp_types::CompletionResponse>> {
         let empty = Task::ready(Ok(lsp_types::CompletionResponse::Array(vec![])));
         let Some((at, prefix)) = mention_prefix(text, offset) else {
@@ -1427,7 +1427,7 @@ impl CompletionProvider for MentionProvider {
         Task::ready(Ok(lsp_types::CompletionResponse::Array(items)))
     }
 
-    fn is_completion_trigger(&self, _offset: usize, _new_text: &str, _cx: &mut App) -> bool {
+    fn is_completion_trigger(&self, _offset: usize, _new_text: &str, cx: &mut App) -> bool {
         // Cheap to always run; `completions` returns nothing outside a mention.
         true
     }
@@ -1765,8 +1765,8 @@ impl ReviewApp {
                 async {}
             }),
             cx.on_release(|this, _| this.persist_positions()),
-            // The system appearance can flip while we run; re-apply the
-            // palette (Mocha ↔ Latte) and repaint when it does.
+            // Kit initialization alone does not follow the system appearance.
+            // Synchronize again whenever the native appearance changes.
             cx.observe_window_appearance(window, |_, window, cx| {
                 theme::apply_ui_theme(Some(window), cx);
                 cx.notify();
@@ -3893,7 +3893,7 @@ impl ReviewApp {
                 .w(px(16.))
                 .h(px(16.))
                 .rounded_sm()
-                .bg(theme::blue())
+                .bg(theme::blue(cx))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -4127,8 +4127,8 @@ impl ReviewApp {
             }))
             .rounded_lg()
             .border_1()
-            .border_color(theme::surface0())
-            .bg(theme::mantle())
+            .border_color(theme::surface0(cx))
+            .bg(theme::mantle(cx))
             .p_2()
             .flex()
             .flex_col()
@@ -4136,13 +4136,13 @@ impl ReviewApp {
             .text_size(px(12.))
             .child(
                 div()
-                    .text_color(theme::overlay0())
+                    .text_color(theme::overlay0(cx))
                     .truncate()
                     .child(SharedString::from(target)),
             )
             .child(comment_editor::field(&composer.input, cx))
             .when_some(composer.error.clone(), |card, err| {
-                card.child(div().text_color(theme::red()).child(err))
+                card.child(div().text_color(theme::red(cx)).child(err))
             })
             .child(
                 div()
@@ -4153,7 +4153,7 @@ impl ReviewApp {
                         div()
                             .flex_1()
                             .text_size(px(11.))
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child(SharedString::from("⌘⏎ to submit")),
                     )
                     .child(
@@ -4270,8 +4270,8 @@ impl ReviewApp {
             .px_3()
             .py_2()
             .border_t_1()
-            .border_color(theme::surface0())
-            .bg(theme::mantle())
+            .border_color(theme::surface0(cx))
+            .bg(theme::mantle(cx))
             .text_size(px(12.))
             .child(
                 div()
@@ -4316,7 +4316,7 @@ impl ReviewApp {
                     ),
             );
         if let Some(error) = &ui.error {
-            tray = tray.child(div().text_color(theme::red()).child(error.clone()));
+            tray = tray.child(div().text_color(theme::red(cx)).child(error.clone()));
         }
         if let Some(review) = &ui.state.pending {
             let mut comments = div()
@@ -4428,9 +4428,9 @@ impl ReviewApp {
                             .text_color(color)
                     })
                     .when(verdict != selected, |opt| {
-                        opt.border_color(theme::surface0())
-                            .text_color(theme::subtext())
-                            .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+                        opt.border_color(theme::surface0(cx))
+                            .text_color(theme::subtext(cx))
+                            .hover(|style| style.bg(Hsla::from(theme::surface0(cx)).opacity(0.5)))
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(review) = &mut this.review {
@@ -4454,7 +4454,7 @@ impl ReviewApp {
             .flex_col()
             .items_center()
             .pt(px(120.))
-            .bg(theme::modal_backdrop())
+            .bg(theme::modal_backdrop(cx))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -4479,8 +4479,8 @@ impl ReviewApp {
                     }))
                     .rounded_lg()
                     .border_1()
-                    .border_color(theme::surface0())
-                    .bg(theme::mantle())
+                    .border_color(theme::surface0(cx))
+                    .bg(theme::mantle(cx))
                     .shadow_lg()
                     .p_3()
                     .flex()
@@ -4489,7 +4489,7 @@ impl ReviewApp {
                     .text_size(px(12.))
                     .child(
                         div()
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child(SharedString::from("Finish your review")),
                     )
                     .child(
@@ -4500,22 +4500,22 @@ impl ReviewApp {
                             .child(verdict_option(
                                 "approve",
                                 github::ReviewVerdict::Approve,
-                                theme::green(),
+                                theme::green(cx),
                             ))
                             .child(verdict_option(
                                 "request changes",
                                 github::ReviewVerdict::RequestChanges,
-                                theme::red(),
+                                theme::red(cx),
                             ))
                             .child(verdict_option(
                                 "comment",
                                 github::ReviewVerdict::Comment,
-                                theme::blue(),
+                                theme::blue(cx),
                             )),
                     )
                     .child(comment_editor::field(&review.input, cx))
                     .when_some(review.error.clone(), |card, err| {
-                        card.child(div().text_color(theme::red()).child(err))
+                        card.child(div().text_color(theme::red(cx)).child(err))
                     })
                     .child(
                         div()
@@ -4526,7 +4526,7 @@ impl ReviewApp {
                                 div()
                                     .flex_1()
                                     .text_size(px(11.))
-                                    .text_color(theme::overlay0())
+                                    .text_color(theme::overlay0(cx))
                                     .child(SharedString::from("⌘⏎ to submit")),
                             )
                             .child(
@@ -4564,9 +4564,9 @@ impl ReviewApp {
             .w(px(MINIMAP_WIDTH))
             .h_full()
             .flex_shrink_0()
-            .bg(Hsla::from(theme::crust()).opacity(0.5))
+            .bg(Hsla::from(theme::crust(cx)).opacity(0.5))
             .border_l_1()
-            .border_color(theme::surface0())
+            .border_color(theme::surface0(cx))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -4608,12 +4608,12 @@ impl ReviewApp {
                             // Full alpha-ish tints: these are 1-3px bars and
                             // need punch, unlike the row backgrounds.
                             let color: Hsla = match run.color {
-                                MinimapColor::Added => Hsla::from(theme::green()).opacity(0.8),
-                                MinimapColor::Removed => Hsla::from(theme::red()).opacity(0.8),
+                                MinimapColor::Added => Hsla::from(theme::green(cx)).opacity(0.8),
+                                MinimapColor::Removed => Hsla::from(theme::red(cx)).opacity(0.8),
                                 MinimapColor::Context => {
-                                    Hsla::from(theme::overlay0()).opacity(0.35)
+                                    Hsla::from(theme::overlay0(cx)).opacity(0.35)
                                 }
-                                MinimapColor::Header => Hsla::from(theme::blue()).opacity(0.5),
+                                MinimapColor::Header => Hsla::from(theme::blue(cx)).opacity(0.5),
                             };
                             window.paint_quad(fill(
                                 Bounds::new(
@@ -4636,10 +4636,10 @@ impl ReviewApp {
                                     point(bounds.left(), px(y0 + vy)),
                                     size(bounds.size.width, px(vh)),
                                 ),
-                                Hsla::from(theme::text()).opacity(0.08),
+                                Hsla::from(theme::text(cx)).opacity(0.08),
                             )
                             .border_widths(1.)
-                            .border_color(Hsla::from(theme::overlay0()).opacity(0.4)),
+                            .border_color(Hsla::from(theme::overlay0(cx)).opacity(0.4)),
                         );
                     },
                 )
@@ -4650,20 +4650,24 @@ impl ReviewApp {
 
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let content: gpui::AnyElement = if self.show_queue {
-            app_title(None)
+            app_title(None, cx)
         } else {
             match self.active_item() {
-                None => app_title(None),
+                None => app_title(None, cx),
                 Some(item) => match &item.state {
                     ItemState::Ready(data) => match &item.source {
                         Source::Pr(_) => match &data.pr_meta {
                             Some(meta) => pr_titlebar_content(meta, cx),
-                            None => app_title(None),
+                            None => app_title(None, cx),
                         },
                         Source::Local(src) => local_titlebar_content(item.id, src, data, cx),
                     },
-                    ItemState::Loading => app_title(Some(format!("loading {}…", item.primary()))),
-                    ItemState::Failed(_) => app_title(Some(format!("{} — failed", item.primary()))),
+                    ItemState::Loading => {
+                        app_title(Some(format!("loading {}…", item.primary())), cx)
+                    }
+                    ItemState::Failed(_) => {
+                        app_title(Some(format!("{} — failed", item.primary())), cx)
+                    }
                 },
             }
         };
@@ -4736,11 +4740,11 @@ impl ReviewApp {
                 div()
                     .max_w(px(280.))
                     .truncate()
-                    .text_color(theme::overlay0())
+                    .text_color(theme::overlay0(cx))
                     .child(note),
             );
         }
-        right = right.child(self.render_account());
+        right = right.child(self.render_account(cx));
         TitleBar::new()
             .text_size(px(13.))
             .child(content)
@@ -4751,7 +4755,7 @@ impl ReviewApp {
     /// GitHub knows who we are; the fix in one line when it doesn't — the
     /// empty pane spells the failure out in full. While the check is still
     /// running, nothing: the chip appears rather than flickers.
-    fn render_account(&self) -> gpui::AnyElement {
+    fn render_account(&self, cx: &gpui::App) -> gpui::AnyElement {
         match &self.account {
             AccountStatus::Checking => div().into_any_element(),
             AccountStatus::SignedIn(viewer) => div()
@@ -4763,7 +4767,7 @@ impl ReviewApp {
                 .child(
                     div()
                         .text_size(px(12.))
-                        .text_color(theme::subtext())
+                        .text_color(theme::subtext(cx))
                         .child(SharedString::from(viewer.login.clone())),
                 )
                 .into_any_element(),
@@ -4772,7 +4776,7 @@ impl ReviewApp {
                 .max_w(px(360.))
                 .truncate()
                 .text_size(px(12.))
-                .text_color(theme::peach())
+                .text_color(theme::peach(cx))
                 .child(SharedString::from(err.to_string()))
                 .into_any_element(),
         }
@@ -4798,7 +4802,7 @@ impl ReviewApp {
             .py_1();
         for (ix, item) in self.items.iter().enumerate() {
             let active = ix == self.active;
-            let dot: Hsla = item.dot_color().into();
+            let dot: Hsla = item.dot_color(cx).into();
             let status: gpui::AnyElement = match &item.state {
                 ItemState::Ready(data) => div()
                     .flex()
@@ -4808,25 +4812,25 @@ impl ReviewApp {
                     .text_size(px(11.))
                     .child(
                         div()
-                            .text_color(theme::green())
+                            .text_color(theme::green(cx))
                             .child(SharedString::from(format!("+{}", data.additions))),
                     )
                     .child(
                         div()
-                            .text_color(theme::red())
+                            .text_color(theme::red(cx))
                             .child(SharedString::from(format!("−{}", data.deletions))),
                     )
                     .into_any_element(),
                 ItemState::Loading => div()
                     .flex_shrink_0()
                     .text_size(px(11.))
-                    .text_color(theme::overlay0())
+                    .text_color(theme::overlay0(cx))
                     .child(SharedString::from("loading…"))
                     .into_any_element(),
                 ItemState::Failed(_) => div()
                     .flex_shrink_0()
                     .text_size(px(11.))
-                    .text_color(theme::red())
+                    .text_color(theme::red(cx))
                     .child(SharedString::from("failed"))
                     .into_any_element(),
             };
@@ -4839,9 +4843,9 @@ impl ReviewApp {
                 .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .when(active, |entry| entry.bg(theme::surface0()))
+                .when(active, |entry| entry.bg(theme::surface0(cx)))
                 .when(!active, |entry| {
-                    entry.hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+                    entry.hover(|style| style.bg(Hsla::from(theme::surface0(cx)).opacity(0.5)))
                 })
                 .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)))
                 .child(
@@ -4862,7 +4866,7 @@ impl ReviewApp {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_color(theme::text())
+                                .text_color(theme::text(cx))
                                 .child(item.primary()),
                         )
                         .child(status)
@@ -4888,7 +4892,7 @@ impl ReviewApp {
                             .pl(px(16.))
                             .truncate()
                             .text_size(px(11.))
-                            .text_color(theme::subtext())
+                            .text_color(theme::subtext(cx))
                             .child(secondary),
                     )
                 });
@@ -4956,6 +4960,7 @@ impl ReviewApp {
                                 data,
                                 &entity,
                                 this.active_item().is_some_and(|item| item.reloading),
+                                cx,
                             )
                         })
                         .collect()
@@ -4967,7 +4972,7 @@ impl ReviewApp {
             Some(_) if !query.is_empty() => div()
                 .px_3()
                 .py_2()
-                .text_color(theme::overlay0())
+                .text_color(theme::overlay0(cx))
                 .child(SharedString::from("no matching files"))
                 .into_any_element(),
             _ => div().into_any_element(),
@@ -4982,9 +4987,9 @@ impl ReviewApp {
             .h_full()
             .flex()
             .flex_col()
-            .bg(theme::mantle())
+            .bg(theme::mantle(cx))
             .border_r_1()
-            .border_color(theme::surface0())
+            .border_color(theme::surface0(cx))
             .text_size(px(12.))
             .child(
                 div()
@@ -4994,11 +4999,16 @@ impl ReviewApp {
                     .gap_1()
                     .child(Input::new(&self.open_input).small())
                     .when_some(self.open_error.clone(), |area, err| {
-                        area.child(div().text_size(px(11.)).text_color(theme::red()).child(err))
+                        area.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme::red(cx))
+                                .child(err),
+                        )
                     }),
             )
             .child(list)
-            .child(div().h(px(1.)).flex_shrink_0().bg(theme::surface0()))
+            .child(div().h(px(1.)).flex_shrink_0().bg(theme::surface0(cx)))
             .child(
                 div()
                     .flex_1()
@@ -5028,7 +5038,7 @@ impl ReviewApp {
                                     .px_2()
                                     .pb_2()
                                     .text_size(px(11.))
-                                    .text_color(theme::red())
+                                    .text_color(theme::red(cx))
                                     .child(error),
                             )
                         },
@@ -5045,9 +5055,9 @@ impl ReviewApp {
                     .w(px(6.))
                     .h_full()
                     .cursor_col_resize()
-                    .hover(|style| style.bg(theme::blue()))
+                    .hover(|style| style.bg(theme::blue(cx)))
                     .when(self.sidebar_resize.is_some(), |handle| {
-                        handle.bg(theme::blue())
+                        handle.bg(theme::blue(cx))
                     })
                     .on_mouse_down(
                         MouseButton::Left,
@@ -5072,7 +5082,7 @@ impl ReviewApp {
     fn render_queue(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let queue = &self.queue;
         if queue.prs.is_empty() && queue.loading {
-            return centered_message("loading review queue…".into(), theme::overlay0());
+            return centered_message("loading review queue…".into(), theme::overlay0(cx));
         }
         if queue.prs.is_empty() {
             if let Some(err) = &queue.error {
@@ -5089,13 +5099,13 @@ impl ReviewApp {
                             .max_w(px(560.))
                             .text_center()
                             .text_size(px(14.))
-                            .text_color(theme::peach())
+                            .text_color(theme::peach(cx))
                             .child(SharedString::from(err.clone())),
                     )
                     .child(
                         div()
                             .text_size(px(13.))
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child(SharedString::from("⌘R to retry")),
                     )
                     .into_any_element();
@@ -5115,7 +5125,7 @@ impl ReviewApp {
                     .child(
                         div()
                             .text_size(px(14.))
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child("no PRs match the current filters"),
                     )
                     .child(
@@ -5128,10 +5138,10 @@ impl ReviewApp {
                             .h(px(24.))
                             .rounded_md()
                             .border_1()
-                            .border_color(theme::surface0())
+                            .border_color(theme::surface0(cx))
                             .text_size(px(13.))
-                            .text_color(theme::subtext())
-                            .hover(|style| style.bg(theme::surface0()))
+                            .text_color(theme::subtext(cx))
+                            .hover(|style| style.bg(theme::surface0(cx)))
                             .child("clear filters (escape)")
                             .on_click(move |_, window, cx| {
                                 entity.update(cx, |this, cx| {
@@ -5142,7 +5152,7 @@ impl ReviewApp {
                     )
                     .into_any_element();
             }
-            return centered_message("no PRs awaiting your review".into(), theme::overlay0());
+            return centered_message("no PRs awaiting your review".into(), theme::overlay0(cx));
         }
         let entity = cx.entity();
         let now = now_unix();
@@ -5162,28 +5172,30 @@ impl ReviewApp {
                     .flex_shrink_0()
                     .h(px(34.))
                     .border_b_1()
-                    .border_color(theme::surface0())
-                    .child(div().text_color(theme::text()).child("Review queue"))
+                    .border_color(theme::surface0(cx))
+                    .child(div().text_color(theme::text(cx)).child("Review queue"))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_right()
                             .text_size(px(12.))
-                            .text_color(theme::subtext())
+                            .text_color(theme::subtext(cx))
                             .child(SharedString::from(format!(
                                 "{count} {}",
                                 if count == 1 { "PR" } else { "PRs" }
                             ))),
                     ),
             )
-            .child(self.queue_controls(entity.clone()))
+            .child(self.queue_controls(entity.clone(), cx))
             .child(
                 uniform_list("queue", count, move |range, _window, cx| {
                     let this = entity.read(cx);
                     range
                         .filter_map(|pos| this.queue.prs.get(pos).map(|pr| (pos, pr)))
-                        .map(|(pos, pr)| queue_row(pr, pos, pos == selected, now, entity.clone()))
+                        .map(|(pos, pr)| {
+                            queue_row(pr, pos, pos == selected, now, entity.clone(), cx)
+                        })
                         .collect()
                 })
                 .track_scroll(&queue.scroll)
@@ -5201,7 +5213,7 @@ impl ReviewApp {
     /// failure that kept the rows stale — beside the chips that caused
     /// it, where the eye already is. The chips are click-driven for now;
     /// the keyboard drives the sort (`s`) and the clear (`escape`).
-    fn queue_controls(&self, entity: gpui::Entity<Self>) -> gpui::AnyElement {
+    fn queue_controls(&self, entity: gpui::Entity<Self>, cx: &gpui::App) -> gpui::AnyElement {
         let search = &self.queue.search;
         let oldest = search.ordering() == github::QueueSort::OldestUpdated;
         // The sort toggle: its label is the order the next refresh runs in
@@ -5215,7 +5227,7 @@ impl ReviewApp {
             .py_1()
             .flex_shrink_0()
             .border_b_1()
-            .border_color(theme::surface0())
+            .border_color(theme::surface0(cx))
             .child(
                 div()
                     .id("queue-sort-toggle")
@@ -5227,10 +5239,10 @@ impl ReviewApp {
                     .h(px(22.))
                     .rounded_md()
                     .border_1()
-                    .border_color(theme::surface0())
+                    .border_color(theme::surface0(cx))
                     .text_size(px(12.))
-                    .text_color(theme::subtext())
-                    .hover(|style| style.bg(theme::surface0()))
+                    .text_color(theme::subtext(cx))
+                    .hover(|style| style.bg(theme::surface0(cx)))
                     .on_click({
                         let entity = entity.clone();
                         move |_, window, cx| {
@@ -5242,7 +5254,7 @@ impl ReviewApp {
                     })
                     .child(
                         div()
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child(SharedString::from("sort:")),
                     )
                     .child(SharedString::from(if oldest {
@@ -5263,9 +5275,9 @@ impl ReviewApp {
                 // like GitHub's own label chips — and the inactive ones sit
                 // quiet until hovered.
                 let (bg, fg, border) = if chip.active {
-                    label_chip_colors(Some(Hsla::from(theme::blue())), theme::is_light())
+                    label_chip_colors(Some(Hsla::from(theme::blue(cx))), theme::is_light(cx), cx)
                 } else {
-                    label_chip_colors(None, theme::is_light())
+                    label_chip_colors(None, theme::is_light(cx), cx)
                 };
                 row = row.child(
                     div()
@@ -5282,10 +5294,10 @@ impl ReviewApp {
                         .bg(bg)
                         .text_size(px(12.))
                         .when(chip.active, |chip| {
-                            chip.hover(|style| style.bg(Hsla::from(theme::blue()).opacity(0.2)))
+                            chip.hover(|style| style.bg(Hsla::from(theme::blue(cx)).opacity(0.2)))
                         })
                         .when(!chip.active, |chip| {
-                            chip.hover(|style| style.bg(theme::surface0()))
+                            chip.hover(|style| style.bg(theme::surface0(cx)))
                         })
                         .on_click({
                             let entity = entity.clone();
@@ -5299,7 +5311,7 @@ impl ReviewApp {
                         })
                         .child(
                             div()
-                                .text_color(theme::overlay0())
+                                .text_color(theme::overlay0(cx))
                                 .child(SharedString::from(format!("{}:", group.kind.prefix()))),
                         )
                         .child(
@@ -5314,7 +5326,7 @@ impl ReviewApp {
                                 .text_color(if chip.active {
                                     fg
                                 } else {
-                                    Hsla::from(theme::overlay0())
+                                    Hsla::from(theme::overlay0(cx))
                                 })
                                 .child(SharedString::from(format!("· {}", chip.count))),
                         ),
@@ -5324,7 +5336,7 @@ impl ReviewApp {
                 row = row.child(
                     div()
                         .text_size(px(12.))
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child(SharedString::from(format!("+{} more", group.hidden))),
                 );
             }
@@ -5340,10 +5352,14 @@ impl ReviewApp {
                     .h(px(22.))
                     .rounded_md()
                     .border_1()
-                    .border_color(theme::surface0())
+                    .border_color(theme::surface0(cx))
                     .text_size(px(12.))
-                    .text_color(theme::overlay0())
-                    .hover(|style| style.text_color(theme::red()).border_color(theme::red()))
+                    .text_color(theme::overlay0(cx))
+                    .hover(|style| {
+                        style
+                            .text_color(theme::red(cx))
+                            .border_color(theme::red(cx))
+                    })
                     .on_click({
                         let entity = entity.clone();
                         move |_, window, cx| {
@@ -5371,15 +5387,15 @@ impl ReviewApp {
                     QueueOrigin::Cached => "refreshing queue… (showing cached rows)".to_string(),
                     _ => "refreshing queue…".to_string(),
                 },
-                gpui::Hsla::from(theme::overlay0()),
+                gpui::Hsla::from(theme::overlay0(cx)),
             ));
         } else if let Some(err) = self.queue.error.as_deref() {
-            status.push((err.to_string(), gpui::Hsla::from(theme::peach())));
+            status.push((err.to_string(), gpui::Hsla::from(theme::peach(cx))));
         } else if self.queue.origin == QueueOrigin::Cached {
             let age = self.store.cached_queue().age_seconds(local_store::now_ms());
             status.push((
                 format!("cached · {age}s ago"),
-                gpui::Hsla::from(theme::overlay0()),
+                gpui::Hsla::from(theme::overlay0(cx)),
             ));
         }
         // A store that couldn't be opened is worth saying out loud: the
@@ -5393,7 +5409,7 @@ impl ReviewApp {
             };
             status.push((
                 format!("cache unavailable{where_}: {err}"),
-                gpui::Hsla::from(theme::peach()),
+                gpui::Hsla::from(theme::peach(cx)),
             ));
         }
         row = row
@@ -5417,7 +5433,7 @@ impl ReviewApp {
     /// without `gh auth login` explains itself instead of showing a near-
     /// blank screen. With something open, local diffs included, only the
     /// title-bar chip carries the message.
-    fn render_empty_pane(&self) -> gpui::AnyElement {
+    fn render_empty_pane(&self, cx: &gpui::App) -> gpui::AnyElement {
         match &self.account {
             AccountStatus::SignedOut(err) => div()
                 .size_full()
@@ -5432,21 +5448,21 @@ impl ReviewApp {
                         .max_w(px(560.))
                         .text_center()
                         .text_size(px(14.))
-                        .text_color(theme::peach())
+                        .text_color(theme::peach(cx))
                         .child(SharedString::from(err.to_string())),
                 )
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child(SharedString::from("⌘T to open a PR or path")),
                 )
                 .into_any_element(),
-            _ => centered_message("⌘T to open a PR or path".into(), theme::overlay0()),
+            _ => centered_message("⌘T to open a PR or path".into(), theme::overlay0(cx)),
         }
     }
 
-    fn render_footer(&self) -> impl IntoElement {
+    fn render_footer(&self, cx: &gpui::App) -> impl IntoElement {
         let hint = |keys: &[&'static str], label: &'static str| {
             let mut hint = div().flex().items_center().gap_1();
             for key in keys {
@@ -5454,7 +5470,7 @@ impl ReviewApp {
             }
             hint.child(
                 div()
-                    .text_color(theme::overlay0())
+                    .text_color(theme::overlay0(cx))
                     .child(SharedString::from(label)),
             )
         };
@@ -5465,9 +5481,9 @@ impl ReviewApp {
             .items_center()
             .gap_4()
             .px_3()
-            .bg(theme::mantle())
+            .bg(theme::mantle(cx))
             .border_t_1()
-            .border_color(theme::surface0())
+            .border_color(theme::surface0(cx))
             .text_size(px(12.));
         // The queue screen's hints differ from the diff's: j/k drive the
         // rows, and nothing about hunks or files applies yet.
@@ -5537,9 +5553,9 @@ impl ReviewApp {
             });
         let diff_rows = self.active_data().map_or(0, |data| data.rows.len()) + composer_rows;
         match self.active_item() {
-            None => self.render_empty_pane(),
+            None => self.render_empty_pane(cx),
             Some(item) => match &item.state {
-                ItemState::Loading => centered_message("loading…".into(), theme::overlay0()),
+                ItemState::Loading => centered_message("loading…".into(), theme::overlay0(cx)),
                 ItemState::Failed(msg) => div()
                     .size_full()
                     .flex()
@@ -5549,7 +5565,7 @@ impl ReviewApp {
                     .child(
                         div()
                             .max_w(px(720.))
-                            .text_color(theme::red())
+                            .text_color(theme::red(cx))
                             .child(SharedString::from(msg.clone())),
                     )
                     .into_any_element(),
@@ -5739,6 +5755,7 @@ impl ReviewApp {
                                                         } else {
                                                             None
                                                         },
+                                                        cx,
                                                     )
                                                 })
                                                 .collect()
@@ -5802,7 +5819,10 @@ impl ReviewApp {
     ) -> gpui::AnyElement {
         // Only a PR has a conversation to read; its title stays in the titlebar.
         let (Some(meta), Source::Pr(loc)) = (&data.pr_meta, &item.source) else {
-            return centered_message("A local diff has no conversation".into(), theme::overlay0());
+            return centered_message(
+                "A local diff has no conversation".into(),
+                theme::overlay0(cx),
+            );
         };
         // The pipe runs on every paint; bodies are small, the output is
         // what the TextView's keyed state diffs against (same text → no
@@ -5812,7 +5832,7 @@ impl ReviewApp {
         let content = if body.trim().is_empty() {
             // GitHub's own empty state, verbatim.
             div()
-                .text_color(theme::overlay0())
+                .text_color(theme::overlay0(cx))
                 .child(SharedString::from("No description provided."))
                 .into_any_element()
         } else {
@@ -5864,9 +5884,9 @@ impl ReviewApp {
                                             .mt_6()
                                             .p_4()
                                             .border_1()
-                                            .border_color(theme::surface0())
+                                            .border_color(theme::surface0(cx))
                                             .rounded_md()
-                                            .child(div().mb_2().text_color(theme::yellow()).child(
+                                            .child(div().mb_2().text_color(theme::yellow(cx)).child(
                                                 "Pending review summary · only you can see this",
                                             ))
                                             .child(conversation::render_markdown(
@@ -5907,8 +5927,8 @@ impl Render for ReviewApp {
             .relative()
             .flex()
             .flex_col()
-            .bg(theme::base())
-            .text_color(theme::text())
+            .bg(theme::base(cx))
+            .text_color(theme::text(cx))
             .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
             .on_action(
                 cx.listener(|this, _: &search::OpenSearch, window, cx| {
@@ -6141,7 +6161,7 @@ impl Render for ReviewApp {
                             .child(pane),
                     ),
             )
-            .child(self.render_footer())
+            .child(self.render_footer(cx))
             .child(self.render_pending_tray(cx))
             .child(self.render_search(cx))
             // Root-level so the composer's input escapes the "ReviewApp" key
@@ -7632,13 +7652,13 @@ mod tests {
             let highlights: Vec<_> = (0..data.rows.len())
                 .flat_map(|row| {
                     search
-                        .highlights(row, SelSide::Unified)
+                        .highlights(row, SelSide::Unified, cx)
                         .into_iter()
                         .map(move |(_, color)| (row, color))
                 })
                 .collect();
             assert_eq!(highlights.len(), 2, "the other file is not searched");
-            let active_color: gpui::Rgba = Hsla::from(theme::peach()).opacity(0.4).into();
+            let active_color: gpui::Rgba = Hsla::from(theme::peach(cx)).opacity(0.4).into();
             highlights
                 .into_iter()
                 .find(|(_, color)| *color == active_color)
@@ -7751,7 +7771,7 @@ mod tests {
                 .search
                 .as_ref()
                 .unwrap()
-                .highlights(row, SelSide::Unified)
+                .highlights(row, SelSide::Unified, cx)
                 .is_empty()));
         });
         vcx.simulate_keystrokes("escape");

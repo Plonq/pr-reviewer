@@ -959,6 +959,7 @@ pub(crate) fn build_presented_rows(
 /// Per-kind row tint, word-highlight tint, gutter marker, and marker color.
 fn kind_style(
     kind: LineKind,
+    cx: &gpui::App,
 ) -> (
     Option<gpui::Rgba>,
     Option<gpui::Rgba>,
@@ -966,18 +967,18 @@ fn kind_style(
     gpui::Rgba,
 ) {
     match kind {
-        LineKind::Context => (None, None, "", theme::overlay0()),
+        LineKind::Context => (None, None, "", theme::overlay0(cx)),
         LineKind::Added => (
-            Some(theme::added_row_bg()),
-            Some(theme::added_word_bg()),
+            Some(theme::added_row_bg(cx)),
+            Some(theme::added_word_bg(cx)),
             "+",
-            theme::green(),
+            theme::green(cx),
         ),
         LineKind::Removed => (
-            Some(theme::removed_row_bg()),
-            Some(theme::removed_word_bg()),
+            Some(theme::removed_row_bg(cx)),
+            Some(theme::removed_word_bg(cx)),
             "−",
-            theme::red(),
+            theme::red(cx),
         ),
     }
 }
@@ -994,8 +995,9 @@ fn merge_highlights(
     intra: &[Range<usize>],
     word_bg: Option<gpui::Rgba>,
     selection: Option<Range<usize>>,
+    cx: &gpui::App,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
-    merge_search_highlights(syntax, intra, word_bg, selection, &[])
+    merge_search_highlights(syntax, intra, word_bg, selection, &[], cx)
 }
 
 fn merge_search_highlights(
@@ -1004,6 +1006,7 @@ fn merge_search_highlights(
     word_bg: Option<gpui::Rgba>,
     selection: Option<Range<usize>>,
     search: &[(Range<usize>, gpui::Rgba)],
+    cx: &gpui::App,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
     let mut bounds = Vec::with_capacity(2 * (syntax.len() + intra.len() + 1));
     for (range, _) in syntax {
@@ -1047,7 +1050,9 @@ fn merge_search_highlights(
         if token.is_none() && !in_intra && !in_sel && search_bg.is_none() {
             continue;
         }
-        let mut style = token.map(theme::token_style).unwrap_or_default();
+        let mut style = token
+            .map(|token| theme::token_style(token, cx))
+            .unwrap_or_default();
         if in_intra {
             style.background_color = word_bg.map(Into::into);
         }
@@ -1055,7 +1060,7 @@ fn merge_search_highlights(
             style.background_color = Some(bg.into());
         }
         if in_sel {
-            style.background_color = Some(theme::selection_bg().into());
+            style.background_color = Some(theme::selection_bg(cx).into());
         }
         match out.last_mut() {
             // Coalesce adjacent identically-styled segments.
@@ -1075,11 +1080,12 @@ fn line_content(
     word_bg: Option<gpui::Rgba>,
     selection: Option<Range<usize>>,
     search: &[(Range<usize>, gpui::Rgba)],
+    cx: &gpui::App,
 ) -> gpui::AnyElement {
     let highlights = if search.is_empty() {
-        merge_highlights(syntax, intra, word_bg, selection)
+        merge_highlights(syntax, intra, word_bg, selection, cx)
     } else {
-        merge_search_highlights(syntax, intra, word_bg, selection, search)
+        merge_search_highlights(syntax, intra, word_bg, selection, search, cx)
     };
     if highlights.is_empty() {
         div().child(text.clone()).into_any_element()
@@ -1106,6 +1112,7 @@ fn comment_row(
     half: Option<CommentSide>,
     header: bool,
     edge: CardEdge,
+    cx: &gpui::App,
 ) -> gpui::AnyElement {
     // The card itself: indented past the gutter, blue-tinted and accented so a
     // thread reads as one block distinct from the diff behind it. The author
@@ -1125,11 +1132,11 @@ fn comment_row(
                     .min_w_0()
                     .h_full()
                     .bg(if header {
-                        theme::comment_header_bg()
+                        theme::comment_header_bg(cx)
                     } else {
-                        theme::comment_bg()
+                        theme::comment_bg(cx)
                     })
-                    .border_color(theme::comment_outline())
+                    .border_color(theme::comment_outline(cx))
                     .border_l_2()
                     .border_r_1();
                 let body = match edge {
@@ -1156,10 +1163,10 @@ fn comment_row(
                 .w(px(SPLIT_DIVIDER))
                 .flex_shrink_0()
                 .h_full()
-                .bg(theme::crust())
+                .bg(theme::crust(cx))
                 .border_l_1()
                 .border_r_1()
-                .border_color(theme::surface0());
+                .border_color(theme::surface0(cx));
             match side {
                 CommentSide::Left => row
                     .child(card(inner))
@@ -1178,7 +1185,7 @@ fn comment_row(
 
 /// Fixed-size gutter: the click cue is painted inside the existing space so
 /// neither code alignment nor diff/syntax backgrounds change when it moves.
-fn line_gutter(width: f32, active: bool) -> gpui::Div {
+fn line_gutter(width: f32, active: bool, cx: &gpui::App) -> gpui::Div {
     div()
         .relative()
         .w(px(width))
@@ -1187,24 +1194,24 @@ fn line_gutter(width: f32, active: bool) -> gpui::Div {
         .flex()
         .items_center()
         .when(active, |gutter| {
-            gutter.bg(theme::active_line_gutter_bg()).child(
+            gutter.bg(theme::active_line_gutter_bg(cx)).child(
                 div()
                     .absolute()
                     .left_0()
                     .top_0()
                     .bottom_0()
                     .w(px(2.))
-                    .bg(Hsla::from(theme::blue()).opacity(0.55)),
+                    .bg(Hsla::from(theme::blue(cx)).opacity(0.55)),
             )
         })
 }
 
-fn comment_range_overlay(ix: usize, side: SelSide) -> gpui::Div {
+fn comment_range_overlay(ix: usize, side: SelSide, cx: &gpui::App) -> gpui::Div {
     div()
         .debug_selector(move || format!("comment-range-{side:?}-{ix}"))
         .absolute()
         .inset_0()
-        .bg(theme::comment_range_bg())
+        .bg(theme::comment_range_bg(cx))
 }
 
 /// `selection` is this row's selected byte range (side + non-empty range),
@@ -1224,6 +1231,7 @@ pub(crate) fn render_row(
     search: Option<&crate::search::Search>,
     entity: &gpui::Entity<ReviewApp>,
     controls: Option<gpui::AnyElement>,
+    cx: &gpui::App,
 ) -> gpui::AnyElement {
     let inner = render_row_content(
         ix,
@@ -1235,6 +1243,7 @@ pub(crate) fn render_row(
         search,
         entity,
         controls,
+        cx,
     );
     if let Some(layout) = split_layout {
         // uniform_list moves the entire row by offset.x. Counter that move for
@@ -1266,6 +1275,7 @@ fn render_row_content(
     search: Option<&crate::search::Search>,
     entity: &gpui::Entity<ReviewApp>,
     controls: Option<gpui::AnyElement>,
+    cx: &gpui::App,
 ) -> gpui::AnyElement {
     let row_height = px(row_height());
     match row {
@@ -1279,6 +1289,7 @@ fn render_row_content(
             search,
             entity,
             controls,
+            cx,
         ),
         Row::Fold { key, count } => {
             let key = *key;
@@ -1288,10 +1299,10 @@ fn render_row_content(
                 .h(row_height)
                 .w_full()
                 .px_3()
-                .bg(theme::mantle())
+                .bg(theme::mantle(cx))
                 .border_y_1()
-                .border_color(theme::surface0())
-                .text_color(theme::blue())
+                .border_color(theme::surface0(cx))
+                .text_color(theme::blue(cx))
                 .cursor_pointer()
                 .child(SharedString::from(format!(
                     "⋯ {count} unchanged lines hidden · click to expand"
@@ -1304,7 +1315,7 @@ fn render_row_content(
         Row::LargeFile { lines, expanded } => {
             let entity = entity.clone();
             div().id(("large-file", ix)).h(row_height).w_full().px_3()
-                .bg(theme::mantle()).text_color(theme::blue()).text_size(px(11.)).cursor_pointer()
+                .bg(theme::mantle(cx)).text_color(theme::blue(cx)).text_size(px(11.)).cursor_pointer()
                 .child(SharedString::from(if *expanded {
                     format!("Large file ({lines} lines) · click to collapse")
                 } else {
@@ -1325,7 +1336,7 @@ fn render_row_content(
             if *is_reply {
                 inner = inner.child(
                     div()
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child(SharedString::from("↳")),
                 );
             }
@@ -1334,12 +1345,12 @@ fn render_row_content(
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(theme::text())
+                            .text_color(theme::text(cx))
                             .child(author.clone()),
                     )
                     .child(
                         div()
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .text_size(px(11.))
                             .child(when.clone()),
                     )
@@ -1353,16 +1364,17 @@ fn render_row_content(
                 } else {
                     CardEdge::Middle
                 },
+                cx,
             )
         }
         Row::CommentBody { half, .. } => {
-            comment_row(div().into_any_element(), *half, false, CardEdge::Middle)
+            comment_row(div().into_any_element(), *half, false, CardEdge::Middle, cx)
         }
         Row::CommentMedia { half, .. } => {
-            comment_row(div().into_any_element(), *half, false, CardEdge::Middle)
+            comment_row(div().into_any_element(), *half, false, CardEdge::Middle, cx)
         }
         Row::CommentEditor { half } => {
-            comment_row(div().into_any_element(), *half, false, CardEdge::Middle)
+            comment_row(div().into_any_element(), *half, false, CardEdge::Middle, cx)
         }
         Row::CommentActions {
             root_id,
@@ -1378,7 +1390,7 @@ fn render_row_content(
                 div()
                     .id(("reply", root_id as usize))
                     .cursor_pointer()
-                    .text_color(theme::blue())
+                    .text_color(theme::blue(cx))
                     .hover(|style| style.opacity(0.8))
                     .child(SharedString::from("↳ reply"))
                     .on_click(move |_, window, cx| {
@@ -1398,6 +1410,7 @@ fn render_row_content(
                 *half,
                 false,
                 CardEdge::Bottom,
+                cx,
             )
         }
         Row::FileHeader {
@@ -1409,7 +1422,7 @@ fn render_row_content(
             comments,
             outdated,
         } => {
-            let (status_label, status_color) = status_style(*status);
+            let (status_label, status_color) = status_style(*status, cx);
             let status: Hsla = status_color.into();
             let mut header = div()
                 .h(row_height)
@@ -1418,7 +1431,7 @@ fn render_row_content(
                 .items_center()
                 .gap_3()
                 .px_3()
-                .bg(theme::mantle())
+                .bg(theme::mantle(cx))
                 .child(
                     Tag::custom(status.opacity(0.15), status, status.opacity(0.4))
                         .small()
@@ -1426,14 +1439,14 @@ fn render_row_content(
                 )
                 .child(
                     div()
-                        .text_color(theme::text())
+                        .text_color(theme::text(cx))
                         .font_weight(gpui::FontWeight::BOLD)
                         .child(path.clone()),
                 );
             if let Some(old_path) = old_path {
                 header = header.child(
                     div()
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child(SharedString::from(format!("← {old_path}"))),
                 );
             }
@@ -1454,7 +1467,7 @@ fn render_row_content(
                 header = header.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child(SharedString::from(note)),
                 );
             }
@@ -1462,12 +1475,12 @@ fn render_row_content(
                 .child(div().flex_1())
                 .child(
                     div()
-                        .text_color(theme::green())
+                        .text_color(theme::green(cx))
                         .child(SharedString::from(format!("+{additions}"))),
                 )
                 .child(
                     div()
-                        .text_color(theme::red())
+                        .text_color(theme::red(cx))
                         .child(SharedString::from(format!("−{deletions}"))),
                 )
                 .into_any_element()
@@ -1477,7 +1490,7 @@ fn render_row_content(
             .flex()
             .items_center()
             .px_3()
-            .text_color(theme::overlay0())
+            .text_color(theme::overlay0(cx))
             .child(SharedString::from("binary file changed"))
             .into_any_element(),
         Row::Line {
@@ -1488,12 +1501,12 @@ fn render_row_content(
             intra,
             syntax,
         } => {
-            let (row_bg, word_bg, marker, marker_color) = kind_style(*kind);
+            let (row_bg, word_bg, marker, marker_color) = kind_style(*kind, cx);
             let number = |no: Option<u32>| {
                 div()
                     .w(px(44.))
                     .flex_shrink_0()
-                    .text_color(theme::overlay0())
+                    .text_color(theme::overlay0(cx))
                     .flex()
                     .justify_end()
                     .child(SharedString::from(
@@ -1505,12 +1518,13 @@ fn render_row_content(
                 line = line.bg(bg);
             }
             line.when(commenting == Some(SelSide::Unified), |line| {
-                line.child(comment_range_overlay(ix, SelSide::Unified))
+                line.child(comment_range_overlay(ix, SelSide::Unified, cx))
             })
             .child(
                 line_gutter(
                     88.,
                     active == Some(SelSide::Unified) || commenting == Some(SelSide::Unified),
+                    cx,
                 )
                 .when(commenting == Some(SelSide::Unified), |gutter| {
                     gutter.debug_selector(move || format!("comment-gutter-Unified-{ix}"))
@@ -1538,8 +1552,9 @@ fn render_row_content(
                         word_bg,
                         selection.map(|(_, range)| range),
                         &search
-                            .map(|s| s.highlights(ix, SelSide::Unified))
+                            .map(|s| s.highlights(ix, SelSide::Unified, cx))
                             .unwrap_or_default(),
+                        cx,
                     )),
             )
             .into_any_element()
@@ -1568,24 +1583,24 @@ fn render_row_content(
                     .flex()
                     .items_center();
                 let Some(cell) = cell else {
-                    return base.bg(theme::void_cell_bg());
+                    return base.bg(theme::void_cell_bg(cx));
                 };
-                let (row_bg, word_bg, marker, marker_color) = kind_style(cell.kind);
+                let (row_bg, word_bg, marker, marker_color) = kind_style(cell.kind, cx);
                 let mut side = base;
                 if let Some(bg) = row_bg {
                     side = side.bg(bg);
                 }
                 side.when(commenting == Some(text_side), |side| {
-                    side.child(comment_range_overlay(ix, text_side))
+                    side.child(comment_range_overlay(ix, text_side, cx))
                 })
                 .child(
-                    line_gutter(44., active || commenting == Some(text_side))
+                    line_gutter(44., active || commenting == Some(text_side), cx)
                         .when(commenting == Some(text_side), |gutter| {
                             gutter.debug_selector(move || {
                                 format!("comment-gutter-{text_side:?}-{ix}")
                             })
                         })
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .justify_end()
                         .child(SharedString::from(cell.no.to_string())),
                 )
@@ -1621,8 +1636,9 @@ fn render_row_content(
                                     word_bg,
                                     sel,
                                     &search
-                                        .map(|s| s.highlights(ix, text_side))
+                                        .map(|s| s.highlights(ix, text_side, cx))
                                         .unwrap_or_default(),
+                                    cx,
                                 )),
                         ),
                 )
@@ -1645,10 +1661,10 @@ fn render_row_content(
                         .w(px(6.))
                         .flex_shrink_0()
                         .h_full()
-                        .bg(theme::crust())
+                        .bg(theme::crust(cx))
                         .border_l_1()
                         .border_r_1()
-                        .border_color(theme::surface0()),
+                        .border_color(theme::surface0(cx)),
                 )
                 .child(cell(
                     right,
@@ -1674,20 +1690,23 @@ mod tests {
     use diff_core::diff_texts;
     use syntax::Token;
 
-    #[test]
-    fn active_gutter_does_not_change_line_geometry() {
-        for width in [44., 88.] {
-            let mut plain = line_gutter(width, false);
-            let mut active = line_gutter(width, true);
-            let plain = plain.style();
-            let active = active.style();
-            assert_eq!(plain.size, active.size);
-            assert_eq!(plain.padding, active.padding);
-            assert_eq!(plain.border_widths, active.border_widths);
-            assert_eq!(plain.flex_shrink, active.flex_shrink);
-            assert!(plain.background.is_none());
-            assert!(active.background.is_some());
-        }
+    #[gpui::test]
+    fn active_gutter_does_not_change_line_geometry(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            for width in [44., 88.] {
+                let mut plain = line_gutter(width, false, cx);
+                let mut active = line_gutter(width, true, cx);
+                let plain = plain.style();
+                let active = active.style();
+                assert_eq!(plain.size, active.size);
+                assert_eq!(plain.padding, active.padding);
+                assert_eq!(plain.border_widths, active.border_widths);
+                assert_eq!(plain.flex_shrink, active.flex_shrink);
+                assert!(plain.background.is_none());
+                assert!(active.background.is_some());
+            }
+        });
     }
 
     #[test]
@@ -2097,119 +2116,143 @@ mod tests {
         );
     }
 
-    fn style(token: Token) -> HighlightStyle {
-        theme::token_style(token)
+    fn style(token: Token, cx: &gpui::App) -> HighlightStyle {
+        theme::token_style(token, cx)
     }
 
-    fn style_bg(token: Option<Token>) -> HighlightStyle {
-        let mut style = token.map(style).unwrap_or_default();
-        style.background_color = Some(theme::added_word_bg().into());
+    fn style_bg(token: Option<Token>, cx: &gpui::App) -> HighlightStyle {
+        let mut style = token.map(|token| style(token, cx)).unwrap_or_default();
+        style.background_color = Some(theme::added_word_bg(cx).into());
         style
     }
 
-    #[test]
-    fn merge_syntax_only() {
-        let syntax = [(0..2, Token::Keyword), (3..7, Token::Function)];
-        assert_eq!(
-            merge_highlights(&syntax, &[], None, None),
-            vec![
-                (0..2, style(Token::Keyword)),
-                (3..7, style(Token::Function))
-            ]
-        );
+    #[gpui::test]
+    fn merge_syntax_only(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            let syntax = [(0..2, Token::Keyword), (3..7, Token::Function)];
+            assert_eq!(
+                merge_highlights(&syntax, &[], None, None, cx),
+                vec![
+                    (0..2, style(Token::Keyword, cx)),
+                    (3..7, style(Token::Function, cx))
+                ]
+            );
+        });
     }
 
-    #[test]
-    fn search_background_preserves_syntax_and_yields_to_text_selection() {
-        let highlights = merge_search_highlights(
-            &[(0..8, Token::Keyword)],
-            &[0..8],
-            Some(theme::added_word_bg()),
-            Some(4..6),
-            &[(2..7, theme::yellow())],
-        );
-        assert_eq!(
-            highlights
-                .iter()
-                .map(|(range, _)| range.clone())
-                .collect::<Vec<_>>(),
-            vec![0..2, 2..4, 4..6, 6..7, 7..8]
-        );
-        for (_, style) in &highlights {
-            assert_eq!(style.color, theme::token_style(Token::Keyword).color);
-        }
-        assert_eq!(
-            highlights[1].1.background_color,
-            Some(theme::yellow().into())
-        );
-        assert_eq!(
-            highlights[2].1.background_color,
-            Some(theme::selection_bg().into())
-        );
-        assert_eq!(
-            highlights[4].1.background_color,
-            Some(theme::added_word_bg().into())
-        );
+    #[gpui::test]
+    fn search_background_preserves_syntax_and_yields_to_text_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            let highlights = merge_search_highlights(
+                &[(0..8, Token::Keyword)],
+                &[0..8],
+                Some(theme::added_word_bg(cx)),
+                Some(4..6),
+                &[(2..7, theme::yellow(cx))],
+                cx,
+            );
+            assert_eq!(
+                highlights
+                    .iter()
+                    .map(|(range, _)| range.clone())
+                    .collect::<Vec<_>>(),
+                vec![0..2, 2..4, 4..6, 6..7, 7..8]
+            );
+            for (_, style) in &highlights {
+                assert_eq!(style.color, theme::token_style(Token::Keyword, cx).color);
+            }
+            assert_eq!(
+                highlights[1].1.background_color,
+                Some(theme::yellow(cx).into())
+            );
+            assert_eq!(
+                highlights[2].1.background_color,
+                Some(theme::selection_bg(cx).into())
+            );
+            assert_eq!(
+                highlights[4].1.background_color,
+                Some(theme::added_word_bg(cx).into())
+            );
+        });
     }
 
-    #[test]
-    fn merge_intra_only() {
-        let bg = Some(theme::added_word_bg());
-        assert_eq!(
-            merge_highlights(&[], &[2..5], bg, None),
-            vec![(2..5, style_bg(None))]
-        );
+    #[gpui::test]
+    fn merge_intra_only(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            let bg = Some(theme::added_word_bg(cx));
+            assert_eq!(
+                merge_highlights(&[], &[2..5], bg, None, cx),
+                vec![(2..5, style_bg(None, cx))]
+            );
+        });
     }
 
-    #[test]
-    fn merge_partial_overlap() {
-        let bg = Some(theme::added_word_bg());
-        let syntax = [(0..6, Token::String)];
-        assert_eq!(
-            merge_highlights(&syntax, &[4..8], bg, None),
-            vec![
-                (0..4, style(Token::String)),
-                (4..6, style_bg(Some(Token::String))),
-                (6..8, style_bg(None)),
-            ]
-        );
+    #[gpui::test]
+    fn merge_partial_overlap(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            let bg = Some(theme::added_word_bg(cx));
+            let syntax = [(0..6, Token::String)];
+            assert_eq!(
+                merge_highlights(&syntax, &[4..8], bg, None, cx),
+                vec![
+                    (0..4, style(Token::String, cx)),
+                    (4..6, style_bg(Some(Token::String), cx)),
+                    (6..8, style_bg(None, cx)),
+                ]
+            );
+        });
     }
 
-    #[test]
-    fn merge_intra_spanning_multiple_tokens() {
-        let bg = Some(theme::added_word_bg());
-        let syntax = [(0..3, Token::Keyword), (5..8, Token::Number)];
-        assert_eq!(
-            merge_highlights(&syntax, &[1..7], bg, None),
-            vec![
-                (0..1, style(Token::Keyword)),
-                (1..3, style_bg(Some(Token::Keyword))),
-                (3..5, style_bg(None)),
-                (5..7, style_bg(Some(Token::Number))),
-                (7..8, style(Token::Number)),
-            ]
-        );
+    #[gpui::test]
+    fn merge_intra_spanning_multiple_tokens(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            let bg = Some(theme::added_word_bg(cx));
+            let syntax = [(0..3, Token::Keyword), (5..8, Token::Number)];
+            assert_eq!(
+                merge_highlights(&syntax, &[1..7], bg, None, cx),
+                vec![
+                    (0..1, style(Token::Keyword, cx)),
+                    (1..3, style_bg(Some(Token::Keyword), cx)),
+                    (3..5, style_bg(None, cx)),
+                    (5..7, style_bg(Some(Token::Number), cx)),
+                    (7..8, style(Token::Number, cx)),
+                ]
+            );
+        });
     }
 
-    #[test]
-    fn merge_adjacent_ranges() {
-        // Same style across a shared boundary coalesces; different styles
-        // stay split exactly at the boundary.
-        let syntax = [(0..2, Token::Keyword), (2..4, Token::Keyword)];
-        assert_eq!(
-            merge_highlights(&syntax, &[], None, None),
-            vec![(0..4, style(Token::Keyword))]
-        );
-        let syntax = [(0..2, Token::Keyword), (2..4, Token::Type)];
-        assert_eq!(
-            merge_highlights(&syntax, &[], None, None),
-            vec![(0..2, style(Token::Keyword)), (2..4, style(Token::Type))]
-        );
-        let bg = Some(theme::added_word_bg());
-        assert_eq!(
-            merge_highlights(&[], &[0..2, 2..4], bg, None),
-            vec![(0..4, style_bg(None))]
-        );
+    #[gpui::test]
+    fn merge_adjacent_ranges(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            // Same style across a shared boundary coalesces; different styles
+            // stay split exactly at the boundary.
+            let syntax = [(0..2, Token::Keyword), (2..4, Token::Keyword)];
+            assert_eq!(
+                merge_highlights(&syntax, &[], None, None, cx),
+                vec![(0..4, style(Token::Keyword, cx))]
+            );
+            let syntax = [(0..2, Token::Keyword), (2..4, Token::Type)];
+            assert_eq!(
+                merge_highlights(&syntax, &[], None, None, cx),
+                vec![
+                    (0..2, style(Token::Keyword, cx)),
+                    (2..4, style(Token::Type, cx))
+                ]
+            );
+            let bg = Some(theme::added_word_bg(cx));
+            assert_eq!(
+                merge_highlights(&[], &[0..2, 2..4], bg, None, cx),
+                vec![(0..4, style_bg(None, cx))]
+            );
+        });
     }
 
     #[test]
@@ -2790,29 +2833,32 @@ mod tests {
         assert_eq!(nth_noncomment_row(&plain, 999), plain.len() - 1);
     }
 
-    #[test]
-    fn merge_selection_wins_over_intra() {
-        let bg = Some(theme::added_word_bg());
-        let sel_style = |token: Option<Token>| {
-            let mut style = token.map(style).unwrap_or_default();
-            style.background_color = Some(theme::selection_bg().into());
-            style
-        };
-        // Intra 2..6, selection 4..8: the overlap 4..6 paints selection bg.
-        assert_eq!(
-            merge_highlights(&[], &[2..6], bg, Some(4..8)),
-            vec![(2..4, style_bg(None)), (4..8, sel_style(None))]
-        );
-        // Selection over a syntax token keeps the token foreground.
-        let syntax = [(0..4, Token::Keyword)];
-        assert_eq!(
-            merge_highlights(&syntax, &[], None, Some(2..6)),
-            vec![
-                (0..2, style(Token::Keyword)),
-                (2..4, sel_style(Some(Token::Keyword))),
-                (4..6, sel_style(None)),
-            ]
-        );
+    #[gpui::test]
+    fn merge_selection_wins_over_intra(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            let bg = Some(theme::added_word_bg(cx));
+            let sel_style = |token: Option<Token>| {
+                let mut style = token.map(|token| style(token, cx)).unwrap_or_default();
+                style.background_color = Some(theme::selection_bg(cx).into());
+                style
+            };
+            // Intra 2..6, selection 4..8: the overlap 4..6 paints selection bg.
+            assert_eq!(
+                merge_highlights(&[], &[2..6], bg, Some(4..8), cx),
+                vec![(2..4, style_bg(None, cx)), (4..8, sel_style(None))]
+            );
+            // Selection over a syntax token keeps the token foreground.
+            let syntax = [(0..4, Token::Keyword)];
+            assert_eq!(
+                merge_highlights(&syntax, &[], None, Some(2..6), cx),
+                vec![
+                    (0..2, style(Token::Keyword, cx)),
+                    (2..4, sel_style(Some(Token::Keyword))),
+                    (4..6, sel_style(None)),
+                ]
+            );
+        });
     }
 
     /// File mode rides the threads along: the displayed file's threads

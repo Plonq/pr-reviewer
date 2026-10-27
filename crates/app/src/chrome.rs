@@ -14,7 +14,7 @@ pub(crate) fn centered_message(text: SharedString, color: gpui::Rgba) -> gpui::A
         .into_any_element()
 }
 
-pub(crate) fn app_title(detail: Option<String>) -> gpui::AnyElement {
+pub(crate) fn app_title(detail: Option<String>, cx: &gpui::App) -> gpui::AnyElement {
     let mut title = div()
         .flex()
         .items_center()
@@ -29,7 +29,7 @@ pub(crate) fn app_title(detail: Option<String>) -> gpui::AnyElement {
     if let Some(detail) = detail {
         title = title.child(
             div()
-                .text_color(theme::subtext())
+                .text_color(theme::subtext(cx))
                 .truncate()
                 .child(SharedString::from(detail)),
         );

@@ -129,13 +129,13 @@ pub(crate) fn fuzzy_file_matches(paths: &[&str], query: &str) -> Vec<usize> {
 }
 
 /// Status label for file headers and color shared with tree entries.
-pub(crate) fn status_style(status: FileStatus) -> (&'static str, gpui::Rgba) {
+pub(crate) fn status_style(status: FileStatus, cx: &gpui::App) -> (&'static str, gpui::Rgba) {
     match status {
-        FileStatus::Added => ("added", theme::green()),
-        FileStatus::Deleted => ("deleted", theme::red()),
-        FileStatus::Modified => ("modified", theme::blue()),
-        FileStatus::Renamed => ("renamed", theme::mauve()),
-        FileStatus::Binary => ("binary", theme::peach()),
+        FileStatus::Added => ("added", theme::green(cx)),
+        FileStatus::Deleted => ("deleted", theme::red(cx)),
+        FileStatus::Modified => ("modified", theme::blue(cx)),
+        FileStatus::Renamed => ("renamed", theme::mauve(cx)),
+        FileStatus::Binary => ("binary", theme::peach(cx)),
     }
 }
 
@@ -164,6 +164,7 @@ pub(crate) fn render_tree_row(
     data: &ItemData,
     entity: &gpui::Entity<ReviewApp>,
     reloading: bool,
+    cx: &gpui::App,
 ) -> gpui::AnyElement {
     let comments = |file_ix: usize| {
         let count = file_comment_count(&data.diff.files[file_ix], data.comments.as_ref());
@@ -175,12 +176,12 @@ pub(crate) fn render_tree_row(
                 .items_center()
                 .gap_1()
                 .text_size(px(10.))
-                .text_color(theme::subtext())
+                .text_color(theme::subtext(cx))
                 .child(
                     Icon::default()
                         .path("icons/gander/comment-16.svg")
                         .xsmall()
-                        .text_color(theme::overlay0()),
+                        .text_color(theme::overlay0(cx)),
                 )
                 .child(SharedString::from(count.to_string()))
         })
@@ -227,12 +228,12 @@ pub(crate) fn render_tree_row(
             .text_size(px(10.))
             .child(
                 div()
-                    .text_color(Hsla::from(theme::green()).opacity(0.7))
+                    .text_color(Hsla::from(theme::green(cx)).opacity(0.7))
                     .child(SharedString::from(format!("+{}", file.additions))),
             )
             .child(
                 div()
-                    .text_color(Hsla::from(theme::red()).opacity(0.7))
+                    .text_color(Hsla::from(theme::red(cx)).opacity(0.7))
                     .child(SharedString::from(format!("−{}", file.deletions))),
             )
     };
@@ -247,9 +248,9 @@ pub(crate) fn render_tree_row(
         .gap_1()
         .pr_2()
         .cursor_pointer()
-        .when(current, |row| row.bg(theme::surface0()))
+        .when(current, |row| row.bg(theme::surface0(cx)))
         .when(!current, |row| {
-            row.hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+            row.hover(|style| style.bg(Hsla::from(theme::surface0(cx)).opacity(0.5)))
         });
     match row {
         TreeListRow::Entry(entry_ix) => {
@@ -269,21 +270,21 @@ pub(crate) fn render_tree_row(
                         div()
                             .w(px(12.))
                             .flex_shrink_0()
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child(SharedString::from(chevron)),
                     )
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child(entry.name.clone()),
                     )
                     .into_any_element()
                 }
                 TreeEntryKind::File { file_ix } => {
                     let file = &data.diff.files[*file_ix];
-                    let (_, status_color) = status_style(file.status);
+                    let (_, status_color) = status_style(file.status, cx);
                     base.child(div().w(px(12.)).flex_shrink_0()) // aligns with dir chevrons
                         .child(
                             div()
@@ -302,7 +303,7 @@ pub(crate) fn render_tree_row(
         }
         TreeListRow::FilteredFile(file_ix) => {
             let file = &data.diff.files[file_ix];
-            let (_, status_color) = status_style(file.status);
+            let (_, status_color) = status_style(file.status, cx);
             base.pl_2()
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| this.jump_to_file(file_ix, window, cx));
@@ -469,18 +470,30 @@ mod tests {
         assert_eq!(fuzzy_file_matches(&paths, "main.rs"), vec![1, 0]);
     }
 
-    #[test]
-    fn status_style_matches_file_header_tags() {
-        assert_eq!(status_style(FileStatus::Added), ("added", theme::green()));
-        assert_eq!(status_style(FileStatus::Deleted), ("deleted", theme::red()));
-        assert_eq!(
-            status_style(FileStatus::Modified),
-            ("modified", theme::blue())
-        );
-        assert_eq!(
-            status_style(FileStatus::Renamed),
-            ("renamed", theme::mauve())
-        );
-        assert_eq!(status_style(FileStatus::Binary), ("binary", theme::peach()));
+    #[gpui::test]
+    fn status_style_matches_file_header_tags(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            assert_eq!(
+                status_style(FileStatus::Added, cx),
+                ("added", theme::green(cx))
+            );
+            assert_eq!(
+                status_style(FileStatus::Deleted, cx),
+                ("deleted", theme::red(cx))
+            );
+            assert_eq!(
+                status_style(FileStatus::Modified, cx),
+                ("modified", theme::blue(cx))
+            );
+            assert_eq!(
+                status_style(FileStatus::Renamed, cx),
+                ("renamed", theme::mauve(cx))
+            );
+            assert_eq!(
+                status_style(FileStatus::Binary, cx),
+                ("binary", theme::peach(cx))
+            );
+        });
     }
 }
