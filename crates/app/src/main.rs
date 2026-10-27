@@ -1542,6 +1542,30 @@ struct Composer {
     in_flight: bool,
 }
 
+impl Composer {
+    /// Resolve against source line numbers so wrapping and row rebuilds don't
+    /// move the highlight, and never carry it into another item or file.
+    fn highlighted_side(&self, item_id: u64, data: &ItemData, row: &Row) -> Option<SelSide> {
+        if self.placement != ComposerPlacement::Diff
+            || self.item_id != item_id
+            || data.diff.files.get(data.file_ix)?.display_path() != self.path
+        {
+            return None;
+        }
+        let range = self.start_line.unwrap_or(self.line)..=self.line;
+        let (side, line) = match (rows::source_row(row), self.side) {
+            (Row::Line { old_no, .. }, CommentSide::Left) => (SelSide::Unified, (*old_no)?),
+            (Row::Line { new_no, .. }, CommentSide::Right) => (SelSide::Unified, (*new_no)?),
+            (Row::SplitLine { left, .. }, CommentSide::Left) => (SelSide::Left, left.as_ref()?.no),
+            (Row::SplitLine { right, .. }, CommentSide::Right) => {
+                (SelSide::Right, right.as_ref()?.no)
+            }
+            _ => return None,
+        };
+        range.contains(&(line as u64)).then_some(side)
+    }
+}
+
 /// The "submit review" modal: a verdict (approve / request changes /
 /// comment) plus an optional body, targeting the item it was opened on.
 struct ReviewDialog {
@@ -3469,6 +3493,11 @@ impl ReviewApp {
         data.selection = Some(Selection { side, anchor, head });
         self.drag_anchor = None;
         self.open_composer_on_selection(window, cx);
+        // The selection only supplies the comment range; Shift+click should
+        // not leave ordinary diff text selected behind the composer.
+        if let Some(data) = self.active_data_mut() {
+            data.selection = None;
+        }
         cx.notify();
     }
 
@@ -6326,6 +6355,10 @@ impl ReviewApp {
                                         else {
                                             return;
                                         };
+                                        // The composer takes focus below; don't let
+                                        // the parent diff container's default
+                                        // mouse-down behavior take it back.
+                                        window.prevent_default();
                                         this.extend_comment_selection(side, head, window, cx);
                                         return;
                                     }
@@ -6423,6 +6456,16 @@ impl ReviewApp {
                                                     let active = (ix == data.cursor)
                                                         .then_some(data.cursor_side)
                                                         .flatten();
+                                                    let commenting = this
+                                                        .composer
+                                                        .as_ref()
+                                                        .and_then(|composer| {
+                                                            composer.highlighted_side(
+                                                                this.items[this.active].id,
+                                                                data,
+                                                                row,
+                                                            )
+                                                        });
                                                     let split_layout = ((data.mode
                                                         == ViewMode::Split
                                                         || matches!(
@@ -6447,6 +6490,7 @@ impl ReviewApp {
                                                         row,
                                                         row_sel,
                                                         active,
+                                                        commenting,
                                                         split_layout,
                                                         data.search.as_ref(),
                                                         &entity,
@@ -6903,6 +6947,7 @@ mod tests {
         add, hunk, queued, rc, row_name, sample_comments, sample_diff, two_file_diff,
     };
     use diff_core::{diff_texts, FileDiff};
+    use gpui::Focusable;
 
     fn sample_commits() -> github::PrCommits {
         github::PrCommits {
@@ -13720,6 +13765,28 @@ mod tests {
                     vcx.run_until_parked();
                 }
                 let card = vcx.debug_bounds("composer-card").unwrap();
+                if anchor.max(head) <= 3 {
+                    let (highlight, code, opposite) = match side {
+                        SelSide::Unified => ("comment-range-Unified-2", "diff-code-2", None),
+                        SelSide::Left => (
+                            "comment-range-Left-2",
+                            "diff-code-left-2",
+                            Some("diff-code-right-clip-2"),
+                        ),
+                        SelSide::Right => (
+                            "comment-range-Right-2",
+                            "diff-code-right-2",
+                            Some("diff-code-left-clip-2"),
+                        ),
+                    };
+                    let highlight = vcx.debug_bounds(highlight).unwrap();
+                    let code = vcx.debug_bounds(code).unwrap();
+                    assert!(highlight.contains(&code.center()));
+                    if let Some(opposite) = opposite {
+                        let opposite = vcx.debug_bounds(opposite).unwrap();
+                        assert!(!highlight.intersects(&opposite));
+                    }
+                }
                 if anchor == eof {
                     assert!(
                         card.size.height > initial_height,
@@ -13737,6 +13804,25 @@ mod tests {
                             composer.start_line,
                             (anchor != head).then_some(anchor.min(head) as u64)
                         );
+                        let data = this.active_data().unwrap();
+                        let item_id = this.active_item().unwrap().id;
+                        let highlighted: Vec<_> = data
+                            .rows
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(ix, row)| {
+                                composer.highlighted_side(item_id, data, row).map(
+                                    |highlight_side| {
+                                        assert_eq!(highlight_side, side);
+                                        ix
+                                    },
+                                )
+                            })
+                            .collect();
+                        assert_eq!(highlighted, (anchor.min(head)..=last).collect::<Vec<_>>());
+                        for row in &data.rows {
+                            assert!(composer.highlighted_side(item_id + 1, data, row).is_none());
+                        }
                         let scroll = this.active_data().unwrap().scroll.0.borrow();
                         let line_bottom = scroll.base_handle.bounds().top()
                             + scroll.base_handle.offset().y
@@ -13756,6 +13842,58 @@ mod tests {
                 vcx.run_until_parked();
             }
         }
+    }
+
+    #[gpui::test]
+    fn comment_range_highlight_tracks_source_lines_not_display_rows(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, FakePr::with_threads(Vec::new()));
+        install_item(&app, range_pr_item(), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_composer(None, "a.rs".into(), CommentSide::Right, 3, 3, window, cx);
+                let composer = app.composer.as_mut().unwrap();
+                composer.start_line = Some(1);
+                let item_id = composer.item_id;
+                // A wrapped context fragment has both source numbers, even
+                // though its display index need not match either of them.
+                let fragment = Row::Continuation(Box::new(Row::Line {
+                    old_no: Some(12),
+                    new_no: Some(2),
+                    kind: LineKind::Context,
+                    text: "wrapped fragment".into(),
+                    intra: Vec::new(),
+                    syntax: Vec::new(),
+                }));
+                let ItemState::Ready(data) = &app.items[app.active].state else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    composer.highlighted_side(item_id, data, &fragment),
+                    Some(SelSide::Unified)
+                );
+                assert!(composer
+                    .highlighted_side(item_id, data, &Row::Binary)
+                    .is_none());
+                composer.side = CommentSide::Left;
+                composer.line = 12;
+                composer.start_line = None;
+                assert_eq!(
+                    composer.highlighted_side(item_id, data, &fragment),
+                    Some(SelSide::Unified)
+                );
+                composer.path = "another.rs".into();
+                assert!(composer
+                    .highlighted_side(item_id, data, &fragment)
+                    .is_none());
+                composer.path = "a.rs".into();
+                composer.placement = ComposerPlacement::ConversationMain;
+                assert!(composer
+                    .highlighted_side(item_id, data, &fragment)
+                    .is_none());
+                app.close_composer(window, cx);
+            });
+        });
     }
 
     #[gpui::test]
@@ -13784,6 +13922,9 @@ mod tests {
         let first = at_row(1, &mut vcx.cx);
         vcx.simulate_mouse_down(first, MouseButton::Left, gpui::Modifiers::default());
         vcx.simulate_mouse_up(first, MouseButton::Left, gpui::Modifiers::default());
+        vcx.update(|window, cx| {
+            assert!(app.read(cx).focus_handle.is_focused(window));
+        });
         let last = at_row(3, &mut vcx.cx);
         let shift = gpui::Modifiers {
             shift: true,
@@ -13792,9 +13933,44 @@ mod tests {
         vcx.simulate_mouse_down(last, MouseButton::Left, shift);
         vcx.simulate_mouse_up(last, MouseButton::Left, shift);
         vcx.run_until_parked();
-        vcx.cx.update(|cx| {
+        let range_selectors = [
+            (
+                "comment-range-Unified-1",
+                "comment-gutter-Unified-1",
+                "diff-code-1",
+            ),
+            (
+                "comment-range-Unified-2",
+                "comment-gutter-Unified-2",
+                "diff-code-2",
+            ),
+            (
+                "comment-range-Unified-3",
+                "comment-gutter-Unified-3",
+                "diff-code-3",
+            ),
+        ];
+        for (highlight, gutter, code) in range_selectors {
+            let highlight = vcx.debug_bounds(highlight).unwrap();
+            let gutter = vcx.debug_bounds(gutter).unwrap();
+            let code = vcx.debug_bounds(code).unwrap();
+            assert_eq!(highlight.top(), code.top());
+            assert_eq!(highlight.size.height, px(row_height()));
+            assert!(highlight.contains(&code.center()));
+            assert!(highlight.contains(&gutter.center()));
+        }
+        assert!(vcx.debug_bounds("comment-range-Unified-4").is_none());
+        vcx.simulate_input("range feedback");
+        vcx.update(|window, cx| {
             let app = app.read(cx);
             let composer = app.composer.as_ref().expect("shift-click composes a range");
+            assert!(composer.input.focus_handle(cx).is_focused(window));
+            assert_eq!(composer.input.read(cx).value(), "range feedback");
+            assert!(
+                app.active_data().unwrap().selection.is_none(),
+                "shift-click selects a comment range, not diff text"
+            );
+            assert!(app.drag_anchor.is_none());
             assert_eq!(composer.start_line, Some(1));
             assert_eq!(composer.line, 3);
             assert_eq!(composer.side, CommentSide::Right);
@@ -13802,6 +13978,10 @@ mod tests {
                 composer.row_ix, 3,
                 "the card sits below the range's last row"
             );
+        });
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| app.close_composer(window, cx));
+            assert!(app.read(cx).composer.is_none());
         });
     }
 }

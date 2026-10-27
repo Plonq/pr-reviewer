@@ -1199,17 +1199,27 @@ fn line_gutter(width: f32, active: bool) -> gpui::Div {
         })
 }
 
+fn comment_range_overlay(ix: usize, side: SelSide) -> gpui::Div {
+    div()
+        .debug_selector(move || format!("comment-range-{side:?}-{ix}"))
+        .absolute()
+        .inset_0()
+        .bg(theme::comment_range_bg())
+}
+
 /// `selection` is this row's selected byte range (side + non-empty range),
 /// computed by the caller via `row_selection_range`; its side always matches
 /// the row shape (Unified for Line rows, Left/Right for SplitLine rows).
 /// `entity` is used by CommentActions rows (click opens the reply
 /// composer); `ix` is the display-row index.
 /// `active` marks only the clicked side's line-number gutter.
+/// `commenting` extends that gutter cue and tints the code for the open composer.
 pub(crate) fn render_row(
     ix: usize,
     row: &Row,
     selection: Option<(SelSide, Range<usize>)>,
     active: Option<SelSide>,
+    commenting: Option<SelSide>,
     split_layout: Option<SplitLayout>,
     search: Option<&crate::search::Search>,
     entity: &gpui::Entity<ReviewApp>,
@@ -1220,6 +1230,7 @@ pub(crate) fn render_row(
         row,
         selection,
         active,
+        commenting,
         split_layout.map(|layout| layout.offset),
         search,
         entity,
@@ -1250,6 +1261,7 @@ fn render_row_content(
     row: &Row,
     selection: Option<(SelSide, Range<usize>)>,
     active: Option<SelSide>,
+    commenting: Option<SelSide>,
     horizontal_offset: Option<gpui::Pixels>,
     search: Option<&crate::search::Search>,
     entity: &gpui::Entity<ReviewApp>,
@@ -1262,6 +1274,7 @@ fn render_row_content(
             row,
             selection,
             active,
+            commenting,
             horizontal_offset,
             search,
             entity,
@@ -1487,14 +1500,23 @@ fn render_row_content(
                         no.map(|no| no.to_string()).unwrap_or_default(),
                     ))
             };
-            let mut line = div().h(row_height).flex().items_center();
+            let mut line = div().relative().h(row_height).flex().items_center();
             if let Some(bg) = row_bg {
                 line = line.bg(bg);
             }
-            line.child(
-                line_gutter(88., active == Some(SelSide::Unified))
-                    .child(number(*old_no))
-                    .child(number(*new_no)),
+            line.when(commenting == Some(SelSide::Unified), |line| {
+                line.child(comment_range_overlay(ix, SelSide::Unified))
+            })
+            .child(
+                line_gutter(
+                    88.,
+                    active == Some(SelSide::Unified) || commenting == Some(SelSide::Unified),
+                )
+                .when(commenting == Some(SelSide::Unified), |gutter| {
+                    gutter.debug_selector(move || format!("comment-gutter-Unified-{ix}"))
+                })
+                .child(number(*old_no))
+                .child(number(*new_no)),
             )
             .child(
                 div()
@@ -1538,6 +1560,7 @@ fn render_row_content(
                     "diff-code-right"
                 };
                 let base = div()
+                    .relative()
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
@@ -1552,8 +1575,16 @@ fn render_row_content(
                 if let Some(bg) = row_bg {
                     side = side.bg(bg);
                 }
-                side.child(
-                    line_gutter(44., active)
+                side.when(commenting == Some(text_side), |side| {
+                    side.child(comment_range_overlay(ix, text_side))
+                })
+                .child(
+                    line_gutter(44., active || commenting == Some(text_side))
+                        .when(commenting == Some(text_side), |gutter| {
+                            gutter.debug_selector(move || {
+                                format!("comment-gutter-{text_side:?}-{ix}")
+                            })
+                        })
                         .text_color(theme::overlay0())
                         .justify_end()
                         .child(SharedString::from(cell.no.to_string())),
