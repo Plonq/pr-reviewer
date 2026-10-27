@@ -24,6 +24,7 @@ impl Posts {
             reply_to,
             receipt: None,
             comment: DiscussionComment {
+                permissions: Default::default(),
                 id: token,
                 author,
                 body,
@@ -92,6 +93,7 @@ mod tests {
 
     fn comment(id: u64) -> DiscussionComment {
         DiscussionComment {
+            permissions: Default::default(),
             id,
             author: "tester".into(),
             body: "same text".into(),

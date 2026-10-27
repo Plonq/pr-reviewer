@@ -2,6 +2,21 @@
 
 use crate::{Author, ReviewComment};
 
+/// Opaque identity and API family for a published comment mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentTarget {
+    Issue(String),
+    Review(String),
+    ReviewComment(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommentPermissions {
+    pub node_id: String,
+    pub can_edit: bool,
+    pub can_delete: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Reaction {
     pub content: String,
@@ -27,6 +42,9 @@ impl Reaction {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiscussionComment {
     pub id: u64,
+    /// Missing permissions in older caches deliberately default to read-only.
+    #[serde(default)]
+    pub permissions: CommentPermissions,
     pub author: String,
     pub body: String,
     pub created_at: String,
@@ -136,6 +154,7 @@ impl PrDiscussion {
                 })
                 .map(|c| DiscussionComment {
                     id: c.id,
+                    permissions: CommentPermissions::default(),
                     author: c.user.login.clone(),
                     body: c.body.clone(),
                     created_at: c.created_at.clone(),

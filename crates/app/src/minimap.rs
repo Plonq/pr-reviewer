@@ -57,6 +57,7 @@ pub(crate) fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
             | Row::Fold { .. }
             | Row::LargeFile { .. }
             | Row::CommentHeader { .. }
+            | Row::CommentEditor { .. }
             | Row::CommentBody { .. }
             | Row::CommentMedia { .. }
             | Row::CommentActions { .. } => MinimapRow {

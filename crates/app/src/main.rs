@@ -1,4 +1,5 @@
 mod chrome;
+mod comment_actions;
 mod comment_anchor;
 mod conversation;
 mod diff_media;
@@ -25,6 +26,7 @@ use chrome::{
     app_title, centered_message, filtered_sources, palette_pr_row, BaseListState, PaletteStep,
     PrListState, PALETTE_ROW_HEIGHT, PALETTE_SOURCES, SOURCE_FOLDER, SOURCE_PR,
 };
+use comment_actions::CommentTarget;
 use diff_core::{FileStatus, PrDiff};
 use github::review_session::{Command as SessionCommand, ReviewSession};
 use gpui::{
@@ -578,6 +580,7 @@ pub(crate) struct ItemData {
     local_review: Option<LocalReview>,
     /// `c` toggles the comment rows; the file-header counts always show.
     comments_visible: bool,
+    editing_comment: Option<(u64, Rc<Cell<Pixels>>)>,
     /// Columns used for initial comment-height estimates, derived from the
     /// measured pane width (see `comment_wrap_cols`). Changing it re-wraps the
     /// estimates, which changes the row count, so render rebuilds the rows when
@@ -653,6 +656,7 @@ impl ItemData {
             comments,
             local_review,
             comments_visible: true,
+            editing_comment: None,
             comment_wrap: COMMENT_WRAP_CHARS,
             comment_text_layouts: HashMap::new(),
             preferences: Default::default(),
@@ -678,6 +682,13 @@ impl ItemData {
     /// (every row rebuild goes through here).
     fn set_rows(&mut self, mut built_rows: BuiltRows) {
         diff_media::resize_text_rows(&mut built_rows, &self.comment_text_layouts);
+        if let Some((id, height)) = &self.editing_comment {
+            comment_actions::reserve_editor_rows(
+                &mut built_rows,
+                *id,
+                (f32::from(height.get()) / row_height()).ceil() as usize,
+            );
+        }
         let BuiltRows {
             rows,
             file_rows,
@@ -1497,6 +1508,8 @@ enum ComposerPlacement {
     Diff,
     ConversationMain,
     ConversationThread(String),
+    ConversationComment(String),
+    PendingTray(u64),
 }
 
 /// The comment/reply composer. One at a time, targeting a specific
@@ -1516,6 +1529,7 @@ struct Composer {
     position: Option<github::CommentPosition>,
     pending: bool,
     edit_id: Option<u64>,
+    edit_target: Option<CommentTarget>,
     /// Display row the composer is anchored beneath (best effort; goes stale
     /// harmlessly if rows rebuild while it is open).
     row_ix: usize,
@@ -3559,6 +3573,11 @@ impl ReviewApp {
             SessionCommand::Reply { .. } | SessionCommand::ConversationReply { .. }
         );
         let commented = matches!(command, SessionCommand::Conversation { .. });
+        let mutation = command.clone();
+        let mutated = matches!(
+            command,
+            SessionCommand::EditPublished { .. } | SessionCommand::DeletePublished { .. }
+        );
         let Some(job) = self.session_job(item_id, command, cx) else {
             return;
         };
@@ -3568,6 +3587,9 @@ impl ReviewApp {
             let result = result.map(|_| ());
             this.update_in(cx, |app, window, cx| {
                 app.finish_session(item_id, session, &result, cx);
+                if result.is_ok() {
+                    app.apply_comment_mutation(item_id, &mutation);
+                }
                 if let SessionCompletion::Composer(gen) = completion {
                     if let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) {
                         if let ItemState::Ready(data) = &mut item.state {
@@ -3599,7 +3621,7 @@ impl ReviewApp {
                     },
                     _ => {}
                 }
-                if (submitted || replied || commented) && result.is_ok() {
+                if (submitted || replied || commented || mutated) && result.is_ok() {
                     if let Some(Source::Pr(loc)) = app
                         .items
                         .iter()
@@ -3696,6 +3718,9 @@ impl ReviewApp {
                 }
             }
         }
+        if self.composer.is_some() {
+            self.close_composer(window, cx);
+        }
         self.composer_gen += 1;
         let input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -3728,6 +3753,7 @@ impl ReviewApp {
             position,
             pending: false,
             edit_id: None,
+            edit_target: None,
             row_ix,
             input,
             height: Rc::new(Cell::new(px(250.))),
@@ -3785,7 +3811,17 @@ impl ReviewApp {
     }
 
     fn close_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer.take().is_some() {
+        if let Some(composer) = self.composer.take() {
+            if let Some(ItemState::Ready(data)) = self
+                .items
+                .iter_mut()
+                .find(|item| item.id == composer.item_id)
+                .map(|item| &mut item.state)
+            {
+                if data.editing_comment.take().is_some() {
+                    data.rebuild_rows_anchored();
+                }
+            }
             self.composer_gen += 1;
             window.focus(&self.focus_handle);
             cx.notify();
@@ -3793,6 +3829,12 @@ impl ReviewApp {
     }
 
     fn composer_uses_pending_review(&self, composer: &Composer) -> bool {
+        if matches!(
+            composer.edit_target,
+            Some(CommentTarget::Published(_)) | Some(CommentTarget::Local(_))
+        ) {
+            return false;
+        }
         composer.pending
             || self
                 .sessions
@@ -3802,7 +3844,11 @@ impl ReviewApp {
 
     fn composer_submit_label(&self, composer: &Composer) -> &'static str {
         if composer.edit_id.is_some() {
-            "Save draft"
+            if matches!(composer.edit_target, Some(CommentTarget::Published(_))) {
+                "Save changes"
+            } else {
+                "Save draft"
+            }
         } else if self.composer_uses_pending_review(composer) {
             "Add to review"
         } else if composer.reply_to.is_some() {
@@ -3832,12 +3878,58 @@ impl ReviewApp {
         };
         let item_id = item.id;
         let source = item.source.clone();
+        if self.active_item().map(|item| item.id) != Some(item_id) {
+            return;
+        }
         let gen = self.composer_gen;
         // Keyboard submission must obey the same per-PR serialization as the
         // disabled button, including while pending-review reconciliation runs.
         if matches!(source, Source::Pr(_)) && self.sessions.get(&item_id).is_some_and(|ui| ui.busy)
         {
             return;
+        }
+        if let Some(target) = composer.edit_target.clone() {
+            match target {
+                CommentTarget::Local(id) => {
+                    if let Some(data) = self.active_data_mut() {
+                        if let Some(local) = &mut data.local_review {
+                            if let Some(comment) = local.comments.iter_mut().find(|c| c.id == id) {
+                                comment.body = body;
+                            }
+                            data.comments = Some(local.index());
+                            data.rebuild_rows_anchored();
+                        }
+                    }
+                    self.close_composer(window, cx);
+                    return;
+                }
+                CommentTarget::Pending(id) => {
+                    let composer = self.composer.as_mut().unwrap();
+                    composer.in_flight = true;
+                    composer.error = None;
+                    self.run_session(
+                        item_id,
+                        SessionCommand::Edit { id, body },
+                        SessionCompletion::Composer(gen),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+                CommentTarget::Published(target) => {
+                    let composer = self.composer.as_mut().unwrap();
+                    composer.in_flight = true;
+                    composer.error = None;
+                    self.run_session(
+                        item_id,
+                        SessionCommand::EditPublished { target, body },
+                        SessionCompletion::Composer(gen),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            }
         }
         if matches!(source, Source::Pr(_)) && composer.placement != ComposerPlacement::Diff {
             let pending = self.composer_uses_pending_review(composer);
@@ -4289,11 +4381,27 @@ impl ReviewApp {
         let Some(data) = self.active_data() else {
             return empty();
         };
+        if self
+            .active_item()
+            .is_none_or(|item| item.pane != ItemPane::Changes)
+        {
+            return empty();
+        }
         let (bounds, offset) = {
             let state = data.scroll.0.borrow();
             (state.base_handle.bounds(), state.base_handle.offset())
         };
-        let row_y = composer.row_ix as f32 * row_height() + f32::from(offset.y);
+        let row_ix = if let Some(id) = composer.edit_id {
+            let Some(ix) = data.rows.iter().position(
+                |row| matches!(row, Row::CommentHeader { comment_id, .. } if *comment_id == id),
+            ) else {
+                return empty();
+            };
+            ix
+        } else {
+            composer.row_ix
+        };
+        let row_y = row_ix as f32 * row_height() + f32::from(offset.y);
         let y = f32::from(bounds.top()) + (row_y + row_height()).max(8.);
         let x = composer_x(
             f32::from(bounds.left()),
@@ -4302,14 +4410,36 @@ impl ReviewApp {
             composer.side,
         );
         let scroll = data.scroll.clone();
+        let entity = cx.entity();
+        let item_id = composer.item_id;
+        let editing = composer.edit_id.is_some();
+        let half_width = (bounds.size.width - px(SPLIT_DIVIDER)) / 2.;
+        let inline_left = px(72.)
+            + if data.mode == ViewMode::Split && composer.side == CommentSide::Right {
+                half_width + px(SPLIT_DIVIDER)
+            } else {
+                px(0.)
+            };
         let height = composer.height.clone();
         let reveal = composer.reveal.clone();
-        let row_ix = composer.row_ix;
-        div()
+        let card = div()
             .absolute()
-            .left(px(x))
-            .top(px(y))
-            .w(px(520.))
+            .left(if editing { inline_left } else { px(x) })
+            .top(if editing {
+                px(row_y + row_height())
+            } else {
+                px(y)
+            })
+            .w(if editing {
+                (if data.mode == ViewMode::Split {
+                    half_width
+                } else {
+                    bounds.size.width
+                } - px(72.))
+                .max(px(1.))
+            } else {
+                px(520.)
+            })
             .occlude()
             .shadow_lg()
             .on_children_prepainted(move |bounds, window, cx| {
@@ -4337,9 +4467,40 @@ impl ReviewApp {
                         window.refresh();
                     });
                 }
+                if editing && height_changed {
+                    let entity = entity.clone();
+                    window.defer(cx, move |_, cx| {
+                        entity.update(cx, |app, cx| {
+                            if let Some(ItemState::Ready(data)) = app
+                                .items
+                                .iter_mut()
+                                .find(|item| item.id == item_id)
+                                .map(|item| &mut item.state)
+                            {
+                                data.rebuild_rows_anchored();
+                                cx.notify();
+                            }
+                        })
+                    });
+                }
             })
             .child(self.render_composer_card(cx))
-            .into_any_element()
+            .into_any_element();
+        if editing {
+            // Match the list's clipping: an edited comment scrolls with its
+            // thread, never over the title bar, tray, or neighboring split pane.
+            div()
+                .absolute()
+                .left(bounds.left())
+                .top(bounds.top())
+                .w(bounds.size.width)
+                .h(bounds.size.height)
+                .overflow_hidden()
+                .child(card)
+                .into_any_element()
+        } else {
+            card
+        }
     }
 
     fn render_composer_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -4350,7 +4511,15 @@ impl ReviewApp {
             .get(&composer.item_id)
             .is_some_and(|ui| ui.busy);
         let action = self.composer_submit_label(composer);
-        let target = if composer.placement == ComposerPlacement::ConversationMain {
+        let target = if let Some(CommentTarget::Published(target)) = &composer.edit_target {
+            match target {
+                github::CommentTarget::Issue(_) => "Edit PR conversation comment".to_owned(),
+                github::CommentTarget::Review(_) => "Edit review summary".to_owned(),
+                github::CommentTarget::ReviewComment(_) => {
+                    format!("Edit comment · {}", composer.path)
+                }
+            }
+        } else if composer.placement == ComposerPlacement::ConversationMain {
             if pending {
                 "PR conversation · saved in your review summary"
             } else {
@@ -4476,38 +4645,16 @@ impl ReviewApp {
     }
 
     fn edit_pending(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.active_item() else {
-            return;
+        let target = CommentTarget::Pending(id);
+        let placement = if self
+            .active_item()
+            .is_some_and(|item| item.pane == ItemPane::Conversation)
+        {
+            ComposerPlacement::PendingTray(id)
+        } else {
+            ComposerPlacement::Diff
         };
-        let Some(comment) = self
-            .sessions
-            .get(&item.id)
-            .and_then(|ui| ui.state.pending.as_ref())
-            .and_then(|review| review.comments.iter().find(|comment| comment.id == id))
-            .cloned()
-        else {
-            return;
-        };
-        // Edits address an existing id, including outdated comments; they do
-        // not create a new anchor or pretend the old one is current.
-        self.open_composer(
-            Some(id),
-            comment.path,
-            comment.side,
-            comment.line.unwrap_or(0),
-            0,
-            window,
-            cx,
-        );
-        if let Some(composer) = &mut self.composer {
-            composer.reply_to = None;
-            composer.edit_id = Some(id);
-            composer.pending = true;
-            composer.start_line = comment.start_line;
-            composer
-                .input
-                .update(cx, |state, cx| state.set_value(comment.body, window, cx));
-        }
+        self.edit_comment(target, placement, window, cx);
     }
 
     fn render_pending_tray(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -4617,6 +4764,13 @@ impl ReviewApp {
                 .gap_1();
             for comment in &review.comments {
                 let comment_id = comment.id;
+                if self.composer.as_ref().is_some_and(|composer| {
+                    composer.item_id == id
+                        && composer.placement == ComposerPlacement::PendingTray(comment_id)
+                }) {
+                    comments = comments.child(self.render_composer_card(cx));
+                    continue;
+                }
                 let location = match comment.line {
                     Some(line) => format!(
                         "{}:{}{} ({})",
@@ -4650,7 +4804,9 @@ impl ReviewApp {
                                 .label("Edit")
                                 .ghost()
                                 .small()
-                                .disabled(ui.busy)
+                                .disabled(
+                                    ui.busy || self.composer.is_some() || self.review.is_some(),
+                                )
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.edit_pending(comment_id, window, cx)
                                 })),
@@ -4660,12 +4816,12 @@ impl ReviewApp {
                                 .label("Delete")
                                 .ghost()
                                 .small()
-                                .disabled(ui.busy)
+                                .disabled(
+                                    ui.busy || self.composer.is_some() || self.review.is_some(),
+                                )
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.run_session(
-                                        id,
-                                        SessionCommand::Delete { id: comment_id },
-                                        SessionCompletion::None,
+                                    this.confirm_delete_comment(
+                                        CommentTarget::Pending(comment_id),
                                         window,
                                         cx,
                                     )
@@ -6108,6 +6264,7 @@ impl ReviewApp {
                 self.active_item()
                     .is_some_and(|item| item.id == composer.item_id)
                     && composer.placement == ComposerPlacement::Diff
+                    && composer.edit_id.is_none()
             })
             .map_or(0, |composer| {
                 (f32::from(composer.height.get()) / row_height()).ceil() as usize
@@ -6270,6 +6427,8 @@ impl ReviewApp {
                                                             row,
                                                             Row::CommentMedia { .. }
                                                                 | Row::CommentBody { .. }
+                                                                | Row::CommentHeader { .. }
+                                                                | Row::CommentEditor { .. }
                                                         ))
                                                         && !data
                                                             .preferences
@@ -6289,6 +6448,22 @@ impl ReviewApp {
                                                         split_layout,
                                                         data.search.as_ref(),
                                                         &entity,
+                                                        if let Row::CommentHeader {
+                                                            comment_id,
+                                                            ..
+                                                        } = row
+                                                        {
+                                                            this.diff_comment_target(*comment_id)
+                                                                .map(|target| {
+                                                                    this.comment_controls(
+                                                                        target,
+                                                                        ComposerPlacement::Diff,
+                                                                        &entity,
+                                                                    )
+                                                                })
+                                                        } else {
+                                                            None
+                                                        },
                                                     )
                                                 })
                                                 .collect()
@@ -10294,6 +10469,13 @@ mod tests {
     /// (in order — the tests pin that nothing posts twice or out of turn).
     #[derive(Debug, Clone, PartialEq)]
     enum Post {
+        Edit {
+            target: github::CommentTarget,
+            body: String,
+        },
+        Delete {
+            target: github::CommentTarget,
+        },
         Comment {
             commit_id: String,
             path: String,
@@ -10320,6 +10502,7 @@ mod tests {
     /// the tests watch the refetch show what was posted.
     #[derive(Default)]
     struct FakePr {
+        comment_permissions: std::sync::Mutex<HashMap<u64, github::CommentPermissions>>,
         comments: std::sync::Mutex<Vec<github::ReviewComment>>,
         conversation: std::sync::Mutex<Vec<github::DiscussionComment>>,
         posted: std::sync::Mutex<Vec<Post>>,
@@ -10354,6 +10537,77 @@ mod tests {
     }
 
     impl github::GitHubClient for FakePr {
+        fn edit_comment(
+            &self,
+            target: &github::CommentTarget,
+            body: &str,
+        ) -> Result<(), github::ClientError> {
+            self.posted.lock().unwrap().push(Post::Edit {
+                target: target.clone(),
+                body: body.into(),
+            });
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(github::ClientError::Failed("edit rejected".into()));
+            }
+            match target {
+                github::CommentTarget::ReviewComment(node_id) => {
+                    let permissions = self.comment_permissions.lock().unwrap();
+                    let id = permissions
+                        .iter()
+                        .find(|(_, p)| &p.node_id == node_id)
+                        .unwrap()
+                        .0;
+                    self.comments
+                        .lock()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|c| c.id == *id)
+                        .unwrap()
+                        .body = body.into();
+                }
+                github::CommentTarget::Issue(node_id) | github::CommentTarget::Review(node_id) => {
+                    self.conversation
+                        .lock()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|c| &c.permissions.node_id == node_id)
+                        .unwrap()
+                        .body = body.into();
+                }
+            }
+            Ok(())
+        }
+
+        fn delete_comment(
+            &self,
+            target: &github::CommentTarget,
+        ) -> Result<(), github::ClientError> {
+            self.posted.lock().unwrap().push(Post::Delete {
+                target: target.clone(),
+            });
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(github::ClientError::Failed("delete rejected".into()));
+            }
+            match target {
+                github::CommentTarget::ReviewComment(node_id) => {
+                    let permissions = self.comment_permissions.lock().unwrap();
+                    let id = permissions
+                        .iter()
+                        .find(|(_, p)| &p.node_id == node_id)
+                        .unwrap()
+                        .0;
+                    self.comments.lock().unwrap().retain(|c| c.id != *id);
+                }
+                github::CommentTarget::Issue(node_id) | github::CommentTarget::Review(node_id) => {
+                    self.conversation
+                        .lock()
+                        .unwrap()
+                        .retain(|c| &c.permissions.node_id != node_id);
+                }
+            }
+            Ok(())
+        }
+
         fn viewed_files(
             &self,
             loc: &github::PrLocator,
@@ -10427,6 +10681,10 @@ mod tests {
             let mut discussion =
                 github::PrDiscussion::from_review_comments(self.comments.lock().unwrap().clone());
             discussion.comments = self.conversation.lock().unwrap().clone();
+            let permissions = self.comment_permissions.lock().unwrap();
+            for comment in discussion.threads.iter_mut().flat_map(|t| &mut t.comments) {
+                comment.permissions = permissions.get(&comment.id).cloned().unwrap_or_default();
+            }
             if self
                 .stale_discussion
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -10484,6 +10742,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(github::DiscussionComment {
+                    permissions: Default::default(),
                     id: self
                         .next_id
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -11258,6 +11517,12 @@ mod tests {
         vcx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+        // Markdown measurements can change the reserved rows after the first
+        // frame. Click the settled card, not its initial plain-text estimate.
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
         let bounds = vcx
             .debug_bounds(selector)
             .unwrap_or_else(|| panic!("missing {selector}"));
@@ -11868,6 +12133,9 @@ mod tests {
                 comment_id: 11,
                 body,
             },
+            ComposerPlacement::ConversationComment(_) | ComposerPlacement::PendingTray(_) => {
+                unreachable!("this helper tests new comments only")
+            }
         };
         assert_eq!(fake.posts(), vec![expected]);
     }
@@ -12424,6 +12692,545 @@ mod tests {
             })
         });
         assert!(fake.posts().is_empty());
+    }
+
+    fn permitted_comment(
+        node_id: &str,
+        can_edit: bool,
+        can_delete: bool,
+    ) -> github::CommentPermissions {
+        github::CommentPermissions {
+            node_id: node_id.into(),
+            can_edit,
+            can_delete,
+        }
+    }
+
+    #[gpui::test]
+    fn local_comment_cards_edit_replies_and_preserve_them_when_deleting_the_root(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(vec![]);
+        item.source = Source::Local(git::LocalSource {
+            repo_root: PathBuf::from("/repo"),
+            branch: "topic".into(),
+            base_ref: None,
+            base_label: "main".into(),
+            base_oid: None,
+        });
+        if let ItemState::Ready(data) = &mut item.state {
+            let mut local = LocalReview::default();
+            local.add_comment(
+                None,
+                "a.rs".into(),
+                CommentSide::Right,
+                1,
+                "local root".into(),
+            );
+            local.add_comment(
+                Some(1),
+                "a.rs".into(),
+                CommentSide::Right,
+                1,
+                "local reply".into(),
+            );
+            data.comments = Some(local.index());
+            data.local_review = Some(local);
+            data.rebuild_rows_anchored();
+        }
+        install_item(&app, item, cx);
+        click_commenting(&mut vcx, "comment-edit-local-2");
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.composer
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |input, cx| {
+                        input.set_value("edited local reply", window, cx)
+                    });
+                this.submit_composer(window, cx);
+                assert_eq!(
+                    this.active_data()
+                        .unwrap()
+                        .local_review
+                        .as_ref()
+                        .unwrap()
+                        .comments
+                        .len(),
+                    2
+                );
+            })
+        });
+        click_commenting(&mut vcx, "comment-delete-local-1");
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let data = app.read(cx).active_data().unwrap();
+            let local = data.local_review.as_ref().unwrap();
+            assert_eq!(local.comments.len(), 1);
+            assert_eq!(local.comments[0].body, "edited local reply");
+            assert_eq!(local.comments[0].in_reply_to_id, None);
+            assert_eq!(data.comments.as_ref().unwrap().counts["a.rs"], (1, 0));
+        });
+        assert!(fake.posts().is_empty());
+    }
+
+    #[gpui::test]
+    fn pending_reply_edits_stay_in_the_conversation_and_outdated_drafts_edit_in_the_tray(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "root",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        *fake.pending.lock().unwrap() = Some(github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: String::new(),
+            comments: vec![
+                github::PendingComment {
+                    id: 12,
+                    node_id: "reply".into(),
+                    path: "a.rs".into(),
+                    side: CommentSide::Right,
+                    line: Some(1),
+                    start_line: None,
+                    body: "draft reply".into(),
+                    in_reply_to_id: Some(11),
+                },
+                github::PendingComment {
+                    id: 13,
+                    node_id: "outdated".into(),
+                    path: "gone.rs".into(),
+                    side: CommentSide::Left,
+                    line: None,
+                    start_line: None,
+                    body: "outdated draft".into(),
+                    in_reply_to_id: None,
+                },
+            ],
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(&app, commenting_item(&fake), cx);
+        cx.update(|cx| app.update(cx, |this, cx| this.resume_session(0, cx)));
+        cx.run_until_parked();
+        click_commenting(&mut vcx, "comment-edit-draft-12");
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                assert_eq!(
+                    this.composer.as_ref().unwrap().placement,
+                    ComposerPlacement::ConversationComment("draft-12".into())
+                );
+                this.composer
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |input, cx| input.set_value("edited reply", window, cx));
+                this.submit_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.items[0].pane = ItemPane::Changes;
+                this.edit_pending(13, window, cx);
+                assert_eq!(
+                    this.composer.as_ref().unwrap().placement,
+                    ComposerPlacement::PendingTray(13)
+                );
+                this.composer
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |input, cx| {
+                        input.set_value("edited outdated draft", window, cx)
+                    });
+                this.submit_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let pending = fake.pending.lock().unwrap();
+        let comments = &pending.as_ref().unwrap().comments;
+        assert_eq!(comments[0].body, "edited reply");
+        assert_eq!(comments[0].in_reply_to_id, Some(11));
+        assert_eq!(comments[1].body, "edited outdated draft");
+        assert!(fake.posts().is_empty());
+    }
+
+    #[gpui::test]
+    fn draft_card_edit_replaces_its_body_in_place_and_delete_requires_confirmation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![]);
+        *fake.pending.lock().unwrap() = Some(github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: String::new(),
+            comments: vec![github::PendingComment {
+                id: 12,
+                node_id: "draft_node".into(),
+                path: "a.rs".into(),
+                side: CommentSide::Right,
+                line: Some(1),
+                start_line: None,
+                body: "original draft".into(),
+                in_reply_to_id: None,
+            }],
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(&app, loop_pr_item(vec![]), cx);
+        cx.update(|cx| app.update(cx, |this, cx| this.resume_session(0, cx)));
+        cx.run_until_parked();
+        click_commenting(&mut vcx, "comment-edit-draft-12");
+        vcx.update(|window, cx| app.update(cx, |this, cx| {
+            let composer = this.composer.as_ref().unwrap();
+            assert_eq!(composer.edit_target, Some(CommentTarget::Pending(12)));
+            assert!(composer.row_ix > 0, "not the old top-of-diff editor");
+            let data = this.active_data().unwrap();
+            assert!(matches!(&data.rows[composer.row_ix], Row::CommentHeader { comment_id: 12, .. }));
+            assert!(matches!(&data.rows[composer.row_ix + 1], Row::CommentEditor { .. }));
+            assert!(!data.rows.iter().any(|r| matches!(r, Row::CommentBody { line, .. } if line.as_ref() == "original draft")));
+            this.close_composer(window, cx);
+            assert!(this.active_data().unwrap().rows.iter().any(|r| matches!(r, Row::CommentBody { line, .. } if line.as_ref() == "original draft")));
+        }));
+        click_commenting(&mut vcx, "comment-edit-draft-12");
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.composer
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |input, cx| input.set_value("edited draft", window, cx));
+            })
+        });
+        vcx.simulate_keystrokes("cmd-enter");
+        vcx.run_until_parked();
+        cx.update(|cx| {
+            assert!(app.read(cx).composer.is_none());
+            assert_eq!(
+                app.read(cx).sessions[&0]
+                    .state
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .comments[0]
+                    .body,
+                "edited draft"
+            );
+            assert!(app
+                .read(cx)
+                .active_data()
+                .unwrap()
+                .editing_comment
+                .is_none());
+        });
+        click_commenting(&mut vcx, "comment-delete-draft-12");
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(
+            fake.pending
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .comments
+                .len(),
+            1
+        );
+        click_commenting(&mut vcx, "comment-delete-draft-12");
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert!(fake
+            .pending
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .comments
+            .is_empty());
+        assert!(
+            fake.posts().is_empty(),
+            "draft changes never publish comments"
+        );
+    }
+
+    #[gpui::test]
+    fn published_card_permissions_allow_foreign_comment_deletion_but_not_editing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use github::GitHubClient;
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "someone else's comment",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        fake.comment_permissions
+            .lock()
+            .unwrap()
+            .insert(11, permitted_comment("PRRC11", false, true));
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(fake.comments.lock().unwrap().clone());
+        if let ItemState::Ready(data) = &mut item.state {
+            data.discussion = Some(fake.pr_discussion(&loop_loc()).unwrap());
+        }
+        install_item(&app, item, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(vcx
+            .debug_bounds("comment-edit-review-comment-PRRC11")
+            .is_none());
+        assert!(vcx
+            .debug_bounds("comment-delete-review-comment-PRRC11")
+            .is_some());
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.edit_comment(
+                    CommentTarget::Published(github::CommentTarget::ReviewComment("PRRC11".into())),
+                    ComposerPlacement::Diff,
+                    window,
+                    cx,
+                );
+                assert!(
+                    this.composer.is_none(),
+                    "handlers also enforce edit permission"
+                );
+            })
+        });
+        click_commenting(&mut vcx, "comment-delete-review-comment-PRRC11");
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Delete {
+                target: github::CommentTarget::ReviewComment("PRRC11".into())
+            }]
+        );
+        cx.update(|cx| {
+            assert!(app
+                .read(cx)
+                .active_data()
+                .unwrap()
+                .discussion
+                .as_ref()
+                .unwrap()
+                .threads
+                .is_empty());
+            assert!(!app
+                .read(cx)
+                .active_data()
+                .unwrap()
+                .rows
+                .iter()
+                .any(rows::is_comment_row));
+        });
+    }
+
+    #[gpui::test]
+    fn published_inline_edit_saves_in_both_views_without_touching_the_pending_review(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use github::GitHubClient;
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "published original",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        fake.comment_permissions
+            .lock()
+            .unwrap()
+            .insert(11, permitted_comment("PRRC11", true, false));
+        *fake.pending.lock().unwrap() = Some(github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: "keep my draft".into(),
+            comments: vec![],
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(fake.comments.lock().unwrap().clone());
+        if let ItemState::Ready(data) = &mut item.state {
+            data.discussion = Some(fake.pr_discussion(&loop_loc()).unwrap());
+        }
+        install_item(&app, item, cx);
+        cx.update(|cx| app.update(cx, |this, cx| this.resume_session(0, cx)));
+        cx.run_until_parked();
+        for (pane, mode, body) in [
+            (ItemPane::Changes, ViewMode::Unified, "edit unified"),
+            (ItemPane::Changes, ViewMode::Split, "edit split"),
+            (ItemPane::Conversation, ViewMode::Split, "edit conversation"),
+        ] {
+            cx.update(|cx| {
+                app.update(cx, |this, cx| {
+                    this.items[0].pane = pane;
+                    let data = this.active_data_mut().unwrap();
+                    data.mode = mode;
+                    data.rebuild_rows_anchored();
+                    cx.notify();
+                })
+            });
+            click_commenting(&mut vcx, "comment-edit-review-comment-PRRC11");
+            vcx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    let composer = this.composer.as_ref().unwrap();
+                    assert_eq!(this.composer_submit_label(composer), "Save changes");
+                    assert!(!this.composer_uses_pending_review(composer));
+                    if pane == ItemPane::Conversation {
+                        assert_eq!(
+                            composer.placement,
+                            ComposerPlacement::ConversationComment("review-comment-PRRC11".into())
+                        );
+                    }
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_value(body, window, cx));
+                })
+            });
+            vcx.simulate_keystrokes("cmd-enter");
+            vcx.run_until_parked();
+            cx.update(|cx| {
+                assert!(app.read(cx).composer.is_none());
+                assert_eq!(
+                    app.read(cx)
+                        .active_data()
+                        .unwrap()
+                        .discussion
+                        .as_ref()
+                        .unwrap()
+                        .threads[0]
+                        .comments[0]
+                        .body,
+                    body
+                );
+                assert_eq!(
+                    app.read(cx).sessions[&0]
+                        .state
+                        .pending
+                        .as_ref()
+                        .unwrap()
+                        .body,
+                    "keep my draft"
+                );
+            });
+        }
+        assert_eq!(fake.posts().len(), 3);
+        assert!(fake
+            .posts()
+            .iter()
+            .all(|post| matches!(post, Post::Edit { .. })));
+    }
+
+    #[gpui::test]
+    fn published_issue_and_review_edit_errors_keep_text_and_closed_editors_keep_success(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use github::GitHubClient;
+        let fake = FakePr::with_threads(vec![]);
+        for (id, node_id, state) in [(11, "IC11", None), (12, "PRR12", Some("APPROVED"))] {
+            fake.conversation
+                .lock()
+                .unwrap()
+                .push(github::DiscussionComment {
+                    id,
+                    permissions: permitted_comment(node_id, true, true),
+                    author: "alice".into(),
+                    body: "original".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    reactions: vec![],
+                    review_state: state.map(str::to_owned),
+                    review_id: state.map(|_| node_id.into()),
+                });
+        }
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = commenting_item(&fake);
+        if let ItemState::Ready(data) = &mut item.state {
+            data.discussion = Some(fake.pr_discussion(&loop_loc()).unwrap());
+        }
+        install_item(&app, item, cx);
+        click_commenting(&mut vcx, "comment-edit-issue-IC11");
+        fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.composer
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |input, cx| input.set_value("retry me", window, cx));
+                this.submit_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let composer = app.read(cx).composer.as_ref().unwrap();
+            assert!(!composer.in_flight);
+            assert!(composer.error.as_ref().unwrap().contains("edit rejected"));
+            assert_eq!(composer.input.read(cx).value().as_str(), "retry me");
+        });
+        fake.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        fake.fail_discussion
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.submit_composer(window, cx);
+                this.close_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                app.read(cx)
+                    .active_data()
+                    .unwrap()
+                    .discussion
+                    .as_ref()
+                    .unwrap()
+                    .comments[0]
+                    .body,
+                "retry me"
+            )
+        });
+        click_commenting(&mut vcx, "comment-edit-review-PRR12");
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.composer
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |input, cx| {
+                        input.set_value("updated review summary", window, cx)
+                    });
+                this.submit_composer(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            matches!(fake.posts().last(), Some(Post::Edit { target: github::CommentTarget::Review(id), body }) if id == "PRR12" && body == "updated review summary")
+        );
     }
 
     #[gpui::test]

@@ -616,7 +616,26 @@ impl ReviewApp {
     ) -> gpui::AnyElement {
         let composing = self.composer.as_ref().is_some_and(|composer| {
             composer.item_id == item.id
-                && composer.placement == ComposerPlacement::ConversationThread(thread.id.clone())
+                && (composer.placement == ComposerPlacement::ConversationThread(thread.id.clone())
+                    || thread.comments.iter().any(|comment| {
+                        composer.placement
+                            == ComposerPlacement::ConversationComment(
+                                crate::comment_actions::published_target("review", comment).key(),
+                            )
+                    })
+                    || self
+                        .sessions
+                        .get(&item.id)
+                        .and_then(|ui| ui.state.pending.as_ref())
+                        .is_some_and(|review| {
+                            review.comments.iter().any(|draft| {
+                                draft.in_reply_to_id == Some(thread.comments[0].id)
+                                    && composer.placement
+                                        == ComposerPlacement::ConversationComment(
+                                            crate::CommentTarget::Pending(draft.id).key(),
+                                        )
+                            })
+                        }))
         });
         let expanded =
             composing || !thread.is_resolved || data.expanded_threads.contains(&thread.id);
@@ -779,6 +798,14 @@ impl ReviewApp {
                     .iter()
                     .filter(|draft| draft.in_reply_to_id == Some(root_id))
                 {
+                    let target = crate::CommentTarget::Pending(draft.id);
+                    let placement = ComposerPlacement::ConversationComment(target.key());
+                    if self.composer.as_ref().is_some_and(|composer| {
+                        composer.item_id == item.id && composer.placement == placement
+                    }) {
+                        card = card.child(div().p_4().child(self.render_composer_card(cx)));
+                        continue;
+                    }
                     card = card.child(
                         div()
                             .p_4()
@@ -787,8 +814,16 @@ impl ReviewApp {
                             .child(
                                 div()
                                     .mb_2()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
                                     .text_color(theme::yellow())
-                                    .child("Pending reply · only you can see this"),
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .child("Pending reply · only you can see this"),
+                                    )
+                                    .child(self.comment_controls(target, placement, &cx.entity())),
                             )
                             .child(render_markdown(
                                 &format!("conversation-draft-{}-{}", item.id, draft.id),
@@ -819,6 +854,15 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let target = crate::comment_actions::published_target(kind, comment);
+        let placement = ComposerPlacement::ConversationComment(target.key());
+        if kind != "optimistic"
+            && self.composer.as_ref().is_some_and(|composer| {
+                composer.item_id == item_id && composer.placement == placement
+            })
+        {
+            return self.render_composer_card(cx);
+        }
         let verdict = match comment.review_state.as_deref() {
             Some("APPROVED") => " · approved",
             Some("CHANGES_REQUESTED") => " · requested changes",
@@ -846,12 +890,19 @@ impl ReviewApp {
             .child(
                 div()
                     .mb_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .text_color(theme::subtext())
                     .text_size(px(text_size() - 1.))
-                    .child(format!(
+                    .child(div().flex_1().child(format!(
                         "@{} · {}{verdict}",
                         comment.author, comment.created_at
-                    )),
+                    )))
+                    .children(
+                        (kind != "optimistic")
+                            .then(|| self.comment_controls(target, placement, &cx.entity())),
+                    ),
             );
         if markdown::has_content(&comment.body) {
             card = card.child(render_markdown(
@@ -1084,6 +1135,7 @@ pub(crate) mod tests {
 
     pub(crate) fn sample_discussion() -> github::PrDiscussion {
         let comment = |id, time: &str| github::DiscussionComment {
+            permissions: Default::default(),
             id,
             author: "alice".into(),
             body: "Thanks @bob :tada: — see #12.\n\n```rust\nlet x = 1;\n```".into(),

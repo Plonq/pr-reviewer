@@ -82,12 +82,14 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - local repo diffs
 - minimap
 - inline GitHub review comments with GFM formatting (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
+- edit comments in place and delete them from their own cards, in the diff or
+  conversation; published comments follow GitHub's per-comment permissions
 - multi-line comments: click then shift-click a line, or drag a selection and
   press `C` (ranges stay on one side); comments outside a patch hunk, including
   cross-hunk ranges, use GitHub's experimental positioning API and may depend
   on GitHub's rollout for the repository
 - pending reviews: start/add to a review without posting, resume drafts started
-  on GitHub, and edit/delete them in the pending-review tray before submitting;
+  on GitHub, and edit/delete them inline or in the pending-review tray before submitting;
    replies join the pending review too; **Add single comment** is available
    only without a pending review and posts immediately
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
