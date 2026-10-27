@@ -17,7 +17,7 @@ Changes at the fork point relative to upstream lgtm:
   (Bifrost / rust-analyzer hover + go-to-definition),
 - the diff/review core that lgtm is kept for is intact: whole-file two-phase
   diff rendering, tree-sitter highlighting, word-level intra-line diffs,
-  minimap, ⌘K palette, file tree, inline review comments, local repo diffs,
+   minimap, file tree, inline review comments, local repo diffs,
   and the blob disk cache (now under `~/.cache/gander/`),
 - the palette follows the system appearance: Catppuccin Mocha in dark mode,
   Latte in light mode,
@@ -69,7 +69,7 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - file-tree comment badges count comments and replies, including outdated comments and drafts
 - per-viewer viewed checkboxes at the right edge of the file tree; click or `V`
   to mark/unmark on GitHub, with optimistic updates and visible sync failures
-- cmd-k palette with fuzzy PR picker
+- quick-open (`cmd-t`) for known PR identifiers, PR URLs, and local repository paths
 - PR conversation (title-bar Conversation / Changes button, or `⇧⌘←` / `⇧⌘→`):
   GFM description and chronological comments; reviews
   group their inline threads beneath the summary, with captured code context,
@@ -124,7 +124,6 @@ only by your account. Delete that directory to clear downloaded images.
 
 | Key | Action |
 |---|---|
-| `cmd-k` | open palette (GitHub PR picker / folder) |
 | `cmd-t` / `cmd-w` / `cmd-b` | quick-open input / close item / toggle sidebar |
 | `ctrl-tab` | cycle open items |
 | `j` / `k` + `enter` | queue: move the selection, open the selected PR |

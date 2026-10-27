@@ -215,8 +215,8 @@ pub fn token_style(token: Token) -> HighlightStyle {
     }
 }
 
-/// Dimming layer behind the command palette.
-pub fn palette_backdrop() -> Rgba {
+/// Dimming layer behind the review modal.
+pub fn modal_backdrop() -> Rgba {
     if is_light() {
         rgba(0xdce0f8aa)
     } else {

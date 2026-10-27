@@ -141,20 +141,6 @@ pub(crate) fn app_rc(
     rc(id, path, side, line, body, author, created_at, reply_to).into()
 }
 
-pub(crate) fn pr(number: u64, title: &str, author: &str, branch: &str) -> github::PrSummary {
-    github::PrSummary {
-        number,
-        title: title.to_string(),
-        author: github::Author {
-            login: author.to_string(),
-        },
-        state: "OPEN".to_string(),
-        is_draft: false,
-        head_ref_name: branch.to_string(),
-        updated_at: "2026-07-01T00:00:00Z".to_string(),
-    }
-}
-
 /// A queue row for the chip tests: a fully-formed [`QueueItem`] with
 /// only the fields the chips derive from filled in.
 pub(crate) fn queued(number: u64, repository: &str, author: &str) -> github::QueueItem {

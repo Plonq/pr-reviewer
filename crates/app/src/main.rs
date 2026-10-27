@@ -22,10 +22,7 @@ mod viewed;
 #[cfg(test)]
 mod test_util;
 
-use chrome::{
-    app_title, centered_message, filtered_sources, palette_pr_row, BaseListState, PaletteStep,
-    PrListState, PALETTE_ROW_HEIGHT, PALETTE_SOURCES, SOURCE_FOLDER, SOURCE_PR,
-};
+use chrome::{app_title, centered_message};
 use comment_actions::CommentTarget;
 use diff_core::{FileStatus, PrDiff};
 use github::review_session::{Command as SessionCommand, ReviewSession};
@@ -33,9 +30,8 @@ use gpui::{
     actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
     Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy, SharedString,
-    Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
-    WindowOptions,
+    MouseUpEvent, Pixels, Point, ScrollHandle, ScrollStrategy, SharedString, Subscription, Task,
+    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     avatar::Avatar,
@@ -53,7 +49,7 @@ use minimap::{
     minimap_rows, minimap_runs, minimap_scale, MinimapColor, MinimapLane, MinimapLayout,
     MinimapRow, MINIMAP_GAP, MINIMAP_PAD, MINIMAP_WIDTH,
 };
-use queue::{filter_base_refs, filter_prs, label_chip_colors, queue_chips, queue_row};
+use queue::{label_chip_colors, queue_chips, queue_row};
 use review_target::{dir_name, fetch_item, sources_match, Loaded, LoadedMeta, Source};
 use rows::{
     build_rows, comment_anchor, cursor_anchor, is_comment_row, now_unix, nth_noncomment_row,
@@ -222,10 +218,6 @@ actions!(
         BackToQueue,
         QueueSortToggle,
         QueueClearFilters,
-        OpenPalette,
-        PaletteUp,
-        PaletteDown,
-        PaletteBack,
         ClearSelection,
         CopySelection,
         FocusTreeFilter,
@@ -323,8 +315,8 @@ fn main() {
     // GitHub vocabulary.
     let github = github_client();
     // Bare launch lands on the review queue — the home screen. The repo we
-    // stand in stays one explicit act away (`.` as an argument, or the
-    // palette's "open local folder"), so local review keeps working
+    // stand in stays one explicit act away (`.` as an argument or in
+    // quick-open), so local review keeps working
     // without hijacking the launch.
     for arg in &args {
         let parsed = if Path::new(arg).is_dir() {
@@ -363,7 +355,7 @@ fn main() {
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
                 // Sideways through long lines in either diff mode. Inputs
-                // deeper in the tree (a focused palette/filter input) keep
+                // deeper in the tree (a focused filter input) keep
                 // their own left/right for caret movement.
                 KeyBinding::new("left", ScrollLeft, Some("ReviewApp")),
                 KeyBinding::new("right", ScrollRight, Some("ReviewApp")),
@@ -388,7 +380,7 @@ fn main() {
                 KeyBinding::new("s", QueueSortToggle, Some("Queue")),
                 KeyBinding::new("escape", QueueClearFilters, Some("Queue")),
                 // `u` leaves the changes view for the queue again; the open
-                // item stays open behind the scenes (⌘K / ctrl-tab reach
+                // item stays open behind the scenes (ctrl-tab reaches
                 // it). Bound in the diff's context so typing in the queue
                 // or any input never triggers it.
                 KeyBinding::new("u", BackToQueue, Some("ReviewApp")),
@@ -407,9 +399,7 @@ fn main() {
                 // Only while the diff pane has focus; typing `/` in any input
                 // stays a plain character.
                 KeyBinding::new("/", FocusTreeFilter, Some("ReviewApp")),
-                // Selection: escape/cmd-c only fire while the diff pane has
-                // focus; with the palette open its input has focus, so the
-                // palette's own escape routing wins by construction.
+                // Selection: escape/cmd-c only fire while the diff pane has focus.
                 KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
                 KeyBinding::new("cmd-c", CopySelection, Some("ReviewApp")),
                 KeyBinding::new("ctrl-tab", NextItem, Some("ReviewApp")),
@@ -424,17 +414,7 @@ fn main() {
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
                 KeyBinding::new("cmd-t", OpenInput, None),
                 KeyBinding::new("cmd-w", CloseItem, None),
-                KeyBinding::new("cmd-k", OpenPalette, None),
                 KeyBinding::new("cmd-q", Quit, None),
-                // Palette navigation. The `Palette > Input` variants are bound
-                // after gpui_component::init, so at the input's dispatch depth
-                // they take precedence over the Input's own up/down (which a
-                // single-line input consumes without propagating).
-                KeyBinding::new("up", PaletteUp, Some("Palette")),
-                KeyBinding::new("down", PaletteDown, Some("Palette")),
-                KeyBinding::new("escape", PaletteBack, Some("Palette")),
-                KeyBinding::new("up", PaletteUp, Some("Palette > Input")),
-                KeyBinding::new("down", PaletteDown, Some("Palette > Input")),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             // One window is the whole app: closing it quits the process.
@@ -1271,13 +1251,12 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
 }
 
 fn local_titlebar_content(
-    item_id: u64,
+    _item_id: u64,
     src: &git::LocalSource,
     data: &ItemData,
     cx: &mut Context<ReviewApp>,
 ) -> gpui::AnyElement {
     let blue: Hsla = theme::blue().into();
-    let repo_root = src.repo_root.clone();
     div()
         .flex()
         .items_center()
@@ -1311,15 +1290,8 @@ fn local_titlebar_content(
                 .pr_3()
                 .child(
                     div()
-                        .id("local-base-picker")
                         .px_1()
-                        .rounded_sm()
-                        .cursor_pointer()
                         .text_color(theme::overlay0())
-                        .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.6)))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_local_base_palette(item_id, repo_root.clone(), window, cx);
-                        }))
                         .child(SharedString::from(format!(
                             "{} ← {}",
                             src.base_label, src.branch
@@ -1346,14 +1318,6 @@ fn local_titlebar_content(
                 ),
         )
         .into_any_element()
-}
-
-fn parse_repo_slug(value: &str) -> Result<(String, String), &'static str> {
-    let (owner, repo) = value.split_once('/').ok_or("expected owner/repo")?;
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-        return Err("expected owner/repo");
-    }
-    Ok((owner.to_string(), repo.to_string()))
 }
 
 // --- @-mention autocomplete ------------------------------------------------
@@ -1718,12 +1682,6 @@ pub(crate) struct ReviewApp {
     tree_filter_input: gpui::Entity<InputState>,
     focus_handle: FocusHandle,
     next_id: u64,
-    palette: Option<PaletteStep>,
-    palette_input: gpui::Entity<InputState>,
-    /// Bumped on every palette transition; an in-flight PR-list fetch only
-    /// lands if the generation it captured is still current.
-    palette_gen: u64,
-    palette_scroll: UniformListScrollHandle,
     /// Where the current selection drag started (side locked at mouse-down);
     /// None when no drag is in progress.
     drag_anchor: Option<(SelSide, RowCol)>,
@@ -1803,7 +1761,6 @@ impl ReviewApp {
     ) -> Self {
         let open_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
-        let palette_input = cx.new(|cx| InputState::new(window, cx));
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
         let _subscriptions = vec![
@@ -1834,15 +1791,6 @@ impl ReviewApp {
                 },
             ),
             cx.subscribe_in(
-                &palette_input,
-                window,
-                |this, _, event: &InputEvent, window, cx| match event {
-                    InputEvent::PressEnter { .. } => this.palette_confirm(window, cx),
-                    InputEvent::Change => this.palette_query_changed(cx),
-                    _ => {}
-                },
-            ),
-            cx.subscribe_in(
                 &tree_filter_input,
                 window,
                 |this, _, event: &InputEvent, window, cx| match event {
@@ -1862,8 +1810,7 @@ impl ReviewApp {
             items: Vec::new(),
             active: 0,
             // The queue is the home screen now: with nothing opened the
-            // sidebar starts hidden (⌘T/⌘K carry the open affordances, and
-            // both open it); several sources or CLI errors still start it
+            // sidebar starts hidden (⌘T opens it); several sources or CLI errors still start it
             // open, the way they always did.
             sidebar_visible: !errors.is_empty() || sources.len() > 1,
             sidebar_width: store
@@ -1877,10 +1824,6 @@ impl ReviewApp {
             tree_filter_input,
             focus_handle: cx.focus_handle(),
             next_id: 0,
-            palette: None,
-            palette_input,
-            palette_gen: 0,
-            palette_scroll: UniformListScrollHandle::new(),
             drag_anchor: None,
             minimap_visible: true,
             minimap_scrub: false,
@@ -2142,7 +2085,7 @@ impl ReviewApp {
         cx.notify();
     }
 
-    /// `u`: back to the queue. The open item stays open — ⌘K and
+    /// `u`: back to the queue. The open item stays open — the sidebar and
     /// ctrl-tab come right back to it — and the queue keeps the
     /// selection and scroll exactly where they were left.
     fn back_to_queue(&mut self, cx: &mut Context<Self>) {
@@ -2413,7 +2356,7 @@ impl ReviewApp {
         // already has brings that item forward — scroll, cursor, view mode
         // and comments exactly where they were left — instead of a second
         // copy that would be a way to lose your place in the first. Every
-        // open path (queue Enter, palette, ⌘T, the CLI) shares this.
+        // open path (queue Enter, ⌘T, the CLI) shares this.
         if let Some(ix) = self
             .items
             .iter()
@@ -2673,398 +2616,6 @@ impl ReviewApp {
             Err(message) => self.open_error = Some(message.into()),
         }
         cx.notify();
-    }
-
-    /// Reset the palette's shared input for the step being entered and keep
-    /// keyboard focus in it (the palette traps focus while open).
-    fn set_palette_input(
-        &mut self,
-        value: &str,
-        placeholder: &'static str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.palette_input.update(cx, |state, cx| {
-            state.set_value(value.to_string(), window, cx);
-            state.set_placeholder(placeholder, window, cx);
-            state.focus(window, cx);
-        });
-    }
-
-    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = Some(PaletteStep::Sources { selected: 0 });
-        self.palette_gen += 1;
-        self.set_palette_input("", "type to filter…", window, cx);
-        cx.notify();
-    }
-
-    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = None;
-        self.palette_gen += 1;
-        window.focus(&self.focus_handle);
-        cx.notify();
-    }
-
-    /// Esc: one step back, or close from step 1.
-    fn palette_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match &self.palette {
-            None | Some(PaletteStep::Sources { .. }) => self.close_palette(window, cx),
-            Some(PaletteStep::RepoInput { .. }) => {
-                self.palette = Some(PaletteStep::Sources { selected: 0 });
-                self.palette_gen += 1;
-                self.set_palette_input("", "type to filter…", window, cx);
-                cx.notify();
-            }
-            Some(PaletteStep::PrList { repo, .. }) => {
-                let repo = repo.clone();
-                self.palette = Some(PaletteStep::RepoInput { error: None });
-                self.palette_gen += 1;
-                self.set_palette_input(&repo, "owner/repo", window, cx);
-                cx.notify();
-            }
-            Some(PaletteStep::LocalBaseList { .. }) => self.close_palette(window, cx),
-        }
-    }
-
-    fn palette_move(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let query = self.palette_input.read(cx).value().to_string();
-        match &mut self.palette {
-            Some(PaletteStep::Sources { selected }) => {
-                let len = filtered_sources(&query).len();
-                if len > 0 {
-                    *selected = (*selected as isize + delta).clamp(0, len as isize - 1) as usize;
-                }
-            }
-            Some(PaletteStep::PrList {
-                prs:
-                    PrListState::Loaded {
-                        filtered, selected, ..
-                    },
-                ..
-            }) => {
-                if !filtered.is_empty() {
-                    *selected =
-                        (*selected as isize + delta).clamp(0, filtered.len() as isize - 1) as usize;
-                    self.palette_scroll
-                        .scroll_to_item(*selected, ScrollStrategy::Top);
-                }
-            }
-            Some(PaletteStep::LocalBaseList {
-                bases:
-                    BaseListState::Loaded {
-                        filtered, selected, ..
-                    },
-                ..
-            }) => {
-                if !filtered.is_empty() {
-                    *selected =
-                        (*selected as isize + delta).clamp(0, filtered.len() as isize - 1) as usize;
-                    self.palette_scroll
-                        .scroll_to_item(*selected, ScrollStrategy::Top);
-                }
-            }
-            _ => return,
-        }
-        cx.notify();
-    }
-
-    fn palette_query_changed(&mut self, cx: &mut Context<Self>) {
-        let query = self.palette_input.read(cx).value().to_string();
-        match &mut self.palette {
-            Some(PaletteStep::Sources { selected }) => {
-                let len = filtered_sources(&query).len();
-                *selected = (*selected).min(len.saturating_sub(1));
-            }
-            Some(PaletteStep::RepoInput { error }) => *error = None,
-            Some(PaletteStep::PrList {
-                prs:
-                    PrListState::Loaded {
-                        all,
-                        filtered,
-                        selected,
-                    },
-                ..
-            }) => {
-                *filtered = filter_prs(all, &query);
-                *selected = 0;
-                self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
-            }
-            Some(PaletteStep::LocalBaseList {
-                bases:
-                    BaseListState::Loaded {
-                        all,
-                        filtered,
-                        selected,
-                    },
-                ..
-            }) => {
-                *filtered = filter_base_refs(all, &query);
-                *selected = 0;
-                self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
-            }
-            _ => return,
-        }
-        cx.notify();
-    }
-
-    /// Enter, on whichever step is showing.
-    fn palette_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let query = self.palette_input.read(cx).value().trim().to_string();
-        match &self.palette {
-            Some(PaletteStep::Sources { selected }) => {
-                if let Some(&opt) = filtered_sources(&query).get(*selected) {
-                    self.palette_activate_source(opt, window, cx);
-                }
-            }
-            Some(PaletteStep::RepoInput { .. }) => match parse_repo_slug(&query) {
-                Ok((owner, repo)) => self.palette_fetch_prs(owner, repo, window, cx),
-                Err(msg) => {
-                    if let Some(PaletteStep::RepoInput { error }) = &mut self.palette {
-                        *error = Some(msg.into());
-                        cx.notify();
-                    }
-                }
-            },
-            Some(PaletteStep::PrList {
-                prs: PrListState::Loaded { selected, .. },
-                ..
-            }) => {
-                let selected = *selected;
-                self.palette_open_pr_row(selected, window, cx);
-            }
-            Some(PaletteStep::LocalBaseList {
-                bases: BaseListState::Loaded { selected, .. },
-                ..
-            }) => {
-                let selected = *selected;
-                self.palette_open_base_row(selected, window, cx);
-            }
-            _ => {}
-        }
-    }
-
-    fn palette_activate_source(&mut self, opt: usize, window: &mut Window, cx: &mut Context<Self>) {
-        match opt {
-            SOURCE_PR => {
-                self.palette = Some(PaletteStep::RepoInput { error: None });
-                self.palette_gen += 1;
-                self.set_palette_input("", "owner/repo", window, cx);
-                cx.notify();
-            }
-            SOURCE_FOLDER => {
-                // The palette closes when the native dialog opens.
-                self.close_palette(window, cx);
-                self.prompt_open_folder(cx);
-            }
-            _ => {}
-        }
-    }
-
-    /// Step 2 → step 3: show "loading…" and fetch the open-PR list on the
-    /// background executor. The generation guard drops the result if the user
-    /// closed the palette or navigated away before it landed.
-    fn palette_fetch_prs(
-        &mut self,
-        owner: String,
-        repo: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.palette_gen += 1;
-        let gen = self.palette_gen;
-        self.palette = Some(PaletteStep::PrList {
-            repo: format!("{owner}/{repo}"),
-            prs: PrListState::Loading,
-        });
-        self.set_palette_input("", "search pull requests…", window, cx);
-        cx.notify();
-        let github = self.github.clone();
-        cx.spawn(async move |this, cx| {
-            let fetched = cx
-                .background_spawn(async move { github.list_prs(&owner, &repo) })
-                .await;
-            this.update(cx, |app, cx| {
-                if app.palette_gen != gen {
-                    return;
-                }
-                let query = app.palette_input.read(cx).value().to_string();
-                let Some(PaletteStep::PrList { prs, .. }) = &mut app.palette else {
-                    return;
-                };
-                *prs = match fetched {
-                    Ok(all) => {
-                        let filtered = filter_prs(&all, &query);
-                        PrListState::Loaded {
-                            all,
-                            filtered,
-                            selected: 0,
-                        }
-                    }
-                    Err(err) => PrListState::Failed(err.to_string()),
-                };
-                app.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn open_local_base_palette(
-        &mut self,
-        item_id: u64,
-        repo_root: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let current = self
-            .items
-            .iter()
-            .find(|item| item.id == item_id)
-            .and_then(|item| match &item.source {
-                Source::Local(src) => Some(src.base_label.clone()),
-                Source::Pr(_) => None,
-            })
-            .unwrap_or_else(|| "HEAD".to_string());
-        self.palette_gen += 1;
-        let gen = self.palette_gen;
-        self.palette = Some(PaletteStep::LocalBaseList {
-            item_id,
-            repo_root: repo_root.clone(),
-            current,
-            bases: BaseListState::Loading,
-        });
-        self.set_palette_input("", "search base refs…", window, cx);
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let fetched = cx
-                .background_spawn(async move { git::list_base_refs(&repo_root) })
-                .await;
-            this.update(cx, |app, cx| {
-                if app.palette_gen != gen {
-                    return;
-                }
-                let query = app.palette_input.read(cx).value().to_string();
-                let Some(PaletteStep::LocalBaseList { bases, .. }) = &mut app.palette else {
-                    return;
-                };
-                *bases = match fetched {
-                    Ok(all) => {
-                        let filtered = filter_base_refs(&all, &query);
-                        BaseListState::Loaded {
-                            all,
-                            filtered,
-                            selected: 0,
-                        }
-                    }
-                    Err(err) => BaseListState::Failed(format!("{err:#}")),
-                };
-                app.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Open the PR at `pos` in the filtered list as a new review item.
-    fn palette_open_pr_row(&mut self, pos: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(PaletteStep::PrList {
-            repo,
-            prs: PrListState::Loaded { all, filtered, .. },
-        }) = &self.palette
-        else {
-            return;
-        };
-        let Some(&ix) = filtered.get(pos) else {
-            return;
-        };
-        let Some((owner, repo)) = repo.split_once('/') else {
-            return;
-        };
-        let source = Source::Pr(github::PrLocator {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            number: all[ix].number,
-        });
-        self.close_palette(window, cx);
-        self.open_item(source, cx);
-    }
-
-    fn palette_open_base_row(&mut self, pos: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(PaletteStep::LocalBaseList {
-            item_id,
-            repo_root,
-            bases: BaseListState::Loaded { all, filtered, .. },
-            ..
-        }) = &self.palette
-        else {
-            return;
-        };
-        let Some(&ix) = filtered.get(pos) else {
-            return;
-        };
-        let (item_id, repo_root, base_ref) = (*item_id, repo_root.clone(), all[ix].clone());
-        self.close_palette(window, cx);
-        let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) else {
-            return;
-        };
-        let mode = match &item.state {
-            ItemState::Ready(data) => data.mode,
-            _ => ViewMode::Split,
-        };
-        let branch = match &item.source {
-            Source::Local(src) => src.branch.clone(),
-            Source::Pr(_) => dir_name(&repo_root),
-        };
-        let source = Source::Local(git::LocalSource {
-            repo_root,
-            branch,
-            base_ref: Some(base_ref.clone()),
-            base_label: base_ref,
-            base_oid: None,
-        });
-        item.source = source.clone();
-        item.refresh_error = None;
-        match item.state {
-            ItemState::Failed(_) => item.state = ItemState::Loading,
-            ItemState::Loading => {}
-            ItemState::Ready(_) => item.reloading = true,
-        }
-        self.spawn_fetch(item_id, source, mode, cx);
-        cx.notify();
-    }
-
-    /// Native directory picker. The chosen path becomes a Local item through
-    /// the normal add-item path; fetch_item re-resolves it on the background
-    /// executor, so a non-repo directory surfaces as a Failed item.
-    fn prompt_open_folder(&mut self, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: None,
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
-            };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
-            this.update(cx, |app, cx| {
-                let source = Source::Local(git::LocalSource {
-                    branch: dir_name(&path),
-                    base_ref: None,
-                    base_label: "…".to_string(),
-                    base_oid: None,
-                    repo_root: path,
-                });
-                app.open_item(source, cx);
-            })
-            .ok();
-        })
-        .detach();
     }
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -3355,9 +2906,6 @@ impl ReviewApp {
         position: Point<Pixels>,
         window: &Window,
     ) -> Option<(usize, SelSide)> {
-        if self.palette.is_some() {
-            return None;
-        }
         let char_width = self.char_width(window);
         let item = self.active_item()?;
         let ItemState::Ready(data) = &item.state else {
@@ -4318,9 +3866,6 @@ impl ReviewApp {
     /// row's anchor.
     fn render_plus(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (row_ix, side) = self.hover_plus?;
-        if self.palette.is_some() {
-            return None;
-        }
         let item = self.active_item()?;
         let ItemState::Ready(data) = &item.state else {
             return None;
@@ -4921,7 +4466,7 @@ impl ReviewApp {
             .flex_col()
             .items_center()
             .pt(px(120.))
-            .bg(theme::palette_backdrop())
+            .bg(theme::modal_backdrop())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -5527,301 +5072,6 @@ impl ReviewApp {
             )
     }
 
-    fn render_palette(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(step) = &self.palette else {
-            return div().into_any_element();
-        };
-        let query = self.palette_input.read(cx).value().to_string();
-
-        let header: Option<SharedString> = match step {
-            PaletteStep::Sources { .. } => None,
-            PaletteStep::RepoInput { .. } => Some("Open GitHub pull request".into()),
-            PaletteStep::PrList { repo, .. } => Some(repo.clone().into()),
-            PaletteStep::LocalBaseList { .. } => Some("Choose local diff base".into()),
-        };
-
-        let body: gpui::AnyElement = match step {
-            PaletteStep::Sources { selected } => {
-                let filtered = filtered_sources(&query);
-                let selected = *selected;
-                let mut list = div().py_1().flex().flex_col();
-                if filtered.is_empty() {
-                    list = list.child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .text_color(theme::overlay0())
-                            .child(SharedString::from("no matches")),
-                    );
-                }
-                for (pos, &opt) in filtered.iter().enumerate() {
-                    list = list.child(
-                        div()
-                            .id(("palette-source", opt))
-                            .mx_1()
-                            .px_2()
-                            .h(px(PALETTE_ROW_HEIGHT))
-                            .rounded_md()
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .when(pos == selected, |row| row.bg(theme::surface0()))
-                            .when(pos != selected, |row| {
-                                row.hover(|style| {
-                                    style.bg(Hsla::from(theme::surface0()).opacity(0.5))
-                                })
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.palette_activate_source(opt, window, cx)
-                            }))
-                            .child(
-                                div()
-                                    .text_color(theme::text())
-                                    .child(SharedString::from(PALETTE_SOURCES[opt])),
-                            ),
-                    );
-                }
-                list.into_any_element()
-            }
-            PaletteStep::RepoInput { error } => {
-                let (text, color): (SharedString, gpui::Rgba) = match error {
-                    Some(err) => (err.clone(), theme::red()),
-                    None => (
-                        "enter to list open pull requests · esc to go back".into(),
-                        theme::overlay0(),
-                    ),
-                };
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_color(color)
-                    .child(text)
-                    .into_any_element()
-            }
-            PaletteStep::PrList { prs, .. } => match prs {
-                PrListState::Loading => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("loading pull requests…"))
-                    .into_any_element(),
-                PrListState::Failed(msg) => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::red())
-                    .child(SharedString::from(msg.clone()))
-                    .into_any_element(),
-                PrListState::Loaded { filtered, .. } if filtered.is_empty() => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("no matching pull requests"))
-                    .into_any_element(),
-                PrListState::Loaded { filtered, .. } => {
-                    let entity = cx.entity();
-                    let count = filtered.len();
-                    div()
-                        .py_1()
-                        .h(px(count.min(10) as f32 * PALETTE_ROW_HEIGHT + 8.))
-                        .child(
-                            uniform_list("palette-prs", count, move |range, _window, cx| {
-                                let this = entity.read(cx);
-                                let Some(PaletteStep::PrList {
-                                    prs:
-                                        PrListState::Loaded {
-                                            all,
-                                            filtered,
-                                            selected,
-                                        },
-                                    ..
-                                }) = &this.palette
-                                else {
-                                    return Vec::new();
-                                };
-                                range
-                                    .filter_map(|pos| Some((pos, &all[*filtered.get(pos)?])))
-                                    .map(|(pos, pr)| {
-                                        palette_pr_row(pr, pos, pos == *selected, entity.clone())
-                                    })
-                                    .collect()
-                            })
-                            .track_scroll(self.palette_scroll.clone())
-                            .h_full(),
-                        )
-                        .into_any_element()
-                }
-            },
-            PaletteStep::LocalBaseList { bases, .. } => match bases {
-                BaseListState::Loading => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("loading base refs…"))
-                    .into_any_element(),
-                BaseListState::Failed(msg) => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::red())
-                    .child(SharedString::from(msg.clone()))
-                    .into_any_element(),
-                BaseListState::Loaded { filtered, .. } if filtered.is_empty() => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("no matching base refs"))
-                    .into_any_element(),
-                BaseListState::Loaded { filtered, .. } => {
-                    let entity = cx.entity();
-                    let count = filtered.len();
-                    div()
-                        .py_1()
-                        .h(px(count.min(10) as f32 * PALETTE_ROW_HEIGHT + 8.))
-                        .child(
-                            uniform_list("palette-bases", count, move |range, _window, cx| {
-                                let this = entity.read(cx);
-                                let Some(PaletteStep::LocalBaseList {
-                                    current,
-                                    bases:
-                                        BaseListState::Loaded {
-                                            all,
-                                            filtered,
-                                            selected,
-                                        },
-                                    ..
-                                }) = &this.palette
-                                else {
-                                    return Vec::new();
-                                };
-                                range
-                                    .filter_map(|pos| {
-                                        let base = all.get(*filtered.get(pos)?)?;
-                                        Some((pos, base.clone(), base == current))
-                                    })
-                                    .map(|(pos, base, is_current)| {
-                                        div()
-                                            .id(("palette-base", pos))
-                                            .mx_1()
-                                            .px_2()
-                                            .h(px(PALETTE_ROW_HEIGHT))
-                                            .rounded_md()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .cursor_pointer()
-                                            .when(pos == *selected, |row| row.bg(theme::surface0()))
-                                            .when(pos != *selected, |row| {
-                                                row.hover(|style| {
-                                                    style
-                                                        .bg(Hsla::from(theme::surface0())
-                                                            .opacity(0.5))
-                                                })
-                                            })
-                                            .on_click({
-                                                let entity = entity.clone();
-                                                move |_, window, cx| {
-                                                    entity.update(cx, |this, cx| {
-                                                        this.palette_open_base_row(pos, window, cx)
-                                                    });
-                                                }
-                                            })
-                                            .child(
-                                                div()
-                                                    .w(px(8.))
-                                                    .h(px(8.))
-                                                    .flex_shrink_0()
-                                                    .rounded_full()
-                                                    .bg(if is_current {
-                                                        theme::green()
-                                                    } else {
-                                                        theme::overlay0()
-                                                    }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .text_color(theme::text())
-                                                    .child(SharedString::from(base)),
-                                            )
-                                            .into_any_element()
-                                    })
-                                    .collect()
-                            })
-                            .track_scroll(self.palette_scroll.clone())
-                            .h_full(),
-                        )
-                        .into_any_element()
-                }
-            },
-        };
-
-        // Backdrop: dims and occludes everything (sidebar included); click
-        // closes. The panel swallows its own mouse-downs so clicks inside
-        // don't bubble to the backdrop.
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(120.))
-            .bg(theme::palette_backdrop())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.close_palette(window, cx);
-                }),
-            )
-            .child(
-                div()
-                    .key_context("Palette")
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_action(cx.listener(|this, _: &PaletteUp, _, cx| this.palette_move(-1, cx)))
-                    .on_action(cx.listener(|this, _: &PaletteDown, _, cx| this.palette_move(1, cx)))
-                    .on_action(cx.listener(|this, _: &PaletteBack, window, cx| {
-                        this.palette_back(window, cx)
-                    }))
-                    // The palette input propagates Escape when it has nothing
-                    // of its own to dismiss; intercept it here before the
-                    // root's handler steals focus back to the diff.
-                    .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                        this.palette_back(window, cx)
-                    }))
-                    .w(px(560.))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme::surface0())
-                    .bg(theme::mantle())
-                    .shadow_lg()
-                    .text_size(px(13.))
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .when_some(header, |panel, header| {
-                        panel.child(
-                            div()
-                                .px_3()
-                                .pt_2()
-                                .text_size(px(11.))
-                                .text_color(theme::overlay0())
-                                .child(header),
-                        )
-                    })
-                    .child(
-                        div()
-                            .p_2()
-                            .border_b_1()
-                            .border_color(theme::surface0())
-                            .child(Input::new(&self.palette_input).small()),
-                    )
-                    .child(body),
-            )
-            .into_any_element()
-    }
-
     /// The review queue screen — what a bare launch opens on. Rows are the
     /// facade's queue items in the search's order (recently updated first,
     /// oldest-first at a toggle); `j`/`k` walk them with a visible
@@ -6245,7 +5495,6 @@ impl ReviewApp {
                     footer.child(hint(&["escape"], "clear filters"))
                 })
                 .child(hint(&["cmd-t"], "open"))
-                .child(hint(&["cmd-k"], "palette"))
                 .child(hint(&["cmd-b"], "sidebar"));
         } else if self
             .active_item()
@@ -6257,7 +5506,6 @@ impl ReviewApp {
                 .child(hint(&["shift-cmd-right"], "changes"))
                 .child(hint(&["u"], "queue"))
                 .child(hint(&["r"], "refresh"))
-                .child(hint(&["cmd-k"], "palette"))
                 .child(hint(&["cmd-t"], "open"))
                 .child(hint(&["cmd-b"], "sidebar"));
         } else {
@@ -6273,7 +5521,6 @@ impl ReviewApp {
                 .child(hint(&["C"], "comment"))
                 .child(hint(&["/"], "filter files"))
                 .child(hint(&["home", "end"], "top/bottom"))
-                .child(hint(&["cmd-k"], "palette"))
                 .child(hint(&["cmd-t"], "open"))
                 .child(hint(&["cmd-b"], "sidebar"))
                 .child(hint(&["r"], "refresh"))
@@ -6336,17 +5583,11 @@ impl ReviewApp {
                             .text_size(px(text_size()))
                             .line_height(px(row_height()))
                             // Selection mouse listeners live on the diff pane only.
-                            // While the palette is open its occluding backdrop keeps
-                            // this hitbox from being hovered, so none of these fire;
-                            // the palette.is_none() guard documents (and backstops)
-                            // that. The Scrollbar stops propagation of its own
+                            // The Scrollbar stops propagation of its own
                             // mouse-downs and thumb drags before they reach us.
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                    if this.palette.is_some() {
-                                        return;
-                                    }
                                     window.focus(&this.focus_handle);
                                     let char_width = this.char_width(window);
                                     if event.modifiers.shift {
@@ -6680,13 +5921,6 @@ impl Render for ReviewApp {
             .flex_col()
             .bg(theme::base())
             .text_color(theme::text())
-            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
-                if this.palette.is_some() {
-                    this.close_palette(window, cx);
-                } else {
-                    this.open_palette(window, cx);
-                }
-            }))
             .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
             .on_action(
                 cx.listener(|this, _: &search::OpenSearch, window, cx| {
@@ -6816,8 +6050,7 @@ impl Render for ReviewApp {
                 cx.listener(|this, _: &QueueClearFilters, _, cx| this.queue_clear_filters(cx)),
             )
             // Bound in the "ReviewApp" context: these only fire while the
-            // diff pane has focus. With the palette open, focus sits in the
-            // palette input, so its escape routing (PaletteBack) wins.
+            // diff pane has focus.
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
                 if this.close_search(window, cx) {
                     return;
@@ -6861,9 +6094,6 @@ impl Render for ReviewApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenInput, window, cx| {
-                // The sidebar input can't take focus under the palette.
-                this.palette = None;
-                this.palette_gen += 1;
                 this.sidebar_visible = true;
                 this.open_input
                     .update(cx, |state, cx| state.focus(window, cx));
@@ -6927,15 +6157,12 @@ impl Render for ReviewApp {
             .child(self.render_pending_tray(cx))
             .child(self.render_search(cx))
             // Root-level so the composer's input escapes the "ReviewApp" key
-            // context (plain letters must stay text, like the palette input).
+            // context (plain letters must stay text, like the quick-open input).
             .when(self.composer.is_some(), |root| {
                 root.child(self.render_composer(cx))
             })
             .when(self.review.is_some(), |root| {
                 root.child(self.render_review(cx))
-            })
-            .when(self.palette.is_some(), |root| {
-                root.child(self.render_palette(cx))
             })
     }
 }
@@ -8886,14 +8113,6 @@ mod tests {
             ))
         }
 
-        fn list_prs(
-            &self,
-            _owner: &str,
-            _repo: &str,
-        ) -> Result<Vec<github::PrSummary>, github::ClientError> {
-            unimplemented!("queue tests never list PRs")
-        }
-
         fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
             Err(github::ClientError::Failed(
                 "queue tests never fetch a patch".into(),
@@ -9109,14 +8328,6 @@ mod tests {
 
         fn pr_meta(&self, _loc: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
             unimplemented!("queue tests never read PR meta")
-        }
-
-        fn list_prs(
-            &self,
-            _owner: &str,
-            _repo: &str,
-        ) -> Result<Vec<github::PrSummary>, github::ClientError> {
-            unimplemented!("queue tests never list PRs")
         }
 
         fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
@@ -9342,7 +8553,7 @@ mod tests {
                 // The sidebar carries the file tree: it must be showing.
                 assert!(this.sidebar_visible);
                 // `u`: back to the queue — the item stays open behind the
-                // scenes (⌘K / ctrl-tab reach it) and the queue keeps the
+                // scenes (ctrl-tab reaches it) and the queue keeps the
                 // selection where it was left.
                 this.back_to_queue(cx);
                 assert!(this.show_queue, "u must come home");
@@ -9664,7 +8875,7 @@ mod tests {
         assert_eq!(pane(cx), ItemPane::Changes);
 
         // Re-opening the item the session already has brings it forward
-        // with its pane intact — flipping isn't something `u`/⌘K resets.
+        // with its pane intact — flipping isn't something `u` resets.
         vcx.dispatch_action(ShowConversation);
         cx.update(|cx| {
             app.update(cx, |this, cx| this.open_item(Source::Pr(loc), cx));
@@ -10277,18 +9488,6 @@ mod tests {
             .unwrap()
             .0
             .contains("author:"));
-    }
-
-    #[test]
-    fn repo_slug_parsing() {
-        assert_eq!(
-            parse_repo_slug("BurntSushi/ripgrep"),
-            Ok(("BurntSushi".to_string(), "ripgrep".to_string()))
-        );
-        assert!(parse_repo_slug("ripgrep").is_err());
-        assert!(parse_repo_slug("/ripgrep").is_err());
-        assert!(parse_repo_slug("BurntSushi/").is_err());
-        assert!(parse_repo_slug("a/b/c").is_err());
     }
 
     // --- Review comments ----------------------------------------------------
@@ -11157,14 +10356,6 @@ mod tests {
 
         fn pr_meta(&self, _loc: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
             Ok(loop_pr_meta())
-        }
-
-        fn list_prs(
-            &self,
-            _owner: &str,
-            _repo: &str,
-        ) -> Result<Vec<github::PrSummary>, github::ClientError> {
-            unimplemented!("loop tests never list PRs")
         }
 
         fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {

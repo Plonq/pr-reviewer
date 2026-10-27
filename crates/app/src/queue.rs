@@ -2,54 +2,13 @@
 
 use crate::threads::short_age;
 use crate::{theme, ReviewApp};
-use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{div, prelude::*, px, Hsla, Rgba, SharedString};
 use gpui_component::{avatar::Avatar, tag::Tag, Icon, IconName, Sizable as _};
 
 /// Queue rows stay compact — avatar, title, badges, size, counts, chips,
-/// and stacked timestamps — so they sit a little taller than the palette's, with
+/// and stacked timestamps — with
 /// the uniform list keeping scroll math simple and rows virtualized.
 const QUEUE_ROW_HEIGHT: f32 = 36.0;
-
-/// Fuzzy-filter PRs against `#number title author branch`, best score first;
-/// an empty query keeps gh's original (most recently updated) order.
-pub(crate) fn filter_prs(all: &[github::PrSummary], query: &str) -> Vec<usize> {
-    let query = query.trim();
-    if query.is_empty() {
-        return (0..all.len()).collect();
-    }
-    let matcher = SkimMatcherV2::default();
-    let mut scored: Vec<(i64, usize)> = all
-        .iter()
-        .enumerate()
-        .filter_map(|(ix, pr)| {
-            let haystack = format!(
-                "#{} {} {} {}",
-                pr.number, pr.title, pr.author.login, pr.head_ref_name
-            );
-            matcher
-                .fuzzy_match(&haystack, query)
-                .map(|score| (score, ix))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, ix)| ix).collect()
-}
-
-pub(crate) fn filter_base_refs(all: &[String], query: &str) -> Vec<usize> {
-    let query = query.trim();
-    if query.is_empty() {
-        return (0..all.len()).collect();
-    }
-    let matcher = SkimMatcherV2::default();
-    let mut scored: Vec<(i64, usize)> = all
-        .iter()
-        .enumerate()
-        .filter_map(|(ix, base)| matcher.fuzzy_match(base, query).map(|score| (score, ix)))
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, ix)| ix).collect()
-}
 
 /// The CI dot's paint, per verdict: green opens without fear, red means
 /// expect breakage, yellow means checks still running, gray means no
@@ -501,7 +460,7 @@ pub(crate) fn queue_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{pr, queued};
+    use crate::test_util::queued;
 
     #[test]
     fn queue_ages_use_the_viewers_request_not_last_activity() {
@@ -522,29 +481,6 @@ mod tests {
             queue_ages(&pr, now),
             ["Opened unknown", "Requested unknown"]
         );
-    }
-
-    #[test]
-    fn pr_filter_empty_query_keeps_original_order() {
-        let all = vec![
-            pr(3, "fix crash", "alice", "fix-crash"),
-            pr(1, "add feature", "bob", "feat"),
-            pr(2, "docs", "carol", "docs"),
-        ];
-        assert_eq!(filter_prs(&all, ""), vec![0, 1, 2]);
-        assert_eq!(filter_prs(&all, "   "), vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn pr_filter_matches_number_title_author_and_branch() {
-        let all = vec![
-            pr(3, "fix crash", "alice", "fix-crash"),
-            pr(1, "add feature", "bob", "feat"),
-        ];
-        assert_eq!(filter_prs(&all, "#3"), vec![0]);
-        assert_eq!(filter_prs(&all, "bob"), vec![1]);
-        assert_eq!(filter_prs(&all, "crash"), vec![0]);
-        assert!(filter_prs(&all, "zzzqqq").is_empty());
     }
 
     /// A queue row's label colors: GitHub's six-hex form parses, and only

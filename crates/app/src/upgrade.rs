@@ -744,13 +744,6 @@ mod tests {
         fn pr_meta(&self, _: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
             unreachable!()
         }
-        fn list_prs(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<Vec<github::PrSummary>, github::ClientError> {
-            unreachable!()
-        }
         fn pr_patch(&self, _: &github::PrLocator) -> Result<String, github::ClientError> {
             unreachable!()
         }

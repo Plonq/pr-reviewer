@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CiState, ClientError, CommentAnchor, GitHubClient, Mention, PendingComment, PendingReview,
-    PrLocator, PrMeta, PrSummary, QueueItem, QueueLabel, QueueSearch, ReviewComment, ReviewState,
+    PrLocator, PrMeta, QueueItem, QueueLabel, QueueSearch, ReviewComment, ReviewState,
     ReviewVerdict, Viewer,
 };
 
@@ -1041,30 +1041,6 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 "--json",
                 "number,title,author,state,url,body,baseRefName,headRefName,baseRefOid,headRefOid,\
                  additions,deletions,changedFiles,reviewDecision",
-            ])
-            .map_err(spawn_failure)?;
-        if out.code != Some(0) {
-            return Err(classify_failure(&out));
-        }
-        serde_json::from_str(out.text()?)
-            .map_err(|err| ClientError::Failed(format!("unexpected GitHub response: {err}")))
-    }
-
-    fn list_prs(&self, owner: &str, repo: &str) -> Result<Vec<PrSummary>, ClientError> {
-        let slug = format!("{owner}/{repo}");
-        let out = self
-            .process
-            .run(&[
-                "pr",
-                "list",
-                "--repo",
-                &slug,
-                "--state",
-                "open",
-                "--limit",
-                "200",
-                "--json",
-                "number,title,author,state,isDraft,headRefName,updatedAt",
             ])
             .map_err(spawn_failure)?;
         if out.code != Some(0) {
@@ -2583,7 +2559,6 @@ mod tests {
     const PR_VIEW_SUCCESS: &str = include_str!("../fixtures/gh_pr_view_success.json");
     /// The `gh pr list --json` payload for the PR picker, exactly as the
     /// CLI projects it — two open PRs, one a draft, newest first.
-    const PR_LIST_SUCCESS: &str = include_str!("../fixtures/gh_pr_list_success.json");
     /// The `gh api --paginate --slurp` pulls-comments payload: one array
     /// per page — a top-level comment, its reply, and an outdated comment
     /// with null anchors — snake_case, as the REST API returns it.
@@ -4578,41 +4553,6 @@ mod tests {
             .pr_meta(&loc())
             .unwrap_err();
         assert_eq!(err, ClientError::Unauthenticated);
-    }
-
-    #[test]
-    fn list_prs_parses_the_recorded_payload() {
-        let prs = client(ok(Some(0), PR_LIST_SUCCESS, ""))
-            .list_prs("octocat", "Hello-World")
-            .unwrap();
-        assert_eq!(prs.len(), 2);
-        assert_eq!(prs[0].number, 4781);
-        assert_eq!(
-            prs[0].title,
-            "Add deactivation filters to the users manage list"
-        );
-        assert_eq!(prs[0].author.login, "octocat");
-        assert_eq!(prs[0].state, "OPEN");
-        assert!(!prs[0].is_draft);
-        assert_eq!(prs[0].head_ref_name, "deactivation-filters");
-        assert_eq!(prs[0].updated_at, "2026-10-20T08:07:08Z");
-        assert!(prs[1].is_draft);
-    }
-
-    #[test]
-    fn list_prs_invokes_gh_pr_list_verbatim() {
-        let fake = FakeGh::one(ok(Some(0), PR_LIST_SUCCESS, ""));
-        let calls = fake.calls_handle();
-        GhCliClient::with_process(fake)
-            .list_prs("octocat", "Hello-World")
-            .unwrap();
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].join(" "),
-            "pr list --repo octocat/Hello-World --state open --limit 200 \
-             --json number,title,author,state,isDraft,headRefName,updatedAt"
-        );
     }
 
     // --- patch, comments, mentions ------------------------------------------
