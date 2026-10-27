@@ -2,3 +2,6 @@
 # `cargo build`/`cargo test`/`cargo run` always produce an arm64 binary.
 [build]
 target = "aarch64-apple-darwin"
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "15.0"

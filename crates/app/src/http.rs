@@ -84,10 +84,6 @@ impl UreqHttpClient {
 }
 
 impl HttpClient for UreqHttpClient {
-    fn type_name(&self) -> &'static str {
-        "ureq"
-    }
-
     fn user_agent(&self) -> Option<&http::HeaderValue> {
         None
     }

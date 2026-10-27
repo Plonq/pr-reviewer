@@ -5,8 +5,8 @@ use crate::threads::{wrap_body, CommentIndex, CommentSide, CommentTime, FileAnch
 use crate::tree::status_style;
 use crate::{row_height, theme, ReviewApp, SPLIT_DIVIDER};
 use diff_core::{DiffRow, FileStatus, Hunk, PrDiff};
+use gpui::component::{tag::Tag, Sizable as _};
 use gpui::{div, prelude::*, px, HighlightStyle, Hsla, SharedString, StyledText};
-use gpui_component::{tag::Tag, Sizable as _};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;

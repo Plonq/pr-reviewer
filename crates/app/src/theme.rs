@@ -3,8 +3,8 @@
 //! and from the window's appearance-change observer, so every color helper
 //! stays a free function.
 
+use gpui::component::{Theme, ThemeMode};
 use gpui::{rgb, rgba, App, FontStyle, HighlightStyle, Hsla, Rgba, Window};
-use gpui_component::{Theme, ThemeMode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use syntax::Token;
 
@@ -113,7 +113,7 @@ pub fn yellow() -> Rgba {
 /// the Catppuccin palette (Mocha ↔ Latte). Pass the window when one exists
 /// so component repaints are flushed immediately; call again from the
 /// window's appearance-change observer to track live switches. Call after
-/// `gpui_component::init`.
+/// `gpui::component::init`.
 pub fn apply_ui_theme(window: Option<&mut Window>, cx: &mut App) {
     let appearance = window
         .as_ref()
@@ -327,7 +327,7 @@ mod tests {
     #[gpui::test]
     fn scrollbar_track_is_transparent_but_thumbs_remain_visible(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui::component::init(cx);
             apply_ui_theme(None, cx);
 
             let theme = Theme::global(cx);

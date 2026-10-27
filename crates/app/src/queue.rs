@@ -2,8 +2,8 @@
 
 use crate::threads::short_age;
 use crate::{theme, ReviewApp};
+use gpui::component::{avatar::Avatar, tag::Tag, Icon, IconName, Sizable as _};
 use gpui::{div, prelude::*, px, Hsla, Rgba, SharedString};
-use gpui_component::{avatar::Avatar, tag::Tag, Icon, IconName, Sizable as _};
 
 /// Queue rows stay compact — avatar, title, badges, size, counts, chips,
 /// and stacked timestamps — with
@@ -340,7 +340,7 @@ pub(crate) fn queue_row(
             entity.update(cx, |this, cx| {
                 // Focus lands on the pane so the keyboard keeps working —
                 // j/k from a click still move the (new) selection.
-                window.focus(&this.focus_handle);
+                window.focus(&this.focus_handle, cx);
                 this.queue_open(pos, cx);
             });
         })

@@ -6,11 +6,11 @@ use crate::{
     CommentSide, ComposerPlacement, ItemState, ReviewApp, ReviewComment, SessionCommand,
     SessionCompletion,
 };
-use gpui::{div, prelude::*, Context, MouseButton, SharedString, Window};
-use gpui_component::{
+use gpui::component::{
     button::{Button, ButtonVariants as _},
     Disableable as _, Sizable as _,
 };
+use gpui::{div, prelude::*, Context, MouseButton, SharedString, Window};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommentTarget {

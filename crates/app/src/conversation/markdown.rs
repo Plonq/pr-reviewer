@@ -8,13 +8,13 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use ::markdown::{mdast::Node, ParseOptions};
+use gpui::component::{
+    text::{TextView, TextViewStyle},
+    ActiveTheme,
+};
 use gpui::{
     div, px, rems, App, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     Styled, Window,
-};
-use gpui_component::{
-    text::{TextView, TextViewStyle},
-    ActiveTheme,
 };
 
 use super::media::{self, Media};
@@ -367,7 +367,7 @@ pub(super) fn text_view(
             move || format!("{id}-text")
         })
         .child(
-            TextView::markdown(SharedString::from(id.to_owned()), source, window, cx)
+            TextView::markdown(SharedString::from(id.to_owned()), source)
                 .w_full()
                 .h_auto()
                 .selectable(true)

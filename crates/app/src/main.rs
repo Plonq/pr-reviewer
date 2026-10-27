@@ -1,6 +1,7 @@
 mod chrome;
 mod comment_actions;
 mod comment_anchor;
+mod comment_editor;
 mod conversation;
 mod diff_media;
 mod http;
@@ -26,14 +27,7 @@ use chrome::{app_title, centered_message};
 use comment_actions::CommentTarget;
 use diff_core::{FileStatus, PrDiff};
 use github::review_session::{Command as SessionCommand, ReviewSession};
-use gpui::{
-    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
-    Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding,
-    Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, ScrollHandle, ScrollStrategy, SharedString, Subscription, Task,
-    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
-};
-use gpui_component::{
+use gpui::component::{
     avatar::Avatar,
     button::{Button, ButtonVariants as _},
     input::{
@@ -44,6 +38,13 @@ use gpui_component::{
     scroll::Scrollbar,
     tag::Tag,
     Disableable as _, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
+};
+use gpui::{
+    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
+    AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding, Keystroke,
+    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, ScrollHandle, ScrollStrategy, SharedString, Subscription, Task, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use minimap::{
     minimap_rows, minimap_runs, minimap_scale, MinimapColor, MinimapLane, MinimapLayout,
@@ -280,11 +281,11 @@ impl AssetSource for AppAssets {
         if let Some((_, bytes)) = OWNED_ASSETS.iter().find(|(known, _)| *known == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        gpui_component_assets::Assets.load(path)
+        gpui::assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
-        let mut all = gpui_component_assets::Assets.list(path)?;
+        let mut all = gpui::assets::Assets.list(path)?;
         all.extend(
             OWNED_ASSETS
                 .iter()
@@ -337,13 +338,13 @@ fn main() {
             }
         }
     }
-    Application::new()
+    gpui::application()
         .with_assets(AppAssets)
         // gpui ships a NullHttpClient: without a real one, every remote
         // `img()` (the account avatar, later PR media) silently fails.
         .with_http_client(http::http_client())
         .run(move |cx: &mut App| {
-            gpui_component::init(cx);
+            gpui::component::init(cx);
             theme::apply_ui_theme(None, cx);
             cx.bind_keys(presentation::keybindings());
             cx.bind_keys(search::keybindings());
@@ -418,7 +419,7 @@ fn main() {
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             // One window is the whole app: closing it quits the process.
-            cx.on_window_closed(|cx| {
+            cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
                 }
@@ -444,7 +445,7 @@ fn main() {
                     let view = cx.new(|cx| {
                         ReviewApp::new(sources, errors, github, store, store_error, window, cx)
                     });
-                    window.focus(&view.read(cx).focus_handle);
+                    window.focus(&view.read(cx).focus_handle.clone(), cx);
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             )
@@ -1391,7 +1392,7 @@ impl CompletionProvider for MentionProvider {
         offset: usize,
         _trigger: lsp_types::CompletionContext,
         _window: &mut Window,
-        _cx: &mut Context<InputState>,
+        _cx: &mut App,
     ) -> Task<anyhow::Result<lsp_types::CompletionResponse>> {
         let empty = Task::ready(Ok(lsp_types::CompletionResponse::Array(vec![])));
         let Some((at, prefix)) = mention_prefix(text, offset) else {
@@ -1426,12 +1427,7 @@ impl CompletionProvider for MentionProvider {
         Task::ready(Ok(lsp_types::CompletionResponse::Array(items)))
     }
 
-    fn is_completion_trigger(
-        &self,
-        _offset: usize,
-        _new_text: &str,
-        _cx: &mut Context<InputState>,
-    ) -> bool {
+    fn is_completion_trigger(&self, _offset: usize, _new_text: &str, _cx: &mut App) -> bool {
         // Cheap to always run; `completions` returns nothing outside a mention.
         true
     }
@@ -1497,7 +1493,7 @@ struct Composer {
     /// Display row the composer is anchored beneath (best effort; goes stale
     /// harmlessly if rows rebuild while it is open).
     row_ix: usize,
-    input: gpui::Entity<InputState>,
+    input: gpui::Entity<gpui::component::input::EditorState>,
     /// Space below the diff's last row, measured from the floating card.
     height: Rc<Cell<gpui::Pixels>>,
     /// Reveal a composer once, after its card is laid out.
@@ -1535,7 +1531,7 @@ impl Composer {
 struct ReviewDialog {
     item_id: u64,
     verdict: github::ReviewVerdict,
-    input: gpui::Entity<InputState>,
+    input: gpui::Entity<gpui::component::input::EditorState>,
     error: Option<SharedString>,
     in_flight: bool,
 }
@@ -2611,7 +2607,7 @@ impl ReviewApp {
                 self.open_input
                     .update(cx, |state, cx| state.set_value("", window, cx));
                 self.open_item(source, cx);
-                window.focus(&self.focus_handle);
+                window.focus(&self.focus_handle, cx);
             }
             Err(message) => self.open_error = Some(message.into()),
         }
@@ -2623,7 +2619,7 @@ impl ReviewApp {
             self.persist_positions();
             self.active = ix;
             self.show_queue = false;
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
             cx.notify();
         }
     }
@@ -2747,10 +2743,7 @@ impl ReviewApp {
         }
         let (offset, max_x) = {
             let state = data.scroll.0.borrow();
-            (
-                state.base_handle.offset(),
-                state.base_handle.max_offset().width,
-            )
+            (state.base_handle.offset(), state.base_handle.max_offset().x)
         };
         let x = (f32::from(offset.x) + direction as f32 * step).clamp(-f32::from(max_x), 0.);
         data.scroll
@@ -2799,7 +2792,7 @@ impl ReviewApp {
         cx: &mut Context<Self>,
     ) {
         self.flip_pane(ItemPane::Changes, cx);
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         if let Some(data) = self.active_data_mut() {
             data.open_file(file_ix, None);
         }
@@ -3299,11 +3292,7 @@ impl ReviewApp {
             self.close_composer(window, cx);
         }
         self.composer_gen += 1;
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .auto_grow(3, 8)
-                .placeholder("leave a comment…")
-        });
+        let input = cx.new(|cx| comment_editor::new(window, cx).placeholder("leave a comment…"));
         input.update(cx, |state, cx| state.focus(window, cx));
         // Wire up @-mention autocomplete for PR items: seed the pool with known
         // participants now, attach the provider, then fetch the full list once.
@@ -3312,7 +3301,7 @@ impl ReviewApp {
                 let mentions = data.mentions.clone();
                 seed_mentions(&mentions, data);
                 input.update(cx, |state, _| {
-                    state.lsp.completion_provider =
+                    state.lsp_mut().completion_provider =
                         Some(Rc::new(MentionProvider { users: mentions }));
                 });
             }
@@ -3400,7 +3389,7 @@ impl ReviewApp {
                 }
             }
             self.composer_gen += 1;
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
             cx.notify();
         }
     }
@@ -3762,8 +3751,7 @@ impl ReviewApp {
         let item_id = item.id;
         self.review_gen += 1;
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .auto_grow(3, 8)
+            comment_editor::new(window, cx)
                 .placeholder("review summary… (optional with pending comments)")
         });
         if let Some(pending) = self
@@ -3789,7 +3777,7 @@ impl ReviewApp {
     fn close_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.review.take().is_some() {
             self.review_gen += 1;
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
             cx.notify();
         }
     }
@@ -4152,7 +4140,7 @@ impl ReviewApp {
                     .truncate()
                     .child(SharedString::from(target)),
             )
-            .child(Input::new(&composer.input))
+            .child(comment_editor::field(&composer.input, cx))
             .when_some(composer.error.clone(), |card, err| {
                 card.child(div().text_color(theme::red()).child(err))
             })
@@ -4525,7 +4513,7 @@ impl ReviewApp {
                                 theme::blue(),
                             )),
                     )
-                    .child(Input::new(&review.input))
+                    .child(comment_editor::field(&review.input, cx))
                     .when_some(review.error.clone(), |card, err| {
                         card.child(div().text_color(theme::red()).child(err))
                     })
@@ -4583,7 +4571,7 @@ impl ReviewApp {
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    window.focus(&this.focus_handle);
+                    window.focus(&this.focus_handle, cx);
                     this.minimap_scrub = true;
                     this.minimap_scrub_to(event.position, cx);
                 }),
@@ -4737,7 +4725,7 @@ impl ReviewApp {
                             .label(label)
                             .tooltip(tooltip)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                window.focus(&this.focus_handle);
+                                window.focus(&this.focus_handle, cx);
                                 this.flip_pane(target, cx);
                             })),
                     ),
@@ -4972,7 +4960,7 @@ impl ReviewApp {
                         })
                         .collect()
                 })
-                .track_scroll(scroll)
+                .track_scroll(&scroll)
                 .h_full()
                 .into_any_element()
             }
@@ -5023,7 +5011,7 @@ impl ReviewApp {
                     .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
                         this.tree_filter_input
                             .update(cx, |state, cx| state.set_value("", window, cx));
-                        window.focus(&this.focus_handle);
+                        window.focus(&this.focus_handle, cx);
                         cx.notify();
                     }))
                     .child(
@@ -5147,7 +5135,7 @@ impl ReviewApp {
                             .child("clear filters (escape)")
                             .on_click(move |_, window, cx| {
                                 entity.update(cx, |this, cx| {
-                                    window.focus(&this.focus_handle);
+                                    window.focus(&this.focus_handle, cx);
                                     this.queue_clear_filters(cx);
                                 })
                             }),
@@ -5198,7 +5186,7 @@ impl ReviewApp {
                         .map(|(pos, pr)| queue_row(pr, pos, pos == selected, now, entity.clone()))
                         .collect()
                 })
-                .track_scroll(queue.scroll.clone())
+                .track_scroll(&queue.scroll)
                 .flex_1()
                 .min_h_0(),
             )
@@ -5247,7 +5235,7 @@ impl ReviewApp {
                         let entity = entity.clone();
                         move |_, window, cx| {
                             entity.update(cx, |this, cx| {
-                                window.focus(&this.focus_handle);
+                                window.focus(&this.focus_handle, cx);
                                 this.queue_toggle_sort(cx);
                             })
                         }
@@ -5304,7 +5292,7 @@ impl ReviewApp {
                             let filter = chip.filter.clone();
                             move |_, window, cx| {
                                 entity.update(cx, |this, cx| {
-                                    window.focus(&this.focus_handle);
+                                    window.focus(&this.focus_handle, cx);
                                     this.queue_toggle_filter(filter.clone(), cx);
                                 })
                             }
@@ -5360,7 +5348,7 @@ impl ReviewApp {
                         let entity = entity.clone();
                         move |_, window, cx| {
                             entity.update(cx, |this, cx| {
-                                window.focus(&this.focus_handle);
+                                window.focus(&this.focus_handle, cx);
                                 this.queue_clear_filters(cx);
                             })
                         }
@@ -5459,7 +5447,7 @@ impl ReviewApp {
     }
 
     fn render_footer(&self) -> impl IntoElement {
-        let hint = |keys: &[&str], label: &'static str| {
+        let hint = |keys: &[&'static str], label: &'static str| {
             let mut hint = div().flex().items_center().gap_1();
             for key in keys {
                 hint = hint.child(Kbd::new(Keystroke::parse(key).unwrap()));
@@ -5588,7 +5576,7 @@ impl ReviewApp {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                    window.focus(&this.focus_handle);
+                                    window.focus(&this.focus_handle, cx);
                                     let char_width = this.char_width(window);
                                     if event.modifiers.shift {
                                         let Some((side, head)) =
@@ -5760,7 +5748,7 @@ impl ReviewApp {
                                 })
                                 .with_decoration(diff_media::InlineMedia(cx.entity()))
                                 .with_decoration(diff_media::InlineText(cx.entity()))
-                                .track_scroll(data.scroll.clone())
+                                .track_scroll(&data.scroll)
                                 .with_horizontal_sizing_behavior(
                                     if data.preferences.soft_wrap.unwrap_or(false) {
                                         ListHorizontalSizingBehavior::FitList
@@ -6114,7 +6102,7 @@ impl Render for ReviewApp {
             // The open input propagates Escape when it has nothing of its own
             // to dismiss: hand focus back to the diff.
             .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                window.focus(&this.focus_handle);
+                window.focus(&this.focus_handle, cx);
                 cx.notify();
             }))
             .child(self.render_titlebar(cx))
@@ -7019,7 +7007,7 @@ mod tests {
             });
             draw(&mut vcx);
             let body = vcx.debug_bounds("inline-text-0-11-0-text").unwrap();
-            vcx.simulate_event(gpui::ScrollWheelEvent {
+            vcx.simulate_event(gpui::ScrollEvent {
                 position: body.center(),
                 delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-32.))),
                 ..Default::default()
@@ -7037,7 +7025,7 @@ mod tests {
                     point(card.left() + px(20.), card.top() + px(12.))
                 };
                 let before = offset(cx);
-                vcx.simulate_event(gpui::ScrollWheelEvent {
+                vcx.simulate_event(gpui::ScrollEvent {
                     position: at,
                     delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-32.))),
                     ..Default::default()
@@ -7790,7 +7778,7 @@ mod tests {
         });
         vcx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                window.focus(&app.focus_handle);
+                window.focus(&app.focus_handle, cx);
                 app.flip_pane(ItemPane::Conversation, cx);
             })
         });
@@ -8192,7 +8180,7 @@ mod tests {
         store: local_store::LocalStore,
     ) -> (gpui::AnyWindowHandle, gpui::Entity<ReviewApp>) {
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui::component::init(cx);
             theme::apply_ui_theme(None, cx);
         });
         let stash = std::rc::Rc::new(std::cell::RefCell::new(None::<gpui::Entity<ReviewApp>>));
@@ -8209,7 +8197,7 @@ mod tests {
                     cx,
                 )
             });
-            window.focus(&view.read(cx).focus_handle);
+            window.focus(&view.read(cx).focus_handle.clone(), cx);
             *stash2.borrow_mut() = Some(view.clone());
             Root::new(view, window, cx)
         });
@@ -9203,7 +9191,7 @@ mod tests {
         let mut pages = 0;
         loop {
             let before = offset(cx);
-            vcx.simulate_event(gpui::ScrollWheelEvent {
+            vcx.simulate_event(gpui::ScrollEvent {
                 position: gpui::point(px(1100.), px(500.)),
                 delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-800.))),
                 ..Default::default()
@@ -9306,7 +9294,7 @@ mod tests {
         // centered 760px column (which starts around x≈710 in the
         // 1920-wide test window). A wheel there must scroll — the whole
         // point of the pane-level scroller.
-        vcx.simulate_event(gpui::ScrollWheelEvent {
+        vcx.simulate_event(gpui::ScrollEvent {
             position: point(px(400.), px(500.)),
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))),
             ..Default::default()
@@ -9318,7 +9306,7 @@ mod tests {
         );
 
         // And over the column itself, where it always worked.
-        vcx.simulate_event(gpui::ScrollWheelEvent {
+        vcx.simulate_event(gpui::ScrollEvent {
             position: point(px(1100.), px(500.)),
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))),
             ..Default::default()
@@ -10519,7 +10507,7 @@ mod tests {
                 let _ = window.draw(cx);
                 let data = app.read(cx).active_data().unwrap();
                 assert!(
-                    data.scroll.0.borrow().base_handle.max_offset().width > px(0.),
+                    data.scroll.0.borrow().base_handle.max_offset().x > px(0.),
                     "long lines must be reachable without wrapping"
                 );
             });
@@ -10592,10 +10580,7 @@ mod tests {
             }
             vcx.update(|_, cx| {
                 let data = app.read(cx).active_data().unwrap();
-                assert_eq!(
-                    data.scroll.0.borrow().base_handle.max_offset().width,
-                    px(0.)
-                );
+                assert_eq!(data.scroll.0.borrow().base_handle.max_offset().x, px(0.));
                 assert!(data
                     .rows
                     .iter()
@@ -10730,7 +10715,7 @@ mod tests {
             assert_eq!(state.base_handle.offset().y, px(-90.375 * row_height()));
             (state.base_handle.bounds(), state.base_handle.offset())
         });
-        vcx.simulate_event(gpui::ScrollWheelEvent {
+        vcx.simulate_event(gpui::ScrollEvent {
             position: bounds.center(),
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-137.))),
             ..Default::default()

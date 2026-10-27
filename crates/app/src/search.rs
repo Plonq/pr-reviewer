@@ -4,13 +4,13 @@ use crate::local_store::ReviewPosition;
 use crate::rows::Row;
 use crate::selection::{row_side_text, SelSide};
 use crate::{theme, ItemData, ItemPane, ReviewApp};
-use gpui::{
-    div, prelude::*, px, Context, Entity, KeyBinding, ScrollStrategy, Subscription, Window,
-};
-use gpui_component::{
+use gpui::component::{
     button::{Button, ButtonVariants as _},
     input::{Escape, Input, InputEvent, InputState},
     Sizable as _,
+};
+use gpui::{
+    div, prelude::*, px, Context, Entity, KeyBinding, ScrollStrategy, Subscription, Window,
 };
 use std::ops::Range;
 
@@ -247,7 +247,7 @@ impl ReviewApp {
             return false;
         }
         self.active_data_mut().unwrap().end_search();
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
         true
     }

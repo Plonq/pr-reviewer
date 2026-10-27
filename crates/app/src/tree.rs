@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use crate::{theme, threads::CommentIndex, ItemData, ReviewApp};
 use diff_core::{FileDiff, FileStatus};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use gpui::component::{checkbox::Checkbox, Disableable as _, Icon, Sizable as _};
 use gpui::{div, prelude::*, px, Hsla, SharedString};
-use gpui_component::{checkbox::Checkbox, Disableable as _, Icon, Sizable as _};
 
 /// Row height of sidebar file-tree entries.
 const TREE_ROW_HEIGHT: f32 = 24.0;
@@ -212,7 +212,7 @@ pub(crate) fn render_tree_row(
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
                         entity.update(cx, |this, cx| {
-                            window.focus(&this.focus_handle);
+                            window.focus(&this.focus_handle, cx);
                             this.toggle_file_viewed(file_ix, cx);
                         });
                     }),

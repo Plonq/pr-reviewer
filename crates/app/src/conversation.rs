@@ -259,11 +259,11 @@ use crate::{
     text_size, theme, CommentSide, ComposerPlacement, ItemData, ItemState, ReviewApp, ReviewItem,
     Source,
 };
+use gpui::component::{button::Button, Disableable, Sizable};
 use gpui::{
     div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window,
 };
-use gpui_component::{button::Button, Disableable, Sizable};
 
 impl ReviewApp {
     pub(crate) fn conversation_composer(

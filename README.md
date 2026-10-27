@@ -38,7 +38,15 @@ Note that you will need Xcode to build it from source because the metal dev
 tools are bundled with it (and `xcodebuild -downloadComponent MetalToolchain`
 if `cargo` complains about a missing Metal toolchain).
 
-Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
+Apple Silicon, macOS 15 or later — `aarch64-apple-darwin` is the pinned default
+target. `rust-toolchain.toml` pins Rust 1.98.1. Use `cargo build --release --locked`
+for a reproducible release build and `cargo test --workspace --locked` for the
+deterministic suite (authenticated/network checks are explicitly ignored).
+
+The UI stack is GPUI Kit **0.8.1**, using its exactly matched **gpui-pre 0.3.10**
+family. This is Longbridge's adapted Zed snapshot, not a newer official Zed GPUI
+release. Update the family together, with `Cargo.lock`; do not mix snapshots.
+Kit's platform enables the font backend and runtime Metal shader compilation.
 
 ## Features
 
