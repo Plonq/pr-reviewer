@@ -327,6 +327,8 @@ fn cached_row(item: &QueueItem) -> CachedQueueRow {
                 color: label.color.clone(),
             })
             .collect(),
+        created_at: item.created_at.clone(),
+        review_requested_at: item.review_requested_at.clone(),
         updated_at: item.updated_at.clone(),
     }
 }
@@ -353,6 +355,8 @@ pub fn queue_item(row: &CachedQueueRow) -> QueueItem {
                 color: label.color.clone(),
             })
             .collect(),
+        created_at: row.created_at.clone(),
+        review_requested_at: row.review_requested_at.clone(),
         updated_at: row.updated_at.clone(),
     }
 }
@@ -419,6 +423,8 @@ mod tests {
                 name: "api".into(),
                 color: "1D76DB".into(),
             }],
+            created_at: "2026-10-15T10:00:00Z".into(),
+            review_requested_at: Some("2026-10-19T09:00:00Z".into()),
             updated_at: "2026-10-20T08:07:08Z".into(),
         }
     }

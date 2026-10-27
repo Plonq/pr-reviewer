@@ -44,6 +44,8 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 
 - opens straight into the review queue, painted from a local cache and hot-swapped
   when the network answers (works offline, too)
+- queue rows show when each PR was opened and when your review was last requested
+  directly (team-only requests or unavailable history show an unknown request age)
 - enter (or click) opens a queue row straight into its changes view; `u` comes
   back to the queue with open PRs kept open behind the scenes
 - one file at a time: the whole file fills the pane — no `@@` markers, hunk
