@@ -4310,7 +4310,9 @@ impl ReviewApp {
             .left(px(x))
             .top(px(y))
             .w(px(520.))
-            .occlude()
+            // Keep clicks/hover off the diff underneath, but let wheel events
+            // reach its scroller when the composer's input cannot scroll.
+            .block_mouse_except_scroll()
             .shadow_lg()
             .on_children_prepainted(move |bounds, window, cx| {
                 let Some(card) = bounds.first() else {
@@ -7507,6 +7509,112 @@ mod tests {
                 .height
                 < px(row_height() * 3.)
         );
+    }
+
+    #[gpui::test]
+    fn diff_scrolls_over_inline_comments_and_the_composer(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut item = loop_pr_item(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "A **formatted** inline comment.",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        let context: String = (1..=200).map(|line| format!(" line {line}\n")).collect();
+        data.diff = diff_core::parse_patch(&format!("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,201 +1,201 @@\n{context}-old\n+new\n"));
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let draw = |vcx: &mut gpui::VisualTestContext| {
+            for _ in 0..3 {
+                vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+                vcx.run_until_parked();
+            }
+        };
+        let offset = |cx: &gpui::TestAppContext| {
+            cx.update(|cx| {
+                app.read(cx)
+                    .active_data()
+                    .unwrap()
+                    .scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .offset()
+                    .y
+            })
+        };
+        for (mode, side) in [
+            (ViewMode::Unified, SelSide::Unified),
+            (ViewMode::Split, SelSide::Left),
+            (ViewMode::Split, SelSide::Right),
+        ] {
+            vcx.update(|_, cx| {
+                app.update(cx, |this, cx| {
+                    let data = this.active_data_mut().unwrap();
+                    data.mode = mode;
+                    data.set_rows(data.row_build());
+                    data.cursor = 1;
+                    data.cursor_side = Some(side);
+                    let mut scroll = data.scroll.0.borrow_mut();
+                    scroll.deferred_scroll_to_item = None;
+                    scroll.base_handle.set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                });
+            });
+            draw(&mut vcx);
+            let body = vcx.debug_bounds("inline-text-0-11-0-text").unwrap();
+            vcx.simulate_event(gpui::ScrollWheelEvent {
+                position: body.center(),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-32.))),
+                ..Default::default()
+            });
+            assert_eq!(offset(cx), px(-32.), "posted Markdown must allow scrolling");
+
+            vcx.dispatch_action(NewComment);
+            draw(&mut vcx);
+            // Both the card chrome and its empty input must let the diff scroll.
+            for over_input in [false, true] {
+                let card = vcx.debug_bounds("composer-card").unwrap();
+                let at = if over_input {
+                    card.center()
+                } else {
+                    point(card.left() + px(20.), card.top() + px(12.))
+                };
+                let before = offset(cx);
+                vcx.simulate_event(gpui::ScrollWheelEvent {
+                    position: at,
+                    delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-32.))),
+                    ..Default::default()
+                });
+                assert_eq!(
+                    offset(cx),
+                    before - px(32.),
+                    "composer must allow scrolling"
+                );
+                draw(&mut vcx);
+            }
+            let card = vcx.debug_bounds("composer-card").unwrap();
+            let at = point(card.left() + px(20.), card.top() + px(12.));
+            vcx.simulate_mouse_down(at, MouseButton::Left, gpui::Modifiers::default());
+            vcx.simulate_mouse_up(at, MouseButton::Left, gpui::Modifiers::default());
+            vcx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    assert!(this.drag_anchor.is_none());
+                    assert_eq!(this.active_data().unwrap().cursor, 1);
+                    assert!(this.active_data().unwrap().selection.is_none());
+                    this.close_composer(window, cx);
+                });
+            });
+        }
     }
 
     #[gpui::test]
