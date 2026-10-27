@@ -434,8 +434,8 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         // Paginate each connection independently: a busy PR can have >100
         // comments, reviews, threads, AND replies within one thread.
         for (name, fields) in [
-            ("comments", "id:fullDatabaseId author { login } body createdAt reactionGroups { content users { totalCount } }"),
-            ("reviews", "id:fullDatabaseId node_id:id author { login } body createdAt submittedAt state"),
+            ("comments", "id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete author { login } body createdAt reactionGroups { content users { totalCount } }"),
+            ("reviews", "id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete author { login } body createdAt submittedAt state"),
         ] {
             let mut after = None;
             loop {
@@ -526,6 +526,63 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 .sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         }
         Ok(discussion)
+    }
+
+    fn edit_comment(&self, target: &crate::CommentTarget, body: &str) -> Result<(), ClientError> {
+        use crate::CommentTarget::*;
+        let (mutation, input, output, id) = match target {
+            Issue(id) => ("updateIssueComment", "id", "issueComment", id),
+            Review(id) => (
+                "updatePullRequestReview",
+                "pullRequestReviewId",
+                "pullRequestReview",
+                id,
+            ),
+            ReviewComment(id) => (
+                "updatePullRequestReviewComment",
+                "pullRequestReviewCommentId",
+                "pullRequestReviewComment",
+                id,
+            ),
+        };
+        if id.is_empty() || body.trim().is_empty() {
+            return Err(ClientError::Invalid(
+                "missing comment identity or body".into(),
+            ));
+        }
+        let value = self.review_graphql(format!(
+            "mutation {{ {mutation}(input:{{{input}:{},body:{}}}) {{ {output} {{ id }} }} }}",
+            json_string(id),
+            json_string(body)
+        ))?;
+        if value["data"][mutation][output]["id"].as_str() != Some(id) {
+            return Err(ClientError::Failed(
+                "GitHub returned no updated comment".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn delete_comment(&self, target: &crate::CommentTarget) -> Result<(), ClientError> {
+        use crate::CommentTarget::*;
+        let (mutation, input, id) = match target {
+            Issue(id) => ("deleteIssueComment", "id", id),
+            Review(id) => ("deletePullRequestReview", "pullRequestReviewId", id),
+            ReviewComment(id) => ("deletePullRequestReviewComment", "id", id),
+        };
+        if id.is_empty() {
+            return Err(ClientError::Invalid("missing comment identity".into()));
+        }
+        let value = self.review_graphql(format!(
+            "mutation {{ {mutation}(input:{{{input}:{},clientMutationId:{}}}) {{ clientMutationId }} }}",
+            json_string(id), json_string(id)
+        ))?;
+        if value["data"][mutation]["clientMutationId"].as_str() != Some(id) {
+            return Err(ClientError::Failed(
+                "GitHub returned no deleted comment".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn pending_review(&self, loc: &PrLocator) -> Result<Option<PendingReview>, ClientError> {
@@ -1234,7 +1291,7 @@ fn after_arg(cursor: Option<&str>) -> String {
 }
 
 fn review_thread_fields(cursor: Option<&str>) -> String {
-    format!("id path isResolved originalLine originalStartLine side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id path body diffHunk createdAt author {{ login }} reactionGroups {{ content users {{ totalCount }} }} replyTo {{ id:fullDatabaseId }} pullRequestReview {{ id state }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
+    format!("id path isResolved originalLine originalStartLine side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete path body diffHunk createdAt author {{ login }} reactionGroups {{ content users {{ totalCount }} }} replyTo {{ id:fullDatabaseId }} pullRequestReview {{ id state }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
 }
 
 fn database_id(value: &serde_json::Value) -> Result<u64, ClientError> {
@@ -1263,6 +1320,11 @@ fn discussion_comment(raw: &serde_json::Value) -> Result<crate::DiscussionCommen
     }
     Ok(crate::DiscussionComment {
         id,
+        permissions: crate::CommentPermissions {
+            node_id: raw["node_id"].as_str().unwrap_or_default().into(),
+            can_edit: raw["viewerCanUpdate"].as_bool().unwrap_or(false),
+            can_delete: raw["viewerCanDelete"].as_bool().unwrap_or(false),
+        },
         author: raw["author"]["login"].as_str().unwrap_or("ghost").into(),
         body: decode_value(raw["body"].clone())?,
         created_at: decode_value(raw["createdAt"].clone())?,
@@ -2623,6 +2685,137 @@ mod tests {
             start_line: Some(5),
             position: None,
         }
+    }
+
+    #[test]
+    fn published_mutations_route_each_comment_family_without_touching_pending_reviews() {
+        use crate::{
+            review_session::{Command, ReviewSession},
+            CommentTarget,
+        };
+        for (target, update, delete, input, output) in [
+            (
+                CommentTarget::Issue("IC1".into()),
+                "updateIssueComment",
+                "deleteIssueComment",
+                "id",
+                "issueComment",
+            ),
+            (
+                CommentTarget::Review("PRR1".into()),
+                "updatePullRequestReview",
+                "deletePullRequestReview",
+                "pullRequestReviewId",
+                "pullRequestReview",
+            ),
+            (
+                CommentTarget::ReviewComment("PRRC1".into()),
+                "updatePullRequestReviewComment",
+                "deletePullRequestReviewComment",
+                "pullRequestReviewCommentId",
+                "pullRequestReviewComment",
+            ),
+        ] {
+            let id = match &target {
+                CommentTarget::Issue(id)
+                | CommentTarget::Review(id)
+                | CommentTarget::ReviewComment(id) => id,
+            };
+            let edited = serde_json::json!({"data": {update: {output: {"id": id}}}}).to_string();
+            let deleted =
+                serde_json::json!({"data": {delete: {"clientMutationId": id}}}).to_string();
+            let (client, calls) = session_script(&[&edited, &deleted]);
+            let mut session = ReviewSession {
+                pending: Some(PendingReview {
+                    id: 91,
+                    node_id: "pending".into(),
+                    body: "untouched draft".into(),
+                    comments: vec![],
+                }),
+                verified: true,
+            };
+            session
+                .execute(
+                    &client,
+                    &loc(),
+                    Command::EditPublished {
+                        target: target.clone(),
+                        body: "  quoted \"body\"\nnext  ".into(),
+                    },
+                )
+                .unwrap();
+            session
+                .execute(
+                    &client,
+                    &loc(),
+                    Command::DeletePublished {
+                        target: target.clone(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(session.pending.unwrap().body, "untouched draft");
+            assert!(session.verified);
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 2, "no draft lookup or submission");
+            let query = calls[0].join(" ");
+            assert!(query.contains(&format!("{input}:{}", json_string(id))));
+            assert!(query.contains(r#"body:"quoted \"body\"\nnext""#));
+            assert!(calls[1].join(" ").contains(delete));
+        }
+    }
+
+    #[test]
+    fn published_mutations_reject_empty_identity_body_and_failed_or_missing_results() {
+        use crate::CommentTarget;
+        let (client, calls) = session_script(&[]);
+        assert!(client
+            .edit_comment(&CommentTarget::Issue("".into()), "body")
+            .is_err());
+        assert!(client
+            .edit_comment(&CommentTarget::Issue("IC1".into()), " \n ")
+            .is_err());
+        assert!(client
+            .delete_comment(&CommentTarget::Issue("".into()))
+            .is_err());
+        assert!(calls.lock().unwrap().is_empty());
+        for response in [
+            r#"{"errors":[{"message":"not permitted"}]}"#,
+            r#"{"data":{}}"#,
+        ] {
+            let (client, _) = session_script(&[response, response]);
+            assert!(client
+                .edit_comment(&CommentTarget::Issue("IC1".into()), "body")
+                .is_err());
+            assert!(client
+                .delete_comment(&CommentTarget::Issue("IC1".into()))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn discussion_permissions_preserve_independent_server_capabilities_not_authorship() {
+        let mut raw = serde_json::json!({"id":"5000000001", "node_id":"IC1", "body":"body",
+            "createdAt":"2026-10-26T00:00:00Z", "author":{"login":"someone-else"},
+            "viewerCanUpdate":false, "viewerCanDelete":true});
+        let c = discussion_comment(&raw).unwrap();
+        assert_eq!(
+            c.permissions,
+            crate::CommentPermissions {
+                node_id: "IC1".into(),
+                can_edit: false,
+                can_delete: true
+            }
+        );
+        raw["viewerCanUpdate"] = serde_json::json!(true);
+        raw["viewerCanDelete"] = serde_json::json!(false);
+        let c = discussion_comment(&raw).unwrap();
+        assert!(c.permissions.can_edit);
+        assert!(!c.permissions.can_delete);
+        let mut cached = serde_json::to_value(&c).unwrap();
+        cached.as_object_mut().unwrap().remove("permissions");
+        let cached: crate::DiscussionComment = serde_json::from_value(cached).unwrap();
+        assert_eq!(cached.permissions, Default::default());
+        assert!(review_thread_fields(None).contains("viewerCanUpdate viewerCanDelete"));
     }
 
     #[test]

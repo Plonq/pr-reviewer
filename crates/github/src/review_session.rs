@@ -156,6 +156,13 @@ pub enum Command {
     Delete {
         id: u64,
     },
+    EditPublished {
+        target: crate::CommentTarget,
+        body: String,
+    },
+    DeletePublished {
+        target: crate::CommentTarget,
+    },
     Submit {
         verdict: ReviewVerdict,
         body: String,
@@ -214,6 +221,14 @@ impl ReviewSession {
         if let Command::Conversation { body } = command {
             nonempty(&body)?;
             return client.post_conversation_comment_id(loc, body.trim());
+        }
+        // Published mutations must never resume, create, or submit a draft review.
+        if let Command::EditPublished { target, body } = command {
+            nonempty(&body)?;
+            return client.edit_comment(&target, body.trim()).map(|_| None);
+        }
+        if let Command::DeletePublished { target } = command {
+            return client.delete_comment(&target).map(|_| None);
         }
         match &command {
             Command::Add { anchor, body } => {
@@ -314,7 +329,10 @@ impl ReviewSession {
                 }
                 self.pending = None;
             }
-            Command::Immediate { .. } | Command::Conversation { .. } => unreachable!(),
+            Command::Immediate { .. }
+            | Command::Conversation { .. }
+            | Command::EditPublished { .. }
+            | Command::DeletePublished { .. } => unreachable!(),
         }
         Ok(None)
     }

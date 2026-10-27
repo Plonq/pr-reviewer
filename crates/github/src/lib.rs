@@ -17,7 +17,10 @@ pub mod commits;
 pub use commits::{ActionsRun, PrCommit, PrCommits};
 pub mod discussion;
 pub mod gh_cli;
-pub use discussion::{DiscussionComment, PrDiscussion, Reaction, ReviewCodeContext, ReviewThread};
+pub use discussion::{
+    CommentPermissions, CommentTarget, DiscussionComment, PrDiscussion, Reaction,
+    ReviewCodeContext, ReviewThread,
+};
 pub mod review_session;
 pub use review_session::{CommentAnchor, CommentPosition, DiffSide, PendingComment, PendingReview};
 
@@ -518,6 +521,17 @@ impl std::error::Error for ClientError {}
 /// construct and synchronous — they run on background threads, never the UI
 /// thread — and may spawn subprocesses or make network calls inside a call.
 pub trait GitHubClient: Send + Sync {
+    fn edit_comment(&self, _target: &CommentTarget, _body: &str) -> Result<(), ClientError> {
+        Err(ClientError::Failed(
+            "comment editing is not supported by this backend".into(),
+        ))
+    }
+
+    fn delete_comment(&self, _target: &CommentTarget) -> Result<(), ClientError> {
+        Err(ClientError::Failed(
+            "comment deletion is not supported by this backend".into(),
+        ))
+    }
     /// Detail-only, paginated state for the authenticated viewer, never queue data.
     fn viewed_files(&self, _loc: &PrLocator) -> Result<ViewedFiles, ClientError> {
         Err(ClientError::Failed(

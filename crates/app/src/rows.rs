@@ -87,6 +87,7 @@ pub(crate) enum Row {
     /// like headers. In split mode `half` places the card in the pane the
     /// comment was left on (LEFT/RIGHT, like GitHub); None spans full width.
     CommentHeader {
+        comment_id: u64,
         author: SharedString,
         when: SharedString,
         is_reply: bool,
@@ -111,6 +112,10 @@ pub(crate) enum Row {
         slot: usize,
         half: Option<CommentSide>,
     },
+    /// Space for the root-level editor, replacing this comment's body in place.
+    CommentEditor {
+        half: Option<CommentSide>,
+    },
     /// The "↳ reply" affordance closing a thread; clicking opens the
     /// composer targeting `post_reply` on the thread's root comment.
     CommentActions {
@@ -128,6 +133,7 @@ pub(crate) fn is_comment_row(row: &Row) -> bool {
         Row::CommentHeader { .. }
             | Row::CommentBody { .. }
             | Row::CommentMedia { .. }
+            | Row::CommentEditor { .. }
             | Row::CommentActions { .. }
     )
 }
@@ -242,6 +248,7 @@ fn push_thread_rows(
             .enumerate()
         {
             rows.push(Row::CommentHeader {
+                comment_id: comment.id,
                 author: comment.author.clone().into(),
                 when: comment.time.short_age(now).into(),
                 is_reply: ix > 0,
@@ -1206,6 +1213,7 @@ pub(crate) fn render_row(
     split_layout: Option<SplitLayout>,
     search: Option<&crate::search::Search>,
     entity: &gpui::Entity<ReviewApp>,
+    controls: Option<gpui::AnyElement>,
 ) -> gpui::AnyElement {
     let inner = render_row_content(
         ix,
@@ -1215,6 +1223,7 @@ pub(crate) fn render_row(
         split_layout.map(|layout| layout.offset),
         search,
         entity,
+        controls,
     );
     if let Some(layout) = split_layout {
         // uniform_list moves the entire row by offset.x. Counter that move for
@@ -1244,6 +1253,7 @@ fn render_row_content(
     horizontal_offset: Option<gpui::Pixels>,
     search: Option<&crate::search::Search>,
     entity: &gpui::Entity<ReviewApp>,
+    controls: Option<gpui::AnyElement>,
 ) -> gpui::AnyElement {
     let row_height = px(row_height());
     match row {
@@ -1255,6 +1265,7 @@ fn render_row_content(
             horizontal_offset,
             search,
             entity,
+            controls,
         ),
         Row::Fold { key, count } => {
             let key = *key;
@@ -1295,8 +1306,9 @@ fn render_row_content(
             is_reply,
             half,
             top,
+            ..
         } => {
-            let mut inner = div().flex().items_center().gap_2().min_w_0();
+            let mut inner = div().flex().items_center().gap_2().min_w_0().w_full();
             if *is_reply {
                 inner = inner.child(
                     div()
@@ -1318,6 +1330,8 @@ fn render_row_content(
                             .text_size(px(11.))
                             .child(when.clone()),
                     )
+                    .child(div().flex_1())
+                    .children(controls)
                     .into_any_element(),
                 *half,
                 true,
@@ -1332,6 +1346,9 @@ fn render_row_content(
             comment_row(div().into_any_element(), *half, false, CardEdge::Middle)
         }
         Row::CommentMedia { half, .. } => {
+            comment_row(div().into_any_element(), *half, false, CardEdge::Middle)
+        }
+        Row::CommentEditor { half } => {
             comment_row(div().into_any_element(), *half, false, CardEdge::Middle)
         }
         Row::CommentActions {
