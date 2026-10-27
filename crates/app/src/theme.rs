@@ -253,6 +253,16 @@ pub fn active_line_gutter_bg() -> Rgba {
     }
 }
 
+/// A full-line comment anchor wash, distinct from selectable text and gentle
+/// enough to retain the added/removed row and word-diff backgrounds beneath it.
+pub fn comment_range_bg() -> Rgba {
+    if is_light() {
+        rgba(0x1e66f51f)
+    } else {
+        rgba(0x89b4fa1f)
+    }
+}
+
 /// Review comment card: a blue tint that lifts the thread off the diff without
 /// hiding it, with a stronger wash behind each comment's author line.
 pub fn comment_bg() -> Rgba {
