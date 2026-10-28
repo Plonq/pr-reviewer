@@ -60,8 +60,11 @@ pub fn token_style(token: Token, cx: &App) -> HighlightStyle {
         .unwrap_or_default()
 }
 
-pub fn modal_backdrop(cx: &App) -> Rgba {
-    cx.theme().overlay.into()
+pub fn search_current_bg(cx: &App) -> Rgba {
+    cx.theme().warning.opacity(0.45).into()
+}
+pub fn search_match_bg(cx: &App) -> Rgba {
+    cx.theme().warning.opacity(0.20).into()
 }
 pub fn void_cell_bg(cx: &App) -> Rgba {
     cx.theme().muted.opacity(0.6).into()

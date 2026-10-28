@@ -256,7 +256,11 @@ use crate::{
     text_size, theme, CommentSide, ComposerPlacement, ItemData, ItemState, ReviewApp, ReviewItem,
     Source,
 };
-use gpui::component::{button::Button, Disableable, Sizable};
+use gpui::component::{
+    button::{Button, ButtonVariants},
+    link::Link,
+    Disableable, Sizable,
+};
 use gpui::{
     div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window,
@@ -381,29 +385,32 @@ impl ReviewApp {
             .p_4()
             .child(
                 div()
-                    .id(SharedString::from(format!("commits-toggle-{item_id}")))
                     .debug_selector(|| format!("commits-toggle-{item_id}"))
-                    .cursor_pointer()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(match &data.commits {
-                        Some(commits) => format!(
-                            "{} Commits ({}) · {}",
-                            if expanded { "▾" } else { "▸" },
-                            commits.commits.len(),
-                            if expanded { "collapse" } else { "expand" },
-                        ),
-                        None => "Commits".into(),
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let Some(item) = this.items.iter_mut().find(|item| item.id == item_id)
-                        else {
-                            return;
-                        };
-                        if let ItemState::Ready(data) = &mut item.state {
-                            data.commits_expanded = !data.commits_expanded;
-                            cx.notify();
-                        }
-                    })),
+                    .child(
+                        Button::new(SharedString::from(format!("commits-toggle-{item_id}")))
+                            .ghost()
+                            .small()
+                            .label(match &data.commits {
+                                Some(commits) => format!(
+                                    "{} Commits ({}) · {}",
+                                    if expanded { "▾" } else { "▸" },
+                                    commits.commits.len(),
+                                    if expanded { "collapse" } else { "expand" },
+                                ),
+                                None => "Commits".into(),
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(item) =
+                                    this.items.iter_mut().find(|item| item.id == item_id)
+                                else {
+                                    return;
+                                };
+                                if let ItemState::Ready(data) = &mut item.state {
+                                    data.commits_expanded = !data.commits_expanded;
+                                    cx.notify();
+                                }
+                            })),
+                    ),
             );
         let Some(commits) = &data.commits else {
             return section
@@ -473,19 +480,18 @@ impl ReviewApp {
                 );
             }
             for (run_ix, run) in commit.actions.iter().enumerate() {
-                let url = run.url.clone();
                 row = row.child(
                     div()
-                        .id(SharedString::from(format!(
-                            "commit-action-{}-{ix}-{run_ix}",
-                            item.id
-                        )))
                         .debug_selector(|| format!("commit-action-{}-{ix}-{run_ix}", item.id))
                         .mt_1()
-                        .text_color(theme::blue(cx))
-                        .cursor_pointer()
-                        .child(format!("Actions: {} ↗", run.name))
-                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                        .child(
+                            Link::new(SharedString::from(format!(
+                                "commit-action-{}-{ix}-{run_ix}",
+                                item.id
+                            )))
+                            .href(run.url.clone())
+                            .child(format!("Actions: {} ↗", run.name)),
+                        ),
                 );
             }
             section = section.child(row);
@@ -674,11 +680,17 @@ impl ReviewApp {
             .py_2()
             .text_size(px(text_size() - 1.))
             .text_color(theme::subtext(cx))
-            .overflow_hidden()
-            .child(div().truncate().child(summary));
+            .overflow_hidden();
         if thread.is_resolved && !composing {
-            header = header
-                .cursor_pointer()
+            header = header.child(
+                Button::new(SharedString::from(format!(
+                    "thread-toggle-{}-{}",
+                    item.id, thread.id
+                )))
+                .ghost()
+                .small()
+                .w_full()
+                .label(summary)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let Some(item) = this.items.iter_mut().find(|item| item.id == item_id) else {
                         return;
@@ -690,7 +702,10 @@ impl ReviewApp {
                         data.expanded_threads.insert(thread_id.clone());
                     }
                     cx.notify();
-                }));
+                })),
+            );
+        } else {
+            header = header.child(div().truncate().child(summary));
         }
         let mut card = div()
             .w_full()

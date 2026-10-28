@@ -137,14 +137,11 @@ impl Search {
             .filter(|(_, span)| span.side == side)
             .map(|(ix, span)| {
                 let color = if Some(*ix) == self.matches.current {
-                    theme::peach(cx)
+                    theme::search_current_bg(cx)
                 } else {
-                    theme::yellow(cx)
+                    theme::search_match_bg(cx)
                 };
-                (
-                    span.range.clone(),
-                    gpui::Hsla::from(color).opacity(0.4).into(),
-                )
+                (span.range.clone(), color)
             })
             .collect()
     }

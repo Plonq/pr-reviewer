@@ -5,7 +5,11 @@ use crate::threads::{wrap_body, CommentIndex, CommentSide, CommentTime, FileAnch
 use crate::tree::status_style;
 use crate::{row_height, theme, ReviewApp, SPLIT_DIVIDER};
 use diff_core::{DiffRow, FileStatus, Hunk, PrDiff};
-use gpui::component::{tag::Tag, Sizable as _};
+use gpui::component::{
+    button::{Button, ButtonVariants as _},
+    tag::Tag,
+    Sizable as _,
+};
 use gpui::{div, prelude::*, px, HighlightStyle, Hsla, SharedString, StyledText};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -1344,12 +1348,11 @@ fn render_row_content(
             let path = path.clone();
             let entity = entity.clone();
             comment_row(
-                div()
-                    .id(("reply", root_id as usize))
-                    .cursor_pointer()
-                    .text_color(theme::blue(cx))
-                    .hover(|style| style.opacity(0.8))
-                    .child(SharedString::from("↳ reply"))
+                Button::new(("reply", root_id as usize))
+                    .ghost()
+                    .xsmall()
+                    .h(row_height)
+                    .label("↳ reply")
                     .on_click(move |_, window, cx| {
                         entity.update(cx, |this, cx| {
                             this.open_composer(
