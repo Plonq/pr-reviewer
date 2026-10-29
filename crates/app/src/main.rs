@@ -11,6 +11,7 @@ mod minimap;
 mod position;
 mod presentation;
 mod queue;
+mod resolution;
 mod review_dialog;
 mod review_target;
 mod rows;
@@ -537,6 +538,8 @@ pub(crate) struct ItemData {
     /// and the scrollbar paints at the pane's edge — like the diff pane's.
     conv_scroll: ScrollHandle,
     discussion: Option<github::PrDiscussion>,
+    /// Invalidate older comment fetches when a resolution write starts.
+    discussion_generation: u64,
     posts: conversation::posting::Posts,
     commits: Option<github::PrCommits>,
     commits_expanded: bool,
@@ -622,6 +625,7 @@ impl ItemData {
             search: None,
             conv_scroll: ScrollHandle::new(),
             discussion: None,
+            discussion_generation: 0,
             posts: Default::default(),
             commits: None,
             commits_expanded: false,
@@ -659,6 +663,21 @@ impl ItemData {
     /// Install freshly built display rows, keeping the minimap model in sync
     /// (every row rebuild goes through here).
     fn set_rows(&mut self, mut built_rows: BuiltRows) {
+        let collapsed = self
+            .discussion
+            .iter()
+            .flat_map(|d| &d.threads)
+            .filter(|thread| {
+                thread.is_resolved
+                    && !self.expanded_threads.contains(&thread.id)
+                    && !self
+                        .editing_comment
+                        .as_ref()
+                        .is_some_and(|(id, _)| thread.comments.iter().any(|c| c.id == *id))
+            })
+            .filter_map(|thread| thread.comments.first().map(|c| c.id))
+            .collect();
+        resolution::collapse_threads(&mut built_rows, &collapsed);
         diff_media::resize_text_rows(&mut built_rows, &self.comment_text_layouts);
         if let Some((id, height)) = &self.editing_comment {
             comment_actions::reserve_editor_rows(
@@ -1136,6 +1155,7 @@ impl ReviewItem {
                 data.discussion = discussion;
                 data.commits = commits;
                 data.viewed.install(viewed);
+                data.set_rows(data.row_build());
                 self.state = ItemState::Ready(data);
             }
         }
@@ -2565,7 +2585,9 @@ impl ReviewApp {
         if matches!(item.state, ItemState::Loading) || item.reloading {
             return;
         }
-        if matches!(&item.state, ItemState::Ready(data) if !data.viewed.pending.is_empty()) {
+        if self.sessions.get(&item.id).is_some_and(|ui| ui.busy)
+            || matches!(&item.state, ItemState::Ready(data) if !data.viewed.pending.is_empty())
+        {
             return;
         }
         let mode = match &item.state {
@@ -3006,7 +3028,9 @@ impl ReviewApp {
         let mutation = command.clone();
         let mutated = matches!(
             command,
-            SessionCommand::EditPublished { .. } | SessionCommand::DeletePublished { .. }
+            SessionCommand::EditPublished { .. }
+                | SessionCommand::DeletePublished { .. }
+                | SessionCommand::SetThreadResolved { .. }
         );
         let Some(job) = self.session_job(item_id, command, cx) else {
             return;
@@ -3019,6 +3043,7 @@ impl ReviewApp {
                 app.finish_session(item_id, session, &result, cx);
                 if result.is_ok() {
                     app.apply_comment_mutation(item_id, &mutation);
+                    app.apply_thread_resolution(item_id, &mutation);
                 }
                 if let SessionCompletion::Composer(gen) = completion {
                     if let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) {
@@ -3051,7 +3076,9 @@ impl ReviewApp {
                     },
                     _ => {}
                 }
-                if (submitted || replied || commented || mutated) && result.is_ok() {
+                if ((submitted || replied || commented || mutated) && result.is_ok())
+                    || matches!(mutation, SessionCommand::SetThreadResolved { .. })
+                {
                     if let Some(Source::Pr(loc)) = app
                         .items
                         .iter()
@@ -3535,6 +3562,14 @@ impl ReviewApp {
     /// rebuild the rows with the viewport anchored — the counterpart of a
     /// full refresh for the post-comment path.
     fn refetch_comments(&mut self, item_id: u64, loc: github::PrLocator, cx: &mut Context<Self>) {
+        let generation = self
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .and_then(|item| match &item.state {
+                ItemState::Ready(data) => Some(data.discussion_generation),
+                _ => None,
+            });
         let github = self.github.clone();
         cx.spawn(async move |this, cx| {
             let fetched = cx
@@ -3547,6 +3582,9 @@ impl ReviewApp {
                 let ItemState::Ready(data) = &mut item.state else {
                     return;
                 };
+                if generation != Some(data.discussion_generation) {
+                    return;
+                }
                 match fetched {
                     Ok(discussion) => {
                         data.posts.reconcile(&discussion);
@@ -5439,17 +5477,16 @@ impl ReviewApp {
                                                         &entity,
                                                         if let Row::CommentHeader {
                                                             comment_id,
+                                                            top,
                                                             ..
                                                         } = row
                                                         {
-                                                            this.diff_comment_target(*comment_id)
-                                                                .map(|target| {
-                                                                    this.comment_controls(
-                                                                        target,
-                                                                        ComposerPlacement::Diff,
-                                                                        &entity,
-                                                                    )
-                                                                })
+                                                            Some(this.diff_comment_controls(
+                                                                *comment_id,
+                                                                *top,
+                                                                &entity,
+                                                                cx,
+                                                            ))
                                                         } else {
                                                             None
                                                         },
@@ -9269,6 +9306,10 @@ mod tests {
     /// (in order — the tests pin that nothing posts twice or out of turn).
     #[derive(Debug, Clone, PartialEq)]
     enum Post {
+        Resolve {
+            thread_id: String,
+            resolved: bool,
+        },
         Edit {
             target: github::CommentTarget,
             body: String,
@@ -9302,6 +9343,7 @@ mod tests {
     /// the tests watch the refetch show what was posted.
     #[derive(Default)]
     struct FakePr {
+        resolutions: std::sync::Mutex<HashMap<String, bool>>,
         comment_permissions: std::sync::Mutex<HashMap<u64, github::CommentPermissions>>,
         comments: std::sync::Mutex<Vec<github::ReviewComment>>,
         conversation: std::sync::Mutex<Vec<github::DiscussionComment>>,
@@ -9337,6 +9379,24 @@ mod tests {
     }
 
     impl github::GitHubClient for FakePr {
+        fn set_thread_resolved(
+            &self,
+            thread_id: &str,
+            resolved: bool,
+        ) -> Result<(), github::ClientError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(github::ClientError::Failed("resolution failed".into()));
+            }
+            self.resolutions
+                .lock()
+                .unwrap()
+                .insert(thread_id.into(), resolved);
+            self.posted.lock().unwrap().push(Post::Resolve {
+                thread_id: thread_id.into(),
+                resolved,
+            });
+            Ok(())
+        }
         fn edit_comment(
             &self,
             target: &github::CommentTarget,
@@ -9481,6 +9541,13 @@ mod tests {
             let mut discussion =
                 github::PrDiscussion::from_review_comments(self.comments.lock().unwrap().clone());
             discussion.comments = self.conversation.lock().unwrap().clone();
+            for thread in &mut discussion.threads {
+                if let Some(resolved) = self.resolutions.lock().unwrap().get(&thread.id) {
+                    thread.is_resolved = *resolved;
+                    thread.viewer_can_resolve = true;
+                    thread.viewer_can_unresolve = true;
+                }
+            }
             let permissions = self.comment_permissions.lock().unwrap();
             for comment in discussion.threads.iter_mut().flat_map(|t| &mut t.comments) {
                 comment.permissions = permissions.get(&comment.id).cloned().unwrap_or_default();
@@ -10323,6 +10390,236 @@ mod tests {
         vcx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
         vcx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
         vcx.run_until_parked();
+    }
+
+    #[test]
+    fn resolved_diff_threads_are_one_row_in_both_modes_and_keep_navigation_counts() {
+        let comments = vec![
+            rc(
+                11,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "root\n\n![image](https://example.com/a.png)",
+                "alice",
+                "a",
+                None,
+            ),
+            rc(
+                12,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "reply",
+                "bob",
+                "b",
+                Some(11),
+            ),
+            rc(
+                13,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "still open",
+                "bob",
+                "c",
+                None,
+            ),
+        ];
+        let mut item = loop_pr_item(comments.clone());
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        let mut discussion = github::PrDiscussion::from_review_comments(comments);
+        discussion.threads[0].is_resolved = true;
+        data.discussion = Some(discussion);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            data.mode = mode;
+            data.expanded_threads.clear();
+            data.set_rows(data.row_build());
+            assert_eq!(
+                data.rows
+                    .iter()
+                    .filter(|row| matches!(
+                        row,
+                        Row::CommentHeader {
+                            comment_id: 11,
+                            collapsed: true,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+            assert!(!data.rows.iter().any(|row| matches!(
+                row,
+                Row::CommentHeader { comment_id: 12, .. } | Row::CommentActions { root_id: 11, .. }
+            )));
+            assert!(!data.rows.iter().any(|row| matches!(row, Row::CommentBody { text, .. } if matches!(text.comment_id, 11 | 12))));
+            assert!(data
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::CommentActions { root_id: 13, .. })));
+            assert_eq!(data.comments.as_ref().unwrap().counts["a.rs"], (3, 0));
+            assert!(data
+                .file_rows
+                .iter()
+                .all(|&ix| matches!(data.rows[ix], Row::FileHeader { .. })));
+            assert!(data
+                .hunk_rows
+                .iter()
+                .all(|&ix| matches!(data.rows[ix], Row::Line { .. } | Row::SplitLine { .. })));
+            data.expanded_threads.insert("11".into());
+            data.set_rows(data.row_build());
+            assert!(data
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::CommentHeader { comment_id: 12, .. })));
+            assert!(data
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::CommentBody { text, .. } if text.comment_id == 11)));
+        }
+    }
+
+    #[gpui::test]
+    fn thread_resolution_controls_sync_both_views_and_show_failures(cx: &mut gpui::TestAppContext) {
+        use github::GitHubClient;
+        use std::sync::atomic::Ordering::SeqCst;
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "question",
+            "alice",
+            "a",
+            None,
+        )]);
+        fake.resolutions.lock().unwrap().insert("11".into(), false);
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut item = loop_pr_item(fake.comments.lock().unwrap().clone());
+        if let ItemState::Ready(data) = &mut item.state {
+            data.discussion = Some(fake.pr_discussion(&loop_loc()).unwrap());
+        }
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        click_commenting(&mut vcx, "thread-resolve-0-11");
+        cx.update(|cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert!(data.discussion.as_ref().unwrap().threads[0].is_resolved);
+            assert_eq!(
+                data.rows
+                    .iter()
+                    .filter(|row| rows::is_comment_row(row))
+                    .count(),
+                1
+            );
+            assert!(
+                !data.expanded_threads.contains("11"),
+                "resolving collapses the thread"
+            );
+        });
+        click_commenting(&mut vcx, "thread-expand-0-11");
+        cx.update(|cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert!(data.expanded_threads.contains("11"));
+            assert!(data
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::CommentActions { root_id: 11, .. })));
+        });
+        click_commenting(&mut vcx, "thread-expand-0-11");
+        cx.update(|cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert!(!data.expanded_threads.contains("11"));
+            assert_eq!(
+                data.rows
+                    .iter()
+                    .filter(|row| rows::is_comment_row(row))
+                    .count(),
+                1
+            );
+        });
+        vcx.dispatch_action(ShowConversation);
+        click_commenting(&mut vcx, "thread-resolve-0-11");
+        cx.update(|cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert!(!data.discussion.as_ref().unwrap().threads[0].is_resolved);
+            assert!(data
+                .rows
+                .iter()
+                .any(|row| matches!(row, Row::CommentActions { root_id: 11, .. })));
+            assert!(
+                !data.expanded_threads.contains("11"),
+                "the resolve button must not also toggle the header"
+            );
+        });
+        assert_eq!(
+            fake.posts(),
+            vec![
+                Post::Resolve {
+                    thread_id: "11".into(),
+                    resolved: true
+                },
+                Post::Resolve {
+                    thread_id: "11".into(),
+                    resolved: false
+                }
+            ]
+        );
+        fake.fail.store(true, SeqCst);
+        click_commenting(&mut vcx, "thread-resolve-0-11");
+        cx.update(|cx| {
+            let app = app.read(cx);
+            assert!(
+                !app.active_data()
+                    .unwrap()
+                    .discussion
+                    .as_ref()
+                    .unwrap()
+                    .threads[0]
+                    .is_resolved
+            );
+            assert!(app.sessions[&0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("resolution failed"));
+        });
+    }
+
+    #[gpui::test]
+    fn thread_resolution_requires_server_permissions(cx: &mut gpui::TestAppContext) {
+        use github::GitHubClient;
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "read only",
+            "alice",
+            "a",
+            None,
+        )]);
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut item = loop_pr_item(fake.comments.lock().unwrap().clone());
+        if let ItemState::Ready(data) = &mut item.state {
+            data.discussion = Some(fake.pr_discussion(&loop_loc()).unwrap());
+        }
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| this.set_thread_resolved(0, "11", window, cx));
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("thread-resolve-0-11").is_none());
+        assert!(fake.posts().is_empty());
+        vcx.dispatch_action(ShowConversation);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("thread-resolve-0-11").is_none());
     }
 
     #[gpui::test]

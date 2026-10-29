@@ -104,6 +104,11 @@ impl ReviewCodeContext {
 pub struct ReviewThread {
     pub id: String,
     pub is_resolved: bool,
+    /// Older cached discussions are read-only until refreshed.
+    #[serde(default)]
+    pub viewer_can_resolve: bool,
+    #[serde(default)]
+    pub viewer_can_unresolve: bool,
     pub is_outdated: bool,
     pub path: String,
     pub side: String,
@@ -174,6 +179,8 @@ impl PrDiscussion {
             discussion.threads.push(ReviewThread {
                 id: root.id.to_string(),
                 is_resolved: false,
+                viewer_can_resolve: false,
+                viewer_can_unresolve: false,
                 is_outdated: root.line.is_none(),
                 path: root.path.clone(),
                 side: root.side.clone().unwrap_or_else(|| "RIGHT".into()),
@@ -237,6 +244,8 @@ mod tests {
         assert!(discussion.threads[0].diff_hunk.is_empty());
         assert!(discussion.threads[0].code_context.is_none());
         assert!(discussion.threads[0].comments[0].review_id.is_none());
+        assert!(!discussion.threads[0].viewer_can_resolve);
+        assert!(!discussion.threads[0].viewer_can_unresolve);
         assert_eq!(
             serde_json::from_value::<PrDiscussion>(serde_json::to_value(&discussion).unwrap())
                 .unwrap(),

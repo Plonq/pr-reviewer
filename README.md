@@ -93,6 +93,9 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - inline GitHub review comments with GFM formatting (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
 - edit comments in place and delete them from their own cards, in the diff or
   conversation; published comments follow GitHub's per-comment permissions
+- review threads show resolved/unresolved status in both views, with
+  permission-aware resolve/unresolve controls; resolved threads start collapsed
+  (one line in the diff) and expand on click
 - multi-line comments: click then shift-click a line, or drag a selection and
   press `C` (ranges stay on one side); comments outside a patch hunk, including
   cross-hunk ranges, use GitHub's experimental positioning API and may depend

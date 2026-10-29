@@ -399,6 +399,32 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         })
     }
 
+    fn set_thread_resolved(&self, thread_id: &str, resolved: bool) -> Result<(), ClientError> {
+        if thread_id.is_empty() {
+            return Err(ClientError::Invalid(
+                "missing review thread identity".into(),
+            ));
+        }
+        let operation = if resolved {
+            "resolveReviewThread"
+        } else {
+            "unresolveReviewThread"
+        };
+        let value = self.review_graphql(format!(
+            "mutation {{ {operation}(input:{{threadId:{}}}) {{ thread {{ id isResolved }} }} }}",
+            json_string(thread_id)
+        ))?;
+        let thread = &value["data"][operation]["thread"];
+        if thread["id"].as_str() != Some(thread_id)
+            || thread["isResolved"].as_bool() != Some(resolved)
+        {
+            return Err(ClientError::Failed(
+                "GitHub returned no updated thread resolution".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn set_file_viewed(
         &self,
         pull_request_id: &str,
@@ -571,6 +597,12 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                     discussion.threads.push(crate::ReviewThread {
                         id: id.clone(),
                         is_resolved: decode_value(raw_thread["isResolved"].clone())?,
+                        viewer_can_resolve: raw_thread["viewerCanResolve"]
+                            .as_bool()
+                            .unwrap_or(false),
+                        viewer_can_unresolve: raw_thread["viewerCanUnresolve"]
+                            .as_bool()
+                            .unwrap_or(false),
                         is_outdated: decode_value(raw_thread["isOutdated"].clone())?,
                         path,
                         side: decode_value(raw_thread["side"].clone())?,
@@ -1338,7 +1370,7 @@ fn after_arg(cursor: Option<&str>) -> String {
 }
 
 fn review_thread_fields(cursor: Option<&str>) -> String {
-    format!("id path isResolved originalLine originalStartLine side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete path body diffHunk createdAt author {{ login }} reactionGroups {{ content users {{ totalCount }} }} replyTo {{ id:fullDatabaseId }} pullRequestReview {{ id state }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
+    format!("id path isResolved viewerCanResolve viewerCanUnresolve originalLine originalStartLine side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete path body diffHunk createdAt author {{ login }} reactionGroups {{ content users {{ totalCount }} }} replyTo {{ id:fullDatabaseId }} pullRequestReview {{ id state }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
 }
 
 fn database_id(value: &serde_json::Value) -> Result<u64, ClientError> {
@@ -2102,6 +2134,7 @@ mod tests {
             json!({
                 "id": id, "path": "src/main.rs", "side": "LEFT", "line": null, "start_line": null,
                 "isResolved": true, "isOutdated": true, "originalLine": 42, "originalStartLine": 40,
+                "viewerCanResolve": false, "viewerCanUnresolve": true,
                 "comments": comments
             })
         };
@@ -2169,6 +2202,8 @@ mod tests {
             "no pending comments in the published timeline"
         );
         assert!(discussion.threads[0].is_resolved);
+        assert!(!discussion.threads[0].viewer_can_resolve);
+        assert!(discussion.threads[0].viewer_can_unresolve);
         assert_eq!(discussion.threads[0].original_line, Some(42));
         assert_eq!(
             discussion.threads[0].comments[0].review_id.as_deref(),
@@ -2188,6 +2223,9 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert!(calls[2].join(" ").contains("node_id:id"));
         assert!(calls[4].join(" ").contains("diffHunk"));
+        assert!(calls[4]
+            .join(" ")
+            .contains("viewerCanResolve viewerCanUnresolve"));
         for (ix, cursor) in [
             (1, "main-next"),
             (3, "reviews-next"),
@@ -2309,6 +2347,70 @@ mod tests {
         ] {
             assert!(captured_code_position(&json!({"positioning": position})).is_none());
         }
+    }
+
+    #[test]
+    fn resolution_mutations_use_thread_identity_and_never_touch_pending_reviews() {
+        let id = "T\"\\\n1";
+        let replies: Vec<_> = [
+            ("resolveReviewThread", true),
+            ("unresolveReviewThread", false),
+        ]
+        .into_iter()
+        .map(|(operation, resolved)| {
+            serde_json::json!({
+                "data": {operation: {"thread": {"id": id, "isResolved": resolved}}}
+            })
+            .to_string()
+        })
+        .collect();
+        let (client, calls) =
+            session_script(&replies.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut session = crate::review_session::ReviewSession::default();
+        for resolved in [true, false] {
+            session
+                .execute(
+                    &client,
+                    &loc(),
+                    crate::review_session::Command::SetThreadResolved {
+                        thread_id: id.into(),
+                        resolved,
+                    },
+                )
+                .unwrap();
+        }
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        for (call, operation) in calls
+            .iter()
+            .zip(["resolveReviewThread", "unresolveReviewThread"])
+        {
+            assert_eq!(call[3], format!(
+                "query=mutation {{ {operation}(input:{{threadId:{}}}) {{ thread {{ id isResolved }} }} }}", json_string(id)
+            ));
+        }
+    }
+
+    #[test]
+    fn resolution_errors_and_missing_or_mismatched_results_are_not_success() {
+        for response in [
+            r#"{"errors":[{"message":"not permitted"}]}"#,
+            r#"{"data":{"resolveReviewThread":{"thread":null}}}"#,
+            r#"{"data":{"resolveReviewThread":{"thread":{"id":"other","isResolved":true}}}}"#,
+            r#"{"data":{"resolveReviewThread":{"thread":{"id":"T1","isResolved":false}}}}"#,
+        ] {
+            let (client, _) = session_script(&[response]);
+            assert!(client.set_thread_resolved("T1", true).is_err());
+        }
+        let (empty_client, calls) = session_script(&[]);
+        assert!(matches!(
+            empty_client.set_thread_resolved("", true),
+            Err(ClientError::Invalid(_))
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(client(ok(Some(1), "", "network unavailable"))
+            .set_thread_resolved("T1", false)
+            .is_err());
     }
 
     #[test]

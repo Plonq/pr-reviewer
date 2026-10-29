@@ -653,7 +653,7 @@ impl ReviewApp {
                     "▸ Resolved · "
                 }
             } else {
-                "Review thread · "
+                "Unresolved · "
             },
             anchor(thread),
             thread.comments[0].author,
@@ -676,6 +676,9 @@ impl ReviewApp {
             )))
             .debug_selector(|| format!("thread-header-{}-{}", item.id, thread.id))
             .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
             .px_4()
             .py_2()
             .text_size(px(text_size() - 1.))
@@ -683,30 +686,24 @@ impl ReviewApp {
             .overflow_hidden();
         if thread.is_resolved && !composing {
             header = header.child(
-                Button::new(SharedString::from(format!(
-                    "thread-toggle-{}-{}",
-                    item.id, thread.id
-                )))
-                .ghost()
-                .small()
-                .w_full()
-                .label(summary)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let Some(item) = this.items.iter_mut().find(|item| item.id == item_id) else {
-                        return;
-                    };
-                    let ItemState::Ready(data) = &mut item.state else {
-                        return;
-                    };
-                    if !data.expanded_threads.remove(&thread_id) {
-                        data.expanded_threads.insert(thread_id.clone());
-                    }
-                    cx.notify();
-                })),
+                div().flex_1().min_w_0().child(
+                    Button::new(SharedString::from(format!(
+                        "thread-toggle-{}-{}",
+                        item.id, thread.id
+                    )))
+                    .ghost()
+                    .small()
+                    .w_full()
+                    .label(summary)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_thread_expanded(item_id, &thread_id, cx);
+                    })),
+                ),
             );
         } else {
-            header = header.child(div().truncate().child(summary));
+            header = header.child(div().flex_1().min_w_0().truncate().child(summary));
         }
+        header = header.child(self.thread_controls(item.id, thread, false, &cx.entity(), cx));
         let mut card = div()
             .w_full()
             .flex_shrink_0()
@@ -1170,6 +1167,8 @@ pub(crate) mod tests {
             threads: vec![github::ReviewThread {
                 id: "T1".into(),
                 is_resolved: true,
+                viewer_can_resolve: true,
+                viewer_can_unresolve: true,
                 is_outdated: true,
                 path: "src/main.rs".into(),
                 side: "LEFT".into(),
