@@ -1,4 +1,4 @@
-//! Per-PR viewport memory. Persist source coordinates, not transient row indices:
+//! Per-PR and per-file viewport memory. Use source coordinates, not transient row indices:
 //! full-file upgrades, split view, and inline comments all change display rows.
 
 use crate::local_store::ReviewPosition;
@@ -93,13 +93,18 @@ impl ItemData {
             .map(|jump| jump.item_index as f32)
             .unwrap_or_else(|| f32::from(-offset.y).max(0.) / row_height());
         let row = (top.floor() as usize).min(self.rows.len().saturating_sub(1));
-        let (base, old_line, new_line) = (0..=row)
+        let (mut base, old_line, new_line) = (0..=row)
             .rev()
             .find_map(|ix| {
                 let (old, new) = line_numbers(self.rows.get(ix)?);
                 (old.is_some() || new.is_some()).then_some((ix, old, new))
             })
             .unwrap_or((row, None, None));
+        // Source-line restoration resolves to its first visual row. Include
+        // wrapped fragments in row_delta, even when a comment follows one.
+        while base > 0 && matches!(self.rows.get(base), Some(Row::Continuation(_))) {
+            base -= 1;
+        }
         Some(ReviewPosition {
             path,
             old_line,
