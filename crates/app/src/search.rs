@@ -199,17 +199,9 @@ impl ReviewApp {
             search.input.update(cx, |input, cx| input.focus(window, cx));
             return;
         }
-        let Some(mut prior) = data.review_position() else {
+        let Some(prior) = data.review_position() else {
             return;
         };
-        // Position restoration resolves a source line to its first visual row.
-        // Remember which wrapped fragment was at the top, including when a
-        // comment immediately beneath that fragment was the viewport anchor.
-        let mut base = prior.row.saturating_sub(prior.row_delta);
-        while base > 0 && matches!(data.rows.get(base), Some(Row::Continuation(_))) {
-            prior.row_delta += 1;
-            base -= 1;
-        }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in current diff…"));
         let subscription = cx.subscribe_in(&input, window, |this, input, event, window, cx| {
             // An input belonging to a background item must never search another file.

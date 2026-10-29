@@ -532,6 +532,9 @@ pub(crate) struct ItemData {
     scroll: UniformListScrollHandle,
     position_restore: Option<position::PositionRestore>,
     saved_position: Option<local_store::ReviewPosition>,
+    /// In-session viewport memory for files visited in this item, keyed by
+    /// path so refreshes that reorder the diff do not mix up positions.
+    file_positions: HashMap<String, local_store::ReviewPosition>,
     search: Option<search::Search>,
     /// The conversation pane's scroll position. A pane-level container (not
     /// the TextView's own), so the wheel scrolls from anywhere over the pane
@@ -622,6 +625,7 @@ impl ItemData {
             scroll: UniformListScrollHandle::new(),
             position_restore: None,
             saved_position: None,
+            file_positions: HashMap::new(),
             search: None,
             conv_scroll: ScrollHandle::new(),
             discussion: None,
@@ -763,13 +767,31 @@ impl ItemData {
         self.remember_jump();
     }
 
-    /// Show `file_ix` alone in the pane, revealed at `hunk_ix` (its first
-    /// hunk when None).
+    /// Show `file_ix` alone in the pane. An explicit hunk takes precedence;
+    /// otherwise resume its viewport, or reveal the first hunk on first visit.
     fn open_file(&mut self, file_ix: usize, hunk_ix: Option<usize>) {
         self.end_search();
+        if let Some(position) = self.review_position() {
+            self.file_positions.insert(position.path.clone(), position);
+        }
         self.file_ix = file_ix;
         self.selection = None;
         self.set_rows(self.row_build());
+        if hunk_ix.is_none() {
+            let position = self
+                .diff
+                .files
+                .get(file_ix)
+                .and_then(|file| self.file_positions.get(file.display_path()))
+                .cloned();
+            if let Some(mut position) = position {
+                // View mode belongs to the item, not the individual file.
+                position.split = self.mode == ViewMode::Split;
+                if self.restore_review_position(position, true) {
+                    return;
+                }
+            }
+        }
         self.reveal_hunk(hunk_ix);
     }
 
@@ -2677,7 +2699,7 @@ impl ReviewApp {
     }
 
     /// `]`/`[`: step to the next/previous file in tree order, wrapping —
-    /// the pane switches to it, revealed at its first change.
+    /// resuming its viewport, or revealing its first change on first visit.
     fn step_file(&mut self, delta: i32, cx: &mut Context<Self>) {
         let target = self.active_data().and_then(|data| data.step_file(delta));
         let Some(file_ix) = target else {
@@ -2689,7 +2711,7 @@ impl ReviewApp {
         cx.notify();
     }
 
-    /// Switch to changes, show `file_ix` (revealed at its first change),
+    /// Switch to changes, resume `file_ix` (first change on first visit),
     /// and focus the diff pane — what clicking a sidebar file does.
     pub(crate) fn jump_to_file(
         &mut self,
@@ -7290,11 +7312,67 @@ mod tests {
         assert_eq!(data.step_file(1), Some(1));
         data.open_file(1, None);
         assert_eq!(data.step_file(-1), Some(0));
-        // Opening a file applies the reveal: first change on screen.
+        // Selecting the current file keeps its position.
         data.open_file(1, None);
         assert_eq!(data.file_ix, 1);
         assert!(matches!(data.rows[0], Row::FileHeader { .. }));
         assert_eq!(data.cursor, data.hunk_rows[0]);
+    }
+
+    #[test]
+    fn file_switching_remembers_positions_but_explicit_hunks_override_them() {
+        let mut data = file_mode_data(two_file_diff());
+        data.position_restore = None;
+        data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        data.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(-17.), px(-2.375 * row_height())));
+        let first = data.review_position().unwrap();
+        data.open_file(1, None);
+        assert_eq!(data.cursor, data.hunk_rows[0], "first visit reveals a hunk");
+        let second = data.review_position().unwrap();
+        // Switch back before the deferred first-visit reveal has painted.
+        data.open_file(0, None);
+        assert_eq!(data.review_position(), Some(first.clone()));
+        data.open_file(0, None);
+        assert_eq!(data.review_position(), Some(first));
+        data.open_file(1, None);
+        assert_eq!(data.review_position(), Some(second));
+        data.open_file(0, Some(1));
+        assert_eq!(data.cursor, data.hunk_rows[1]);
+        let jumped = data.review_position().unwrap();
+        data.open_file(1, None);
+        data.open_file(0, None);
+        assert_eq!(data.review_position(), Some(jumped));
+    }
+
+    #[test]
+    fn file_viewports_follow_paths_without_reverting_the_current_view_mode() {
+        let mut data = file_mode_data(two_file_diff());
+        data.position_restore = None;
+        data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        data.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(-17.), px(-2.375 * row_height())));
+        let first = data.review_position().unwrap();
+        data.open_file(1, None);
+        // Model a refresh that reorders the files and a view-mode change
+        // while a.rs is not on screen.
+        data.diff.files.swap(0, 1);
+        data.file_ix = 0;
+        data.mode = ViewMode::Split;
+        data.set_rows(data.row_build());
+        data.open_file(1, None);
+        let restored = data.review_position().unwrap();
+        assert!(data.mode == ViewMode::Split);
+        assert_eq!(restored.path, first.path);
+        assert_eq!(restored.new_line, first.new_line);
+        assert_eq!(restored.fraction, first.fraction);
+        assert_eq!(restored.horizontal_offset, first.horizontal_offset);
     }
 
     #[test]
@@ -9947,6 +10025,84 @@ mod tests {
                 this.next_id = 1;
             });
         });
+    }
+
+    #[gpui::test]
+    fn file_switching_restores_the_painted_viewport(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            for wrap in [false, true] {
+                let lines = "abcdefghij".repeat(60) + "\n";
+                let mut diff = two_file_diff();
+                diff.files[0].hunks = diff_texts("", &lines.repeat(200), 3);
+                let mut data = file_mode_data(diff);
+                data.mode = mode;
+                data.preferences.soft_wrap = Some(wrap);
+                data.set_rows(data.row_build());
+                let mut item = loop_pr_item(Vec::new());
+                item.state = ItemState::Ready(data);
+                install_item(&app, item, &mut vcx);
+                vcx.update(|window, cx| {
+                    let focus = app.read(cx).focus_handle.clone();
+                    window.focus(&focus, cx);
+                    let _ = window.draw(cx);
+                });
+                let prior = vcx.update(|window, cx| {
+                    app.update(cx, |this, _| {
+                        let data = this.active_data_mut().unwrap();
+                        // In wrap mode, anchor to a continuation, not just
+                        // the source line's first visual row.
+                        let row = if wrap {
+                            data.rows
+                                .iter()
+                                .enumerate()
+                                .skip(60)
+                                .find(|(_, row)| matches!(row, Row::Continuation(_)))
+                                .unwrap()
+                                .0
+                        } else {
+                            60
+                        };
+                        data.position_restore = None;
+                        data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+                        data.scroll.0.borrow().base_handle.set_offset(point(
+                            px(if wrap { 0. } else { -45. }),
+                            px(-(row as f32 + 0.375) * row_height()),
+                        ));
+                    });
+                    let _ = window.draw(cx);
+                    app.read(cx)
+                        .active_data()
+                        .unwrap()
+                        .scroll
+                        .0
+                        .borrow()
+                        .base_handle
+                        .offset()
+                });
+                // Keyboard navigation to a short file clamps the shared
+                // scroll handle. Returning via the sidebar must restore it.
+                vcx.update(|window, cx| {
+                    app.update(cx, |this, cx| this.step_file(1, cx));
+                    let _ = window.draw(cx);
+                    assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1);
+                    app.update(cx, |this, cx| this.jump_to_file(0, window, cx));
+                    let _ = window.draw(cx);
+                    assert_eq!(
+                        app.read(cx)
+                            .active_data()
+                            .unwrap()
+                            .scroll
+                            .0
+                            .borrow()
+                            .base_handle
+                            .offset(),
+                        prior
+                    );
+                });
+            }
+        }
     }
 
     #[gpui::test]

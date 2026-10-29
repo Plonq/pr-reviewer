@@ -56,7 +56,8 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - enter (or click) opens a queue row straight into its changes view; `u` comes
   back to the queue with open PRs kept open behind the scenes
 - one file at a time: the whole file fills the pane — no `@@` markers, hunk
-  boundaries read from the highlighting — revealed at its first change;
+  boundaries read from the highlighting — revealed at its first change on
+  first visit, with each file's scroll position remembered while the review is open;
   `]`/`[` move between files and `n`/`p` between hunks (both wrap); returning
   to a PR resumes its last file and scroll position, even after restarting
 - unified + split views
