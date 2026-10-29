@@ -350,7 +350,8 @@ pub(crate) fn render_tree_row(
         .flex()
         .items_center()
         .gap_1()
-        .pr_2()
+        // Leave room for the stock tree's overlay scrollbar, even on hover.
+        .pr_5()
         .cursor_pointer()
         .child(
             div()
@@ -435,6 +436,8 @@ pub(crate) fn render_tree_row(
     ListItem::new(("file-tree-row", pos))
         .h(px(TREE_ROW_HEIGHT))
         .p_0()
+        // ListItem's text_base overrides the sidebar's inherited 12px size.
+        .text_size(px(12.))
         .child(content)
 }
 

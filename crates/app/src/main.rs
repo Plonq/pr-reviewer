@@ -6361,8 +6361,8 @@ mod tests {
         let checkbox = vcx.debug_bounds("viewed-1").unwrap();
         assert_eq!(
             checkbox.right(),
-            sidebar.right() - px(8.), // stock handle owns the divider; no duplicate border
-            "checkbox is the far-right row child"
+            sidebar.right() - px(20.),
+            "checkbox leaves room for the overlay scrollbar"
         );
         vcx.simulate_mouse_down(
             checkbox.center(),
@@ -6386,6 +6386,11 @@ mod tests {
             let _ = window.draw(cx);
         });
         let checkbox = vcx.debug_bounds("viewed-1").unwrap();
+        assert_eq!(
+            checkbox.right(),
+            sidebar.right() - px(20.),
+            "filtered rows also leave room for the overlay scrollbar"
+        );
         vcx.simulate_mouse_down(
             checkbox.center(),
             MouseButton::Left,
