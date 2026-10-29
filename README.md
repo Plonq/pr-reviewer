@@ -19,7 +19,7 @@ Changes at the fork point relative to upstream lgtm:
   diff rendering, tree-sitter highlighting, word-level intra-line diffs,
    minimap, file tree, inline review comments, local repo diffs,
   and the blob disk cache (now under `~/.cache/gander/`),
-- stock GPUI Kit appearance and syntax colors follow system light/dark mode,
+- dark-only Catppuccin Macchiato colors shared by the UI and syntax highlighting,
 - builds target Apple Silicon only.
 
 ## Setup
@@ -102,7 +102,7 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
    replies join the pending review too; **Add single comment** is available
    only without a pending review and posts immediately
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
-- follows the system light/dark appearance
+- dark-only theme with soft blue-grey surfaces and pastel accents
 
 ### Stock Markdown differences
 

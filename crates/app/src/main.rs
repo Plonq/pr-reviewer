@@ -342,7 +342,7 @@ fn main() {
         .with_http_client(http::http_client())
         .run(move |cx: &mut App| {
             gpui::component::init(cx);
-            theme::apply_ui_theme(None, cx);
+            theme::apply_ui_theme(cx);
             cx.bind_keys(presentation::keybindings());
             cx.bind_keys(search::keybindings());
             cx.bind_keys([
@@ -1650,12 +1650,6 @@ impl ReviewApp {
                 async {}
             }),
             cx.on_release(|this, _| this.persist_positions()),
-            // Kit initialization alone does not follow the system appearance.
-            // Synchronize again whenever the native appearance changes.
-            cx.observe_window_appearance(window, |_, window, cx| {
-                theme::apply_ui_theme(Some(window), cx);
-                cx.notify();
-            }),
             // The window's key status: the app refreshes when it comes
             // back to the front, and the background poll only runs while
             // it is frontmost.
@@ -7584,7 +7578,7 @@ mod tests {
     ) -> (gpui::AnyWindowHandle, gpui::Entity<ReviewApp>) {
         cx.update(|cx| {
             gpui::component::init(cx);
-            theme::apply_ui_theme(None, cx);
+            theme::apply_ui_theme(cx);
         });
         let stash = std::rc::Rc::new(std::cell::RefCell::new(None::<gpui::Entity<ReviewApp>>));
         let stash2 = stash.clone();

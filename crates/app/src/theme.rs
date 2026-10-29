@@ -1,16 +1,17 @@
-//! Domain-role adaptation only. Kit owns UI appearance and syntax colors.
-use gpui::component::{ActiveTheme, Theme, ThemeMode};
-use gpui::{App, HighlightStyle, Rgba, Window};
+//! One dark-only Catppuccin theme shared by Kit controls, Markdown and diffs.
+use gpui::component::{ActiveTheme, Theme, ThemeConfig};
+use gpui::{App, HighlightStyle, Rgba};
+use std::rc::Rc;
 use syntax::Token;
 
-/// Initialization does not establish system following; synchronize explicitly
-/// after Kit init and whenever the native window appearance changes.
-pub fn apply_ui_theme(window: Option<&mut Window>, cx: &mut App) {
-    let appearance = window
-        .as_ref()
-        .map(|w| w.appearance())
-        .unwrap_or_else(|| cx.window_appearance());
-    Theme::change(ThemeMode::from(appearance), window, cx);
+/// Install through Kit's supported write path so component tokens, TextView
+/// defaults and the Base scrollbar/resize handles all receive the same palette.
+/// Deliberately independent of the native window's light/dark appearance.
+pub fn apply_ui_theme(cx: &mut App) {
+    let config: ThemeConfig =
+        serde_json::from_str(include_str!("../themes/catppuccin-macchiato.json"))
+            .expect("bundled Catppuccin theme must be valid");
+    Theme::update(cx, |theme| theme.apply_config(&Rc::new(config)));
 }
 
 macro_rules! role {
@@ -20,19 +21,34 @@ macro_rules! role {
 }
 
 role! {
-    base => background, mantle => sidebar, crust => secondary,
+    base => background, mantle => sidebar,
     surface0 => border, text => foreground, subtext => muted_foreground,
     overlay0 => muted_foreground, green => success, red => danger,
-    blue => info, mauve => link, peach => warning, yellow => warning,
+    blue => info, mauve => magenta, yellow => warning,
     selection_bg => selection,
+}
+
+pub fn crust(cx: &App) -> Rgba {
+    cx.theme()
+        .highlight_theme
+        .style
+        .editor_gutter_background
+        .unwrap_or(cx.theme().sidebar)
+        .into()
+}
+
+pub fn peach(cx: &App) -> Rgba {
+    token_style(Token::Number, cx)
+        .color
+        .unwrap_or(cx.theme().warning)
+        .into()
 }
 
 pub fn is_light(cx: &App) -> bool {
     !cx.theme().mode.is_dark()
 }
 
-/// Keep our tree-sitter token model, resolving captures through Kit's stock
-/// syntax theme rather than maintaining another palette.
+/// Resolve our tree-sitter tokens through the same syntax theme as Kit's editors.
 pub fn token_style(token: Token, cx: &App) -> HighlightStyle {
     let capture = match token {
         Token::Keyword => "keyword",
@@ -45,12 +61,12 @@ pub fn token_style(token: Token, cx: &App) -> HighlightStyle {
         Token::Property => "property",
         Token::Variable => "variable",
         Token::Embedded => "embedded",
-        Token::Parameter => "variable.parameter",
+        Token::Parameter => "variable.special",
         Token::Operator => "operator",
         Token::Punctuation => "punctuation",
         Token::Attribute => "attribute",
         Token::Label => "label",
-        Token::Namespace => "namespace",
+        Token::Namespace => "constant",
     };
     cx.theme()
         .highlight_theme
@@ -101,13 +117,28 @@ pub fn removed_word_bg(cx: &App) -> Rgba {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::component::ThemeMode;
+    use gpui::{rgb, Hsla};
 
     #[gpui::test]
-    fn roles_and_syntax_follow_stock_appearance(cx: &mut gpui::TestAppContext) {
+    fn catppuccin_is_dark_and_shared_by_controls_and_syntax(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             gpui::init(cx);
             for mode in [ThemeMode::Light, ThemeMode::Dark] {
                 Theme::change(mode, None, cx);
+                apply_ui_theme(cx);
+                assert_eq!(cx.theme().mode, ThemeMode::Dark);
+                assert_eq!(
+                    cx.theme().theme_name().as_ref(),
+                    "Gander · Catppuccin Macchiato"
+                );
+                assert_eq!(cx.theme().background, Hsla::from(rgb(0x24273a)));
+                assert_eq!(cx.theme().tokens.background.color, cx.theme().background);
+                assert_eq!(cx.theme().tokens.sidebar.color, cx.theme().sidebar);
+                assert_eq!(cx.theme().button_primary, cx.theme().primary);
+                assert_eq!(cx.theme().tokens.button_primary.color, cx.theme().primary);
+                assert_eq!(cx.theme().scrollbar.a, 0.0);
+                assert!(cx.theme().scrollbar_thumb.a > 0.0);
                 assert_eq!(base(cx), Rgba::from(cx.theme().background));
                 assert_eq!(selection_bg(cx), Rgba::from(cx.theme().selection));
                 assert_eq!(
@@ -119,9 +150,38 @@ mod tests {
                         .style("keyword")
                         .unwrap_or_default()
                 );
+                assert_eq!(
+                    token_style(Token::Keyword, cx).color,
+                    Some(rgb(0xc6a0f6).into())
+                );
+                assert_ne!(peach(cx), yellow(cx));
+                assert_ne!(mauve(cx), blue(cx));
                 assert_ne!(added_row_bg(cx), removed_row_bg(cx));
                 assert!(added_word_bg(cx).a > added_row_bg(cx).a);
             }
         });
+    }
+
+    #[test]
+    fn bundled_theme_has_no_unknown_fields() {
+        // ThemeConfig accepts unknown JSON keys; a round-trip catches typos
+        // that would silently fall back to Kit's default colors or syntax.
+        let source: serde_json::Value =
+            serde_json::from_str(include_str!("../themes/catppuccin-macchiato.json")).unwrap();
+        let config: ThemeConfig = serde_json::from_value(source.clone()).unwrap();
+        for (key, value) in source["colors"].as_object().unwrap() {
+            gpui::component::try_parse_color(value.as_str().unwrap())
+                .unwrap_or_else(|_| panic!("invalid theme color: {key}"));
+        }
+        let parsed = serde_json::to_value(config).unwrap();
+        fn check(source: &serde_json::Value, parsed: &serde_json::Value) {
+            if let Some(object) = source.as_object() {
+                for (key, value) in object {
+                    assert!(parsed.get(key).is_some(), "unknown theme key: {key}");
+                    check(value, &parsed[key]);
+                }
+            }
+        }
+        check(&source, &parsed);
     }
 }
