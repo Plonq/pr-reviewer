@@ -88,7 +88,9 @@ fn height(rows: usize, line_height: gpui::Pixels) -> gpui::Pixels {
 }
 
 pub(crate) fn field<T: 'static>(state: &Entity<EditorState>, cx: &mut Context<T>) -> AnyElement {
-    let line_height = cx.theme().font_size * 1.5;
+    // Match the original Input's text-sm size (14px with the default theme).
+    let font_size = cx.theme().font_size * 0.875;
+    let line_height = font_size * 1.5;
     let h = height(
         state.read(cx).display_map().display_row_count(),
         line_height,
@@ -107,7 +109,7 @@ pub(crate) fn field<T: 'static>(state: &Entity<EditorState>, cx: &mut Context<T>
             Editor::new(state)
                 .h(h)
                 .font_family(cx.theme().font_family.clone())
-                .text_size(cx.theme().font_size)
+                .text_size(font_size)
                 .line_height(line_height),
         )
         .child(
@@ -179,6 +181,7 @@ mod tests {
         let (mut vcx, view, input) = fixture(cx);
         let minimum = settle(&mut vcx);
         vcx.update(|_, cx| {
+            assert_eq!(input.read(cx).line_height(), Some(px(21.)));
             assert_eq!(
                 input.read(cx).input_bounds().size.height,
                 input.read(cx).line_height().unwrap() * 3.
@@ -204,10 +207,10 @@ mod tests {
         });
         assert_eq!(settle(&mut vcx), minimum);
         vcx.update(|window, cx| {
-            gpui::component::Theme::global_mut(cx).font_size = px(20.);
+            gpui::component::Theme::global_mut(cx).font_size = px(24.);
             window.refresh();
         });
-        assert_eq!(settle(&mut vcx), height(3, px(30.)));
+        assert_eq!(settle(&mut vcx), height(3, px(31.5)));
     }
 
     #[gpui::test]
