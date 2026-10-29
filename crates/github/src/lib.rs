@@ -515,6 +515,12 @@ impl std::error::Error for ClientError {}
 /// construct and synchronous — they run on background threads, never the UI
 /// thread — and may spawn subprocesses or make network calls inside a call.
 pub trait GitHubClient: Send + Sync {
+    fn set_thread_resolved(&self, _thread_id: &str, _resolved: bool) -> Result<(), ClientError> {
+        Err(ClientError::Failed(
+            "thread resolution is not supported by this backend".into(),
+        ))
+    }
+
     fn edit_comment(&self, _target: &CommentTarget, _body: &str) -> Result<(), ClientError> {
         Err(ClientError::Failed(
             "comment editing is not supported by this backend".into(),

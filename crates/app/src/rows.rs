@@ -95,6 +95,8 @@ pub(crate) enum Row {
         half: Option<CommentSide>,
         /// First row of the whole thread, so it draws the card's top edge.
         top: bool,
+        /// A resolved thread represented by this header alone.
+        collapsed: bool,
     },
     /// A reservation for a Markdown block. `line` is the initial plain-text
     /// height estimate; the decoration renders the unwrapped source once.
@@ -247,6 +249,7 @@ fn push_thread_rows(
                 // A thread always opens with its root's header and closes with
                 // the actions row, so those two carry the card's edges.
                 top: ix == 0,
+                collapsed: false,
             });
             let push_text = |rows: &mut Vec<Row>, source: &str, part: usize| {
                 let text = Arc::new(crate::diff_media::CommentText {
@@ -1066,6 +1069,7 @@ fn line_content(
 /// continuous outline instead of a box per row.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CardEdge {
+    Single,
     Top,
     Middle,
     Bottom,
@@ -1104,6 +1108,7 @@ fn comment_row(
                     .border_l_2()
                     .border_r_1();
                 let body = match edge {
+                    CardEdge::Single => body.border_y_1().rounded_md(),
                     CardEdge::Top => body.border_t_1().rounded_t_md(),
                     CardEdge::Bottom => body.border_b_1().rounded_b_md(),
                     CardEdge::Middle => body,
@@ -1294,6 +1299,7 @@ fn render_row_content(
             is_reply,
             half,
             top,
+            collapsed,
             ..
         } => {
             let mut inner = div().flex().items_center().gap_2().min_w_0().w_full();
@@ -1323,7 +1329,9 @@ fn render_row_content(
                     .into_any_element(),
                 *half,
                 true,
-                if *top {
+                if *collapsed {
+                    CardEdge::Single
+                } else if *top {
                     CardEdge::Top
                 } else {
                     CardEdge::Middle

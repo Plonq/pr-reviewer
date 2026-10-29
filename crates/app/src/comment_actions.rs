@@ -314,6 +314,13 @@ impl ReviewApp {
         let mut row_ix = 0;
         if placement == ComposerPlacement::Diff {
             if let Some(data) = self.active_data_mut() {
+                if let Some(thread) = data.discussion.as_ref().and_then(|d| {
+                    d.threads
+                        .iter()
+                        .find(|t| t.comments.iter().any(|c| c.id == id))
+                }) {
+                    data.expanded_threads.insert(thread.id.clone());
+                }
                 if let Some(file_ix) = data
                     .diff
                     .files
