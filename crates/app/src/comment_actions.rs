@@ -6,11 +6,11 @@ use crate::{
     CommentSide, ComposerPlacement, ItemState, ReviewApp, ReviewComment, SessionCommand,
     SessionCompletion,
 };
-use gpui::{div, prelude::*, Context, MouseButton, SharedString, Window};
-use gpui_component::{
+use gpui::component::{
     button::{Button, ButtonVariants as _},
     Disableable as _, Sizable as _,
 };
+use gpui::{div, prelude::*, Context, MouseButton, SharedString, Window};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommentTarget {
@@ -69,7 +69,7 @@ pub(crate) fn reserve_editor_rows(built: &mut BuiltRows, id: u64, count: usize) 
     let end = start
         + built.rows[start..]
             .iter()
-            .take_while(|row| matches!(row, Row::CommentBody { .. } | Row::CommentMedia { .. }))
+            .take_while(|row| matches!(row, Row::CommentBody { .. }))
             .count();
     let count = count.max(1);
     for ix in built.file_rows.iter_mut().chain(&mut built.hunk_rows) {

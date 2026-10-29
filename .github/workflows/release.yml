@@ -23,7 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Create app bundle
         run: |
@@ -52,7 +52,7 @@ jobs:
             <key>CFBundleVersion</key>
             <string>${GITHUB_SHA::7}</string>
             <key>LSMinimumSystemVersion</key>
-            <string>12.0</string>
+            <string>15.0</string>
             <key>NSHighResolutionCapable</key>
             <true/>
           </dict>

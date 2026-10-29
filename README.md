@@ -17,10 +17,9 @@ Changes at the fork point relative to upstream lgtm:
   (Bifrost / rust-analyzer hover + go-to-definition),
 - the diff/review core that lgtm is kept for is intact: whole-file two-phase
   diff rendering, tree-sitter highlighting, word-level intra-line diffs,
-  minimap, ⌘K palette, file tree, inline review comments, local repo diffs,
+   minimap, file tree, inline review comments, local repo diffs,
   and the blob disk cache (now under `~/.cache/gander/`),
-- the palette follows the system appearance: Catppuccin Mocha in dark mode,
-  Latte in light mode,
+- dark-only Catppuccin Macchiato colors shared by the UI and syntax highlighting,
 - builds target Apple Silicon only.
 
 ## Setup
@@ -38,7 +37,15 @@ Note that you will need Xcode to build it from source because the metal dev
 tools are bundled with it (and `xcodebuild -downloadComponent MetalToolchain`
 if `cargo` complains about a missing Metal toolchain).
 
-Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
+Apple Silicon, macOS 15 or later — `aarch64-apple-darwin` is the pinned default
+target. `rust-toolchain.toml` pins Rust 1.98.1. Use `cargo build --release --locked`
+for a reproducible release build and `cargo test --workspace --locked` for the
+deterministic suite (authenticated/network checks are explicitly ignored).
+
+The UI stack is GPUI Kit **0.8.1**, using its exactly matched **gpui-pre 0.3.10**
+family. This is Longbridge's adapted Zed snapshot, not a newer official Zed GPUI
+release. Update the family together, with `Cargo.lock`; do not mix snapshots.
+Kit's platform enables the font backend and runtime Metal shader compilation.
 
 ## Features
 
@@ -69,7 +76,7 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
 - file-tree comment badges count comments and replies, including outdated comments and drafts
 - per-viewer viewed checkboxes at the right edge of the file tree; click or `V`
   to mark/unmark on GitHub, with optimistic updates and visible sync failures
-- cmd-k palette with fuzzy PR picker
+- quick-open (`cmd-t`) for known PR identifiers, PR URLs, and local repository paths
 - PR conversation (title-bar Conversation / Changes button, or `⇧⌘←` / `⇧⌘→`):
   GFM description and chronological comments; reviews
   group their inline threads beneath the summary, with captured code context,
@@ -79,9 +86,8 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
   Main-thread drafts append to the pending review summary; replies stay in-thread.
   Posted comments appear immediately as placeholders and update in place when
   the refreshed discussion arrives.
-- inline images and screenshots in conversations and diff comment threads,
-  including private GitHub attachments using `gh auth token`; each SVG switches
-  between rendered and source views
+- stock Markdown and images in conversations and diff comment threads,
+  including cached private GitHub attachments using the secure HTTP bridge
 - local repo diffs
 - minimap
 - inline GitHub review comments with GFM formatting (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
@@ -96,7 +102,16 @@ Apple Silicon only — `aarch64-apple-darwin` is the pinned default target.
    replies join the pending review too; **Add single comment** is available
    only without a pending review and posts immediately
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
-- follows the system light/dark appearance
+- dark-only theme with soft blue-grey surfaces and pastel accents
+
+### Stock Markdown differences
+
+Kit's TextView owns Markdown layout and media. GitHub mention/issue links and
+emoji preprocessing remain. Reference-style images are omitted; unlinked images
+do not open on click; SVG source toggles and custom image loading/error messages
+are gone. Inline images can be smaller than the former media cards, and narrow
+tables may clip. These are intentional stock-renderer tradeoffs, not custom
+rendering features to restore.
 
 ## Where its state lives
 
@@ -124,7 +139,6 @@ only by your account. Delete that directory to clear downloaded images.
 
 | Key | Action |
 |---|---|
-| `cmd-k` | open palette (GitHub PR picker / folder) |
 | `cmd-t` / `cmd-w` / `cmd-b` | quick-open input / close item / toggle sidebar |
 | `ctrl-tab` | cycle open items |
 | `j` / `k` + `enter` | queue: move the selection, open the selected PR |

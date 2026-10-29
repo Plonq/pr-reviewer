@@ -12,7 +12,7 @@ use gpui::{
 
 use crate::{
     conversation, row_height,
-    rows::{BuiltRows, Row, COMMENT_MEDIA_ROWS},
+    rows::{BuiltRows, Row},
     text_size, theme,
     threads::{CommentSide, COMMENT_WRAP_CHARS},
     ItemPane, ItemState, ReviewApp, Source, MONO, SPLIT_DIVIDER,
@@ -120,7 +120,7 @@ fn text_content(
         .font_family(MONO)
         .text_size(px(text_size()))
         .line_height(px(row_height()))
-        .text_color(theme::subtext())
+        .text_color(theme::subtext(cx))
         .child(conversation::render_markdown(id, source, window, cx))
         .into_any_element()
 }
@@ -270,6 +270,13 @@ impl UniformListDecoration for InlineText {
                     _ => px(0.),
                 };
                 let id = text.id(item.id);
+                let owner = self.0.clone();
+                let item_id = item.id;
+                let key = text.key();
+                let source = text.source.clone();
+                let measured_width = layout.width;
+                let measured_font = layout.font_size;
+                let reserved = layout.rows;
                 layer = layer.child(
                     div()
                         .absolute()
@@ -283,6 +290,48 @@ impl UniformListDecoration for InlineText {
                             move || format!("{id}-card")
                         })
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        // Images resolve asynchronously inside stock TextView.
+                        // Observe its outer content geometry, not its block or
+                        // media internals, and resize only the matching source.
+                        .on_children_prepainted(move |bounds, window, cx| {
+                            let Some(content) = bounds.first() else {
+                                return;
+                            };
+                            let rows = ((f32::from(content.size.height) + 8.) / row_height())
+                                .ceil()
+                                .max(1.) as usize;
+                            if rows == reserved {
+                                return;
+                            }
+                            let owner = owner.clone();
+                            let source = source.clone();
+                            window.defer(cx, move |_, cx| {
+                                owner.update(cx, |app, cx| {
+                                    let Some(ItemState::Ready(data)) = app
+                                        .items
+                                        .iter_mut()
+                                        .find(|item| item.id == item_id)
+                                        .map(|item| &mut item.state)
+                                    else {
+                                        return;
+                                    };
+                                    let Some(layout) = data.comment_text_layouts.get_mut(&key)
+                                    else {
+                                        return;
+                                    };
+                                    if layout.source != source
+                                        || layout.width != measured_width
+                                        || layout.font_size != measured_font
+                                        || layout.rows == rows
+                                    {
+                                        return;
+                                    }
+                                    layout.rows = rows;
+                                    data.rebuild_rows_anchored();
+                                    cx.notify();
+                                });
+                            });
+                        })
                         .child(text_content(
                             &id,
                             layout.rendered.clone(),
@@ -294,97 +343,6 @@ impl UniformListDecoration for InlineText {
             }
             layer.into_any_element()
         })
-    }
-}
-
-pub(crate) struct InlineMedia(pub Entity<ReviewApp>);
-
-impl UniformListDecoration for InlineMedia {
-    fn compute(
-        &self,
-        visible: Range<usize>,
-        bounds: Bounds<Pixels>,
-        scroll_offset: Point<Pixels>,
-        item_height: Pixels,
-        _item_count: usize,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> gpui::AnyElement {
-        let mut cards = Vec::new();
-        let mut last_start = None;
-        let item_id = {
-            let app = self.0.read(cx);
-            let Some(item) = app.active_item() else {
-                return div().into_any_element();
-            };
-            let ItemState::Ready(data) = &item.state else {
-                return div().into_any_element();
-            };
-            // Only inspect visible slots, not every source row in a large diff.
-            for ix in visible {
-                if let Some(Row::CommentMedia {
-                    comment_id,
-                    image_ix,
-                    media,
-                    slot,
-                    half,
-                }) = data.rows.get(ix)
-                {
-                    let start = ix - slot;
-                    if last_start == Some(start) {
-                        continue;
-                    }
-                    last_start = Some(start);
-                    cards.push((start, *comment_id, *image_ix, media.clone(), *half));
-                }
-            }
-            item.id
-        };
-        let mut layer = div().relative().w(bounds.size.width).h(bounds.size.height);
-        for (start, comment_id, image_ix, media, half) in cards {
-            let width = match half {
-                None => bounds.size.width,
-                Some(_) => (bounds.size.width - px(SPLIT_DIVIDER)) / 2.,
-            };
-            let x = match half {
-                Some(CommentSide::Right) => width + px(SPLIT_DIVIDER),
-                _ => px(0.),
-            };
-            let height = item_height * COMMENT_MEDIA_ROWS;
-            let id = format!("inline-comment-{item_id}-{comment_id}-{image_ix}");
-            layer = layer.child(
-                div()
-                    .absolute()
-                    // Decorations' origin already includes both scroll offsets.
-                    // Like split code gutters, media stays inside its viewport.
-                    .left(x - scroll_offset.x + px(72.))
-                    .top(item_height * start)
-                    .w((width - px(72.)).max(px(0.)))
-                    .h(height)
-                    .bg(theme::comment_bg())
-                    .border_l_2()
-                    .border_r_1()
-                    .border_color(theme::comment_outline())
-                    .px_3()
-                    .py_1()
-                    .overflow_hidden()
-                    .debug_selector({
-                        let id = id.clone();
-                        move || format!("{id}-card")
-                    })
-                    // Image/source interactions must not start code selection or
-                    // move the diff cursor to a media placeholder.
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(conversation::render_inline(
-                        &id,
-                        &media,
-                        f32::from(height) - 8.,
-                        window,
-                        cx,
-                    )),
-            );
-        }
-        layer.into_any_element()
     }
 }
 

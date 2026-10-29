@@ -96,42 +96,6 @@ pub fn resolve_local_with_base(path: &Path, base_ref: Option<&str>) -> Result<Lo
     })
 }
 
-/// Refs suitable for choosing a local diff base, in UI order.
-pub fn list_base_refs(path: &Path) -> Result<Vec<String>> {
-    let repo_root = PathBuf::from(
-        git(path, &["rev-parse", "--show-toplevel"])
-            .with_context(|| format!("{} is not inside a git repository", path.display()))?
-            .trim(),
-    );
-    let branch = git(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
-        .trim()
-        .to_string();
-    let mut candidates = Vec::new();
-    for cand in default_base_candidates(&repo_root) {
-        push_unique(&mut candidates, cand);
-    }
-    push_unique(&mut candidates, "HEAD".to_string());
-    let refs = git(
-        &repo_root,
-        &[
-            "for-each-ref",
-            "--format=%(refname:short)",
-            "refs/heads",
-            "refs/remotes",
-        ],
-    )?;
-    for cand in refs.lines().map(str::trim).filter(|cand| !cand.is_empty()) {
-        if cand == branch || cand.ends_with("/HEAD") {
-            continue;
-        }
-        push_unique(&mut candidates, cand.to_string());
-    }
-    Ok(candidates
-        .into_iter()
-        .filter(|cand| cand == "HEAD" || git(&repo_root, &["merge-base", "HEAD", cand]).is_ok())
-        .collect())
-}
-
 fn default_base_candidates(repo_root: &Path) -> Vec<String> {
     let mut candidates = Vec::new();
     push_remote_head(repo_root, "origin", &mut candidates);
@@ -361,25 +325,6 @@ mod tests {
             explicit.base_oid.as_deref(),
             Some(git(dir, &["merge-base", "HEAD", "release"]).unwrap().trim())
         );
-    }
-
-    #[test]
-    fn list_base_refs_includes_head_and_local_branches() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        init_repo(dir);
-        fs::write(dir.join("lib.rs"), "pub fn one() {}\n").unwrap();
-        run(dir, &["git", "add", "."]);
-        run(dir, &["git", "commit", "-m", "init"]);
-        run(dir, &["git", "checkout", "-b", "release"]);
-        run(dir, &["git", "checkout", "main"]);
-        run(dir, &["git", "checkout", "-b", "feature"]);
-
-        let refs = list_base_refs(dir).unwrap();
-        assert!(refs.iter().any(|base| base == "HEAD"), "{refs:?}");
-        assert!(refs.iter().any(|base| base == "main"), "{refs:?}");
-        assert!(refs.iter().any(|base| base == "release"), "{refs:?}");
-        assert!(!refs.iter().any(|base| base == "feature"), "{refs:?}");
     }
 
     #[test]

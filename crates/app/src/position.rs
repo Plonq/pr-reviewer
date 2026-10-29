@@ -76,8 +76,8 @@ impl ItemData {
             if let Some(restore) = &self.position_restore {
                 let max = state.base_handle.max_offset();
                 let clamped = point(
-                    restore.offset.x.max(-max.width).min(px(0.)),
-                    restore.offset.y.max(-max.height).min(px(0.)),
+                    restore.offset.x.max(-max.x).min(px(0.)),
+                    restore.offset.y.max(-max.y).min(px(0.)),
                 );
                 // A patch may not contain this line yet, or may be too short
                 // to put it at the top. Keep the requested anchor until phase 2,

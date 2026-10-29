@@ -1,14 +1,17 @@
 mod chrome;
 mod comment_actions;
 mod comment_anchor;
+mod comment_editor;
 mod conversation;
 mod diff_media;
 mod http;
 mod local_store;
+mod mentions;
 mod minimap;
 mod position;
 mod presentation;
 mod queue;
+mod review_dialog;
 mod review_target;
 mod rows;
 mod search;
@@ -22,49 +25,41 @@ mod viewed;
 #[cfg(test)]
 mod test_util;
 
-use chrome::{
-    app_title, centered_message, filtered_sources, palette_pr_row, BaseListState, PaletteStep,
-    PrListState, PALETTE_ROW_HEIGHT, PALETTE_SOURCES, SOURCE_FOLDER, SOURCE_PR,
-};
+use chrome::{app_title, centered_message};
 use comment_actions::CommentTarget;
 use diff_core::{FileStatus, PrDiff};
 use github::review_session::{Command as SessionCommand, ReviewSession};
-use gpui::{
-    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
-    Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding,
-    Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy, SharedString,
-    Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
-    WindowOptions,
-};
-use gpui_component::{
+use gpui::component::{
     avatar::Avatar,
     button::{Button, ButtonVariants as _},
-    input::{
-        CompletionProvider, Enter as InputEnter, Escape as InputEscape, Input, InputEvent,
-        InputState,
-    },
+    input::{Enter as InputEnter, Escape as InputEscape, Input, InputEvent, InputState},
     kbd::Kbd,
     scroll::Scrollbar,
     tag::Tag,
-    Disableable as _, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
+    Disableable as _, IconName, Root, Selectable as _, Sizable as _, TitleBar, WindowExt as _,
+};
+use gpui::{
+    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
+    AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding, Keystroke,
+    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, ScrollHandle, ScrollStrategy, SharedString, Subscription, Task, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use minimap::{
     minimap_rows, minimap_runs, minimap_scale, MinimapColor, MinimapLane, MinimapLayout,
     MinimapRow, MINIMAP_GAP, MINIMAP_PAD, MINIMAP_WIDTH,
 };
-use queue::{filter_base_refs, filter_prs, label_chip_colors, queue_chips, queue_row};
+use queue::{queue_chips, queue_row};
 use review_target::{dir_name, fetch_item, sources_match, Loaded, LoadedMeta, Source};
 use rows::{
     build_rows, comment_anchor, cursor_anchor, is_comment_row, now_unix, nth_noncomment_row,
-    render_row, widest_row_ix, BuiltRows, FileUpgrade, LineKind, Row, RowOptions, RowsView,
-    ViewMode,
+    render_row, widest_row_ix, BuiltRows, FileUpgrade, Row, RowOptions, RowsView, ViewMode,
 };
 use selection::{row_selection_range, selection_text, RowCol, SelSide, Selection};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -73,8 +68,7 @@ use threads::{
     CommentTime, ReviewComment, COMMENT_WRAP_CHARS,
 };
 use tree::{
-    build_tree, fuzzy_file_matches, render_tree_row, visible_entries, TreeEntry, TreeEntryKind,
-    TreeListRow,
+    build_tree, fuzzy_file_matches, render_tree_row, TreeEntry, TreeEntryKind, TreeListRow,
 };
 use upgrade::{run_upgrade, UpgradeJob, UpgradeSource};
 
@@ -222,10 +216,6 @@ actions!(
         BackToQueue,
         QueueSortToggle,
         QueueClearFilters,
-        OpenPalette,
-        PaletteUp,
-        PaletteDown,
-        PaletteBack,
         ClearSelection,
         CopySelection,
         FocusTreeFilter,
@@ -288,11 +278,11 @@ impl AssetSource for AppAssets {
         if let Some((_, bytes)) = OWNED_ASSETS.iter().find(|(known, _)| *known == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        gpui_component_assets::Assets.load(path)
+        gpui::assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
-        let mut all = gpui_component_assets::Assets.list(path)?;
+        let mut all = gpui::assets::Assets.list(path)?;
         all.extend(
             OWNED_ASSETS
                 .iter()
@@ -323,8 +313,8 @@ fn main() {
     // GitHub vocabulary.
     let github = github_client();
     // Bare launch lands on the review queue — the home screen. The repo we
-    // stand in stays one explicit act away (`.` as an argument, or the
-    // palette's "open local folder"), so local review keeps working
+    // stand in stays one explicit act away (`.` as an argument or in
+    // quick-open), so local review keeps working
     // without hijacking the launch.
     for arg in &args {
         let parsed = if Path::new(arg).is_dir() {
@@ -345,14 +335,14 @@ fn main() {
             }
         }
     }
-    Application::new()
+    gpui::application()
         .with_assets(AppAssets)
         // gpui ships a NullHttpClient: without a real one, every remote
         // `img()` (the account avatar, later PR media) silently fails.
         .with_http_client(http::http_client())
         .run(move |cx: &mut App| {
-            gpui_component::init(cx);
-            theme::apply_ui_theme(None, cx);
+            gpui::component::init(cx);
+            theme::apply_ui_theme(cx);
             cx.bind_keys(presentation::keybindings());
             cx.bind_keys(search::keybindings());
             cx.bind_keys([
@@ -363,7 +353,7 @@ fn main() {
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
                 // Sideways through long lines in either diff mode. Inputs
-                // deeper in the tree (a focused palette/filter input) keep
+                // deeper in the tree (a focused filter input) keep
                 // their own left/right for caret movement.
                 KeyBinding::new("left", ScrollLeft, Some("ReviewApp")),
                 KeyBinding::new("right", ScrollRight, Some("ReviewApp")),
@@ -388,7 +378,7 @@ fn main() {
                 KeyBinding::new("s", QueueSortToggle, Some("Queue")),
                 KeyBinding::new("escape", QueueClearFilters, Some("Queue")),
                 // `u` leaves the changes view for the queue again; the open
-                // item stays open behind the scenes (⌘K / ctrl-tab reach
+                // item stays open behind the scenes (ctrl-tab reaches
                 // it). Bound in the diff's context so typing in the queue
                 // or any input never triggers it.
                 KeyBinding::new("u", BackToQueue, Some("ReviewApp")),
@@ -407,9 +397,7 @@ fn main() {
                 // Only while the diff pane has focus; typing `/` in any input
                 // stays a plain character.
                 KeyBinding::new("/", FocusTreeFilter, Some("ReviewApp")),
-                // Selection: escape/cmd-c only fire while the diff pane has
-                // focus; with the palette open its input has focus, so the
-                // palette's own escape routing wins by construction.
+                // Selection: escape/cmd-c only fire while the diff pane has focus.
                 KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
                 KeyBinding::new("cmd-c", CopySelection, Some("ReviewApp")),
                 KeyBinding::new("ctrl-tab", NextItem, Some("ReviewApp")),
@@ -424,21 +412,11 @@ fn main() {
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
                 KeyBinding::new("cmd-t", OpenInput, None),
                 KeyBinding::new("cmd-w", CloseItem, None),
-                KeyBinding::new("cmd-k", OpenPalette, None),
                 KeyBinding::new("cmd-q", Quit, None),
-                // Palette navigation. The `Palette > Input` variants are bound
-                // after gpui_component::init, so at the input's dispatch depth
-                // they take precedence over the Input's own up/down (which a
-                // single-line input consumes without propagating).
-                KeyBinding::new("up", PaletteUp, Some("Palette")),
-                KeyBinding::new("down", PaletteDown, Some("Palette")),
-                KeyBinding::new("escape", PaletteBack, Some("Palette")),
-                KeyBinding::new("up", PaletteUp, Some("Palette > Input")),
-                KeyBinding::new("down", PaletteDown, Some("Palette > Input")),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             // One window is the whole app: closing it quits the process.
-            cx.on_window_closed(|cx| {
+            cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
                 }
@@ -464,7 +442,7 @@ fn main() {
                     let view = cx.new(|cx| {
                         ReviewApp::new(sources, errors, github, store, store_error, window, cx)
                     });
-                    window.focus(&view.read(cx).focus_handle);
+                    window.focus(&view.read(cx).focus_handle.clone(), cx);
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             )
@@ -604,7 +582,7 @@ pub(crate) struct ItemData {
     /// Collapsed directory paths, preserved across rebuilds where the
     /// directory still exists.
     pub(crate) collapsed: HashSet<String>,
-    tree_scroll: UniformListScrollHandle,
+    tree_view: Option<tree::FileTree>,
     /// The file last auto-centered in the tree, so follow-the-diff only
     /// scrolls the tree when the viewport's file changes — never while the
     /// user scrolls the tree themselves.
@@ -667,7 +645,7 @@ impl ItemData {
             mentions_fetched: false,
             tree: Vec::new(),
             collapsed: HashSet::new(),
-            tree_scroll: UniformListScrollHandle::new(),
+            tree_view: None,
             tree_last_file: None,
         };
         data.additions = data.diff.files.iter().fold(0, |a, f| a + f.additions);
@@ -1030,18 +1008,18 @@ impl ReviewItem {
         true
     }
 
-    fn dot_color(&self) -> gpui::Rgba {
+    fn dot_color(&self, cx: &gpui::App) -> gpui::Rgba {
         match &self.source {
-            Source::Local(_) => theme::blue(),
+            Source::Local(_) => theme::blue(cx),
             Source::Pr(_) => match &self.state {
                 ItemState::Ready(data) => match data.pr_meta.as_ref().map(|m| m.state.as_str()) {
-                    Some("OPEN") => theme::green(),
-                    Some("MERGED") => theme::mauve(),
-                    Some("CLOSED") => theme::red(),
-                    _ => theme::overlay0(),
+                    Some("OPEN") => theme::green(cx),
+                    Some("MERGED") => theme::mauve(cx),
+                    Some("CLOSED") => theme::red(cx),
+                    _ => theme::overlay0(cx),
                 },
-                ItemState::Failed(_) => theme::red(),
-                ItemState::Loading => theme::overlay0(),
+                ItemState::Failed(_) => theme::red(cx),
+                ItemState::Loading => theme::overlay0(cx),
             },
         }
     }
@@ -1167,16 +1145,16 @@ impl ReviewItem {
 
 fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
     let (state_color, state_label) = match meta.state.as_str() {
-        "OPEN" => (theme::green(), "open"),
-        "MERGED" => (theme::mauve(), "merged"),
-        "CLOSED" => (theme::red(), "closed"),
-        other => (theme::overlay0(), other),
+        "OPEN" => (theme::green(cx), "open"),
+        "MERGED" => (theme::mauve(cx), "merged"),
+        "CLOSED" => (theme::red(cx), "closed"),
+        other => (theme::overlay0(cx), other),
     };
     let state: Hsla = state_color.into();
     // The PR's overall review decision, when it has one.
     let decision = match meta.review_decision.as_str() {
-        "APPROVED" => Some((theme::green(), "approved")),
-        "CHANGES_REQUESTED" => Some((theme::red(), "changes requested")),
+        "APPROVED" => Some((theme::green(cx), "approved")),
+        "CHANGES_REQUESTED" => Some((theme::red(cx), "changes requested")),
         _ => None,
     };
     let url = meta.url.clone();
@@ -1205,12 +1183,12 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                 )
                 .child(
                     div()
-                        .text_color(theme::subtext())
+                        .text_color(theme::subtext(cx))
                         .child(SharedString::from(format!("#{}", meta.number))),
                 )
                 .child(
                     div()
-                        .text_color(theme::subtext())
+                        .text_color(theme::subtext(cx))
                         .whitespace_nowrap()
                         .child(SharedString::from(format!("by {}", meta.author.login))),
                 )
@@ -1232,7 +1210,7 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                 .pr_3()
                 .child(
                     div()
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child(SharedString::from(format!(
                             "{} ← {}",
                             meta.base_ref_name, meta.head_ref_name
@@ -1240,12 +1218,12 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                 )
                 .child(
                     div()
-                        .text_color(theme::green())
+                        .text_color(theme::green(cx))
                         .child(SharedString::from(format!("+{}", meta.additions))),
                 )
                 .child(
                     div()
-                        .text_color(theme::red())
+                        .text_color(theme::red(cx))
                         .child(SharedString::from(format!("−{}", meta.deletions))),
                 )
                 .child(
@@ -1271,13 +1249,12 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
 }
 
 fn local_titlebar_content(
-    item_id: u64,
+    _item_id: u64,
     src: &git::LocalSource,
     data: &ItemData,
     cx: &mut Context<ReviewApp>,
 ) -> gpui::AnyElement {
-    let blue: Hsla = theme::blue().into();
-    let repo_root = src.repo_root.clone();
+    let blue: Hsla = theme::blue(cx).into();
     div()
         .flex()
         .items_center()
@@ -1311,15 +1288,8 @@ fn local_titlebar_content(
                 .pr_3()
                 .child(
                     div()
-                        .id("local-base-picker")
                         .px_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .text_color(theme::overlay0())
-                        .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.6)))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_local_base_palette(item_id, repo_root.clone(), window, cx);
-                        }))
+                        .text_color(theme::overlay0(cx))
                         .child(SharedString::from(format!(
                             "{} ← {}",
                             src.base_label, src.branch
@@ -1327,12 +1297,12 @@ fn local_titlebar_content(
                 )
                 .child(
                     div()
-                        .text_color(theme::green())
+                        .text_color(theme::green(cx))
                         .child(SharedString::from(format!("+{}", data.additions))),
                 )
                 .child(
                     div()
-                        .text_color(theme::red())
+                        .text_color(theme::red(cx))
                         .child(SharedString::from(format!("−{}", data.deletions))),
                 )
                 .child(
@@ -1346,131 +1316,6 @@ fn local_titlebar_content(
                 ),
         )
         .into_any_element()
-}
-
-fn parse_repo_slug(value: &str) -> Result<(String, String), &'static str> {
-    let (owner, repo) = value.split_once('/').ok_or("expected owner/repo")?;
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-        return Err("expected owner/repo");
-    }
-    Ok((owner.to_string(), repo.to_string()))
-}
-
-// --- @-mention autocomplete ------------------------------------------------
-
-/// Most completion items to offer at once.
-const MENTION_LIMIT: usize = 50;
-
-/// `@`-mention autocomplete for the comment composer, backed by the item's
-/// shared, live-updating pool of mentionable users (seeded with PR
-/// participants, then filled from the repo's mentionable set in the
-/// background). Reads the pool fresh on every keystroke.
-struct MentionProvider {
-    users: Rc<RefCell<Vec<github::Mention>>>,
-}
-
-/// If the cursor sits inside an `@mention` token, return the byte offset of the
-/// `@` and the (possibly empty) login text typed after it. The `@` must begin a
-/// word — preceded by whitespace or the start of the text — matching GitHub's
-/// own mention rules, so `foo@bar` never triggers.
-fn mention_prefix(text: &Rope, offset: usize) -> Option<(usize, String)> {
-    let s = text.to_string();
-    let offset = offset.min(s.len());
-    let before = &s[..offset];
-    // GitHub logins are alphanumeric plus hyphen; walk back over that run.
-    let start = before
-        .char_indices()
-        .rev()
-        .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '-')
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(offset);
-    if start == 0 || before.as_bytes()[start - 1] != b'@' {
-        return None;
-    }
-    let at = start - 1;
-    if at > 0 && !before[..at].chars().next_back().unwrap().is_whitespace() {
-        return None;
-    }
-    Some((at, before[start..offset].to_string()))
-}
-
-/// Rank of `user` against `query` (matched case-insensitively), lower = better;
-/// None = no match. Login prefix beats name prefix beats substring matches.
-fn mention_rank(user: &github::Mention, query: &str) -> Option<u8> {
-    if query.is_empty() {
-        return Some(0);
-    }
-    let query = &query.to_ascii_lowercase();
-    let login = user.login.to_ascii_lowercase();
-    let name = user.name.as_ref().map(|n| n.to_ascii_lowercase());
-    if login.starts_with(query) {
-        Some(0)
-    } else if name
-        .as_deref()
-        .is_some_and(|n| n.split_whitespace().any(|w| w.starts_with(query)))
-    {
-        Some(1)
-    } else if login.contains(query) {
-        Some(2)
-    } else if name.as_deref().is_some_and(|n| n.contains(query)) {
-        Some(3)
-    } else {
-        None
-    }
-}
-
-impl CompletionProvider for MentionProvider {
-    fn completions(
-        &self,
-        text: &Rope,
-        offset: usize,
-        _trigger: lsp_types::CompletionContext,
-        _window: &mut Window,
-        _cx: &mut Context<InputState>,
-    ) -> Task<anyhow::Result<lsp_types::CompletionResponse>> {
-        let empty = Task::ready(Ok(lsp_types::CompletionResponse::Array(vec![])));
-        let Some((at, prefix)) = mention_prefix(text, offset) else {
-            return empty;
-        };
-        // The edit replaces `@prefix` (the token so far) with `@login `.
-        let range = lsp_types::Range {
-            start: text.offset_to_position(at),
-            end: text.offset_to_position(offset),
-        };
-        let users = self.users.borrow();
-        let mut ranked: Vec<(u8, &github::Mention)> = users
-            .iter()
-            .filter_map(|u| mention_rank(u, &prefix).map(|r| (r, u)))
-            .collect();
-        // Stable sort keeps GitHub's alphabetical order within each rank.
-        ranked.sort_by_key(|(rank, _)| *rank);
-        let items = ranked
-            .into_iter()
-            .take(MENTION_LIMIT)
-            .map(|(_, u)| lsp_types::CompletionItem {
-                label: u.login.clone(),
-                filter_text: Some(u.login.clone()),
-                detail: u.name.clone(),
-                text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
-                    range,
-                    new_text: format!("@{} ", u.login),
-                })),
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-        Task::ready(Ok(lsp_types::CompletionResponse::Array(items)))
-    }
-
-    fn is_completion_trigger(
-        &self,
-        _offset: usize,
-        _new_text: &str,
-        _cx: &mut Context<InputState>,
-    ) -> bool {
-        // Cheap to always run; `completions` returns nothing outside a mention.
-        true
-    }
 }
 
 /// Seed `cell` with everyone already visible on the PR — the author and every
@@ -1533,7 +1378,7 @@ struct Composer {
     /// Display row the composer is anchored beneath (best effort; goes stale
     /// harmlessly if rows rebuild while it is open).
     row_ix: usize,
-    input: gpui::Entity<InputState>,
+    input: gpui::Entity<gpui::component::input::EditorState>,
     /// Space below the diff's last row, measured from the floating card.
     height: Rc<Cell<gpui::Pixels>>,
     /// Reveal a composer once, after its card is laid out.
@@ -1571,7 +1416,7 @@ impl Composer {
 struct ReviewDialog {
     item_id: u64,
     verdict: github::ReviewVerdict,
-    input: gpui::Entity<InputState>,
+    input: gpui::Entity<gpui::component::input::EditorState>,
     error: Option<SharedString>,
     in_flight: bool,
 }
@@ -1718,12 +1563,6 @@ pub(crate) struct ReviewApp {
     tree_filter_input: gpui::Entity<InputState>,
     focus_handle: FocusHandle,
     next_id: u64,
-    palette: Option<PaletteStep>,
-    palette_input: gpui::Entity<InputState>,
-    /// Bumped on every palette transition; an in-flight PR-list fetch only
-    /// lands if the generation it captured is still current.
-    palette_gen: u64,
-    palette_scroll: UniformListScrollHandle,
     /// Where the current selection drag started (side locked at mouse-down);
     /// None when no drag is in progress.
     drag_anchor: Option<(SelSide, RowCol)>,
@@ -1803,7 +1642,6 @@ impl ReviewApp {
     ) -> Self {
         let open_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
-        let palette_input = cx.new(|cx| InputState::new(window, cx));
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
         let _subscriptions = vec![
@@ -1812,12 +1650,6 @@ impl ReviewApp {
                 async {}
             }),
             cx.on_release(|this, _| this.persist_positions()),
-            // The system appearance can flip while we run; re-apply the
-            // palette (Mocha ↔ Latte) and repaint when it does.
-            cx.observe_window_appearance(window, |_, window, cx| {
-                theme::apply_ui_theme(Some(window), cx);
-                cx.notify();
-            }),
             // The window's key status: the app refreshes when it comes
             // back to the front, and the background poll only runs while
             // it is frontmost.
@@ -1834,15 +1666,6 @@ impl ReviewApp {
                 },
             ),
             cx.subscribe_in(
-                &palette_input,
-                window,
-                |this, _, event: &InputEvent, window, cx| match event {
-                    InputEvent::PressEnter { .. } => this.palette_confirm(window, cx),
-                    InputEvent::Change => this.palette_query_changed(cx),
-                    _ => {}
-                },
-            ),
-            cx.subscribe_in(
                 &tree_filter_input,
                 window,
                 |this, _, event: &InputEvent, window, cx| match event {
@@ -1850,7 +1673,12 @@ impl ReviewApp {
                     InputEvent::Change => {
                         // The match list changes shape; start it at the top.
                         if let Some(data) = this.active_data() {
-                            data.tree_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                            if let Some(tree) = &data.tree_view {
+                                tree.state
+                                    .read(cx)
+                                    .scroll_handle()
+                                    .scroll_to_item(0, ScrollStrategy::Top);
+                            }
                         }
                         cx.notify();
                     }
@@ -1862,8 +1690,7 @@ impl ReviewApp {
             items: Vec::new(),
             active: 0,
             // The queue is the home screen now: with nothing opened the
-            // sidebar starts hidden (⌘T/⌘K carry the open affordances, and
-            // both open it); several sources or CLI errors still start it
+            // sidebar starts hidden (⌘T opens it); several sources or CLI errors still start it
             // open, the way they always did.
             sidebar_visible: !errors.is_empty() || sources.len() > 1,
             sidebar_width: store
@@ -1877,10 +1704,6 @@ impl ReviewApp {
             tree_filter_input,
             focus_handle: cx.focus_handle(),
             next_id: 0,
-            palette: None,
-            palette_input,
-            palette_gen: 0,
-            palette_scroll: UniformListScrollHandle::new(),
             drag_anchor: None,
             minimap_visible: true,
             minimap_scrub: false,
@@ -2142,7 +1965,7 @@ impl ReviewApp {
         cx.notify();
     }
 
-    /// `u`: back to the queue. The open item stays open — ⌘K and
+    /// `u`: back to the queue. The open item stays open — the sidebar and
     /// ctrl-tab come right back to it — and the queue keeps the
     /// selection and scroll exactly where they were left.
     fn back_to_queue(&mut self, cx: &mut Context<Self>) {
@@ -2413,7 +2236,7 @@ impl ReviewApp {
         // already has brings that item forward — scroll, cursor, view mode
         // and comments exactly where they were left — instead of a second
         // copy that would be a way to lose your place in the first. Every
-        // open path (queue Enter, palette, ⌘T, the CLI) shares this.
+        // open path (queue Enter, ⌘T, the CLI) shares this.
         if let Some(ix) = self
             .items
             .iter()
@@ -2668,403 +2491,11 @@ impl ReviewApp {
                 self.open_input
                     .update(cx, |state, cx| state.set_value("", window, cx));
                 self.open_item(source, cx);
-                window.focus(&self.focus_handle);
+                window.focus(&self.focus_handle, cx);
             }
             Err(message) => self.open_error = Some(message.into()),
         }
         cx.notify();
-    }
-
-    /// Reset the palette's shared input for the step being entered and keep
-    /// keyboard focus in it (the palette traps focus while open).
-    fn set_palette_input(
-        &mut self,
-        value: &str,
-        placeholder: &'static str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.palette_input.update(cx, |state, cx| {
-            state.set_value(value.to_string(), window, cx);
-            state.set_placeholder(placeholder, window, cx);
-            state.focus(window, cx);
-        });
-    }
-
-    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = Some(PaletteStep::Sources { selected: 0 });
-        self.palette_gen += 1;
-        self.set_palette_input("", "type to filter…", window, cx);
-        cx.notify();
-    }
-
-    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = None;
-        self.palette_gen += 1;
-        window.focus(&self.focus_handle);
-        cx.notify();
-    }
-
-    /// Esc: one step back, or close from step 1.
-    fn palette_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match &self.palette {
-            None | Some(PaletteStep::Sources { .. }) => self.close_palette(window, cx),
-            Some(PaletteStep::RepoInput { .. }) => {
-                self.palette = Some(PaletteStep::Sources { selected: 0 });
-                self.palette_gen += 1;
-                self.set_palette_input("", "type to filter…", window, cx);
-                cx.notify();
-            }
-            Some(PaletteStep::PrList { repo, .. }) => {
-                let repo = repo.clone();
-                self.palette = Some(PaletteStep::RepoInput { error: None });
-                self.palette_gen += 1;
-                self.set_palette_input(&repo, "owner/repo", window, cx);
-                cx.notify();
-            }
-            Some(PaletteStep::LocalBaseList { .. }) => self.close_palette(window, cx),
-        }
-    }
-
-    fn palette_move(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let query = self.palette_input.read(cx).value().to_string();
-        match &mut self.palette {
-            Some(PaletteStep::Sources { selected }) => {
-                let len = filtered_sources(&query).len();
-                if len > 0 {
-                    *selected = (*selected as isize + delta).clamp(0, len as isize - 1) as usize;
-                }
-            }
-            Some(PaletteStep::PrList {
-                prs:
-                    PrListState::Loaded {
-                        filtered, selected, ..
-                    },
-                ..
-            }) => {
-                if !filtered.is_empty() {
-                    *selected =
-                        (*selected as isize + delta).clamp(0, filtered.len() as isize - 1) as usize;
-                    self.palette_scroll
-                        .scroll_to_item(*selected, ScrollStrategy::Top);
-                }
-            }
-            Some(PaletteStep::LocalBaseList {
-                bases:
-                    BaseListState::Loaded {
-                        filtered, selected, ..
-                    },
-                ..
-            }) => {
-                if !filtered.is_empty() {
-                    *selected =
-                        (*selected as isize + delta).clamp(0, filtered.len() as isize - 1) as usize;
-                    self.palette_scroll
-                        .scroll_to_item(*selected, ScrollStrategy::Top);
-                }
-            }
-            _ => return,
-        }
-        cx.notify();
-    }
-
-    fn palette_query_changed(&mut self, cx: &mut Context<Self>) {
-        let query = self.palette_input.read(cx).value().to_string();
-        match &mut self.palette {
-            Some(PaletteStep::Sources { selected }) => {
-                let len = filtered_sources(&query).len();
-                *selected = (*selected).min(len.saturating_sub(1));
-            }
-            Some(PaletteStep::RepoInput { error }) => *error = None,
-            Some(PaletteStep::PrList {
-                prs:
-                    PrListState::Loaded {
-                        all,
-                        filtered,
-                        selected,
-                    },
-                ..
-            }) => {
-                *filtered = filter_prs(all, &query);
-                *selected = 0;
-                self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
-            }
-            Some(PaletteStep::LocalBaseList {
-                bases:
-                    BaseListState::Loaded {
-                        all,
-                        filtered,
-                        selected,
-                    },
-                ..
-            }) => {
-                *filtered = filter_base_refs(all, &query);
-                *selected = 0;
-                self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
-            }
-            _ => return,
-        }
-        cx.notify();
-    }
-
-    /// Enter, on whichever step is showing.
-    fn palette_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let query = self.palette_input.read(cx).value().trim().to_string();
-        match &self.palette {
-            Some(PaletteStep::Sources { selected }) => {
-                if let Some(&opt) = filtered_sources(&query).get(*selected) {
-                    self.palette_activate_source(opt, window, cx);
-                }
-            }
-            Some(PaletteStep::RepoInput { .. }) => match parse_repo_slug(&query) {
-                Ok((owner, repo)) => self.palette_fetch_prs(owner, repo, window, cx),
-                Err(msg) => {
-                    if let Some(PaletteStep::RepoInput { error }) = &mut self.palette {
-                        *error = Some(msg.into());
-                        cx.notify();
-                    }
-                }
-            },
-            Some(PaletteStep::PrList {
-                prs: PrListState::Loaded { selected, .. },
-                ..
-            }) => {
-                let selected = *selected;
-                self.palette_open_pr_row(selected, window, cx);
-            }
-            Some(PaletteStep::LocalBaseList {
-                bases: BaseListState::Loaded { selected, .. },
-                ..
-            }) => {
-                let selected = *selected;
-                self.palette_open_base_row(selected, window, cx);
-            }
-            _ => {}
-        }
-    }
-
-    fn palette_activate_source(&mut self, opt: usize, window: &mut Window, cx: &mut Context<Self>) {
-        match opt {
-            SOURCE_PR => {
-                self.palette = Some(PaletteStep::RepoInput { error: None });
-                self.palette_gen += 1;
-                self.set_palette_input("", "owner/repo", window, cx);
-                cx.notify();
-            }
-            SOURCE_FOLDER => {
-                // The palette closes when the native dialog opens.
-                self.close_palette(window, cx);
-                self.prompt_open_folder(cx);
-            }
-            _ => {}
-        }
-    }
-
-    /// Step 2 → step 3: show "loading…" and fetch the open-PR list on the
-    /// background executor. The generation guard drops the result if the user
-    /// closed the palette or navigated away before it landed.
-    fn palette_fetch_prs(
-        &mut self,
-        owner: String,
-        repo: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.palette_gen += 1;
-        let gen = self.palette_gen;
-        self.palette = Some(PaletteStep::PrList {
-            repo: format!("{owner}/{repo}"),
-            prs: PrListState::Loading,
-        });
-        self.set_palette_input("", "search pull requests…", window, cx);
-        cx.notify();
-        let github = self.github.clone();
-        cx.spawn(async move |this, cx| {
-            let fetched = cx
-                .background_spawn(async move { github.list_prs(&owner, &repo) })
-                .await;
-            this.update(cx, |app, cx| {
-                if app.palette_gen != gen {
-                    return;
-                }
-                let query = app.palette_input.read(cx).value().to_string();
-                let Some(PaletteStep::PrList { prs, .. }) = &mut app.palette else {
-                    return;
-                };
-                *prs = match fetched {
-                    Ok(all) => {
-                        let filtered = filter_prs(&all, &query);
-                        PrListState::Loaded {
-                            all,
-                            filtered,
-                            selected: 0,
-                        }
-                    }
-                    Err(err) => PrListState::Failed(err.to_string()),
-                };
-                app.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn open_local_base_palette(
-        &mut self,
-        item_id: u64,
-        repo_root: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let current = self
-            .items
-            .iter()
-            .find(|item| item.id == item_id)
-            .and_then(|item| match &item.source {
-                Source::Local(src) => Some(src.base_label.clone()),
-                Source::Pr(_) => None,
-            })
-            .unwrap_or_else(|| "HEAD".to_string());
-        self.palette_gen += 1;
-        let gen = self.palette_gen;
-        self.palette = Some(PaletteStep::LocalBaseList {
-            item_id,
-            repo_root: repo_root.clone(),
-            current,
-            bases: BaseListState::Loading,
-        });
-        self.set_palette_input("", "search base refs…", window, cx);
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let fetched = cx
-                .background_spawn(async move { git::list_base_refs(&repo_root) })
-                .await;
-            this.update(cx, |app, cx| {
-                if app.palette_gen != gen {
-                    return;
-                }
-                let query = app.palette_input.read(cx).value().to_string();
-                let Some(PaletteStep::LocalBaseList { bases, .. }) = &mut app.palette else {
-                    return;
-                };
-                *bases = match fetched {
-                    Ok(all) => {
-                        let filtered = filter_base_refs(&all, &query);
-                        BaseListState::Loaded {
-                            all,
-                            filtered,
-                            selected: 0,
-                        }
-                    }
-                    Err(err) => BaseListState::Failed(format!("{err:#}")),
-                };
-                app.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Open the PR at `pos` in the filtered list as a new review item.
-    fn palette_open_pr_row(&mut self, pos: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(PaletteStep::PrList {
-            repo,
-            prs: PrListState::Loaded { all, filtered, .. },
-        }) = &self.palette
-        else {
-            return;
-        };
-        let Some(&ix) = filtered.get(pos) else {
-            return;
-        };
-        let Some((owner, repo)) = repo.split_once('/') else {
-            return;
-        };
-        let source = Source::Pr(github::PrLocator {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            number: all[ix].number,
-        });
-        self.close_palette(window, cx);
-        self.open_item(source, cx);
-    }
-
-    fn palette_open_base_row(&mut self, pos: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(PaletteStep::LocalBaseList {
-            item_id,
-            repo_root,
-            bases: BaseListState::Loaded { all, filtered, .. },
-            ..
-        }) = &self.palette
-        else {
-            return;
-        };
-        let Some(&ix) = filtered.get(pos) else {
-            return;
-        };
-        let (item_id, repo_root, base_ref) = (*item_id, repo_root.clone(), all[ix].clone());
-        self.close_palette(window, cx);
-        let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) else {
-            return;
-        };
-        let mode = match &item.state {
-            ItemState::Ready(data) => data.mode,
-            _ => ViewMode::Split,
-        };
-        let branch = match &item.source {
-            Source::Local(src) => src.branch.clone(),
-            Source::Pr(_) => dir_name(&repo_root),
-        };
-        let source = Source::Local(git::LocalSource {
-            repo_root,
-            branch,
-            base_ref: Some(base_ref.clone()),
-            base_label: base_ref,
-            base_oid: None,
-        });
-        item.source = source.clone();
-        item.refresh_error = None;
-        match item.state {
-            ItemState::Failed(_) => item.state = ItemState::Loading,
-            ItemState::Loading => {}
-            ItemState::Ready(_) => item.reloading = true,
-        }
-        self.spawn_fetch(item_id, source, mode, cx);
-        cx.notify();
-    }
-
-    /// Native directory picker. The chosen path becomes a Local item through
-    /// the normal add-item path; fetch_item re-resolves it on the background
-    /// executor, so a non-repo directory surfaces as a Failed item.
-    fn prompt_open_folder(&mut self, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: None,
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
-            };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
-            this.update(cx, |app, cx| {
-                let source = Source::Local(git::LocalSource {
-                    branch: dir_name(&path),
-                    base_ref: None,
-                    base_label: "…".to_string(),
-                    base_oid: None,
-                    repo_root: path,
-                });
-                app.open_item(source, cx);
-            })
-            .ok();
-        })
-        .detach();
     }
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -3072,7 +2503,7 @@ impl ReviewApp {
             self.persist_positions();
             self.active = ix;
             self.show_queue = false;
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
             cx.notify();
         }
     }
@@ -3196,10 +2627,7 @@ impl ReviewApp {
         }
         let (offset, max_x) = {
             let state = data.scroll.0.borrow();
-            (
-                state.base_handle.offset(),
-                state.base_handle.max_offset().width,
-            )
+            (state.base_handle.offset(), state.base_handle.max_offset().x)
         };
         let x = (f32::from(offset.x) + direction as f32 * step).clamp(-f32::from(max_x), 0.);
         data.scroll
@@ -3248,35 +2676,11 @@ impl ReviewApp {
         cx: &mut Context<Self>,
     ) {
         self.flip_pane(ItemPane::Changes, cx);
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         if let Some(data) = self.active_data_mut() {
             data.open_file(file_ix, None);
         }
         cx.notify();
-    }
-
-    /// Click on an unfiltered tree row: directories toggle collapse, files
-    /// jump the diff.
-    pub(crate) fn tree_entry_clicked(
-        &mut self,
-        entry_ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(data) = self.active_data_mut() else {
-            return;
-        };
-        match data.tree.get(entry_ix).map(|entry| &entry.kind) {
-            Some(TreeEntryKind::Dir { path }) => {
-                let path = path.clone();
-                if !data.collapsed.remove(&path) {
-                    data.collapsed.insert(path);
-                }
-                cx.notify();
-            }
-            Some(&TreeEntryKind::File { file_ix }) => self.jump_to_file(file_ix, window, cx),
-            None => {}
-        }
     }
 
     /// Enter in the tree filter: jump to the best match and return focus to
@@ -3355,9 +2759,6 @@ impl ReviewApp {
         position: Point<Pixels>,
         window: &Window,
     ) -> Option<(usize, SelSide)> {
-        if self.palette.is_some() {
-            return None;
-        }
         let char_width = self.char_width(window);
         let item = self.active_item()?;
         let ItemState::Ready(data) = &item.state else {
@@ -3751,11 +3152,7 @@ impl ReviewApp {
             self.close_composer(window, cx);
         }
         self.composer_gen += 1;
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .auto_grow(3, 8)
-                .placeholder("leave a comment…")
-        });
+        let input = cx.new(|cx| comment_editor::new(window, cx).placeholder("leave a comment…"));
         input.update(cx, |state, cx| state.focus(window, cx));
         // Wire up @-mention autocomplete for PR items: seed the pool with known
         // participants now, attach the provider, then fetch the full list once.
@@ -3763,10 +3160,7 @@ impl ReviewApp {
             if let Some(data) = self.active_data() {
                 let mentions = data.mentions.clone();
                 seed_mentions(&mentions, data);
-                input.update(cx, |state, _| {
-                    state.lsp.completion_provider =
-                        Some(Rc::new(MentionProvider { users: mentions }));
-                });
+                comment_editor::candidates(&input, mentions, cx);
             }
             self.ensure_mentions(item_id, loc, cx);
         }
@@ -3852,7 +3246,7 @@ impl ReviewApp {
                 }
             }
             self.composer_gen += 1;
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
             cx.notify();
         }
     }
@@ -4202,6 +3596,10 @@ impl ReviewApp {
 
     /// Open the "submit review" modal for the active item (PR items only).
     fn open_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // One review dialog at a time; this migration adds no nested flow.
+        if self.review.is_some() {
+            return;
+        }
         let Some(item) = self.active_item() else {
             return;
         };
@@ -4214,8 +3612,7 @@ impl ReviewApp {
         let item_id = item.id;
         self.review_gen += 1;
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .auto_grow(3, 8)
+            comment_editor::new(window, cx)
                 .placeholder("review summary… (optional with pending comments)")
         });
         if let Some(pending) = self
@@ -4227,7 +3624,18 @@ impl ReviewApp {
                 state.set_value(pending.body.clone(), window, cx)
             });
         }
-        input.update(cx, |state, cx| state.focus(window, cx));
+        if let Some(data) = self.active_data() {
+            seed_mentions(&data.mentions, data);
+            comment_editor::candidates(&input, data.mentions.clone(), cx);
+        }
+        if let Some(Source::Pr(loc)) = self
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .map(|item| item.source.clone())
+        {
+            self.ensure_mentions(item_id, loc, cx);
+        }
         self.review = Some(ReviewDialog {
             item_id,
             verdict: github::ReviewVerdict::Approve,
@@ -4235,14 +3643,64 @@ impl ReviewApp {
             error: None,
             in_flight: false,
         });
+        let generation = self.review_gen;
+        let owner = cx.entity();
+        let initial_focus = Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let (content, input, busy) = owner.update(cx, |app, cx| {
+                let input = app
+                    .review
+                    .as_ref()
+                    .filter(|_| app.review_gen == generation)
+                    .map(|review| review.input.clone());
+                let busy = app.review.as_ref().is_some_and(|review| review.in_flight);
+                (app.render_review(cx), input, busy)
+            });
+            if initial_focus.replace(false) {
+                if let Some(input) = input {
+                    input.update(cx, |state, cx| state.focus(window, cx));
+                }
+            }
+            let closed = owner.clone();
+            let cancelling = owner.clone();
+            dialog
+                .title("Finish your review")
+                .w(px(560.))
+                .overlay_closable(!busy)
+                .close_button(!busy)
+                .keyboard(!busy)
+                .on_cancel(move |_, _, cx| {
+                    !cancelling
+                        .read(cx)
+                        .review
+                        .as_ref()
+                        .is_some_and(|review| review.in_flight)
+                })
+                .on_close(move |_, _, cx| {
+                    closed.update(cx, |app, cx| {
+                        app.cleanup_review(generation, cx);
+                    });
+                })
+                .child(content)
+        });
         cx.notify();
     }
 
+    /// Toolkit user dismissal and imperative close do not share callbacks.
+    /// Cleanup is generation-owned and never requests another toolkit close.
+    fn cleanup_review(&mut self, generation: u64, cx: &mut Context<Self>) -> bool {
+        if self.review_gen != generation || self.review.take().is_none() {
+            return false;
+        }
+        self.review_gen += 1;
+        cx.notify();
+        true
+    }
+
     fn close_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.review.take().is_some() {
-            self.review_gen += 1;
-            window.focus(&self.focus_handle);
-            cx.notify();
+        if self.cleanup_review(self.review_gen, cx) {
+            // Kit restores the pre-dialog focus; don't force the diff's handle.
+            window.close_dialog(cx);
         }
     }
 
@@ -4318,9 +3776,6 @@ impl ReviewApp {
     /// row's anchor.
     fn render_plus(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (row_ix, side) = self.hover_plus?;
-        if self.palette.is_some() {
-            return None;
-        }
         let item = self.active_item()?;
         let ItemState::Ready(data) = &item.state else {
             return None;
@@ -4360,7 +3815,7 @@ impl ReviewApp {
                 .w(px(16.))
                 .h(px(16.))
                 .rounded_sm()
-                .bg(theme::blue())
+                .bg(theme::blue(cx))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -4594,8 +4049,8 @@ impl ReviewApp {
             }))
             .rounded_lg()
             .border_1()
-            .border_color(theme::surface0())
-            .bg(theme::mantle())
+            .border_color(theme::surface0(cx))
+            .bg(theme::mantle(cx))
             .p_2()
             .flex()
             .flex_col()
@@ -4603,13 +4058,13 @@ impl ReviewApp {
             .text_size(px(12.))
             .child(
                 div()
-                    .text_color(theme::overlay0())
+                    .text_color(theme::overlay0(cx))
                     .truncate()
                     .child(SharedString::from(target)),
             )
-            .child(Input::new(&composer.input))
+            .child(comment_editor::field(&composer.input, cx))
             .when_some(composer.error.clone(), |card, err| {
-                card.child(div().text_color(theme::red()).child(err))
+                card.child(div().text_color(theme::red(cx)).child(err))
             })
             .child(
                 div()
@@ -4620,7 +4075,7 @@ impl ReviewApp {
                         div()
                             .flex_1()
                             .text_size(px(11.))
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child(SharedString::from("⌘⏎ to submit")),
                     )
                     .child(
@@ -4737,8 +4192,8 @@ impl ReviewApp {
             .px_3()
             .py_2()
             .border_t_1()
-            .border_color(theme::surface0())
-            .bg(theme::mantle())
+            .border_color(theme::surface0(cx))
+            .bg(theme::mantle(cx))
             .text_size(px(12.))
             .child(
                 div()
@@ -4783,7 +4238,7 @@ impl ReviewApp {
                     ),
             );
         if let Some(error) = &ui.error {
-            tray = tray.child(div().text_color(theme::red()).child(error.clone()));
+            tray = tray.child(div().text_color(theme::red(cx)).child(error.clone()));
         }
         if let Some(review) = &ui.state.pending {
             let mut comments = div()
@@ -4865,162 +4320,6 @@ impl ReviewApp {
         tray.into_any_element()
     }
 
-    /// The "submit review" modal: a dimming backdrop (click closes) over a
-    /// centered card with the verdict picker, body input, and submit row.
-    /// Root-level for the same reason as the composer: its input must sit
-    /// outside the "ReviewApp" key context.
-    fn render_review(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let empty = || div().into_any_element();
-        let Some(review) = &self.review else {
-            return empty();
-        };
-        // Only render for the item it was opened on, and only while active.
-        if self.items.get(self.active).map(|item| item.id) != Some(review.item_id) {
-            return empty();
-        }
-        let selected = review.verdict;
-        let verdict_option =
-            |label: &'static str, verdict: github::ReviewVerdict, color: gpui::Rgba| {
-                let tint: Hsla = color.into();
-                div()
-                    .id(label)
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .cursor_pointer()
-                    .when(verdict == selected, |opt| {
-                        opt.bg(tint.opacity(0.15))
-                            .border_color(tint.opacity(0.6))
-                            .text_color(color)
-                    })
-                    .when(verdict != selected, |opt| {
-                        opt.border_color(theme::surface0())
-                            .text_color(theme::subtext())
-                            .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(review) = &mut this.review {
-                            review.verdict = verdict;
-                            review.error = None;
-                            cx.notify();
-                        }
-                    }))
-                    .child(SharedString::from(label))
-            };
-        let submit_label = match selected {
-            github::ReviewVerdict::Approve => "Approve",
-            github::ReviewVerdict::RequestChanges => "Request changes",
-            github::ReviewVerdict::Comment => "Comment",
-        };
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(120.))
-            .bg(theme::palette_backdrop())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.close_review(window, cx);
-                }),
-            )
-            .child(
-                div()
-                    .w(px(560.))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
-                        if action.secondary {
-                            cx.stop_propagation();
-                            this.submit_review(window, cx);
-                        }
-                    }))
-                    // The input propagates Escape when it has nothing of its
-                    // own to dismiss; catch it here to cancel the dialog.
-                    .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                        this.close_review(window, cx);
-                    }))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme::surface0())
-                    .bg(theme::mantle())
-                    .shadow_lg()
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .text_size(px(12.))
-                    .child(
-                        div()
-                            .text_color(theme::overlay0())
-                            .child(SharedString::from("Finish your review")),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(verdict_option(
-                                "approve",
-                                github::ReviewVerdict::Approve,
-                                theme::green(),
-                            ))
-                            .child(verdict_option(
-                                "request changes",
-                                github::ReviewVerdict::RequestChanges,
-                                theme::red(),
-                            ))
-                            .child(verdict_option(
-                                "comment",
-                                github::ReviewVerdict::Comment,
-                                theme::blue(),
-                            )),
-                    )
-                    .child(Input::new(&review.input))
-                    .when_some(review.error.clone(), |card, err| {
-                        card.child(div().text_color(theme::red()).child(err))
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(px(11.))
-                                    .text_color(theme::overlay0())
-                                    .child(SharedString::from("⌘⏎ to submit")),
-                            )
-                            .child(
-                                Button::new("review-cancel")
-                                    .label("Cancel")
-                                    .ghost()
-                                    .small()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close_review(window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("review-submit")
-                                    .label(submit_label)
-                                    .primary()
-                                    .small()
-                                    .disabled(review.in_flight)
-                                    .loading(review.in_flight)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.submit_review(window, cx);
-                                    })),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
     /// The minimap column: precomputed, coalesced quad runs plus one
     /// per-frame viewport rectangle, painted straight into a canvas (no text,
     /// no per-row elements). Mouse-downs stop propagation here so the pane's
@@ -5031,14 +4330,14 @@ impl ReviewApp {
             .w(px(MINIMAP_WIDTH))
             .h_full()
             .flex_shrink_0()
-            .bg(Hsla::from(theme::crust()).opacity(0.5))
+            .bg(Hsla::from(theme::crust(cx)).opacity(0.5))
             .border_l_1()
-            .border_color(theme::surface0())
+            .border_color(theme::surface0(cx))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    window.focus(&this.focus_handle);
+                    window.focus(&this.focus_handle, cx);
                     this.minimap_scrub = true;
                     this.minimap_scrub_to(event.position, cx);
                 }),
@@ -5075,12 +4374,12 @@ impl ReviewApp {
                             // Full alpha-ish tints: these are 1-3px bars and
                             // need punch, unlike the row backgrounds.
                             let color: Hsla = match run.color {
-                                MinimapColor::Added => Hsla::from(theme::green()).opacity(0.8),
-                                MinimapColor::Removed => Hsla::from(theme::red()).opacity(0.8),
+                                MinimapColor::Added => Hsla::from(theme::green(cx)).opacity(0.8),
+                                MinimapColor::Removed => Hsla::from(theme::red(cx)).opacity(0.8),
                                 MinimapColor::Context => {
-                                    Hsla::from(theme::overlay0()).opacity(0.35)
+                                    Hsla::from(theme::overlay0(cx)).opacity(0.35)
                                 }
-                                MinimapColor::Header => Hsla::from(theme::blue()).opacity(0.5),
+                                MinimapColor::Header => Hsla::from(theme::blue(cx)).opacity(0.5),
                             };
                             window.paint_quad(fill(
                                 Bounds::new(
@@ -5103,10 +4402,10 @@ impl ReviewApp {
                                     point(bounds.left(), px(y0 + vy)),
                                     size(bounds.size.width, px(vh)),
                                 ),
-                                Hsla::from(theme::text()).opacity(0.08),
+                                Hsla::from(theme::text(cx)).opacity(0.08),
                             )
                             .border_widths(1.)
-                            .border_color(Hsla::from(theme::overlay0()).opacity(0.4)),
+                            .border_color(Hsla::from(theme::overlay0(cx)).opacity(0.4)),
                         );
                     },
                 )
@@ -5117,20 +4416,24 @@ impl ReviewApp {
 
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let content: gpui::AnyElement = if self.show_queue {
-            app_title(None)
+            app_title(None, cx)
         } else {
             match self.active_item() {
-                None => app_title(None),
+                None => app_title(None, cx),
                 Some(item) => match &item.state {
                     ItemState::Ready(data) => match &item.source {
                         Source::Pr(_) => match &data.pr_meta {
                             Some(meta) => pr_titlebar_content(meta, cx),
-                            None => app_title(None),
+                            None => app_title(None, cx),
                         },
                         Source::Local(src) => local_titlebar_content(item.id, src, data, cx),
                     },
-                    ItemState::Loading => app_title(Some(format!("loading {}…", item.primary()))),
-                    ItemState::Failed(_) => app_title(Some(format!("{} — failed", item.primary()))),
+                    ItemState::Loading => {
+                        app_title(Some(format!("loading {}…", item.primary())), cx)
+                    }
+                    ItemState::Failed(_) => {
+                        app_title(Some(format!("{} — failed", item.primary())), cx)
+                    }
                 },
             }
         };
@@ -5192,7 +4495,7 @@ impl ReviewApp {
                             .label(label)
                             .tooltip(tooltip)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                window.focus(&this.focus_handle);
+                                window.focus(&this.focus_handle, cx);
                                 this.flip_pane(target, cx);
                             })),
                     ),
@@ -5203,11 +4506,11 @@ impl ReviewApp {
                 div()
                     .max_w(px(280.))
                     .truncate()
-                    .text_color(theme::overlay0())
+                    .text_color(theme::overlay0(cx))
                     .child(note),
             );
         }
-        right = right.child(self.render_account());
+        right = right.child(self.render_account(cx));
         TitleBar::new()
             .text_size(px(13.))
             .child(content)
@@ -5218,7 +4521,7 @@ impl ReviewApp {
     /// GitHub knows who we are; the fix in one line when it doesn't — the
     /// empty pane spells the failure out in full. While the check is still
     /// running, nothing: the chip appears rather than flickers.
-    fn render_account(&self) -> gpui::AnyElement {
+    fn render_account(&self, cx: &gpui::App) -> gpui::AnyElement {
         match &self.account {
             AccountStatus::Checking => div().into_any_element(),
             AccountStatus::SignedIn(viewer) => div()
@@ -5230,7 +4533,7 @@ impl ReviewApp {
                 .child(
                     div()
                         .text_size(px(12.))
-                        .text_color(theme::subtext())
+                        .text_color(theme::subtext(cx))
                         .child(SharedString::from(viewer.login.clone())),
                 )
                 .into_any_element(),
@@ -5239,7 +4542,7 @@ impl ReviewApp {
                 .max_w(px(360.))
                 .truncate()
                 .text_size(px(12.))
-                .text_color(theme::peach())
+                .text_color(theme::peach(cx))
                 .child(SharedString::from(err.to_string()))
                 .into_any_element(),
         }
@@ -5265,7 +4568,7 @@ impl ReviewApp {
             .py_1();
         for (ix, item) in self.items.iter().enumerate() {
             let active = ix == self.active;
-            let dot: Hsla = item.dot_color().into();
+            let dot: Hsla = item.dot_color(cx).into();
             let status: gpui::AnyElement = match &item.state {
                 ItemState::Ready(data) => div()
                     .flex()
@@ -5275,25 +4578,25 @@ impl ReviewApp {
                     .text_size(px(11.))
                     .child(
                         div()
-                            .text_color(theme::green())
+                            .text_color(theme::green(cx))
                             .child(SharedString::from(format!("+{}", data.additions))),
                     )
                     .child(
                         div()
-                            .text_color(theme::red())
+                            .text_color(theme::red(cx))
                             .child(SharedString::from(format!("−{}", data.deletions))),
                     )
                     .into_any_element(),
                 ItemState::Loading => div()
                     .flex_shrink_0()
                     .text_size(px(11.))
-                    .text_color(theme::overlay0())
+                    .text_color(theme::overlay0(cx))
                     .child(SharedString::from("loading…"))
                     .into_any_element(),
                 ItemState::Failed(_) => div()
                     .flex_shrink_0()
                     .text_size(px(11.))
-                    .text_color(theme::red())
+                    .text_color(theme::red(cx))
                     .child(SharedString::from("failed"))
                     .into_any_element(),
             };
@@ -5306,9 +4609,9 @@ impl ReviewApp {
                 .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .when(active, |entry| entry.bg(theme::surface0()))
+                .when(active, |entry| entry.bg(theme::surface0(cx)))
                 .when(!active, |entry| {
-                    entry.hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+                    entry.hover(|style| style.bg(Hsla::from(theme::surface0(cx)).opacity(0.5)))
                 })
                 .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)))
                 .child(
@@ -5329,7 +4632,7 @@ impl ReviewApp {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_color(theme::text())
+                                .text_color(theme::text(cx))
                                 .child(item.primary()),
                         )
                         .child(status)
@@ -5355,87 +4658,93 @@ impl ReviewApp {
                             .pl(px(16.))
                             .truncate()
                             .text_size(px(11.))
-                            .text_color(theme::subtext())
+                            .text_color(theme::subtext(cx))
                             .child(secondary),
                     )
                 });
             list = list.child(entry);
         }
 
-        // --- file tree for the active item ---
+        // --- stock file tree, with application-owned topology and identities ---
         let query = self.tree_filter_input.read(cx).value().trim().to_string();
-        let mut tree_rows: Vec<TreeListRow> = Vec::new();
-        let mut current_file = None;
-        let mut current_row = None;
-        if let Some(data) = self.active_data() {
-            if query.is_empty() {
-                tree_rows = visible_entries(&data.tree, &data.collapsed)
-                    .into_iter()
-                    .map(TreeListRow::Entry)
-                    .collect();
-            } else {
-                let paths: Vec<&str> = data.diff.files.iter().map(|f| f.display_path()).collect();
-                tree_rows = fuzzy_file_matches(&paths, &query)
-                    .into_iter()
-                    .map(TreeListRow::FilteredFile)
-                    .collect();
-            }
-            // Follow the diff: highlight the file the pane is showing.
-            current_file = Some(data.file_ix);
-            current_row = current_file.and_then(|file| {
-                tree_rows.iter().position(|row| match row {
-                    TreeListRow::Entry(ix) => matches!(
-                        data.tree[*ix].kind,
-                        TreeEntryKind::File { file_ix } if file_ix == file
-                    ),
-                    TreeListRow::FilteredFile(file_ix) => *file_ix == file,
-                })
-            });
+        if self
+            .active_data()
+            .is_some_and(|data| data.tree_view.is_none())
+        {
+            let view = tree::FileTree::new(self.active_item().unwrap().id, cx);
+            self.active_data_mut().unwrap().tree_view = Some(view);
         }
-        // Keep the highlighted file in view — but only when it changes, so
-        // the user's own tree scrolling is never fought.
-        if let Some(file) = current_file {
-            if let Some(data) = self.active_data_mut() {
-                if data.tree_last_file != Some(file) {
-                    data.tree_last_file = Some(file);
-                    if let Some(pos) = current_row {
-                        data.tree_scroll.scroll_to_item(pos, ScrollStrategy::Center);
+        let tree_state = self.active_data_mut().and_then(|data| {
+            let paths: Vec<_> = data
+                .diff
+                .files
+                .iter()
+                .map(|file| file.display_path())
+                .collect();
+            let view = data.tree_view.as_mut()?;
+            view.reconcile(&data.tree, &paths, &data.collapsed, &query, cx);
+            if data.tree_last_file != Some(data.file_ix) {
+                data.tree_last_file = Some(data.file_ix);
+                if let Some(path) = paths.get(data.file_ix) {
+                    let state = view.state.read(cx);
+                    if let Some(ix) = state.index_of(&tree::file_id(path)) {
+                        state
+                            .scroll_handle()
+                            .scroll_to_item(ix, ScrollStrategy::Center);
                     }
                 }
             }
-        }
-        let tree_scroll = self.active_data().map(|data| data.tree_scroll.clone());
+            Some(view.state.clone())
+        });
         let entity = cx.entity();
-        let tree_list: gpui::AnyElement = match tree_scroll {
-            Some(scroll) if !tree_rows.is_empty() => {
-                uniform_list("file-tree", tree_rows.len(), move |range, _window, cx| {
-                    let this = entity.read(cx);
-                    let Some(data) = this.active_data() else {
-                        return Vec::new();
+        let filtered = !query.is_empty();
+        let tree_list: gpui::AnyElement = match tree_state {
+            Some(state) if state.read(cx).entry(0).is_some() => {
+                gpui::component::tree::tree(&state, move |pos, entry, _, _, cx| {
+                    let app = entity.read(cx);
+                    let Some(data) = app.active_data() else {
+                        return gpui::component::list::ListItem::new(pos).disabled(true);
                     };
-                    range
-                        .filter_map(|pos| tree_rows.get(pos).map(|row| (pos, *row)))
-                        .map(|(pos, row)| {
-                            render_tree_row(
-                                row,
-                                pos,
-                                current_row == Some(pos),
-                                data,
-                                &entity,
-                                this.active_item().is_some_and(|item| item.reloading),
-                            )
-                        })
-                        .collect()
+                    let id = entry.item().id.as_ref();
+                    let file = id.strip_prefix("file:").and_then(|path| {
+                        data.diff
+                            .files
+                            .iter()
+                            .position(|file| file.display_path() == path)
+                    });
+                    let row = if filtered {
+                        file.map(TreeListRow::FilteredFile)
+                    } else {
+                        data.tree
+                            .iter()
+                            .position(|entry| match &entry.kind {
+                                TreeEntryKind::Dir { path } => {
+                                    id.strip_prefix("directory:") == Some(path.as_str())
+                                }
+                                TreeEntryKind::File { file_ix } => Some(*file_ix) == file,
+                            })
+                            .map(TreeListRow::Entry)
+                    };
+                    let Some(row) = row else {
+                        return gpui::component::list::ListItem::new(pos).disabled(true);
+                    };
+                    render_tree_row(
+                        row,
+                        pos,
+                        file == Some(data.file_ix),
+                        data,
+                        &entity,
+                        app.active_item().is_some_and(|item| item.reloading),
+                        cx,
+                    )
                 })
-                .track_scroll(scroll)
-                .h_full()
                 .into_any_element()
             }
-            Some(_) if !query.is_empty() => div()
+            Some(_) if filtered => div()
                 .px_3()
                 .py_2()
-                .text_color(theme::overlay0())
-                .child(SharedString::from("no matching files"))
+                .text_color(theme::overlay0(cx))
+                .child("no matching files")
                 .into_any_element(),
             _ => div().into_any_element(),
         };
@@ -5449,9 +4758,7 @@ impl ReviewApp {
             .h_full()
             .flex()
             .flex_col()
-            .bg(theme::mantle())
-            .border_r_1()
-            .border_color(theme::surface0())
+            .bg(theme::mantle(cx))
             .text_size(px(12.))
             .child(
                 div()
@@ -5461,11 +4768,16 @@ impl ReviewApp {
                     .gap_1()
                     .child(Input::new(&self.open_input).small())
                     .when_some(self.open_error.clone(), |area, err| {
-                        area.child(div().text_size(px(11.)).text_color(theme::red()).child(err))
+                        area.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme::red(cx))
+                                .child(err),
+                        )
                     }),
             )
             .child(list)
-            .child(div().h(px(1.)).flex_shrink_0().bg(theme::surface0()))
+            .child(div().h(px(1.)).flex_shrink_0().bg(theme::surface0(cx)))
             .child(
                 div()
                     .flex_1()
@@ -5478,7 +4790,7 @@ impl ReviewApp {
                     .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
                         this.tree_filter_input
                             .update(cx, |state, cx| state.set_value("", window, cx));
-                        window.focus(&this.focus_handle);
+                        window.focus(&this.focus_handle, cx);
                         cx.notify();
                     }))
                     .child(
@@ -5495,331 +4807,42 @@ impl ReviewApp {
                                     .px_2()
                                     .pb_2()
                                     .text_size(px(11.))
-                                    .text_color(theme::red())
+                                    .text_color(theme::red(cx))
                                     .child(error),
                             )
                         },
                     )
-                    .child(div().flex_1().min_h_0().child(tree_list)),
-            )
-            .child(
-                div()
-                    .id("sidebar-resize")
-                    .debug_selector(|| "sidebar-resize".to_string())
-                    .absolute()
-                    .right_0()
-                    .top_0()
-                    .w(px(6.))
-                    .h_full()
-                    .cursor_col_resize()
-                    .hover(|style| style.bg(theme::blue()))
-                    .when(self.sidebar_resize.is_some(), |handle| {
-                        handle.bg(theme::blue())
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.sidebar_resize = Some((event.position.x, width));
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ),
-            )
-    }
-
-    fn render_palette(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(step) = &self.palette else {
-            return div().into_any_element();
-        };
-        let query = self.palette_input.read(cx).value().to_string();
-
-        let header: Option<SharedString> = match step {
-            PaletteStep::Sources { .. } => None,
-            PaletteStep::RepoInput { .. } => Some("Open GitHub pull request".into()),
-            PaletteStep::PrList { repo, .. } => Some(repo.clone().into()),
-            PaletteStep::LocalBaseList { .. } => Some("Choose local diff base".into()),
-        };
-
-        let body: gpui::AnyElement = match step {
-            PaletteStep::Sources { selected } => {
-                let filtered = filtered_sources(&query);
-                let selected = *selected;
-                let mut list = div().py_1().flex().flex_col();
-                if filtered.is_empty() {
-                    list = list.child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .text_color(theme::overlay0())
-                            .child(SharedString::from("no matches")),
-                    );
-                }
-                for (pos, &opt) in filtered.iter().enumerate() {
-                    list = list.child(
-                        div()
-                            .id(("palette-source", opt))
-                            .mx_1()
-                            .px_2()
-                            .h(px(PALETTE_ROW_HEIGHT))
-                            .rounded_md()
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .when(pos == selected, |row| row.bg(theme::surface0()))
-                            .when(pos != selected, |row| {
-                                row.hover(|style| {
-                                    style.bg(Hsla::from(theme::surface0()).opacity(0.5))
-                                })
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.palette_activate_source(opt, window, cx)
-                            }))
-                            .child(
-                                div()
-                                    .text_color(theme::text())
-                                    .child(SharedString::from(PALETTE_SOURCES[opt])),
-                            ),
-                    );
-                }
-                list.into_any_element()
-            }
-            PaletteStep::RepoInput { error } => {
-                let (text, color): (SharedString, gpui::Rgba) = match error {
-                    Some(err) => (err.clone(), theme::red()),
-                    None => (
-                        "enter to list open pull requests · esc to go back".into(),
-                        theme::overlay0(),
-                    ),
-                };
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_color(color)
-                    .child(text)
-                    .into_any_element()
-            }
-            PaletteStep::PrList { prs, .. } => match prs {
-                PrListState::Loading => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("loading pull requests…"))
-                    .into_any_element(),
-                PrListState::Failed(msg) => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::red())
-                    .child(SharedString::from(msg.clone()))
-                    .into_any_element(),
-                PrListState::Loaded { filtered, .. } if filtered.is_empty() => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("no matching pull requests"))
-                    .into_any_element(),
-                PrListState::Loaded { filtered, .. } => {
-                    let entity = cx.entity();
-                    let count = filtered.len();
-                    div()
-                        .py_1()
-                        .h(px(count.min(10) as f32 * PALETTE_ROW_HEIGHT + 8.))
-                        .child(
-                            uniform_list("palette-prs", count, move |range, _window, cx| {
-                                let this = entity.read(cx);
-                                let Some(PaletteStep::PrList {
-                                    prs:
-                                        PrListState::Loaded {
-                                            all,
-                                            filtered,
-                                            selected,
-                                        },
-                                    ..
-                                }) = &this.palette
-                                else {
-                                    return Vec::new();
-                                };
-                                range
-                                    .filter_map(|pos| Some((pos, &all[*filtered.get(pos)?])))
-                                    .map(|(pos, pr)| {
-                                        palette_pr_row(pr, pos, pos == *selected, entity.clone())
-                                    })
-                                    .collect()
-                            })
-                            .track_scroll(self.palette_scroll.clone())
-                            .h_full(),
-                        )
-                        .into_any_element()
-                }
-            },
-            PaletteStep::LocalBaseList { bases, .. } => match bases {
-                BaseListState::Loading => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("loading base refs…"))
-                    .into_any_element(),
-                BaseListState::Failed(msg) => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::red())
-                    .child(SharedString::from(msg.clone()))
-                    .into_any_element(),
-                BaseListState::Loaded { filtered, .. } if filtered.is_empty() => div()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("no matching base refs"))
-                    .into_any_element(),
-                BaseListState::Loaded { filtered, .. } => {
-                    let entity = cx.entity();
-                    let count = filtered.len();
-                    div()
-                        .py_1()
-                        .h(px(count.min(10) as f32 * PALETTE_ROW_HEIGHT + 8.))
-                        .child(
-                            uniform_list("palette-bases", count, move |range, _window, cx| {
-                                let this = entity.read(cx);
-                                let Some(PaletteStep::LocalBaseList {
-                                    current,
-                                    bases:
-                                        BaseListState::Loaded {
-                                            all,
-                                            filtered,
-                                            selected,
-                                        },
-                                    ..
-                                }) = &this.palette
-                                else {
-                                    return Vec::new();
-                                };
-                                range
-                                    .filter_map(|pos| {
-                                        let base = all.get(*filtered.get(pos)?)?;
-                                        Some((pos, base.clone(), base == current))
-                                    })
-                                    .map(|(pos, base, is_current)| {
-                                        div()
-                                            .id(("palette-base", pos))
-                                            .mx_1()
-                                            .px_2()
-                                            .h(px(PALETTE_ROW_HEIGHT))
-                                            .rounded_md()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .cursor_pointer()
-                                            .when(pos == *selected, |row| row.bg(theme::surface0()))
-                                            .when(pos != *selected, |row| {
-                                                row.hover(|style| {
-                                                    style
-                                                        .bg(Hsla::from(theme::surface0())
-                                                            .opacity(0.5))
-                                                })
-                                            })
-                                            .on_click({
-                                                let entity = entity.clone();
-                                                move |_, window, cx| {
-                                                    entity.update(cx, |this, cx| {
-                                                        this.palette_open_base_row(pos, window, cx)
-                                                    });
-                                                }
-                                            })
-                                            .child(
-                                                div()
-                                                    .w(px(8.))
-                                                    .h(px(8.))
-                                                    .flex_shrink_0()
-                                                    .rounded_full()
-                                                    .bg(if is_current {
-                                                        theme::green()
-                                                    } else {
-                                                        theme::overlay0()
-                                                    }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .text_color(theme::text())
-                                                    .child(SharedString::from(base)),
-                                            )
-                                            .into_any_element()
-                                    })
-                                    .collect()
-                            })
-                            .track_scroll(self.palette_scroll.clone())
-                            .h_full(),
-                        )
-                        .into_any_element()
-                }
-            },
-        };
-
-        // Backdrop: dims and occludes everything (sidebar included); click
-        // closes. The panel swallows its own mouse-downs so clicks inside
-        // don't bubble to the backdrop.
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(120.))
-            .bg(theme::palette_backdrop())
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.close_palette(window, cx);
-                }),
-            )
-            .child(
-                div()
-                    .key_context("Palette")
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_action(cx.listener(|this, _: &PaletteUp, _, cx| this.palette_move(-1, cx)))
-                    .on_action(cx.listener(|this, _: &PaletteDown, _, cx| this.palette_move(1, cx)))
-                    .on_action(cx.listener(|this, _: &PaletteBack, window, cx| {
-                        this.palette_back(window, cx)
-                    }))
-                    // The palette input propagates Escape when it has nothing
-                    // of its own to dismiss; intercept it here before the
-                    // root's handler steals focus back to the diff.
-                    .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                        this.palette_back(window, cx)
-                    }))
-                    .w(px(560.))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme::surface0())
-                    .bg(theme::mantle())
-                    .shadow_lg()
-                    .text_size(px(13.))
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .when_some(header, |panel, header| {
-                        panel.child(
-                            div()
-                                .px_3()
-                                .pt_2()
-                                .text_size(px(11.))
-                                .text_color(theme::overlay0())
-                                .child(header),
-                        )
-                    })
                     .child(
                         div()
-                            .p_2()
-                            .border_b_1()
-                            .border_color(theme::surface0())
-                            .child(Input::new(&self.palette_input).small()),
-                    )
-                    .child(body),
+                            .flex_1()
+                            .min_h_0()
+                            // Tree's default press focuses its keyboard context.
+                            // Return focus after it observes the packet, without
+                            // suppressing its selection or active interaction state.
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|app, _, window, cx| {
+                                    window.focus(&app.focus_handle, cx);
+                                }),
+                            )
+                            .child(tree_list),
+                    ),
             )
-            .into_any_element()
+            .child(
+                gpui::component::resize_handle::<(), ReviewApp>(
+                    "sidebar-resize",
+                    gpui::Axis::Horizontal,
+                )
+                .inside(gpui::component::resizable::HandleEdge::Trailing)
+                .debug_selector(|| "sidebar-resize".to_string())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.sidebar_resize = Some((event.position.x, width));
+                        cx.notify();
+                    }),
+                ),
+            )
     }
 
     /// The review queue screen — what a bare launch opens on. Rows are the
@@ -5834,7 +4857,7 @@ impl ReviewApp {
     fn render_queue(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let queue = &self.queue;
         if queue.prs.is_empty() && queue.loading {
-            return centered_message("loading review queue…".into(), theme::overlay0());
+            return centered_message("loading review queue…".into(), theme::overlay0(cx));
         }
         if queue.prs.is_empty() {
             if let Some(err) = &queue.error {
@@ -5851,13 +4874,13 @@ impl ReviewApp {
                             .max_w(px(560.))
                             .text_center()
                             .text_size(px(14.))
-                            .text_color(theme::peach())
+                            .text_color(theme::peach(cx))
                             .child(SharedString::from(err.clone())),
                     )
                     .child(
                         div()
                             .text_size(px(13.))
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child(SharedString::from("⌘R to retry")),
                     )
                     .into_any_element();
@@ -5877,34 +4900,23 @@ impl ReviewApp {
                     .child(
                         div()
                             .text_size(px(14.))
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child("no PRs match the current filters"),
                     )
                     .child(
-                        div()
-                            .id("queue-clear-empty")
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .px_2()
-                            .h(px(24.))
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme::surface0())
-                            .text_size(px(13.))
-                            .text_color(theme::subtext())
-                            .hover(|style| style.bg(theme::surface0()))
-                            .child("clear filters (escape)")
+                        Button::new("queue-clear-empty")
+                            .small()
+                            .label("clear filters (escape)")
                             .on_click(move |_, window, cx| {
                                 entity.update(cx, |this, cx| {
-                                    window.focus(&this.focus_handle);
+                                    window.focus(&this.focus_handle, cx);
                                     this.queue_clear_filters(cx);
                                 })
                             }),
                     )
                     .into_any_element();
             }
-            return centered_message("no PRs awaiting your review".into(), theme::overlay0());
+            return centered_message("no PRs awaiting your review".into(), theme::overlay0(cx));
         }
         let entity = cx.entity();
         let now = now_unix();
@@ -5924,31 +4936,33 @@ impl ReviewApp {
                     .flex_shrink_0()
                     .h(px(34.))
                     .border_b_1()
-                    .border_color(theme::surface0())
-                    .child(div().text_color(theme::text()).child("Review queue"))
+                    .border_color(theme::surface0(cx))
+                    .child(div().text_color(theme::text(cx)).child("Review queue"))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_right()
                             .text_size(px(12.))
-                            .text_color(theme::subtext())
+                            .text_color(theme::subtext(cx))
                             .child(SharedString::from(format!(
                                 "{count} {}",
                                 if count == 1 { "PR" } else { "PRs" }
                             ))),
                     ),
             )
-            .child(self.queue_controls(entity.clone()))
+            .child(self.queue_controls(entity.clone(), cx))
             .child(
                 uniform_list("queue", count, move |range, _window, cx| {
                     let this = entity.read(cx);
                     range
                         .filter_map(|pos| this.queue.prs.get(pos).map(|pr| (pos, pr)))
-                        .map(|(pos, pr)| queue_row(pr, pos, pos == selected, now, entity.clone()))
+                        .map(|(pos, pr)| {
+                            queue_row(pr, pos, pos == selected, now, entity.clone(), cx)
+                        })
                         .collect()
                 })
-                .track_scroll(queue.scroll.clone())
+                .track_scroll(&queue.scroll)
                 .flex_1()
                 .min_h_0(),
             )
@@ -5963,7 +4977,7 @@ impl ReviewApp {
     /// failure that kept the rows stale — beside the chips that caused
     /// it, where the eye already is. The chips are click-driven for now;
     /// the keyboard drives the sort (`s`) and the clear (`escape`).
-    fn queue_controls(&self, entity: gpui::Entity<Self>) -> gpui::AnyElement {
+    fn queue_controls(&self, entity: gpui::Entity<Self>, cx: &gpui::App) -> gpui::AnyElement {
         let search = &self.queue.search;
         let oldest = search.ordering() == github::QueueSort::OldestUpdated;
         // The sort toggle: its label is the order the next refresh runs in
@@ -5977,41 +4991,25 @@ impl ReviewApp {
             .py_1()
             .flex_shrink_0()
             .border_b_1()
-            .border_color(theme::surface0())
+            .border_color(theme::surface0(cx))
             .child(
-                div()
-                    .id("queue-sort-toggle")
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_1p5()
-                    .h(px(22.))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme::surface0())
-                    .text_size(px(12.))
-                    .text_color(theme::subtext())
-                    .hover(|style| style.bg(theme::surface0()))
+                Button::new("queue-sort-toggle")
+                    .xsmall()
+                    .label(if oldest {
+                        "sort: oldest first ↑"
+                    } else {
+                        "sort: recently updated ↓"
+                    })
+                    .tooltip("Toggle queue order (s)")
                     .on_click({
                         let entity = entity.clone();
                         move |_, window, cx| {
                             entity.update(cx, |this, cx| {
-                                window.focus(&this.focus_handle);
+                                window.focus(&this.focus_handle, cx);
                                 this.queue_toggle_sort(cx);
                             })
                         }
-                    })
-                    .child(
-                        div()
-                            .text_color(theme::overlay0())
-                            .child(SharedString::from("sort:")),
-                    )
-                    .child(SharedString::from(if oldest {
-                        "oldest first ↑"
-                    } else {
-                        "recently updated ↓"
-                    })),
+                    }),
             );
         // Chip ids run across the whole row: groups re-enumerated would
         // collide ("org"'s first chip and "repo"'s are both
@@ -6021,101 +5019,56 @@ impl ReviewApp {
             for chip in group.chips {
                 let ix = chip_ix;
                 chip_ix += 1;
-                // The active chip reads like a selected filter — blue-tinted
-                // like GitHub's own label chips — and the inactive ones sit
-                // quiet until hovered.
-                let (bg, fg, border) = if chip.active {
-                    label_chip_colors(Some(Hsla::from(theme::blue())), theme::is_light())
-                } else {
-                    label_chip_colors(None, theme::is_light())
-                };
                 row = row.child(
-                    div()
-                        .id(("queue-chip", ix))
-                        .cursor_pointer()
-                        .flex()
-                        .items_center()
-                        .gap_0p5()
-                        .px_1p5()
-                        .h(px(22.))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .bg(bg)
-                        .text_size(px(12.))
-                        .when(chip.active, |chip| {
-                            chip.hover(|style| style.bg(Hsla::from(theme::blue()).opacity(0.2)))
-                        })
-                        .when(!chip.active, |chip| {
-                            chip.hover(|style| style.bg(theme::surface0()))
-                        })
+                    Button::new(("queue-chip", ix))
+                        .xsmall()
+                        .ghost()
+                        .selected(chip.active)
+                        .label(format!(
+                            "{}:{} · {}",
+                            group.kind.prefix(),
+                            chip.filter.value(),
+                            chip.count
+                        ))
+                        .max_w(px(300.))
+                        .tooltip(format!("{}:{}", group.kind.prefix(), chip.filter.value()))
                         .on_click({
                             let entity = entity.clone();
                             let filter = chip.filter.clone();
                             move |_, window, cx| {
                                 entity.update(cx, |this, cx| {
-                                    window.focus(&this.focus_handle);
+                                    window.focus(&this.focus_handle, cx);
                                     this.queue_toggle_filter(filter.clone(), cx);
                                 })
                             }
-                        })
-                        .child(
-                            div()
-                                .text_color(theme::overlay0())
-                                .child(SharedString::from(format!("{}:", group.kind.prefix()))),
-                        )
-                        .child(
-                            div()
-                                .max_w(px(220.))
-                                .truncate()
-                                .text_color(fg)
-                                .child(SharedString::from(chip.filter.value().to_string())),
-                        )
-                        .child(
-                            div()
-                                .text_color(if chip.active {
-                                    fg
-                                } else {
-                                    Hsla::from(theme::overlay0())
-                                })
-                                .child(SharedString::from(format!("· {}", chip.count))),
-                        ),
+                        }),
                 );
             }
             if group.hidden > 0 {
                 row = row.child(
                     div()
                         .text_size(px(12.))
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child(SharedString::from(format!("+{} more", group.hidden))),
                 );
             }
         }
         if !search.filters().is_empty() {
             row = row.child(
-                div()
-                    .id("queue-clear-filters")
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .px_1p5()
-                    .h(px(22.))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme::surface0())
-                    .text_size(px(12.))
-                    .text_color(theme::overlay0())
-                    .hover(|style| style.text_color(theme::red()).border_color(theme::red()))
+                Button::new("queue-clear-filters")
+                    .xsmall()
+                    .ghost()
+                    .label("✕ clear")
+                    .tooltip("Clear queue filters (escape)")
                     .on_click({
                         let entity = entity.clone();
                         move |_, window, cx| {
                             entity.update(cx, |this, cx| {
-                                window.focus(&this.focus_handle);
+                                window.focus(&this.focus_handle, cx);
                                 this.queue_clear_filters(cx);
                             })
                         }
-                    })
-                    .child(SharedString::from("✕ clear")),
+                    }),
             );
         }
         // The fetch status, right-aligned where the chips are: the refresh
@@ -6133,15 +5086,15 @@ impl ReviewApp {
                     QueueOrigin::Cached => "refreshing queue… (showing cached rows)".to_string(),
                     _ => "refreshing queue…".to_string(),
                 },
-                gpui::Hsla::from(theme::overlay0()),
+                gpui::Hsla::from(theme::overlay0(cx)),
             ));
         } else if let Some(err) = self.queue.error.as_deref() {
-            status.push((err.to_string(), gpui::Hsla::from(theme::peach())));
+            status.push((err.to_string(), gpui::Hsla::from(theme::peach(cx))));
         } else if self.queue.origin == QueueOrigin::Cached {
             let age = self.store.cached_queue().age_seconds(local_store::now_ms());
             status.push((
                 format!("cached · {age}s ago"),
-                gpui::Hsla::from(theme::overlay0()),
+                gpui::Hsla::from(theme::overlay0(cx)),
             ));
         }
         // A store that couldn't be opened is worth saying out loud: the
@@ -6155,7 +5108,7 @@ impl ReviewApp {
             };
             status.push((
                 format!("cache unavailable{where_}: {err}"),
-                gpui::Hsla::from(theme::peach()),
+                gpui::Hsla::from(theme::peach(cx)),
             ));
         }
         row = row
@@ -6179,7 +5132,7 @@ impl ReviewApp {
     /// without `gh auth login` explains itself instead of showing a near-
     /// blank screen. With something open, local diffs included, only the
     /// title-bar chip carries the message.
-    fn render_empty_pane(&self) -> gpui::AnyElement {
+    fn render_empty_pane(&self, cx: &gpui::App) -> gpui::AnyElement {
         match &self.account {
             AccountStatus::SignedOut(err) => div()
                 .size_full()
@@ -6194,29 +5147,29 @@ impl ReviewApp {
                         .max_w(px(560.))
                         .text_center()
                         .text_size(px(14.))
-                        .text_color(theme::peach())
+                        .text_color(theme::peach(cx))
                         .child(SharedString::from(err.to_string())),
                 )
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child(SharedString::from("⌘T to open a PR or path")),
                 )
                 .into_any_element(),
-            _ => centered_message("⌘T to open a PR or path".into(), theme::overlay0()),
+            _ => centered_message("⌘T to open a PR or path".into(), theme::overlay0(cx)),
         }
     }
 
-    fn render_footer(&self) -> impl IntoElement {
-        let hint = |keys: &[&str], label: &'static str| {
+    fn render_footer(&self, cx: &gpui::App) -> impl IntoElement {
+        let hint = |keys: &[&'static str], label: &'static str| {
             let mut hint = div().flex().items_center().gap_1();
             for key in keys {
                 hint = hint.child(Kbd::new(Keystroke::parse(key).unwrap()));
             }
             hint.child(
                 div()
-                    .text_color(theme::overlay0())
+                    .text_color(theme::overlay0(cx))
                     .child(SharedString::from(label)),
             )
         };
@@ -6227,9 +5180,9 @@ impl ReviewApp {
             .items_center()
             .gap_4()
             .px_3()
-            .bg(theme::mantle())
+            .bg(theme::mantle(cx))
             .border_t_1()
-            .border_color(theme::surface0())
+            .border_color(theme::surface0(cx))
             .text_size(px(12.));
         // The queue screen's hints differ from the diff's: j/k drive the
         // rows, and nothing about hunks or files applies yet.
@@ -6245,7 +5198,6 @@ impl ReviewApp {
                     footer.child(hint(&["escape"], "clear filters"))
                 })
                 .child(hint(&["cmd-t"], "open"))
-                .child(hint(&["cmd-k"], "palette"))
                 .child(hint(&["cmd-b"], "sidebar"));
         } else if self
             .active_item()
@@ -6257,7 +5209,6 @@ impl ReviewApp {
                 .child(hint(&["shift-cmd-right"], "changes"))
                 .child(hint(&["u"], "queue"))
                 .child(hint(&["r"], "refresh"))
-                .child(hint(&["cmd-k"], "palette"))
                 .child(hint(&["cmd-t"], "open"))
                 .child(hint(&["cmd-b"], "sidebar"));
         } else {
@@ -6273,7 +5224,6 @@ impl ReviewApp {
                 .child(hint(&["C"], "comment"))
                 .child(hint(&["/"], "filter files"))
                 .child(hint(&["home", "end"], "top/bottom"))
-                .child(hint(&["cmd-k"], "palette"))
                 .child(hint(&["cmd-t"], "open"))
                 .child(hint(&["cmd-b"], "sidebar"))
                 .child(hint(&["r"], "refresh"))
@@ -6302,9 +5252,9 @@ impl ReviewApp {
             });
         let diff_rows = self.active_data().map_or(0, |data| data.rows.len()) + composer_rows;
         match self.active_item() {
-            None => self.render_empty_pane(),
+            None => self.render_empty_pane(cx),
             Some(item) => match &item.state {
-                ItemState::Loading => centered_message("loading…".into(), theme::overlay0()),
+                ItemState::Loading => centered_message("loading…".into(), theme::overlay0(cx)),
                 ItemState::Failed(msg) => div()
                     .size_full()
                     .flex()
@@ -6314,7 +5264,7 @@ impl ReviewApp {
                     .child(
                         div()
                             .max_w(px(720.))
-                            .text_color(theme::red())
+                            .text_color(theme::red(cx))
                             .child(SharedString::from(msg.clone())),
                     )
                     .into_any_element(),
@@ -6336,18 +5286,12 @@ impl ReviewApp {
                             .text_size(px(text_size()))
                             .line_height(px(row_height()))
                             // Selection mouse listeners live on the diff pane only.
-                            // While the palette is open its occluding backdrop keeps
-                            // this hitbox from being hovered, so none of these fire;
-                            // the palette.is_none() guard documents (and backstops)
-                            // that. The Scrollbar stops propagation of its own
+                            // The Scrollbar stops propagation of its own
                             // mouse-downs and thumb drags before they reach us.
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                                    if this.palette.is_some() {
-                                        return;
-                                    }
-                                    window.focus(&this.focus_handle);
+                                    window.focus(&this.focus_handle, cx);
                                     let char_width = this.char_width(window);
                                     if event.modifiers.shift {
                                         let Some((side, head)) =
@@ -6470,8 +5414,7 @@ impl ReviewApp {
                                                         == ViewMode::Split
                                                         || matches!(
                                                             row,
-                                                            Row::CommentMedia { .. }
-                                                                | Row::CommentBody { .. }
+                                                            Row::CommentBody { .. }
                                                                 | Row::CommentHeader { .. }
                                                                 | Row::CommentEditor { .. }
                                                         ))
@@ -6510,6 +5453,7 @@ impl ReviewApp {
                                                         } else {
                                                             None
                                                         },
+                                                        cx,
                                                     )
                                                 })
                                                 .collect()
@@ -6517,9 +5461,8 @@ impl ReviewApp {
                                         None => Vec::new(),
                                     }
                                 })
-                                .with_decoration(diff_media::InlineMedia(cx.entity()))
                                 .with_decoration(diff_media::InlineText(cx.entity()))
-                                .track_scroll(data.scroll.clone())
+                                .track_scroll(&data.scroll)
                                 .with_horizontal_sizing_behavior(
                                     if data.preferences.soft_wrap.unwrap_or(false) {
                                         ListHorizontalSizingBehavior::FitList
@@ -6573,7 +5516,10 @@ impl ReviewApp {
     ) -> gpui::AnyElement {
         // Only a PR has a conversation to read; its title stays in the titlebar.
         let (Some(meta), Source::Pr(loc)) = (&data.pr_meta, &item.source) else {
-            return centered_message("A local diff has no conversation".into(), theme::overlay0());
+            return centered_message(
+                "A local diff has no conversation".into(),
+                theme::overlay0(cx),
+            );
         };
         // The pipe runs on every paint; bodies are small, the output is
         // what the TextView's keyed state diffs against (same text → no
@@ -6583,7 +5529,7 @@ impl ReviewApp {
         let content = if body.trim().is_empty() {
             // GitHub's own empty state, verbatim.
             div()
-                .text_color(theme::overlay0())
+                .text_color(theme::overlay0(cx))
                 .child(SharedString::from("No description provided."))
                 .into_any_element()
         } else {
@@ -6635,9 +5581,9 @@ impl ReviewApp {
                                             .mt_6()
                                             .p_4()
                                             .border_1()
-                                            .border_color(theme::surface0())
+                                            .border_color(theme::surface0(cx))
                                             .rounded_md()
-                                            .child(div().mb_2().text_color(theme::yellow()).child(
+                                            .child(div().mb_2().text_color(theme::yellow(cx)).child(
                                                 "Pending review summary · only you can see this",
                                             ))
                                             .child(conversation::render_markdown(
@@ -6678,15 +5624,8 @@ impl Render for ReviewApp {
             .relative()
             .flex()
             .flex_col()
-            .bg(theme::base())
-            .text_color(theme::text())
-            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
-                if this.palette.is_some() {
-                    this.close_palette(window, cx);
-                } else {
-                    this.open_palette(window, cx);
-                }
-            }))
+            .bg(theme::base(cx))
+            .text_color(theme::text(cx))
             .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
             .on_action(
                 cx.listener(|this, _: &search::OpenSearch, window, cx| {
@@ -6782,7 +5721,8 @@ impl Render for ReviewApp {
                                                 start_width + f32::from(event.position.x - start_x),
                                                 window.viewport_size().width.into(),
                                             );
-                                            cx.stop_propagation();
+                                            // Let the stock handle observe the
+                                            // same packet and update its state.
                                             cx.notify();
                                         } else {
                                             this.finish_sidebar_resize(cx);
@@ -6816,8 +5756,7 @@ impl Render for ReviewApp {
                 cx.listener(|this, _: &QueueClearFilters, _, cx| this.queue_clear_filters(cx)),
             )
             // Bound in the "ReviewApp" context: these only fire while the
-            // diff pane has focus. With the palette open, focus sits in the
-            // palette input, so its escape routing (PaletteBack) wins.
+            // diff pane has focus.
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
                 if this.close_search(window, cx) {
                     return;
@@ -6861,9 +5800,6 @@ impl Render for ReviewApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenInput, window, cx| {
-                // The sidebar input can't take focus under the palette.
-                this.palette = None;
-                this.palette_gen += 1;
                 this.sidebar_visible = true;
                 this.open_input
                     .update(cx, |state, cx| state.focus(window, cx));
@@ -6884,7 +5820,7 @@ impl Render for ReviewApp {
             // The open input propagates Escape when it has nothing of its own
             // to dismiss: hand focus back to the diff.
             .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
-                window.focus(&this.focus_handle);
+                window.focus(&this.focus_handle, cx);
                 cx.notify();
             }))
             .child(self.render_titlebar(cx))
@@ -6923,19 +5859,13 @@ impl Render for ReviewApp {
                             .child(pane),
                     ),
             )
-            .child(self.render_footer())
+            .child(self.render_footer(cx))
             .child(self.render_pending_tray(cx))
             .child(self.render_search(cx))
             // Root-level so the composer's input escapes the "ReviewApp" key
-            // context (plain letters must stay text, like the palette input).
+            // context (plain letters must stay text, like the quick-open input).
             .when(self.composer.is_some(), |root| {
                 root.child(self.render_composer(cx))
-            })
-            .when(self.review.is_some(), |root| {
-                root.child(self.render_review(cx))
-            })
-            .when(self.palette.is_some(), |root| {
-                root.child(self.render_palette(cx))
             })
     }
 }
@@ -6943,6 +5873,219 @@ impl Render for ReviewApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mentions::{mention_prefix, mention_rank};
+    use crate::rows::LineKind;
+    use gpui::component::Rope;
+    use std::path::PathBuf;
+    fn file_mode_data(diff: PrDiff) -> Box<ItemData> {
+        let built_rows = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: None,
+            options: RowOptions {
+                mode: ViewMode::Unified,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
+        Box::new(ItemData::new(
+            None,
+            diff,
+            ViewMode::Unified,
+            0,
+            built_rows,
+            None,
+            None,
+        ))
+    }
+
+    fn mention(login: &str, name: Option<&str>) -> github::Mention {
+        github::Mention {
+            login: login.to_string(),
+            name: name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn mention_prefix_detects_at_tokens_at_word_boundaries() {
+        let at = |s: &str, off: usize| mention_prefix(&Rope::from(s), off);
+        // Bare `@` with the cursor right after it: empty prefix.
+        assert_eq!(at("hi @", 4), Some((3, String::new())));
+        // Mid-token cursor returns only what's typed so far.
+        assert_eq!(at("hi @oct", 7), Some((3, "oct".to_string())));
+        assert_eq!(at("hi @oct", 5), Some((3, "o".to_string())));
+        // Start of text counts as a boundary.
+        assert_eq!(at("@oct", 4), Some((0, "oct".to_string())));
+        // Hyphens are valid login characters.
+        assert_eq!(at("@foo-bar", 8), Some((0, "foo-bar".to_string())));
+        // Not a boundary (looks like an email) — no completion.
+        assert_eq!(at("foo@bar", 7), None);
+        // No `@` at all.
+        assert_eq!(at("hello", 5), None);
+        // Cursor before the `@`.
+        assert_eq!(at("hi @oct", 3), None);
+    }
+
+    #[test]
+    fn mention_rank_orders_login_prefix_first() {
+        let octocat = mention("octocat", Some("The Octocat"));
+        // Login prefix is the strongest match.
+        assert_eq!(mention_rank(&octocat, "oct"), Some(0));
+        // Empty query matches everything at the top rank.
+        assert_eq!(mention_rank(&octocat, ""), Some(0));
+        // Name-word prefix beats a login substring.
+        assert_eq!(
+            mention_rank(&mention("xyz", Some("Bob Jones")), "bob"),
+            Some(1)
+        );
+        assert_eq!(mention_rank(&mention("abobc", None), "bob"), Some(2));
+        // Case-insensitive, and no match returns None.
+        assert_eq!(mention_rank(&octocat, "OCT"), Some(0));
+        assert_eq!(mention_rank(&octocat, "zzz"), None);
+    }
+
+    mod markdown_hosts {
+        include!("markdown_tests.rs");
+    }
+
+    #[gpui::test]
+    fn stock_tree_preserves_selection_without_rebuilding_for_badges_or_opening_collapsed_paths(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(Vec::new());
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff = two_file_diff();
+        data.diff.files[0].new_path = Some("src/a.rs".into());
+        data.diff.files[1].new_path = Some("src/b.rs".into());
+        data.rebuild_tree();
+        install_item(&app, item, cx);
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.sidebar_visible = true;
+                cx.notify();
+            })
+        });
+        let draw = |vcx: &mut gpui::VisualTestContext| {
+            for _ in 0..3 {
+                vcx.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                });
+                vcx.run_until_parked();
+            }
+        };
+        draw(&mut vcx);
+        let state = cx.update(|cx| {
+            app.read(cx)
+                .active_data()
+                .unwrap()
+                .tree_view
+                .as_ref()
+                .unwrap()
+                .state
+                .clone()
+        });
+        cx.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.set_selected_index(state.index_of(&tree::file_id("src/b.rs")), cx);
+            })
+        });
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.tree_filter_input
+                    .update(cx, |state, cx| state.set_value("b.rs", window, cx));
+                cx.notify();
+            })
+        });
+        draw(&mut vcx);
+        cx.update(|cx| {
+            assert_eq!(
+                state.read(cx).selected_item().unwrap().id,
+                tree::file_id("src/b.rs")
+            )
+        });
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.tree_filter_input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                // Reverse file-array order like a refreshed diff. Identity is path,
+                // never the old index or visible position.
+                let data = app.active_data_mut().unwrap();
+                data.diff.files.swap(0, 1);
+                data.rebuild_tree();
+                cx.notify();
+            })
+        });
+        draw(&mut vcx);
+        cx.update(|cx| {
+            assert_eq!(
+                state.read(cx).selected_item().unwrap().id,
+                tree::file_id("src/b.rs")
+            )
+        });
+        let directory = vcx.debug_bounds("tree-row-0").unwrap().center();
+        vcx.update(|window, cx| {
+            assert!(
+                app.read(cx).focus_handle.is_focused(window),
+                "focus before Tree click: {:?}",
+                window.focused(cx)
+            );
+        });
+        vcx.simulate_mouse_down(directory, MouseButton::Left, gpui::Modifiers::default());
+        vcx.update(|window, cx| {
+            assert!(
+                app.read(cx).focus_handle.is_focused(window),
+                "Tree must not take focus even during a press"
+            )
+        });
+        vcx.simulate_mouse_up(directory, MouseButton::Left, gpui::Modifiers::default());
+        draw(&mut vcx);
+        cx.update(|cx| {
+            assert!(app
+                .read(cx)
+                .active_data()
+                .unwrap()
+                .collapsed
+                .contains("src"));
+            assert!(state
+                .read(cx)
+                .index_of(&tree::file_id("src/b.rs"))
+                .is_none());
+            assert_eq!(
+                state.read(cx).selected_item().unwrap().id.as_ref(),
+                "directory:src"
+            );
+        });
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.active_data_mut().unwrap().file_ix = 1;
+                cx.notify();
+            })
+        });
+        draw(&mut vcx);
+        cx.update(|cx| {
+            assert!(state
+                .read(cx)
+                .index_of(&tree::file_id("src/a.rs"))
+                .is_none());
+            assert!(state
+                .read(cx)
+                .selected_item()
+                .unwrap()
+                .id
+                .starts_with("directory:"));
+        });
+        vcx.update(|window, cx| {
+            assert!(
+                app.read(cx).focus_handle.is_focused(window),
+                "Tree mouse selection must not create a new keyboard focus route"
+            )
+        });
+    }
     use crate::test_util::{
         add, hunk, queued, rc, row_name, sample_comments, sample_diff, two_file_diff,
     };
@@ -7212,8 +6355,8 @@ mod tests {
         let checkbox = vcx.debug_bounds("viewed-1").unwrap();
         assert_eq!(
             checkbox.right(),
-            sidebar.right() - px(9.), // 8px row padding + 1px sidebar border
-            "checkbox is the far-right row child"
+            sidebar.right() - px(20.),
+            "checkbox leaves room for the overlay scrollbar"
         );
         vcx.simulate_mouse_down(
             checkbox.center(),
@@ -7237,6 +6380,11 @@ mod tests {
             let _ = window.draw(cx);
         });
         let checkbox = vcx.debug_bounds("viewed-1").unwrap();
+        assert_eq!(
+            checkbox.right(),
+            sidebar.right() - px(20.),
+            "filtered rows also leave room for the overlay scrollbar"
+        );
         vcx.simulate_mouse_down(
             checkbox.center(),
             MouseButton::Left,
@@ -7597,9 +6745,8 @@ mod tests {
                     })
                 });
                 draw(&mut vcx);
-                // List markers exist only through the Markdown block renderer,
-                // never through the old raw-string row path.
-                assert!(vcx.debug_bounds("inline-text-0-11-0-0-0-marker").is_some());
+                // Stock Markdown owns list markers; assert the host's measured
+                // content and anchor geometry, not a private block widget tree.
                 let root = vcx.debug_bounds("inline-text-0-11-0-card").unwrap();
                 let content = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
                 assert!(content.size.height > px(row_height() * 5.));
@@ -7639,10 +6786,8 @@ mod tests {
             }
         }
         let cursor = cx.update(|cx| app.read(cx).active_data().unwrap().cursor);
-        let marker = vcx
-            .debug_bounds("inline-text-0-11-0-0-0-marker")
-            .unwrap()
-            .center();
+        let content = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
+        let marker = point(content.left() + px(8.), content.top() + px(8.));
         vcx.simulate_mouse_down(marker, MouseButton::Left, gpui::Modifiers::default());
         vcx.simulate_mouse_up(marker, MouseButton::Left, gpui::Modifiers::default());
         vcx.run_until_parked();
@@ -7792,7 +6937,7 @@ mod tests {
             });
             draw(&mut vcx);
             let body = vcx.debug_bounds("inline-text-0-11-0-text").unwrap();
-            vcx.simulate_event(gpui::ScrollWheelEvent {
+            vcx.simulate_event(gpui::ScrollEvent {
                 position: body.center(),
                 delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-32.))),
                 ..Default::default()
@@ -7810,7 +6955,7 @@ mod tests {
                     point(card.left() + px(20.), card.top() + px(12.))
                 };
                 let before = offset(cx);
-                vcx.simulate_event(gpui::ScrollWheelEvent {
+                vcx.simulate_event(gpui::ScrollEvent {
                     position: at,
                     delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-32.))),
                     ..Default::default()
@@ -7835,539 +6980,6 @@ mod tests {
                 });
             });
         }
-    }
-
-    #[gpui::test]
-    fn inline_diff_media_renders_in_both_halves_and_survives_partial_virtualization(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = requests.clone();
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(240, 160)
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let png = png.into_inner();
-        cx.update(|cx| cx.set_http_client(http_client::FakeHttpClient::create(move |req| {
-            let url = req.uri().to_string();
-            seen.lock().unwrap().push(url.clone());
-            let svg = url.ends_with("diagram"); // extensionless private SVG
-            let bytes = if svg { br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80"><rect width="200" height="80"/></svg>"#.to_vec() } else { png.clone() };
-            async move { Ok(http_client::http::Response::builder().status(200)
-                .header("content-type", if svg { "image/svg+xml" } else { "image/png" })
-                .body(http_client::AsyncBody::from(bytes)).unwrap()) }
-        })));
-        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
-        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
-        vcx.simulate_resize(size(px(1500.), px(2000.)));
-        let mut item = loop_pr_item(vec![
-            rc(11, "a.rs", Some("RIGHT"), Some(1), "Before **screen**\n\n![screen](https://github.com/user-attachments/assets/screen)\n\n![diagram](https://github.com/user-attachments/assets/diagram)\n\nAfter `code`.", "alice", "2026-01-01T00:00:00Z", None),
-            rc(12, "a.rs", Some("RIGHT"), Some(1), "<img src='https://github.com/user-attachments/assets/diagram'>", "bob", "2026-01-02T00:00:00Z", Some(11)),
-            rc(13, "a.rs", Some("LEFT"), Some(1), "![old](https://github.com/user-attachments/assets/old-screen)", "carol", "2026-01-01T00:00:00Z", None),
-        ]);
-        let ItemState::Ready(data) = &mut item.state else {
-            unreachable!()
-        };
-        data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n tail\n");
-        data.set_rows(data.row_build());
-        install_item(&app, item, cx);
-        for mode in [ViewMode::Unified, ViewMode::Split] {
-            cx.update(|cx| {
-                app.update(cx, |this, _| {
-                    let data = this.active_data_mut().unwrap();
-                    data.mode = mode;
-                    data.set_rows(data.row_build());
-                    let mut scroll = data.scroll.0.borrow_mut();
-                    scroll.deferred_scroll_to_item = None;
-                    scroll.base_handle.set_offset(point(px(0.), px(0.)));
-                })
-            });
-            for _ in 0..5 {
-                vcx.update(|window, cx| {
-                    let _ = window.draw(cx);
-                });
-                vcx.run_until_parked();
-            }
-            let screenshot = vcx
-                .debug_bounds("inline-comment-0-11-0-rendered")
-                .expect("root screenshot");
-            assert!(screenshot.size.height > px(0.));
-            let card = vcx.debug_bounds("inline-comment-0-11-0-card").unwrap();
-            assert!(screenshot.bottom() <= card.bottom());
-            let before = vcx.debug_bounds("inline-text-0-11-0-text").unwrap();
-            let after = vcx.debug_bounds("inline-text-0-11-2-text").unwrap();
-            assert!(before.bottom() <= card.top());
-            assert!(
-                after.top()
-                    >= vcx
-                        .debug_bounds("inline-comment-0-11-1-card")
-                        .unwrap()
-                        .bottom()
-            );
-            assert!(
-                vcx.debug_bounds("inline-comment-0-12-0-rendered").is_some(),
-                "reply media"
-            );
-            if mode == ViewMode::Split {
-                let viewport = cx.update(|cx| {
-                    app.read(cx)
-                        .active_data()
-                        .unwrap()
-                        .scroll
-                        .0
-                        .borrow()
-                        .base_handle
-                        .bounds()
-                });
-                assert!(card.left() > viewport.center().x);
-                assert!(
-                    vcx.debug_bounds("inline-comment-0-13-0-card")
-                        .unwrap()
-                        .right()
-                        <= viewport.center().x
-                );
-            }
-            let count = requests.lock().unwrap().len();
-            let cursor = cx.update(|cx| app.read(cx).active_data().unwrap().cursor);
-            let click_point = vcx
-                .debug_bounds("inline-comment-0-11-1-svg-toggle")
-                .unwrap()
-                .center();
-            vcx.simulate_mouse_move(click_point, None, gpui::Modifiers::default());
-            vcx.simulate_mouse_down(
-                click_point,
-                gpui::MouseButton::Left,
-                gpui::Modifiers::default(),
-            );
-            vcx.simulate_mouse_up(
-                click_point,
-                gpui::MouseButton::Left,
-                gpui::Modifiers::default(),
-            );
-            vcx.run_until_parked();
-            vcx.update(|window, cx| {
-                let _ = window.draw(cx);
-            });
-            assert!(vcx
-                .debug_bounds("inline-comment-0-11-1-svg-source")
-                .is_some());
-            assert!(
-                vcx.debug_bounds("inline-comment-0-12-0-rendered").is_some(),
-                "same URL has independent toggle"
-            );
-            assert_eq!(
-                requests.lock().unwrap().len(),
-                count,
-                "source toggle does not fetch"
-            );
-            assert_eq!(
-                cx.update(|cx| app.read(cx).active_data().unwrap().cursor),
-                cursor,
-                "image controls never move the code cursor"
-            );
-            // Shrink the viewport and scroll into the middle of an image. The
-            // first reserved slot is no longer in the list's visible range.
-            vcx.simulate_resize(size(px(1500.), px(450.)));
-            cx.update(|cx| {
-                app.update(cx, |this, _| {
-                    let data = this.active_data_mut().unwrap();
-                    let first = data
-                        .rows
-                        .iter()
-                        .position(|row| {
-                            matches!(
-                                row,
-                                Row::CommentMedia {
-                                    comment_id: 11,
-                                    image_ix: 0,
-                                    ..
-                                }
-                            )
-                        })
-                        .unwrap();
-                    data.scroll
-                        .0
-                        .borrow()
-                        .base_handle
-                        .set_offset(point(px(0.), px(-((first + 2) as f32) * row_height())));
-                })
-            });
-            for _ in 0..3 {
-                vcx.update(|window, cx| {
-                    let _ = window.draw(cx);
-                });
-                vcx.run_until_parked();
-            }
-            assert!(
-                vcx.debug_bounds("inline-comment-0-11-0-rendered").is_some(),
-                "partially scrolled image remains mounted"
-            );
-            let (viewport, offset, first) = cx.update(|cx| {
-                let data = app.read(cx).active_data().unwrap();
-                let scroll = data.scroll.0.borrow();
-                let first = data
-                    .rows
-                    .iter()
-                    .position(|row| {
-                        matches!(
-                            row,
-                            Row::CommentMedia {
-                                comment_id: 11,
-                                image_ix: 0,
-                                ..
-                            }
-                        )
-                    })
-                    .unwrap();
-                (
-                    scroll.base_handle.bounds(),
-                    scroll.base_handle.offset(),
-                    first,
-                )
-            });
-            let partial = vcx.debug_bounds("inline-comment-0-11-0-card").unwrap();
-            assert_eq!(
-                partial.top(),
-                viewport.top() + offset.y + px(first as f32 * row_height())
-            );
-            assert!(partial.top() < viewport.top() && partial.bottom() > viewport.top());
-            vcx.simulate_resize(size(px(1500.), px(2000.)));
-        }
-        cx.update(|cx| app.update(cx, |this, cx| this.toggle_comments(cx)));
-        vcx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-        assert!(cx.update(|cx| app
-            .read(cx)
-            .active_data()
-            .unwrap()
-            .rows
-            .iter()
-            .all(|row| !matches!(row, Row::CommentMedia { .. }))));
-    }
-
-    #[gpui::test]
-    fn conversation_media_renders_in_bodies_and_comments_and_svg_toggles_are_per_image(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = requests.clone();
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(24, 16)
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let png = png.into_inner();
-        let client = http_client::FakeHttpClient::create(move |req| {
-            let url = req.uri().to_string();
-            seen.lock().unwrap().push(url.clone());
-            let is_svg = url.ends_with("diagram.svg") || url.ends_with("/comment-diagram");
-            let bytes = if is_svg {
-                br##"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="24"><rect width="80" height="24" fill="#8899aa"/></svg>"##.to_vec()
-            } else {
-                png.clone()
-            };
-            async move {
-                Ok(http_client::http::Response::builder()
-                    .status(200)
-                    .header(
-                        "Content-Type",
-                        if is_svg { "image/svg+xml" } else { "image/png" },
-                    )
-                    .body(http_client::AsyncBody::from(bytes))
-                    .unwrap())
-            }
-        });
-        cx.update(|cx| cx.set_http_client(client));
-        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
-        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
-        vcx.simulate_resize(size(px(1400.), px(1800.)));
-        let mut item = loop_pr_item(Vec::new());
-        item.pane = ItemPane::Conversation;
-        let ItemState::Ready(data) = &mut item.state else {
-            unreachable!()
-        };
-        data.pr_meta.as_mut().unwrap().body = "Before the screenshot.\n\n<img width='240' alt='private screenshot' src='https://github.com/user-attachments/assets/private-screen'>\n\n![diagram](https://example.com/diagram.svg)\n\n![same diagram](https://example.com/diagram.svg)\n\nAfter the images.\n\n| Before | After |\n| --- | --- |\n| text | ![public screenshot](https://github.com/user-attachments/assets/public-screen) |".into();
-        let mut discussion = conversation::tests::sample_discussion();
-        discussion.threads.clear();
-        discussion.comments.truncate(1);
-        discussion.comments[0].body =
-            "![comment diagram](https://github.com/user-attachments/assets/comment-diagram)".into();
-        data.discussion = Some(discussion);
-        install_item(&app, item, cx);
-        for _ in 0..4 {
-            vcx.update(|window, cx| {
-                let _ = window.draw(cx);
-            });
-            vcx.run_until_parked();
-        }
-        assert!(
-            vcx.debug_bounds("conversation-0-1-0-rendered").is_some(),
-            "private PR-body screenshot is inline"
-        );
-        let screenshot = vcx.debug_bounds("conversation-0-1-0-rendered").unwrap();
-        assert_eq!(screenshot.size.width, px(240.));
-        assert!(
-            screenshot.size.height > px(0.),
-            "the native loader decoded the screenshot"
-        );
-        assert!(vcx.debug_bounds("conversation-0-2-0-rendered").is_some());
-        assert!(
-            vcx.debug_bounds("conversation-0-2-0-rendered")
-                .unwrap()
-                .size
-                .height
-                > px(0.)
-        );
-        assert!(vcx.debug_bounds("conversation-0-3-0-rendered").is_some());
-        assert!(
-            vcx.debug_bounds("conversation-0-5-1-1-0-rendered")
-                .is_some(),
-            "table images stay inside their cell"
-        );
-        assert!(
-            vcx.debug_bounds("discussion-0-main-false-1-0-0-svg-toggle")
-                .is_some(),
-            "extensionless comment attachment is detected as SVG by content type"
-        );
-        let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
-            let point = vcx.debug_bounds(selector).unwrap().center();
-            vcx.simulate_mouse_move(point, None, gpui::Modifiers::default());
-            vcx.simulate_mouse_down(point, gpui::MouseButton::Left, gpui::Modifiers::default());
-            vcx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::default());
-            vcx.run_until_parked();
-            vcx.update(|window, cx| {
-                let _ = window.draw(cx);
-            });
-        };
-        let before = requests.lock().unwrap().len();
-        click(&mut vcx, "conversation-0-2-0-svg-toggle");
-        assert!(vcx.debug_bounds("conversation-0-2-0-svg-source").is_some());
-        assert!(
-            vcx.debug_bounds("conversation-0-3-0-rendered").is_some(),
-            "same URL, independent mode"
-        );
-        assert!(vcx
-            .debug_bounds("discussion-0-main-false-1-0-0-rendered")
-            .is_some());
-        click(&mut vcx, "conversation-0-2-0-svg-toggle");
-        assert!(vcx.debug_bounds("conversation-0-2-0-rendered").is_some());
-        assert_eq!(
-            requests.lock().unwrap().len(),
-            before,
-            "toggles never refetch"
-        );
-        assert!(requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|url| url.ends_with("/private-screen")));
-    }
-
-    #[gpui::test]
-    fn conversation_lists_use_compact_gaps_without_compressing_paragraphs(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let first = "A long list item that wraps onto multiple lines. ".repeat(8);
-        for (list, loose, nested) in [
-            (format!("- {first}\n- Second."), false, false),
-            (format!("10. {first}\n11. Second."), false, false),
-            (format!("- [x] {first}\n- [ ] Second."), false, false),
-            (
-                format!("- {first}\n  - Nested first.\n  - Nested second.\n- Second."),
-                false,
-                true,
-            ),
-            (
-                format!("- {first}\n\n  Another paragraph.\n\n- Second."),
-                true,
-                false,
-            ),
-        ] {
-            let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
-            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
-            let mut item = loop_pr_item(Vec::new());
-            item.pane = ItemPane::Conversation;
-            let ItemState::Ready(data) = &mut item.state else {
-                unreachable!()
-            };
-            data.pr_meta.as_mut().unwrap().body = format!("Before.\n\n{list}\n\nAfter.");
-            install_item(&app, item, cx);
-            for width in [1400., 1000.] {
-                vcx.simulate_resize(size(px(width), px(2200.)));
-                let rem = vcx.update(|window, cx| {
-                    let _ = window.draw(cx);
-                    window.rem_size()
-                });
-                let before = vcx.debug_bounds("conversation-0-0-text").unwrap();
-                let first = vcx.debug_bounds("conversation-0-1-0-body").unwrap();
-                let second = vcx.debug_bounds("conversation-0-1-1-body").unwrap();
-                let after = vcx.debug_bounds("conversation-0-2-text").unwrap();
-                let paragraph_gap = rem * 0.75;
-                let compact_gap = rem * 0.25;
-                let expected = if loose { paragraph_gap } else { compact_gap };
-                let assert_gap = |actual: gpui::Pixels, expected: gpui::Pixels| {
-                    assert!(
-                        (actual - expected).abs() <= px(1.),
-                        "expected gap {expected:?}, got {actual:?} in {list:?}"
-                    );
-                };
-                assert_gap(second.top() - first.bottom(), expected);
-                assert_gap(first.top() - before.bottom(), paragraph_gap);
-                assert_gap(after.top() - second.bottom(), paragraph_gap);
-                let paragraph = vcx.debug_bounds("conversation-0-1-0-0-text").unwrap();
-                assert!(
-                    paragraph.size.height > second.size.height,
-                    "the first item wraps rather than clipping to one line"
-                );
-                if loose {
-                    let next = vcx.debug_bounds("conversation-0-1-0-1-text").unwrap();
-                    assert_gap(next.top() - paragraph.bottom(), paragraph_gap);
-                }
-                if nested {
-                    let nested_first = vcx.debug_bounds("conversation-0-1-0-1-0-body").unwrap();
-                    let nested_second = vcx.debug_bounds("conversation-0-1-0-1-1-body").unwrap();
-                    assert_gap(nested_first.top() - paragraph.bottom(), compact_gap);
-                    assert_gap(nested_second.top() - nested_first.bottom(), compact_gap);
-                    assert!(nested_first.left() > first.left(), "nested lists indent");
-                    assert!(first.bottom() >= nested_second.bottom());
-                }
-            }
-        }
-    }
-
-    #[gpui::test]
-    fn conversation_list_paragraphs_and_thread_headers_have_nonoverlapping_bounds(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
-        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
-        let mut item = loop_pr_item(Vec::new());
-        item.pane = ItemPane::Conversation;
-        let ItemState::Ready(data) = &mut item.state else {
-            unreachable!()
-        };
-        data.pr_meta.as_mut().unwrap().body = format!(
-            "1. {}\n\n   {}\n\n   {}\n\n2. Next item.\n\nAfter the list.",
-            "The HTTP reply lands: `handoffVersion` changes. ".repeat(6),
-            "The ACTIVE branch has the mirror-image failure. ".repeat(6),
-            "Routing both branches through `isNewerHandoffState` fixes this. ".repeat(6),
-        );
-        let mut discussion = conversation::tests::sample_discussion();
-        let mut review = discussion.comments[0].clone();
-        review.id = 100;
-        review.body.clear();
-        review.review_state = Some("COMMENTED".into());
-        review.review_id = Some("R1".into());
-        discussion.comments.push(review);
-        discussion.threads[0].comments[0].review_id = Some("R1".into());
-        data.discussion = Some(discussion);
-        install_item(&app, item, cx);
-        for width in [1400., 1000.] {
-            vcx.simulate_resize(size(px(width), px(2200.)));
-            vcx.update(|window, cx| {
-                let _ = window.draw(cx);
-            });
-            let marker = vcx.debug_bounds("conversation-0-0-0-marker").unwrap();
-            let body = vcx.debug_bounds("conversation-0-0-0-body").unwrap();
-            assert!(marker.size.width >= px(15.));
-            assert!(body.left() > marker.right(), "marker cannot overlap text");
-            assert!(body.size.width > px(150.), "no character-wide columns");
-            let first = vcx.debug_bounds("conversation-0-0-0-0-text").unwrap();
-            let second = vcx.debug_bounds("conversation-0-0-0-1-text").unwrap();
-            let third = vcx.debug_bounds("conversation-0-0-0-2-text").unwrap();
-            assert!(
-                second.top() >= first.bottom(),
-                "paragraphs stack vertically"
-            );
-            assert!(third.top() >= second.bottom());
-            assert!(
-                body.bottom() >= third.bottom(),
-                "text stays inside its list row"
-            );
-            let after = vcx.debug_bounds("conversation-0-1-text").unwrap();
-            assert!(
-                after.top() >= body.bottom(),
-                "following content starts below the entire item"
-            );
-            let header = vcx.debug_bounds("thread-header-0-T1").unwrap();
-            assert!(
-                header.size.width > px(150.),
-                "resolved thread label must not be an empty ellipsis"
-            );
-            assert!(header.top() >= after.bottom());
-        }
-    }
-
-    fn mention(login: &str, name: Option<&str>) -> github::Mention {
-        github::Mention {
-            login: login.to_string(),
-            name: name.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn mention_prefix_detects_at_tokens_at_word_boundaries() {
-        let at = |s: &str, off: usize| mention_prefix(&Rope::from(s), off);
-        // Bare `@` with the cursor right after it: empty prefix.
-        assert_eq!(at("hi @", 4), Some((3, String::new())));
-        // Mid-token cursor returns only what's typed so far.
-        assert_eq!(at("hi @oct", 7), Some((3, "oct".to_string())));
-        assert_eq!(at("hi @oct", 5), Some((3, "o".to_string())));
-        // Start of text counts as a boundary.
-        assert_eq!(at("@oct", 4), Some((0, "oct".to_string())));
-        // Hyphens are valid login characters.
-        assert_eq!(at("@foo-bar", 8), Some((0, "foo-bar".to_string())));
-        // Not a boundary (looks like an email) — no completion.
-        assert_eq!(at("foo@bar", 7), None);
-        // No `@` at all.
-        assert_eq!(at("hello", 5), None);
-        // Cursor before the `@`.
-        assert_eq!(at("hi @oct", 3), None);
-    }
-
-    #[test]
-    fn mention_rank_orders_login_prefix_first() {
-        let octocat = mention("octocat", Some("The Octocat"));
-        // Login prefix is the strongest match.
-        assert_eq!(mention_rank(&octocat, "oct"), Some(0));
-        // Empty query matches everything at the top rank.
-        assert_eq!(mention_rank(&octocat, ""), Some(0));
-        // Name-word prefix beats a login substring.
-        assert_eq!(
-            mention_rank(&mention("xyz", Some("Bob Jones")), "bob"),
-            Some(1)
-        );
-        assert_eq!(mention_rank(&mention("abobc", None), "bob"), Some(2));
-        // Case-insensitive, and no match returns None.
-        assert_eq!(mention_rank(&octocat, "OCT"), Some(0));
-        assert_eq!(mention_rank(&octocat, "zzz"), None);
-    }
-
-    // --- File mode (user stories 28–31) --------------------------------
-
-    /// ItemData exactly as a fresh load builds it: file mode on the first
-    /// file (unified, no comments), revealed at its first change.
-    fn file_mode_data(diff: PrDiff) -> Box<ItemData> {
-        let built_rows = build_rows(RowsView {
-            diff: &diff,
-            upgrades: &HashMap::new(),
-            comments: None,
-            options: RowOptions {
-                mode: ViewMode::Unified,
-                file_ix: 0,
-                comments_visible: true,
-                comment_wrap: COMMENT_WRAP_CHARS,
-            },
-        });
-        Box::new(ItemData::new(
-            None,
-            diff,
-            ViewMode::Unified,
-            0,
-            built_rows,
-            None,
-            None,
-        ))
     }
 
     #[gpui::test]
@@ -8417,13 +7029,13 @@ mod tests {
             let highlights: Vec<_> = (0..data.rows.len())
                 .flat_map(|row| {
                     search
-                        .highlights(row, SelSide::Unified)
+                        .highlights(row, SelSide::Unified, cx)
                         .into_iter()
                         .map(move |(_, color)| (row, color))
                 })
                 .collect();
             assert_eq!(highlights.len(), 2, "the other file is not searched");
-            let active_color: gpui::Rgba = Hsla::from(theme::peach()).opacity(0.4).into();
+            let active_color = theme::search_current_bg(cx);
             highlights
                 .into_iter()
                 .find(|(_, color)| *color == active_color)
@@ -8536,7 +7148,7 @@ mod tests {
                 .search
                 .as_ref()
                 .unwrap()
-                .highlights(row, SelSide::Unified)
+                .highlights(row, SelSide::Unified, cx)
                 .is_empty()));
         });
         vcx.simulate_keystrokes("escape");
@@ -8563,7 +7175,7 @@ mod tests {
         });
         vcx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                window.focus(&app.focus_handle);
+                window.focus(&app.focus_handle, cx);
                 app.flip_pane(ItemPane::Conversation, cx);
             })
         });
@@ -8886,14 +7498,6 @@ mod tests {
             ))
         }
 
-        fn list_prs(
-            &self,
-            _owner: &str,
-            _repo: &str,
-        ) -> Result<Vec<github::PrSummary>, github::ClientError> {
-            unimplemented!("queue tests never list PRs")
-        }
-
         fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
             Err(github::ClientError::Failed(
                 "queue tests never fetch a patch".into(),
@@ -8973,8 +7577,8 @@ mod tests {
         store: local_store::LocalStore,
     ) -> (gpui::AnyWindowHandle, gpui::Entity<ReviewApp>) {
         cx.update(|cx| {
-            gpui_component::init(cx);
-            theme::apply_ui_theme(None, cx);
+            gpui::component::init(cx);
+            theme::apply_ui_theme(cx);
         });
         let stash = std::rc::Rc::new(std::cell::RefCell::new(None::<gpui::Entity<ReviewApp>>));
         let stash2 = stash.clone();
@@ -8990,7 +7594,7 @@ mod tests {
                     cx,
                 )
             });
-            window.focus(&view.read(cx).focus_handle);
+            window.focus(&view.read(cx).focus_handle.clone(), cx);
             *stash2.borrow_mut() = Some(view.clone());
             Root::new(view, window, cx)
         });
@@ -9109,14 +7713,6 @@ mod tests {
 
         fn pr_meta(&self, _loc: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
             unimplemented!("queue tests never read PR meta")
-        }
-
-        fn list_prs(
-            &self,
-            _owner: &str,
-            _repo: &str,
-        ) -> Result<Vec<github::PrSummary>, github::ClientError> {
-            unimplemented!("queue tests never list PRs")
         }
 
         fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
@@ -9342,7 +7938,7 @@ mod tests {
                 // The sidebar carries the file tree: it must be showing.
                 assert!(this.sidebar_visible);
                 // `u`: back to the queue — the item stays open behind the
-                // scenes (⌘K / ctrl-tab reach it) and the queue keeps the
+                // scenes (ctrl-tab reaches it) and the queue keeps the
                 // selection where it was left.
                 this.back_to_queue(cx);
                 assert!(this.show_queue, "u must come home");
@@ -9664,7 +8260,7 @@ mod tests {
         assert_eq!(pane(cx), ItemPane::Changes);
 
         // Re-opening the item the session already has brings it forward
-        // with its pane intact — flipping isn't something `u`/⌘K resets.
+        // with its pane intact — flipping isn't something `u` resets.
         vcx.dispatch_action(ShowConversation);
         cx.update(|cx| {
             app.update(cx, |this, cx| this.open_item(Source::Pr(loc), cx));
@@ -9992,7 +8588,7 @@ mod tests {
         let mut pages = 0;
         loop {
             let before = offset(cx);
-            vcx.simulate_event(gpui::ScrollWheelEvent {
+            vcx.simulate_event(gpui::ScrollEvent {
                 position: gpui::point(px(1100.), px(500.)),
                 delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-800.))),
                 ..Default::default()
@@ -10095,7 +8691,7 @@ mod tests {
         // centered 760px column (which starts around x≈710 in the
         // 1920-wide test window). A wheel there must scroll — the whole
         // point of the pane-level scroller.
-        vcx.simulate_event(gpui::ScrollWheelEvent {
+        vcx.simulate_event(gpui::ScrollEvent {
             position: point(px(400.), px(500.)),
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))),
             ..Default::default()
@@ -10107,7 +8703,7 @@ mod tests {
         );
 
         // And over the column itself, where it always worked.
-        vcx.simulate_event(gpui::ScrollWheelEvent {
+        vcx.simulate_event(gpui::ScrollEvent {
             position: point(px(1100.), px(500.)),
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))),
             ..Default::default()
@@ -10277,18 +8873,6 @@ mod tests {
             .unwrap()
             .0
             .contains("author:"));
-    }
-
-    #[test]
-    fn repo_slug_parsing() {
-        assert_eq!(
-            parse_repo_slug("BurntSushi/ripgrep"),
-            Ok(("BurntSushi".to_string(), "ripgrep".to_string()))
-        );
-        assert!(parse_repo_slug("ripgrep").is_err());
-        assert!(parse_repo_slug("/ripgrep").is_err());
-        assert!(parse_repo_slug("BurntSushi/").is_err());
-        assert!(parse_repo_slug("a/b/c").is_err());
     }
 
     // --- Review comments ----------------------------------------------------
@@ -11159,14 +9743,6 @@ mod tests {
             Ok(loop_pr_meta())
         }
 
-        fn list_prs(
-            &self,
-            _owner: &str,
-            _repo: &str,
-        ) -> Result<Vec<github::PrSummary>, github::ClientError> {
-            unimplemented!("loop tests never list PRs")
-        }
-
         fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
             Ok(self.patch.clone().unwrap_or_else(|| {
                 "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n".into()
@@ -11282,6 +9858,9 @@ mod tests {
                 verdict,
                 body: body.to_string(),
             });
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(github::ClientError::Failed("review rejected".into()));
+            }
             Ok(())
         }
     }
@@ -11328,7 +9907,7 @@ mod tests {
                 let _ = window.draw(cx);
                 let data = app.read(cx).active_data().unwrap();
                 assert!(
-                    data.scroll.0.borrow().base_handle.max_offset().width > px(0.),
+                    data.scroll.0.borrow().base_handle.max_offset().x > px(0.),
                     "long lines must be reachable without wrapping"
                 );
             });
@@ -11401,10 +9980,7 @@ mod tests {
             }
             vcx.update(|_, cx| {
                 let data = app.read(cx).active_data().unwrap();
-                assert_eq!(
-                    data.scroll.0.borrow().base_handle.max_offset().width,
-                    px(0.)
-                );
+                assert_eq!(data.scroll.0.borrow().base_handle.max_offset().x, px(0.));
                 assert!(data
                     .rows
                     .iter()
@@ -11539,7 +10115,7 @@ mod tests {
             assert_eq!(state.base_handle.offset().y, px(-90.375 * row_height()));
             (state.base_handle.bounds(), state.base_handle.offset())
         });
-        vcx.simulate_event(gpui::ScrollWheelEvent {
+        vcx.simulate_event(gpui::ScrollEvent {
             position: bounds.center(),
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-137.))),
             ..Default::default()
@@ -12761,6 +11337,155 @@ mod tests {
                 );
             });
         });
+    }
+
+    #[gpui::test]
+    fn review_dialog_retains_failed_draft_guards_pending_dismissal_and_restores_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, loop_pr_item(vec![]), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let prior = vcx.update(|window, cx| {
+            let prior = app.read(cx).open_input.focus_handle(cx);
+            window.focus(&prior, cx);
+            app.update(cx, |app, cx| app.open_review(window, cx));
+            prior
+        });
+        let draw = |vcx: &mut gpui::VisualTestContext| {
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+            vcx.run_until_parked();
+        };
+        draw(&mut vcx);
+        vcx.update(|window, cx| {
+            assert!(app
+                .read(cx)
+                .review
+                .as_ref()
+                .unwrap()
+                .input
+                .focus_handle(cx)
+                .is_focused(window))
+        });
+        vcx.simulate_input("retain this draft");
+        fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.review.as_mut().unwrap().verdict = github::ReviewVerdict::RequestChanges;
+                app.submit_review(window, cx);
+                assert!(app.review.as_ref().unwrap().in_flight);
+            });
+            // Render the pending dialog without running the background job.
+            window.draw(cx).clear(cx);
+        });
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        draw(&mut vcx);
+        vcx.update(|_, cx| {
+            let review = app
+                .read(cx)
+                .review
+                .as_ref()
+                .expect("pending/failure must not dismiss");
+            assert!(!review.in_flight);
+            assert!(review.error.as_ref().unwrap().contains("review rejected"));
+            assert_eq!(review.input.read(cx).value().as_str(), "retain this draft");
+            assert_eq!(review.verdict, github::ReviewVerdict::RequestChanges);
+        });
+        fake.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        vcx.simulate_keystrokes("cmd-enter");
+        vcx.run_until_parked();
+        draw(&mut vcx);
+        vcx.update(|window, cx| {
+            assert!(app.read(cx).review.is_none());
+            assert!(
+                prior.is_focused(window),
+                "Kit restores the actual prior focus, not always the diff"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn stale_review_completion_does_not_close_a_reopened_dialog(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, loop_pr_item(vec![]), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let (generation, input) = vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_review(window, cx);
+                let old_generation = app.review_gen;
+                app.submit_review(window, cx);
+                // An imperative lifecycle close is distinct from user dismissal.
+                app.close_review(window, cx);
+                app.open_review(window, cx);
+                assert!(!app.cleanup_review(old_generation, cx));
+                let review = app.review.as_ref().unwrap();
+                review
+                    .input
+                    .update(cx, |input, cx| input.set_value("new draft", window, cx));
+                (app.review_gen, review.input.clone())
+            })
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let app = app.read(cx);
+            assert_eq!(app.review_gen, generation);
+            let review = app
+                .review
+                .as_ref()
+                .expect("old success cannot close new generation");
+            assert_eq!(review.input, input);
+            assert_eq!(input.read(cx).value().as_str(), "new draft");
+            assert!(!review.in_flight);
+            assert!(review.error.is_none());
+            assert!(!app.sessions[&0].busy, "per-PR operation still completes");
+        });
+        assert_eq!(fake.posts().len(), 1);
+        vcx.simulate_keystrokes("escape");
+        vcx.update(|_, cx| {
+            assert!(
+                app.read(cx).review.is_none(),
+                "user dismissal cleans application state"
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn cmd_enter_submits_instead_of_accepting_a_mention(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, loop_pr_item(vec![]), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.active_data()
+                    .unwrap()
+                    .mentions
+                    .borrow_mut()
+                    .push(github::Mention {
+                        login: "alice".into(),
+                        name: None,
+                    });
+                app.open_review(window, cx);
+            })
+        });
+        vcx.simulate_input("Thanks @al");
+        for _ in 0..3 {
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+            vcx.run_until_parked();
+        }
+        vcx.simulate_keystrokes("cmd-enter");
+        vcx.run_until_parked();
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Review {
+                verdict: github::ReviewVerdict::Approve,
+                body: "Thanks @al".into(),
+            }]
+        );
     }
 
     #[gpui::test]

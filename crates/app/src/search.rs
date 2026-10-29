@@ -4,13 +4,13 @@ use crate::local_store::ReviewPosition;
 use crate::rows::Row;
 use crate::selection::{row_side_text, SelSide};
 use crate::{theme, ItemData, ItemPane, ReviewApp};
-use gpui::{
-    div, prelude::*, px, Context, Entity, KeyBinding, ScrollStrategy, Subscription, Window,
-};
-use gpui_component::{
+use gpui::component::{
     button::{Button, ButtonVariants as _},
     input::{Escape, Input, InputEvent, InputState},
     Sizable as _,
+};
+use gpui::{
+    div, prelude::*, px, Context, Entity, KeyBinding, ScrollStrategy, Subscription, Window,
 };
 use std::ops::Range;
 
@@ -123,7 +123,12 @@ pub(crate) struct Search {
 }
 
 impl Search {
-    pub(crate) fn highlights(&self, row: usize, side: SelSide) -> Vec<(Range<usize>, gpui::Rgba)> {
+    pub(crate) fn highlights(
+        &self,
+        row: usize,
+        side: SelSide,
+        cx: &gpui::App,
+    ) -> Vec<(Range<usize>, gpui::Rgba)> {
         self.matches
             .by_row
             .get(row)
@@ -132,14 +137,11 @@ impl Search {
             .filter(|(_, span)| span.side == side)
             .map(|(ix, span)| {
                 let color = if Some(*ix) == self.matches.current {
-                    theme::peach()
+                    theme::search_current_bg(cx)
                 } else {
-                    theme::yellow()
+                    theme::search_match_bg(cx)
                 };
-                (
-                    span.range.clone(),
-                    gpui::Hsla::from(color).opacity(0.4).into(),
-                )
+                (span.range.clone(), color)
             })
             .collect()
     }
@@ -187,11 +189,7 @@ impl ReviewApp {
     }
 
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.search_visible()
-            || self.palette.is_some()
-            || self.composer.is_some()
-            || self.review.is_some()
-        {
+        if !self.search_visible() || self.composer.is_some() || self.review.is_some() {
             return;
         }
         let Some(data) = self.active_data() else {
@@ -251,7 +249,7 @@ impl ReviewApp {
             return false;
         }
         self.active_data_mut().unwrap().end_search();
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
         true
     }
@@ -331,9 +329,9 @@ impl ReviewApp {
             .p_2()
             .rounded_md()
             .shadow_md()
-            .bg(theme::mantle())
+            .bg(theme::mantle(cx))
             .border_1()
-            .border_color(theme::surface0())
+            .border_color(theme::surface0(cx))
             .on_action(cx.listener(|this, _: &OpenSearch, window, cx| this.open_search(window, cx)))
             .on_action(
                 cx.listener(|this, _: &NextMatch, window, cx| this.step_search(1, window, cx)),
@@ -358,7 +356,7 @@ impl ReviewApp {
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(theme::subtext())
+                            .text_color(theme::subtext(cx))
                             .child(count),
                     )
                     .child(

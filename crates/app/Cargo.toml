@@ -14,29 +14,24 @@ git = { path = "../git" }
 github = { path = "../github" }
 store = { path = "../store" }
 syntax = { path = "../syntax" }
-# runtime_shaders compiles gpui's Metal shaders at startup instead of in
-# build.rs, so building doesn't need full Xcode's `metal` compiler.
-gpui = { version = "0.2", features = ["runtime_shaders"] }
-# The conversation pane's markdown (gpui-component's TextView) renders
-# the PR description; the tree-sitter-languages feature registers the
-# grammars its code-block highlighter needs, the same set the diff's syntax
-# crate already builds against.
-gpui-component = { version = "0.5", features = ["tree-sitter-languages"] }
-gpui-component-assets = "0.5"
-# Must match gpui-component's lsp-types so its CompletionProvider signatures line up.
-lsp-types = "0.97"
+# Kit's facade supplies the exactly matched gpui-pre 0.3.10 platform family,
+# including font-kit and runtime Metal shader compilation. Keep the alias for
+# GPUI's proc-macro output; all components/assets use this same facade.
+gpui = { package = "gpui-kit", version = "=0.8.1", features = ["tree-sitter-languages"] }
+# Pin the facade's semver component/base/assets edges to this researched stack.
+gpui-base = "=0.8.1"
+gpui-component = "=0.8.1"
+gpui-kit-assets = "=0.8.1"
+lsp-types = "=0.97.0"
 fuzzy-matcher = "0.3"
 # GitHub's emoji shortcode table (gemoji), for the conversation pane's
 # `:rocket:` → 🚀 pipe.
 emojis = "0.9"
-# Use the same GFM AST as TextView for our width-safe block/list layout.
-markdown = "1"
-http_client = { version = "0.2", package = "gpui_http_client" }
+http_client = { version = "=0.3.10", package = "gpui-pre-http-client" }
 futures = "0.3"
 ureq = "2"
 sha2 = { workspace = true }
 tempfile = "3"
-html5ever = "0.27"
 image = { version = "0.25", default-features = false }
 serde_json = { workspace = true }
 libc = "0.2"
@@ -44,4 +39,4 @@ libc = "0.2"
 [dev-dependencies]
 # TestAppContext + the #[gpui::test] harness — app-level behavior tests
 # drive the real window/handler chain against a fake facade.
-gpui = { version = "0.2", features = ["test-support"] }
+gpui = { package = "gpui-kit", version = "=0.8.1", features = ["test-support"] }

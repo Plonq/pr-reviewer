@@ -19,11 +19,8 @@
 //! tradeoff holds.
 
 mod markdown;
-mod media;
 pub(crate) mod posting;
-pub(crate) use markdown::inline_images;
 pub(crate) use markdown::render as render_markdown;
-pub(crate) use media::{render_inline, Media};
 
 /// Expand the GitHub-isms in a description or comment body into plain GFM:
 ///
@@ -259,11 +256,15 @@ use crate::{
     text_size, theme, CommentSide, ComposerPlacement, ItemData, ItemState, ReviewApp, ReviewItem,
     Source,
 };
+use gpui::component::{
+    button::{Button, ButtonVariants},
+    link::Link,
+    Disableable, Sizable,
+};
 use gpui::{
     div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window,
 };
-use gpui_component::{button::Button, Disableable, Sizable};
 
 impl ReviewApp {
     pub(crate) fn conversation_composer(
@@ -379,41 +380,44 @@ impl ReviewApp {
             .mt_6()
             .min_w_0()
             .border_1()
-            .border_color(theme::surface0())
+            .border_color(theme::surface0(cx))
             .rounded_md()
             .p_4()
             .child(
                 div()
-                    .id(SharedString::from(format!("commits-toggle-{item_id}")))
                     .debug_selector(|| format!("commits-toggle-{item_id}"))
-                    .cursor_pointer()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(match &data.commits {
-                        Some(commits) => format!(
-                            "{} Commits ({}) · {}",
-                            if expanded { "▾" } else { "▸" },
-                            commits.commits.len(),
-                            if expanded { "collapse" } else { "expand" },
-                        ),
-                        None => "Commits".into(),
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let Some(item) = this.items.iter_mut().find(|item| item.id == item_id)
-                        else {
-                            return;
-                        };
-                        if let ItemState::Ready(data) = &mut item.state {
-                            data.commits_expanded = !data.commits_expanded;
-                            cx.notify();
-                        }
-                    })),
+                    .child(
+                        Button::new(SharedString::from(format!("commits-toggle-{item_id}")))
+                            .ghost()
+                            .small()
+                            .label(match &data.commits {
+                                Some(commits) => format!(
+                                    "{} Commits ({}) · {}",
+                                    if expanded { "▾" } else { "▸" },
+                                    commits.commits.len(),
+                                    if expanded { "collapse" } else { "expand" },
+                                ),
+                                None => "Commits".into(),
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(item) =
+                                    this.items.iter_mut().find(|item| item.id == item_id)
+                                else {
+                                    return;
+                                };
+                                if let ItemState::Ready(data) = &mut item.state {
+                                    data.commits_expanded = !data.commits_expanded;
+                                    cx.notify();
+                                }
+                            })),
+                    ),
             );
         let Some(commits) = &data.commits else {
             return section
                 .child(
                     div()
                         .mt_2()
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child("Commits unavailable. Refresh to try again."),
                 )
                 .into_any_element();
@@ -422,7 +426,7 @@ impl ReviewApp {
             section = section.child(
                 div()
                     .mt_2()
-                    .text_color(theme::overlay0())
+                    .text_color(theme::overlay0(cx))
                     .child("No commits."),
             );
         }
@@ -430,13 +434,13 @@ impl ReviewApp {
             if !expanded && ix + 1 != commits.commits.len() {
                 continue;
             }
-            let (verdict, color) = commit_ci(commit.ci);
+            let (verdict, color) = commit_ci(commit.ci, cx);
             let mut row = div()
                 .debug_selector(|| format!("commit-{item_id}-{ix}"))
                 .mt_3()
                 .min_w_0()
                 .border_t_1()
-                .border_color(theme::surface0())
+                .border_color(theme::surface0(cx))
                 .pt_3();
             if expanded {
                 row = row
@@ -447,18 +451,18 @@ impl ReviewApp {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_color(theme::overlay0())
+                                    .text_color(theme::overlay0(cx))
                                     .child(format!("{}.", ix + 1)),
                             )
                             .child(
                                 div()
                                     .font_family(crate::MONO)
-                                    .text_color(theme::subtext())
+                                    .text_color(theme::subtext(cx))
                                     .child(commit.sha.chars().take(7).collect::<String>()),
                             )
                             .child(
                                 div()
-                                    .text_color(theme::subtext())
+                                    .text_color(theme::subtext(cx))
                                     .child(format!("by {}", commit.author)),
                             )
                             .child(div().text_color(color).child(verdict)),
@@ -471,24 +475,23 @@ impl ReviewApp {
                         .flex()
                         .flex_wrap()
                         .gap_2()
-                        .child(div().text_color(theme::subtext()).child("Latest commit"))
+                        .child(div().text_color(theme::subtext(cx)).child("Latest commit"))
                         .child(div().text_color(color).child(verdict)),
                 );
             }
             for (run_ix, run) in commit.actions.iter().enumerate() {
-                let url = run.url.clone();
                 row = row.child(
                     div()
-                        .id(SharedString::from(format!(
-                            "commit-action-{}-{ix}-{run_ix}",
-                            item.id
-                        )))
                         .debug_selector(|| format!("commit-action-{}-{ix}-{run_ix}", item.id))
                         .mt_1()
-                        .text_color(theme::blue())
-                        .cursor_pointer()
-                        .child(format!("Actions: {} ↗", run.name))
-                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                        .child(
+                            Link::new(SharedString::from(format!(
+                                "commit-action-{}-{ix}-{run_ix}",
+                                item.id
+                            )))
+                            .href(run.url.clone())
+                            .child(format!("Actions: {} ↗", run.name)),
+                        ),
                 );
             }
             section = section.child(row);
@@ -521,7 +524,7 @@ impl ReviewApp {
             elements.push(
                 div()
                     .mt_6()
-                    .text_color(theme::overlay0())
+                    .text_color(theme::overlay0(cx))
                     .child("No comments yet.")
                     .into_any_element(),
             );
@@ -534,7 +537,7 @@ impl ReviewApp {
                         .w_full()
                         .min_w_0()
                         .border_1()
-                        .border_color(theme::surface0())
+                        .border_color(theme::surface0(cx))
                         .rounded_md()
                         .p_4()
                         .child(self.discussion_comment(item.id, "main", comment, &slug, window, cx))
@@ -546,7 +549,7 @@ impl ReviewApp {
                         .w_full()
                         .min_w_0()
                         .border_1()
-                        .border_color(theme::surface0())
+                        .border_color(theme::surface0(cx))
                         .rounded_md()
                         .child(div().p_4().child(
                             self.discussion_comment(item.id, "main", comment, &slug, window, cx),
@@ -588,7 +591,7 @@ impl ReviewApp {
                     .w_full()
                     .min_w_0()
                     .border_1()
-                    .border_color(theme::surface0())
+                    .border_color(theme::surface0(cx))
                     .rounded_md()
                     .p_4()
                     .child(self.discussion_comment(
@@ -676,12 +679,18 @@ impl ReviewApp {
             .px_4()
             .py_2()
             .text_size(px(text_size() - 1.))
-            .text_color(theme::subtext())
-            .overflow_hidden()
-            .child(div().truncate().child(summary));
+            .text_color(theme::subtext(cx))
+            .overflow_hidden();
         if thread.is_resolved && !composing {
-            header = header
-                .cursor_pointer()
+            header = header.child(
+                Button::new(SharedString::from(format!(
+                    "thread-toggle-{}-{}",
+                    item.id, thread.id
+                )))
+                .ghost()
+                .small()
+                .w_full()
+                .label(summary)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let Some(item) = this.items.iter_mut().find(|item| item.id == item_id) else {
                         return;
@@ -693,14 +702,17 @@ impl ReviewApp {
                         data.expanded_threads.insert(thread_id.clone());
                     }
                     cx.notify();
-                }));
+                })),
+            );
+        } else {
+            header = header.child(div().truncate().child(summary));
         }
         let mut card = div()
             .w_full()
             .flex_shrink_0()
             .min_w_0()
             .border_1()
-            .border_color(theme::surface0())
+            .border_color(theme::surface0(cx))
             .rounded_md()
             .child(header);
         if expanded {
@@ -714,23 +726,23 @@ impl ReviewApp {
                         )))
                         .overflow_x_scroll()
                         .border_t_1()
-                        .border_color(theme::surface0())
+                        .border_color(theme::surface0(cx))
                         .font_family(crate::MONO)
                         .text_size(px(text_size() - 2.))
                         .py_2()
                         .children(excerpt.into_iter().map(|line| {
                             let mut row = div().flex().px_2().gap_2();
                             row = match line.kind {
-                                '+' => row.bg(theme::added_row_bg()),
-                                '-' => row.bg(theme::removed_row_bg()),
+                                '+' => row.bg(theme::added_row_bg(cx)),
+                                '-' => row.bg(theme::removed_row_bg(cx)),
                                 _ => row,
                             };
                             if line.selected {
-                                row = row.border_l_2().border_color(theme::blue());
+                                row = row.border_l_2().border_color(theme::blue(cx));
                             } else {
                                 row = row.border_l_2().border_color(gpui::transparent_black());
                             }
-                            row.child(div().flex_shrink_0().text_color(theme::overlay0()).child(
+                            row.child(div().flex_shrink_0().text_color(theme::overlay0(cx)).child(
                                 format!(
                                     "{:>4} {:>4} {}",
                                     line.old.map(|n| n.to_string()).unwrap_or_default(),
@@ -751,7 +763,7 @@ impl ReviewApp {
                     div()
                         .px_4()
                         .py_2()
-                        .text_color(theme::overlay0())
+                        .text_color(theme::overlay0(cx))
                         .child("Code context unavailable for this thread."),
                 );
             }
@@ -760,7 +772,7 @@ impl ReviewApp {
                     div()
                         .p_4()
                         .border_t_1()
-                        .border_color(theme::surface0())
+                        .border_color(theme::surface0(cx))
                         .child(
                             self.discussion_comment(item.id, "review", comment, slug, window, cx),
                         ),
@@ -776,7 +788,7 @@ impl ReviewApp {
                     div()
                         .p_4()
                         .border_t_1()
-                        .border_color(theme::surface0())
+                        .border_color(theme::surface0(cx))
                         .child(self.discussion_comment(
                             item.id,
                             "optimistic",
@@ -810,14 +822,14 @@ impl ReviewApp {
                         div()
                             .p_4()
                             .border_t_1()
-                            .border_color(theme::surface0())
+                            .border_color(theme::surface0(cx))
                             .child(
                                 div()
                                     .mb_2()
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .text_color(theme::yellow())
+                                    .text_color(theme::yellow(cx))
                                     .child(
                                         div()
                                             .flex_1()
@@ -838,7 +850,7 @@ impl ReviewApp {
                 div()
                     .p_4()
                     .border_t_1()
-                    .border_color(theme::surface0())
+                    .border_color(theme::surface0(cx))
                     .child(self.conversation_composer(item.id, Some(thread), cx)),
             );
         }
@@ -893,7 +905,7 @@ impl ReviewApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .text_color(theme::subtext())
+                    .text_color(theme::subtext(cx))
                     .text_size(px(text_size() - 1.))
                     .child(div().flex_1().child(format!(
                         "@{} · {}{verdict}",
@@ -922,7 +934,7 @@ impl ReviewApp {
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(theme::surface0())
+                    .bg(theme::surface0(cx))
                     .child(format!("{} {}", reaction.emoji(), reaction.count))
             })
             .collect();
@@ -933,12 +945,12 @@ impl ReviewApp {
     }
 }
 
-fn commit_ci(ci: github::CiState) -> (&'static str, gpui::Rgba) {
+fn commit_ci(ci: github::CiState, cx: &gpui::App) -> (&'static str, gpui::Rgba) {
     match ci {
-        github::CiState::Pass => ("CI passed", theme::green()),
-        github::CiState::Fail => ("CI failed", theme::red()),
-        github::CiState::Pending => ("CI pending", theme::yellow()),
-        github::CiState::NoChecks => ("No checks", theme::overlay0()),
+        github::CiState::Pass => ("CI passed", theme::green(cx)),
+        github::CiState::Fail => ("CI failed", theme::red(cx)),
+        github::CiState::Pending => ("CI pending", theme::yellow(cx)),
+        github::CiState::NoChecks => ("No checks", theme::overlay0(cx)),
     }
 }
 
@@ -1113,24 +1125,27 @@ fn expand_text(text: &str, repo_slug: &str, out: &mut String) {
 pub(crate) mod tests {
     use super::*;
 
-    #[test]
-    fn commits_ci_has_visible_text_and_verdict_colors() {
-        assert_eq!(
-            commit_ci(github::CiState::Pass),
-            ("CI passed", theme::green())
-        );
-        assert_eq!(
-            commit_ci(github::CiState::Fail),
-            ("CI failed", theme::red())
-        );
-        assert_eq!(
-            commit_ci(github::CiState::Pending),
-            ("CI pending", theme::yellow())
-        );
-        assert_eq!(
-            commit_ci(github::CiState::NoChecks),
-            ("No checks", theme::overlay0())
-        );
+    #[gpui::test]
+    fn commits_ci_has_visible_text_and_verdict_colors(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            assert_eq!(
+                commit_ci(github::CiState::Pass, cx),
+                ("CI passed", theme::green(cx))
+            );
+            assert_eq!(
+                commit_ci(github::CiState::Fail, cx),
+                ("CI failed", theme::red(cx))
+            );
+            assert_eq!(
+                commit_ci(github::CiState::Pending, cx),
+                ("CI pending", theme::yellow(cx))
+            );
+            assert_eq!(
+                commit_ci(github::CiState::NoChecks, cx),
+                ("No checks", theme::overlay0(cx))
+            );
+        });
     }
 
     pub(crate) fn sample_discussion() -> github::PrDiscussion {

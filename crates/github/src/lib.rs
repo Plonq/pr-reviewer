@@ -435,20 +435,6 @@ pub struct PrMeta {
     pub review_decision: String,
 }
 
-/// One open PR as the PR picker lists it.
-#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct PrSummary {
-    pub number: u64,
-    pub title: String,
-    pub author: Author,
-    pub state: String,
-    pub is_draft: bool,
-    pub head_ref_name: String,
-    /// When the PR last saw activity, ISO 8601 (GitHub's format).
-    pub updated_at: String,
-}
-
 /// One PR review comment, flat — the app groups them into threads by
 /// `in_reply_to_id` and anchors them by (path, side, line). Field names
 /// follow the pulls comments API's snake_case; every backend must hand
@@ -718,10 +704,6 @@ pub trait GitHubClient: Send + Sync {
 
     /// One PR's metadata (see [`PrMeta`]).
     fn pr_meta(&self, loc: &PrLocator) -> Result<PrMeta, ClientError>;
-
-    /// A repository's open PRs, most recently updated first, for the PR
-    /// picker.
-    fn list_prs(&self, owner: &str, repo: &str) -> Result<Vec<PrSummary>, ClientError>;
 
     /// The PR's unified diff patch, for the diff engine to parse.
     fn pr_patch(&self, loc: &PrLocator) -> Result<String, ClientError>;

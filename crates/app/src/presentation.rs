@@ -329,11 +329,11 @@ impl ReviewApp {
         data: &ItemData,
         cx: &mut Context<Self>,
     ) -> impl gpui::IntoElement {
-        use gpui::{div, prelude::*, px};
-        use gpui_component::{
+        use gpui::component::{
             button::{Button, ButtonVariants as _},
             Sizable as _,
         };
+        use gpui::{div, prelude::*, px};
         let label = |name: &str, on: bool| format!("{name}: {}", if on { "on" } else { "off" });
         div()
             .h(px(30.))
@@ -342,9 +342,9 @@ impl ReviewApp {
             .items_center()
             .gap_2()
             .px_2()
-            .bg(crate::theme::mantle())
+            .bg(crate::theme::mantle(cx))
             .border_b_1()
-            .border_color(crate::theme::surface0())
+            .border_color(crate::theme::surface0(cx))
             .child(
                 Button::new("hide-whitespace")
                     .ghost()

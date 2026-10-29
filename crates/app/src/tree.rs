@@ -5,8 +5,12 @@ use std::collections::HashSet;
 use crate::{theme, threads::CommentIndex, ItemData, ReviewApp};
 use diff_core::{FileDiff, FileStatus};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use gpui::component::{checkbox::Checkbox, Disableable as _, Icon, Sizable as _};
+use gpui::component::{
+    list::ListItem,
+    tree::{TreeEvent, TreeItem, TreeState},
+};
 use gpui::{div, prelude::*, px, Hsla, SharedString};
-use gpui_component::{checkbox::Checkbox, Disableable as _, Icon, Sizable as _};
 
 /// Row height of sidebar file-tree entries.
 const TREE_ROW_HEIGHT: f32 = 24.0;
@@ -89,28 +93,6 @@ pub(crate) fn build_tree(paths: &[&str]) -> Vec<TreeEntry> {
     out
 }
 
-/// Indices of the entries visible given the collapsed directories: everything
-/// deeper than a collapsed dir (until the next entry at its depth) is hidden.
-pub(crate) fn visible_entries(entries: &[TreeEntry], collapsed: &HashSet<String>) -> Vec<usize> {
-    let mut out = Vec::with_capacity(entries.len());
-    let mut hide_deeper_than: Option<usize> = None;
-    for (ix, entry) in entries.iter().enumerate() {
-        if let Some(depth) = hide_deeper_than {
-            if entry.depth > depth {
-                continue;
-            }
-            hide_deeper_than = None;
-        }
-        out.push(ix);
-        if let TreeEntryKind::Dir { path } = &entry.kind {
-            if collapsed.contains(path) {
-                hide_deeper_than = Some(entry.depth);
-            }
-        }
-    }
-    out
-}
-
 /// File indices whose full path fuzzy-matches `query`, best score first.
 /// An empty query keeps every file in diff order.
 pub(crate) fn fuzzy_file_matches(paths: &[&str], query: &str) -> Vec<usize> {
@@ -129,13 +111,13 @@ pub(crate) fn fuzzy_file_matches(paths: &[&str], query: &str) -> Vec<usize> {
 }
 
 /// Status label for file headers and color shared with tree entries.
-pub(crate) fn status_style(status: FileStatus) -> (&'static str, gpui::Rgba) {
+pub(crate) fn status_style(status: FileStatus, cx: &gpui::App) -> (&'static str, gpui::Rgba) {
     match status {
-        FileStatus::Added => ("added", theme::green()),
-        FileStatus::Deleted => ("deleted", theme::red()),
-        FileStatus::Modified => ("modified", theme::blue()),
-        FileStatus::Renamed => ("renamed", theme::mauve()),
-        FileStatus::Binary => ("binary", theme::peach()),
+        FileStatus::Added => ("added", theme::green(cx)),
+        FileStatus::Deleted => ("deleted", theme::red(cx)),
+        FileStatus::Modified => ("modified", theme::blue(cx)),
+        FileStatus::Renamed => ("renamed", theme::mauve(cx)),
+        FileStatus::Binary => ("binary", theme::peach(cx)),
     }
 }
 
@@ -147,6 +129,129 @@ pub(crate) enum TreeListRow {
     FilteredFile(usize),
 }
 
+pub(crate) fn file_id(path: &str) -> SharedString {
+    format!("file:{path}").into()
+}
+fn directory_id(path: &str) -> SharedString {
+    format!("directory:{path}").into()
+}
+
+/// Adapts our compressed hierarchy (or score-ordered filtered leaves) to stable
+/// stock identities. Visible positions are never identities.
+fn kit_items(
+    entries: &[TreeEntry],
+    paths: &[&str],
+    collapsed: &HashSet<String>,
+    query: &str,
+) -> Vec<TreeItem> {
+    if !query.is_empty() {
+        return fuzzy_file_matches(paths, query)
+            .into_iter()
+            .map(|ix| TreeItem::new(file_id(paths[ix]), paths[ix].to_owned()))
+            .collect();
+    }
+    fn level(
+        entries: &[TreeEntry],
+        paths: &[&str],
+        collapsed: &HashSet<String>,
+        at: &mut usize,
+        depth: usize,
+    ) -> Vec<TreeItem> {
+        let mut items = Vec::new();
+        while let Some(entry) = entries.get(*at).filter(|entry| entry.depth == depth) {
+            *at += 1;
+            let item = match &entry.kind {
+                TreeEntryKind::File { file_ix } => {
+                    TreeItem::new(file_id(paths[*file_ix]), entry.name.clone())
+                }
+                TreeEntryKind::Dir { path } => {
+                    TreeItem::new(directory_id(path), entry.name.clone())
+                        .expanded(!collapsed.contains(path))
+                        .children(level(entries, paths, collapsed, at, depth + 1))
+                }
+            };
+            items.push(item);
+        }
+        items
+    }
+    level(entries, paths, collapsed, &mut 0, 0)
+}
+
+pub(crate) struct FileTree {
+    pub state: gpui::Entity<TreeState>,
+    paths: Vec<String>,
+    query: String,
+    selection: Option<SharedString>,
+    _subscription: gpui::Subscription,
+}
+
+impl FileTree {
+    pub fn new(item_id: u64, cx: &mut gpui::Context<ReviewApp>) -> Self {
+        let state = cx.new(|cx| TreeState::new(cx));
+        let subscription = cx.subscribe(&state, move |app, _, event: &TreeEvent, cx| {
+            let Some(crate::ItemState::Ready(data)) = app
+                .items
+                .iter_mut()
+                .find(|item| item.id == item_id)
+                .map(|item| &mut item.state)
+            else {
+                return;
+            };
+            match event {
+                TreeEvent::Expanded(id) => {
+                    if let Some(path) = id.strip_prefix("directory:") {
+                        data.collapsed.remove(path);
+                    }
+                }
+                TreeEvent::Collapsed(id) => {
+                    if let Some(path) = id.strip_prefix("directory:") {
+                        data.collapsed.insert(path.into());
+                    }
+                }
+            }
+            cx.notify();
+        });
+        Self {
+            state,
+            paths: Vec::new(),
+            query: String::new(),
+            selection: None,
+            _subscription: subscription,
+        }
+    }
+
+    pub fn reconcile(
+        &mut self,
+        entries: &[TreeEntry],
+        paths: &[&str],
+        collapsed: &HashSet<String>,
+        query: &str,
+        cx: &mut gpui::App,
+    ) {
+        if self
+            .paths
+            .iter()
+            .map(String::as_str)
+            .eq(paths.iter().copied())
+            && self.query == query
+        {
+            return;
+        }
+        if let Some(selected) = self.state.read(cx).selected_item() {
+            self.selection = Some(selected.id.clone());
+        }
+        self.paths = paths.iter().map(|p| p.to_string()).collect();
+        self.query = query.into();
+        let items = kit_items(entries, paths, collapsed, query);
+        self.state.update(cx, |state, cx| {
+            state.set_items(items, cx);
+            // Do not use set_selected_item/reveal_item: they expand ancestors.
+            let ix = self.selection.as_ref().and_then(|id| state.index_of(id));
+            state.set_selected_index(ix, cx);
+        });
+    }
+}
+
 /// Count comments, not threads, including replies, outdated comments and drafts.
 fn file_comment_count(file: &FileDiff, comments: Option<&CommentIndex>) -> usize {
     comments
@@ -154,9 +259,8 @@ fn file_comment_count(file: &FileDiff, comments: Option<&CommentIndex>) -> usize
         .map_or(0, |(anchored, outdated)| anchored + outdated)
 }
 
-/// `current` marks the file the diff viewport is showing (surface0, like the
-/// active sidebar item). Clicking a dir toggles collapse; clicking a file
-/// jumps the diff to its header.
+/// Kit paints mouse selection; `current` is a separate narrow viewport marker.
+/// Kit toggles directories; leaf clicks open the file in the diff.
 pub(crate) fn render_tree_row(
     row: TreeListRow,
     pos: usize,
@@ -164,7 +268,8 @@ pub(crate) fn render_tree_row(
     data: &ItemData,
     entity: &gpui::Entity<ReviewApp>,
     reloading: bool,
-) -> gpui::AnyElement {
+    cx: &gpui::App,
+) -> ListItem {
     let comments = |file_ix: usize| {
         let count = file_comment_count(&data.diff.files[file_ix], data.comments.as_ref());
         (count > 0).then(|| {
@@ -175,12 +280,12 @@ pub(crate) fn render_tree_row(
                 .items_center()
                 .gap_1()
                 .text_size(px(10.))
-                .text_color(theme::subtext())
+                .text_color(theme::subtext(cx))
                 .child(
                     Icon::default()
                         .path("icons/gander/comment-16.svg")
                         .xsmall()
-                        .text_color(theme::overlay0()),
+                        .text_color(theme::overlay0(cx)),
                 )
                 .child(SharedString::from(count.to_string()))
         })
@@ -212,7 +317,7 @@ pub(crate) fn render_tree_row(
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
                         entity.update(cx, |this, cx| {
-                            window.focus(&this.focus_handle);
+                            window.focus(&this.focus_handle, cx);
                             this.toggle_file_viewed(file_ix, cx);
                         });
                     }),
@@ -227,12 +332,12 @@ pub(crate) fn render_tree_row(
             .text_size(px(10.))
             .child(
                 div()
-                    .text_color(Hsla::from(theme::green()).opacity(0.7))
+                    .text_color(Hsla::from(theme::green(cx)).opacity(0.7))
                     .child(SharedString::from(format!("+{}", file.additions))),
             )
             .child(
                 div()
-                    .text_color(Hsla::from(theme::red()).opacity(0.7))
+                    .text_color(Hsla::from(theme::red(cx)).opacity(0.7))
                     .child(SharedString::from(format!("−{}", file.deletions))),
             )
     };
@@ -245,19 +350,22 @@ pub(crate) fn render_tree_row(
         .flex()
         .items_center()
         .gap_1()
-        .pr_2()
+        // Leave room for the stock tree's overlay scrollbar, even on hover.
+        .pr_5()
         .cursor_pointer()
-        .when(current, |row| row.bg(theme::surface0()))
-        .when(!current, |row| {
-            row.hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
-        });
-    match row {
+        .child(
+            div()
+                .w(px(3.))
+                .h(px(14.))
+                .flex_shrink_0()
+                .when(current, |marker| marker.bg(theme::blue(cx)))
+                .debug_selector(move || format!("current-file-{pos}")),
+        );
+    let content = match row {
         TreeListRow::Entry(entry_ix) => {
             let entry = &data.tree[entry_ix];
             let indent = px(8. + entry.depth as f32 * 12.);
-            let base = base.pl(indent).on_click(move |_, window, cx| {
-                entity.update(cx, |this, cx| this.tree_entry_clicked(entry_ix, window, cx));
-            });
+            let base = base.pl(indent);
             match &entry.kind {
                 TreeEntryKind::Dir { path } => {
                     let chevron = if data.collapsed.contains(path) {
@@ -269,40 +377,44 @@ pub(crate) fn render_tree_row(
                         div()
                             .w(px(12.))
                             .flex_shrink_0()
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child(SharedString::from(chevron)),
                     )
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_color(theme::overlay0())
+                            .text_color(theme::overlay0(cx))
                             .child(entry.name.clone()),
                     )
                     .into_any_element()
                 }
                 TreeEntryKind::File { file_ix } => {
                     let file = &data.diff.files[*file_ix];
-                    let (_, status_color) = status_style(file.status);
-                    base.child(div().w(px(12.)).flex_shrink_0()) // aligns with dir chevrons
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_color(status_color)
-                                .child(entry.name.clone()),
-                        )
-                        .children(comments(*file_ix))
-                        .child(stats(file))
-                        .when(data.pr_meta.is_some(), |row| row.child(checkbox(*file_ix)))
-                        .into_any_element()
+                    let (_, status_color) = status_style(file.status, cx);
+                    let file_ix = *file_ix;
+                    base.on_click(move |_, window, cx| {
+                        entity.update(cx, |this, cx| this.jump_to_file(file_ix, window, cx));
+                    })
+                    .child(div().w(px(12.)).flex_shrink_0()) // aligns with dir chevrons
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(status_color)
+                            .child(entry.name.clone()),
+                    )
+                    .children(comments(file_ix))
+                    .child(stats(file))
+                    .when(data.pr_meta.is_some(), |row| row.child(checkbox(file_ix)))
+                    .into_any_element()
                 }
             }
         }
         TreeListRow::FilteredFile(file_ix) => {
             let file = &data.diff.files[file_ix];
-            let (_, status_color) = status_style(file.status);
+            let (_, status_color) = status_style(file.status, cx);
             base.pl_2()
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| this.jump_to_file(file_ix, window, cx));
@@ -320,7 +432,13 @@ pub(crate) fn render_tree_row(
                 .when(data.pr_meta.is_some(), |row| row.child(checkbox(file_ix)))
                 .into_any_element()
         }
-    }
+    };
+    ListItem::new(("file-tree-row", pos))
+        .h(px(TREE_ROW_HEIGHT))
+        .p_0()
+        // ListItem's text_base overrides the sidebar's inherited 12px size.
+        .text_size(px(12.))
+        .child(content)
 }
 
 #[cfg(test)]
@@ -434,25 +552,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn collapse_hides_subtrees() {
-        let tree = build_tree(&[
+    #[gpui::test]
+    fn collapse_hides_subtrees(cx: &mut gpui::TestAppContext) {
+        let paths = [
             "src/core/flags/defs.rs",
             "src/core/flags/parse.rs",
             "src/main.rs",
             "README.md",
-        ]);
-        // flat: [src, core/flags, defs, parse, main.rs, README.md]
-        let none = HashSet::new();
-        assert_eq!(visible_entries(&tree, &none), vec![0, 1, 2, 3, 4, 5]);
-
-        // Collapsing the inner chain hides its files but keeps the sibling.
-        let inner = HashSet::from(["src/core/flags".to_string()]);
-        assert_eq!(visible_entries(&tree, &inner), vec![0, 1, 4, 5]);
-
-        // Collapsing src hides everything under it, collapsed child included.
-        let outer = HashSet::from(["src".to_string(), "src/core/flags".to_string()]);
-        assert_eq!(visible_entries(&tree, &outer), vec![0, 5]);
+        ];
+        let tree = build_tree(&paths);
+        cx.update(|cx| {
+            for (collapsed, count) in [
+                (HashSet::new(), 6),
+                (HashSet::from(["src/core/flags".into()]), 4),
+                (HashSet::from(["src".into(), "src/core/flags".into()]), 2),
+            ] {
+                let state = TreeState::new(cx).items(kit_items(&tree, &paths, &collapsed, ""));
+                assert!(state.entry(count - 1).is_some());
+                assert!(state.entry(count).is_none());
+            }
+            let filtered = kit_items(&tree, &paths, &HashSet::new(), "defs");
+            assert_eq!(filtered[0].id, file_id(paths[0]));
+            assert!(!filtered[0].is_folder());
+            assert!(filtered[0].id != directory_id(paths[0]));
+        });
     }
 
     #[test]
@@ -469,18 +592,30 @@ mod tests {
         assert_eq!(fuzzy_file_matches(&paths, "main.rs"), vec![1, 0]);
     }
 
-    #[test]
-    fn status_style_matches_file_header_tags() {
-        assert_eq!(status_style(FileStatus::Added), ("added", theme::green()));
-        assert_eq!(status_style(FileStatus::Deleted), ("deleted", theme::red()));
-        assert_eq!(
-            status_style(FileStatus::Modified),
-            ("modified", theme::blue())
-        );
-        assert_eq!(
-            status_style(FileStatus::Renamed),
-            ("renamed", theme::mauve())
-        );
-        assert_eq!(status_style(FileStatus::Binary), ("binary", theme::peach()));
+    #[gpui::test]
+    fn status_style_matches_file_header_tags(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            assert_eq!(
+                status_style(FileStatus::Added, cx),
+                ("added", theme::green(cx))
+            );
+            assert_eq!(
+                status_style(FileStatus::Deleted, cx),
+                ("deleted", theme::red(cx))
+            );
+            assert_eq!(
+                status_style(FileStatus::Modified, cx),
+                ("modified", theme::blue(cx))
+            );
+            assert_eq!(
+                status_style(FileStatus::Renamed, cx),
+                ("renamed", theme::mauve(cx))
+            );
+            assert_eq!(
+                status_style(FileStatus::Binary, cx),
+                ("binary", theme::peach(cx))
+            );
+        });
     }
 }
