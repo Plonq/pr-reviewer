@@ -309,7 +309,7 @@ pub(crate) struct QueueChipGroup {
 }
 
 /// The chip groups for the queue as it stands: one per dimension — org,
-/// repo, author — its values derived from the rows the queue is currently
+/// repo — its values derived from the rows the queue is currently
 /// showing, each carrying the rows it covers and whether it's active.
 /// Deriving from the current rows is what keeps the bar honest: a filtered
 /// queue offers the values it still contains — the active chip included,
@@ -323,8 +323,8 @@ pub(crate) fn queue_chips(
     prs: &[github::QueueItem],
     search: &github::QueueSearch,
 ) -> Vec<QueueChipGroup> {
-    use github::QueueFilterKind::{Author, Org, Repo};
-    [Org, Repo, Author]
+    use github::QueueFilterKind::{Org, Repo};
+    [Org, Repo]
         .into_iter()
         .filter_map(|kind| {
             let mut counts: std::collections::BTreeMap<&str, usize> =
@@ -337,7 +337,6 @@ pub(crate) fn queue_chips(
                         .map(|(owner, _)| owner)
                         .unwrap_or(pr.repository.as_str()),
                     Repo => pr.repository.as_str(),
-                    Author => pr.author.as_str(),
                 };
                 *counts.entry(value).or_insert(0) += 1;
             }
@@ -367,7 +366,6 @@ pub(crate) fn queue_chips(
                         filter: match kind {
                             Org => github::QueueFilter::org(*value),
                             Repo => github::QueueFilter::repo(*value),
-                            Author => github::QueueFilter::author(*value),
                         },
                         count: *count,
                         active: active.is_some_and(|f| f.value() == *value),
@@ -764,15 +762,11 @@ mod tests {
             queued(4, "globex/thing", "bob"),
         ];
         let groups = queue_chips(&prs, &github::QueueSearch::review_requested());
-        // Orgs in kind order first, then repos, then authors — every
+        // Orgs in kind order first, then repos — every
         // dimension here has two or more values.
         assert_eq!(
             groups.iter().map(|group| group.kind).collect::<Vec<_>>(),
-            vec![
-                github::QueueFilterKind::Org,
-                github::QueueFilterKind::Repo,
-                github::QueueFilterKind::Author,
-            ]
+            vec![github::QueueFilterKind::Org, github::QueueFilterKind::Repo]
         );
         // Heaviest first, whatever the alphabetical order would say.
         let org = group(&groups, github::QueueFilterKind::Org);
@@ -794,13 +788,6 @@ mod tests {
             repo.chips[2].filter,
             github::QueueFilter::repo("globex/thing")
         );
-        // alice and bob both cover 2 rows: the tie breaks alphabetically.
-        let authors = group(&groups, github::QueueFilterKind::Author);
-        assert_eq!(
-            authors.chips[0].filter,
-            github::QueueFilter::author("alice")
-        );
-        assert_eq!(authors.chips[1].filter, github::QueueFilter::author("bob"));
         assert_eq!(groups.iter().map(|group| group.hidden).sum::<usize>(), 0);
     }
 
@@ -814,11 +801,9 @@ mod tests {
             queued(1, "acme/widgets", "alice"),
             queued(2, "acme/widgets", "bob"),
         ];
-        // One org, one repo, two authors: only the authors offer a choice.
+        // One org, one repo: different authors must not offer filters.
         let groups = queue_chips(&prs, &github::QueueSearch::review_requested());
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].kind, github::QueueFilterKind::Author);
-        assert_eq!(groups[0].chips.len(), 2);
+        assert!(groups.is_empty());
         // Active brings a single-value dimension back — marked, and the
         // only chip in its group.
         let search =
@@ -841,24 +826,26 @@ mod tests {
             queued(2, "acme/widgets", "alice"),
             queued(3, "acme/gadgets", "bob"),
         ];
-        let search =
-            github::QueueSearch::review_requested().filtered_by(github::QueueFilter::author("bob"));
+        let search = github::QueueSearch::review_requested()
+            .filtered_by(github::QueueFilter::repo("acme/gadgets"));
         let groups = queue_chips(&prs, &search);
-        let authors = group(&groups, github::QueueFilterKind::Author);
-        assert_eq!(authors.chips[0].filter, github::QueueFilter::author("bob"));
-        assert_eq!(authors.chips[0].count, 1);
-        assert!(authors.chips[0].active);
+        let repos = group(&groups, github::QueueFilterKind::Repo);
         assert_eq!(
-            authors.chips[1].filter,
-            github::QueueFilter::author("alice")
+            repos.chips[0].filter,
+            github::QueueFilter::repo("acme/gadgets")
         );
-        assert!(!authors.chips[1].active);
+        assert_eq!(repos.chips[0].count, 1);
+        assert!(repos.chips[0].active);
+        assert_eq!(
+            repos.chips[1].filter,
+            github::QueueFilter::repo("acme/widgets")
+        );
+        assert!(!repos.chips[1].active);
     }
 
     /// What the queue holds after narrowing to one repo: the bar offers
-    /// only that repo — the active chip, visible and marked. The org and
-    /// author dimensions now hold a single value each with nothing
-    /// active, so they leave the bar: nothing left to narrow.
+    /// only that repo — the active chip, visible and marked. The org
+    /// dimension has one value and nothing active, so it leaves the bar.
     #[test]
     fn queue_chips_derive_from_the_filtered_queue() {
         let prs = vec![queued(3, "acme/gadgets", "alice")];
@@ -884,25 +871,25 @@ mod tests {
         );
     }
 
-    /// Ten authors: the bar shows the cap and reports the rest — bounded
+    /// Ten repositories: the bar shows the cap and reports the rest — bounded
     /// strip, honest count. All counts equal here, so alphabetical order
     /// decides what shows.
     #[test]
     fn queue_chips_cap_each_group_with_an_overflow_count() {
         let prs: Vec<_> = (0..10)
-            .map(|n| queued(n, "acme/widgets", &format!("user{n:02}")))
+            .map(|n| queued(n, &format!("acme/repo{n:02}"), "alice"))
             .collect();
         let groups = queue_chips(&prs, &github::QueueSearch::review_requested());
-        let authors = group(&groups, github::QueueFilterKind::Author);
-        assert_eq!(authors.chips.len(), QUEUE_CHIPS_SHOWN);
-        assert_eq!(authors.hidden, 10 - QUEUE_CHIPS_SHOWN);
+        let repos = group(&groups, github::QueueFilterKind::Repo);
+        assert_eq!(repos.chips.len(), QUEUE_CHIPS_SHOWN);
+        assert_eq!(repos.hidden, 10 - QUEUE_CHIPS_SHOWN);
         assert_eq!(
-            authors.chips[0].filter,
-            github::QueueFilter::author("user00")
+            repos.chips[0].filter,
+            github::QueueFilter::repo("acme/repo00")
         );
         assert_eq!(
-            authors.chips[QUEUE_CHIPS_SHOWN - 1].filter,
-            github::QueueFilter::author("user07")
+            repos.chips[QUEUE_CHIPS_SHOWN - 1].filter,
+            github::QueueFilter::repo("acme/repo07")
         );
     }
 

@@ -185,7 +185,6 @@ fn restore_queue_search(value: Option<serde_json::Value>) -> github::QueueSearch
                     Some(match kind {
                         "org" => github::QueueFilter::org(value),
                         "repo" => github::QueueFilter::repo(value),
-                        "author" => github::QueueFilter::author(value),
                         _ => return None,
                     })
                 })
@@ -193,8 +192,8 @@ fn restore_queue_search(value: Option<serde_json::Value>) -> github::QueueSearch
         })
         .unwrap_or_default();
     let sort = match value.get("sort").and_then(|sort| sort.as_str()) {
-        Some("oldest") => github::QueueSort::OldestUpdated,
-        _ => github::QueueSort::RecentlyUpdated,
+        Some("created_ascending") => github::QueueSort::CreatedAscending,
+        _ => github::QueueSort::ReviewRequestedAscending,
     };
     github::QueueSearch::from_parts(filters, sort)
 }
@@ -1558,7 +1557,7 @@ enum AccountStatus {
 
 /// The review queue screen: every open PR where the viewer's review is
 /// requested (directly or via a team — the search qualifier covers both),
-/// most recently updated first.
+/// oldest review request first.
 ///
 /// The queue is **cache-first**: the rows it paints come from the local
 /// store when the app opens, and the network's answer hot-swaps in when
@@ -1566,7 +1565,7 @@ enum AccountStatus {
 /// fresh — which is what the status line says.
 struct QueueState {
     /// The compiled search the queue runs. v1 always the review-requested
-    /// preset, recently-updated first.
+    /// preset, oldest review request first.
     search: github::QueueSearch,
     /// Queue rows in the search's order. Kept (stale) across refresh
     /// failures, so the screen stays useful offline.
@@ -1617,7 +1616,8 @@ impl QueueState {
 
     /// Invalidate cached heights even when the refresh has the same row count:
     /// titles and labels may have changed. Preserve the viewport by row position.
-    fn replace_rows(&mut self, prs: Vec<github::QueueItem>) {
+    fn replace_rows(&mut self, mut prs: Vec<github::QueueItem>) {
+        self.search.sort_items(&mut prs);
         let offset = self.scroll.logical_scroll_top();
         self.selected = move_selection(self.selected, prs.len(), 0);
         self.scroll.reset(prs.len());
@@ -2063,20 +2063,21 @@ impl ReviewApp {
         cx.notify();
     }
 
-    /// `s` and the sort toggle: flip the queue between recently-updated
-    /// and oldest-first. The order runs server-side — the compiled search
-    /// carries it — so the rows hot-swap on the next fetch, and the
-    /// selection starts over: a position in one order means nothing in the
+    /// `s` and the sort toggle: flip between review-request time and creation
+    /// time, both oldest-first. Reorder existing rows immediately (even offline),
+    /// then refresh. The selection starts over: a position in one order means nothing in the
     /// other.
     fn queue_toggle_sort(&mut self, cx: &mut Context<Self>) {
         if !self.show_queue {
             return;
         }
         let flipped = match self.queue.search.ordering() {
-            github::QueueSort::RecentlyUpdated => github::QueueSort::OldestUpdated,
-            github::QueueSort::OldestUpdated => github::QueueSort::RecentlyUpdated,
+            github::QueueSort::ReviewRequestedAscending => github::QueueSort::CreatedAscending,
+            github::QueueSort::CreatedAscending => github::QueueSort::ReviewRequestedAscending,
         };
         self.queue.search = self.queue.search.clone().sorted_by(flipped);
+        let prs = std::mem::take(&mut self.queue.prs);
+        self.queue.replace_rows(prs);
         self.persist_queue_search();
         self.queue_run_search(cx);
     }
@@ -2128,8 +2129,8 @@ impl ReviewApp {
             })
             .collect();
         let sort = match self.queue.search.ordering() {
-            github::QueueSort::RecentlyUpdated => "recent",
-            github::QueueSort::OldestUpdated => "oldest",
+            github::QueueSort::ReviewRequestedAscending => "review_requested_ascending",
+            github::QueueSort::CreatedAscending => "created_ascending",
         };
         self.store.set_setting(
             QUEUE_SEARCH_SETTING,
@@ -4960,8 +4961,8 @@ impl ReviewApp {
     }
 
     /// The review queue screen — what a bare launch opens on. Rows are the
-    /// facade's queue items in the search's order (recently updated first,
-    /// oldest-first at a toggle); `j`/`k` walk them with a visible
+    /// facade's queue items in the search's order (oldest request first,
+    /// oldest-created at a toggle); `j`/`k` walk them with a visible
     /// selection, the control row sorts and filters (see
     /// [`Self::queue_controls`]). Failures are non-destructive: the last
     /// rows stay up with the error beside them, and a first-fetch failure
@@ -5108,9 +5109,8 @@ impl ReviewApp {
     /// the keyboard drives the sort (`s`) and the clear (`escape`).
     fn queue_controls(&self, entity: gpui::Entity<Self>, cx: &gpui::App) -> gpui::AnyElement {
         let search = &self.queue.search;
-        let oldest = search.ordering() == github::QueueSort::OldestUpdated;
-        // The sort toggle: its label is the order the next refresh runs in
-        // — newest first by default, oldest first for backlog clearing.
+        let created = search.ordering() == github::QueueSort::CreatedAscending;
+        // The label names the active sort; both options are ascending.
         let mut row = div()
             .flex()
             .flex_wrap()
@@ -5125,10 +5125,10 @@ impl ReviewApp {
                 Button::new("queue-sort-toggle")
                     .debug_selector(|| "queue-sort-toggle".into())
                     .xsmall()
-                    .label(if oldest {
-                        "sort: oldest first ↑"
+                    .label(if created {
+                        "sort: created ↑"
                     } else {
-                        "sort: recently updated ↓"
+                        "sort: review requested ↑"
                     })
                     .tooltip("Toggle queue order (s)")
                     .on_click({
@@ -8044,31 +8044,86 @@ mod tests {
         assert_eq!(move_selection(5, 3, 0), 2);
     }
 
+    #[test]
+    fn queue_rows_use_ascending_request_or_creation_time_even_from_cache() {
+        let mut rows = Vec::new();
+        for (number, created, requested, updated) in [
+            (1, "2026-01-01T00:00:00Z", None, "2026-01-09T00:00:00Z"),
+            (
+                2,
+                "2026-01-02T00:00:00Z",
+                Some("2026-01-06T00:00:00Z"),
+                "2026-01-08T00:00:00Z",
+            ),
+            (
+                3,
+                "2026-01-03T00:00:00Z",
+                Some("2026-01-05T00:00:00Z"),
+                "2026-01-10T00:00:00Z",
+            ),
+            (
+                4,
+                "2026-01-04T00:00:00Z",
+                Some("2026-01-06T00:00:00Z"),
+                "2026-01-07T00:00:00Z",
+            ),
+            (5, "2026-01-05T00:00:00Z", Some(""), "2026-01-06T00:00:00Z"),
+        ] {
+            let mut pr = queued(number, "acme/widgets", "alice");
+            pr.created_at = created.into();
+            pr.review_requested_at = requested.map(str::to_string);
+            pr.updated_at = updated.into();
+            rows.push(pr);
+        }
+        rows.reverse(); // Neither the backend nor a cache need already be sorted.
+        let mut queue = QueueState::new();
+        queue.replace_rows(rows.clone());
+        assert_eq!(
+            queue.prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![3, 2, 4, 1, 5]
+        );
+
+        // Cache metadata must distinguish the two modes even though GitHub
+        // fetches both using created ascending.
+        let store = local_store::LocalStore::in_memory();
+        store.cache_queue(&queue.search, &rows);
+        queue.replace_rows(store.cached_queue_items());
+        assert_eq!(
+            queue.prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![3, 2, 4, 1, 5]
+        );
+        queue.search = queue.search.sorted_by(github::QueueSort::CreatedAscending);
+        let (sort, order) = queue.search.sort();
+        assert!(!store
+            .cached_queue()
+            .matches(&queue.search.query(), sort, order));
+        queue.replace_rows(store.cached_queue_items());
+        assert_eq!(
+            queue.prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
     /// A queue-shaped facade for the app-level tests: scripted search
     /// results keyed by what the app asks for, recording every query it
     /// compiled — the observer for the exact chain a chip click runs.
-    /// The scripted rows are deliberately one-org/one-repo — the shape a
-    /// real queue often has — so the tests also pin that narrowing by
-    /// author works even when org and repo can't narrow anything.
+    /// The scripted rows share an org but live in different repositories,
+    /// so repository chips can narrow the queue.
     struct FakeQueue {
         asked: std::sync::Mutex<Vec<(String, (&'static str, &'static str))>>,
     }
 
     impl FakeQueue {
         fn rows(&self, query: &str) -> Vec<github::QueueItem> {
-            for author in ["alice", "bob"] {
-                if query.contains(&format!("author:{author}")) {
-                    return vec![queued(
-                        if author == "alice" { 1 } else { 2 },
-                        "acme/widgets",
-                        author,
-                    )];
-                }
-            }
-            vec![
+            let rows = vec![
                 queued(1, "acme/widgets", "alice"),
-                queued(2, "acme/widgets", "bob"),
-            ]
+                queued(2, "acme/gadgets", "bob"),
+            ];
+            rows.into_iter()
+                .filter(|pr| {
+                    !query.contains("repo:") || query.contains(&format!("repo:{}", pr.repository))
+                })
+                .collect()
         }
     }
 
@@ -8594,22 +8649,21 @@ mod tests {
             fake.asked.lock().unwrap().as_slice(),
             &[(
                 "is:pr is:open review-requested:@me".to_string(),
-                ("updated", "desc")
+                ("review-requested", "asc")
             )]
         );
 
-        // Click the bob chip: the search narrows, the fetch that lands is
-        // the one the chip asked for, and the rows swap to just bob's.
+        // Click a repository chip: the search and rows narrow together.
         cx.update(|cx| {
             app.update(cx, |this, cx| {
-                this.queue_toggle_filter(github::QueueFilter::author("bob"), cx)
+                this.queue_toggle_filter(github::QueueFilter::repo("acme/gadgets"), cx)
             })
         });
         cx.run_until_parked();
         cx.update(|cx| {
             assert_eq!(
                 app.read(cx).queue.search.filters(),
-                &[github::QueueFilter::author("bob")]
+                &[github::QueueFilter::repo("acme/gadgets")]
             );
             assert_eq!(app.read(cx).queue.prs.len(), 1, "the queue must narrow");
             assert_eq!(app.read(cx).queue.prs[0].author, "bob");
@@ -8617,8 +8671,8 @@ mod tests {
         assert_eq!(
             fake.asked.lock().unwrap().last().unwrap(),
             &(
-                "is:pr is:open review-requested:@me author:bob".to_string(),
-                ("updated", "desc")
+                "is:pr is:open review-requested:@me repo:acme/gadgets".to_string(),
+                ("review-requested", "asc")
             )
         );
 
@@ -8626,7 +8680,7 @@ mod tests {
         // come back.
         cx.update(|cx| {
             app.update(cx, |this, cx| {
-                this.queue_toggle_filter(github::QueueFilter::author("bob"), cx)
+                this.queue_toggle_filter(github::QueueFilter::repo("acme/gadgets"), cx)
             })
         });
         cx.run_until_parked();
@@ -8642,14 +8696,14 @@ mod tests {
         cx.update(|cx| {
             assert_eq!(
                 app.read(cx).queue.search.ordering(),
-                github::QueueSort::OldestUpdated
+                github::QueueSort::CreatedAscending
             )
         });
         assert_eq!(
             fake.asked.lock().unwrap().last().unwrap(),
             &(
                 "is:pr is:open review-requested:@me".to_string(),
-                ("updated", "asc")
+                ("created", "asc")
             )
         );
     }
@@ -8745,6 +8799,48 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn queue_sort_toggle_reorders_existing_rows_even_when_refresh_fails(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_window, app) = queue_window(
+            cx,
+            Arc::new(OfflineQueue {
+                asked: std::sync::Mutex::new(0),
+            }),
+        );
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                let mut older = queued(1, "acme/widgets", "alice");
+                older.created_at = "2026-01-01T00:00:00Z".into();
+                older.review_requested_at = Some("2026-01-04T00:00:00Z".into());
+                let mut newer = queued(2, "acme/widgets", "bob");
+                newer.created_at = "2026-01-02T00:00:00Z".into();
+                newer.review_requested_at = Some("2026-01-03T00:00:00Z".into());
+                app.queue.replace_rows(vec![older, newer]);
+                assert_eq!(app.queue.prs[0].number, 2);
+                app.queue_toggle_sort(cx);
+                assert_eq!(app.queue.prs[0].number, 1);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                assert!(app.queue.error.is_some());
+                assert_eq!(app.queue.prs[0].number, 1);
+                assert_eq!(app.restore_queue_search(), app.queue.search);
+                app.queue_toggle_sort(cx);
+                assert_eq!(app.queue.prs[0].number, 2);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let app = app.read(cx);
+            assert_eq!(app.queue.prs[0].number, 2);
+            assert_eq!(app.restore_queue_search(), app.queue.search);
+        });
+    }
+
     /// The cache-first paint: with a warm cache, the app paints the
     /// cached rows the instant it opens — before the network has answered
     /// — and the fresh rows hot-swap in when the fetch lands.
@@ -8823,8 +8919,8 @@ mod tests {
         let cached = store.cached_queue();
         assert_eq!(cached.prs.len(), 2, "the fetched queue must be cached");
         assert_eq!(cached.search, "is:pr is:open review-requested:@me");
-        assert_eq!(cached.sort, "updated");
-        assert_eq!(cached.order, "desc");
+        assert_eq!(cached.sort, "review-requested");
+        assert_eq!(cached.order, "asc");
         assert!(
             cached.fetched_at_ms > 0,
             "the cache must know when it was written"
@@ -8892,7 +8988,7 @@ mod tests {
 
         cx.update(|cx| {
             app.update(cx, |this, cx| {
-                // j to the second row (bob, acme/widgets#2), Enter to open.
+                // j to the second row (bob, acme/gadgets#2), Enter to open.
                 this.queue_move(1, cx);
                 this.queue_open(this.queue.selected, cx);
                 // The PR opened as its own item, and the pane is showing it.
@@ -8905,7 +9001,7 @@ mod tests {
                 };
                 assert_eq!(
                     (loc.owner.as_str(), loc.repo.as_str(), loc.number),
-                    ("acme", "widgets", 2)
+                    ("acme", "gadgets", 2)
                 );
                 // The sidebar carries the file tree: it must be showing.
                 assert!(this.sidebar_visible);
@@ -8996,13 +9092,13 @@ mod tests {
     fn the_queue_search_survives_a_restart() {
         let store = local_store::LocalStore::in_memory();
         let search = github::QueueSearch::review_requested()
-            .filtered_by(github::QueueFilter::author("bob"))
-            .sorted_by(github::QueueSort::OldestUpdated);
+            .filtered_by(github::QueueFilter::repo("acme/gadgets"))
+            .sorted_by(github::QueueSort::CreatedAscending);
         store.set_setting(
             "queue_search",
             serde_json::json!({
-                "filters": [{"kind": "author", "value": "bob"}],
-                "sort": "oldest",
+                "filters": [{"kind": "repo", "value": "acme/gadgets"}],
+                "sort": "created_ascending",
             }),
         );
         let app_search = restore_queue_search(store.setting("queue_search"));
@@ -9011,13 +9107,27 @@ mod tests {
         assert_eq!(app_search.filters(), search.filters());
     }
 
+    #[test]
+    fn legacy_queue_preferences_drop_author_filters_and_updated_sorts() {
+        for sort in ["recent", "oldest", "review_requested_ascending"] {
+            let search = restore_queue_search(Some(serde_json::json!({
+                "filters": [{"kind": "author", "value": "bob"}],
+                "sort": sort,
+            })));
+            assert_eq!(search, github::QueueSearch::review_requested());
+        }
+    }
+
     /// A setting the app doesn't understand reads as the default queue:
     /// a corrupt preference must never keep the app from starting.
     #[test]
     fn an_unreadable_queue_search_setting_reads_as_the_default_queue() {
         let default = restore_queue_search(None);
         assert_eq!(default.query(), "is:pr is:open review-requested:@me");
-        assert_eq!(default.ordering(), github::QueueSort::RecentlyUpdated);
+        assert_eq!(
+            default.ordering(),
+            github::QueueSort::ReviewRequestedAscending
+        );
         // A blob of the wrong shape.
         let drifted = restore_queue_search(Some(serde_json::json!("nonsense")));
         assert_eq!(drifted.query(), "is:pr is:open review-requested:@me");
@@ -9025,15 +9135,16 @@ mod tests {
         let mixed = restore_queue_search(Some(serde_json::json!({
             "filters": [
                 {"kind": "author", "value": "bob"},
+                {"kind": "org", "value": "acme"},
                 {"kind": "colour", "value": "blue"},
             ],
             "sort": "oldest",
         })));
+        assert_eq!(mixed.query(), "is:pr is:open review-requested:@me org:acme");
         assert_eq!(
-            mixed.query(),
-            "is:pr is:open review-requested:@me author:bob"
+            mixed.ordering(),
+            github::QueueSort::ReviewRequestedAscending
         );
-        assert_eq!(mixed.ordering(), github::QueueSort::OldestUpdated);
     }
 
     /// The freshness bookkeeping: a fetched PR's snapshot lands in the
@@ -9782,22 +9893,26 @@ mod tests {
             vcx.run_until_parked();
         };
         let ordering = |vcx: &gpui::VisualTestContext| {
-            vcx.cx.update(|cx| app.read(cx).queue.search.ordering())
+            vcx.cx.update(|cx| {
+                let app = app.read(cx);
+                assert_eq!(app.restore_queue_search(), app.queue.search);
+                app.queue.search.ordering()
+            })
         };
         click(&mut vcx, "queue-sort-toggle");
-        assert_eq!(ordering(&vcx), github::QueueSort::OldestUpdated);
+        assert_eq!(ordering(&vcx), github::QueueSort::CreatedAscending);
         click(&mut vcx, "queue-sort-toggle");
-        assert_eq!(ordering(&vcx), github::QueueSort::RecentlyUpdated);
+        assert_eq!(ordering(&vcx), github::QueueSort::ReviewRequestedAscending);
 
-        // Both PRs have the same repository, so only author chips appear.
+        // Both PRs share an org, so only repository chips appear.
         click(&mut vcx, "queue-chip-0");
-        let filter = github::QueueFilter::author("alice");
+        let filter = github::QueueFilter::repo("acme/gadgets");
 
         // The click narrowed the queue — the mouse path works end to end.
         vcx.cx.update(|cx| {
             let app = app.read(cx);
             assert_eq!(app.queue.prs.len(), 1, "the click must narrow the queue");
-            assert_eq!(app.queue.prs[0].author, filter.value());
+            assert_eq!(app.queue.prs[0].repository, filter.value());
             assert_eq!(app.queue.search.filters(), std::slice::from_ref(&filter));
         });
         assert!(fake
@@ -9807,7 +9922,7 @@ mod tests {
             .last()
             .unwrap()
             .0
-            .contains("author:"));
+            .contains("repo:"));
     }
 
     // --- Review comments ----------------------------------------------------
