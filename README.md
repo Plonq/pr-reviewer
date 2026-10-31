@@ -137,6 +137,8 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   the refreshed discussion arrives.
 - stock Markdown and images in conversations and diff comment threads,
   including cached private GitHub attachments using the secure HTTP bridge
+- automatic Jira links for `PYAPI-123`, `BOT-123`, `CS-123`, and `HELP-123`
+  in PR descriptions and comments (excluding code and existing links)
 - local repo diffs
 - minimap
 - inline GitHub review comments with GFM formatting (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
