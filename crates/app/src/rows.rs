@@ -1502,7 +1502,13 @@ fn render_row_content(
                         no.map(|no| no.to_string()).unwrap_or_default(),
                     ))
             };
-            let mut line = div().relative().h(row_height).flex().items_center();
+            let mut line = div()
+                .debug_selector(|| format!("diff-line-{ix}"))
+                .relative()
+                .h(row_height)
+                .w_full()
+                .flex()
+                .items_center();
             if let Some(bg) = row_bg {
                 line = line.bg(bg);
             }
