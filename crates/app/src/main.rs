@@ -6804,6 +6804,12 @@ mod tests {
                     })
                 });
                 draw(&mut vcx);
+                for selector in ["inline-avatar-11", "inline-avatar-12", "inline-avatar-13"] {
+                    let avatar = vcx.debug_bounds(selector).expect("comment author avatar");
+                    assert!(avatar.size.width > px(0.));
+                    assert_eq!(avatar.size.width, avatar.size.height);
+                    assert!(avatar.size.height < px(row_height()));
+                }
                 // Stock Markdown owns list markers; assert the host's measured
                 // content and anchor geometry, not a private block widget tree.
                 let root = vcx.debug_bounds("inline-text-0-11-0-card").unwrap();
@@ -7716,6 +7722,40 @@ mod tests {
         let app = stash.borrow().clone().unwrap();
         cx.run_until_parked();
         (window.into(), app)
+    }
+
+    #[gpui::test]
+    fn queue_author_names_are_visible_without_avatars_and_stay_bounded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue.prs = vec![
+                    queued(1, "acme/repo", "alice"),
+                    queued(2, "acme/repo", "a-very-long-automation-account-name[bot]"),
+                ];
+                cx.notify();
+            });
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        for (author_id, row_id) in [
+            ("queue-author-0", "queue-row-0"),
+            ("queue-author-1", "queue-row-1"),
+        ] {
+            let author = vcx
+                .debug_bounds(author_id)
+                .expect("the author login is rendered even without an avatar URL");
+            let row = vcx.debug_bounds(row_id).unwrap();
+            assert!(author.size.width > px(0.));
+            assert!(author.size.width <= px(160.));
+            assert!(author.size.height > px(0.));
+            assert!(row.contains(&author.center()));
+            assert_eq!(row.size.height, px(36.));
+        }
     }
 
     /// The whole chain a chip click runs — handler → search update →
@@ -10526,6 +10566,73 @@ mod tests {
         data.commits = Some(github::PrCommits { commits: vec![] });
         data.discussion = Some(github::PrDiscussion::from_review_comments(comments));
         item
+    }
+
+    #[gpui::test]
+    fn conversation_comments_reviews_and_replies_show_author_avatars(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![
+            rc(
+                11,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "Question",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                12,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "Reply",
+                "dependabot[bot]",
+                "2026-01-02T00:00:00Z",
+                Some(11),
+            ),
+        ]);
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut item = commenting_item(&fake);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        let discussion = data.discussion.as_mut().unwrap();
+        for (id, review_state) in [(21, None), (22, Some("APPROVED"))] {
+            discussion.comments.push(github::DiscussionComment {
+                id,
+                permissions: Default::default(),
+                author: "alice".into(),
+                body: "Looks good".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                reactions: vec![],
+                review_state: review_state.map(str::to_owned),
+                review_id: None,
+            });
+        }
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1100.), px(1800.)));
+        for _ in 0..3 {
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            vcx.run_until_parked();
+        }
+        for selector in [
+            "discussion-avatar-0-review-false-11",
+            "discussion-avatar-0-review-false-12",
+            "discussion-avatar-0-main-false-21",
+            "discussion-avatar-0-main-true-22",
+        ] {
+            let avatar = vcx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing comment author avatar: {selector}"));
+            assert!(avatar.size.width > px(0.));
+            assert_eq!(avatar.size.width, avatar.size.height);
+        }
     }
 
     fn click_commenting(vcx: &mut gpui::VisualTestContext, selector: &'static str) {
