@@ -222,6 +222,9 @@ impl<P: GhProcess> GhCliClient<P> {
     /// defaults — because a search that succeeded means the queue is
     /// usable, and check data can catch up on the next refresh.
     fn search_queue(&self, search: &QueueSearch) -> Result<Vec<QueueItem>, ClientError> {
+        if search.is_past_reviews() {
+            return self.search_past_reviews(search);
+        }
         let args = search_prs_args(search);
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = self.process.run(&argv).map_err(spawn_failure)?;
@@ -244,6 +247,101 @@ impl<P: GhProcess> GhCliClient<P> {
         }
         search.sort_items(&mut items);
         Ok(items)
+    }
+
+    /// Fetch summaries and viewer review timestamps together, one small search
+    /// page at a time. Do not fetch 1,000 candidates up front or spawn one gh
+    /// process per PR. Activity is an upper bound on submission time, so pages
+    /// older than the tenth latest submission cannot change the result.
+    fn search_past_reviews(&self, search: &QueueSearch) -> Result<Vec<QueueItem>, ClientError> {
+        let viewer = self.api_user()?.login;
+        let mut after = None;
+        let mut seen = HashSet::new();
+        let mut recent: Vec<QueueItem> = Vec::new();
+        let mut count = 0;
+        loop {
+            let query = format!(
+                "query {{ search(query:{},type:ISSUE,first:25{}) {{ nodes {{ ... on PullRequest {{ \
+                 number title author {{ login avatarUrl(size:64) }} repository {{ nameWithOwner }} \
+                 isDraft createdAt updatedAt comments {{ totalCount }} labels(first:100) {{ nodes {{ name color }} }} \
+                 additions deletions reviewDecision statusCheckRollup {{ state }} {} \
+                 }} }} pageInfo {{ hasNextPage endCursor }} }} }}",
+                json_string(&format!("{} sort:updated-desc", search.query())),
+                after_arg(after.as_deref()), queue_reviews(&viewer, None),
+            );
+            let response = self.review_graphql(query)?;
+            let connection = &response["data"]["search"];
+            for node in connection_nodes(connection)? {
+                let mut item = past_review_item(node)?;
+                count += 1;
+                if recent.len() == 10
+                    && item.updated_at.as_str() < recent[9].reviewed_at.as_deref().unwrap()
+                {
+                    return Ok(recent);
+                }
+                item.reviewed_at =
+                    self.queue_reviewed_at(&item, &viewer, Some(node["reviews"].clone()))?;
+                if item.reviewed_at.is_some() {
+                    recent.push(item);
+                    search.sort_items(&mut recent);
+                    recent.truncate(10);
+                }
+            }
+            after = next_cursor(connection)?;
+            let Some(cursor) = &after else {
+                return Ok(recent);
+            };
+            if !seen.insert(cursor.clone()) {
+                return Err(ClientError::Failed(
+                    "repeated past review search cursor".into(),
+                ));
+            }
+            if count >= 1000 {
+                return Err(ClientError::Failed(
+                    "Review history exceeds GitHub's search limit. Narrow by organization or repository.".into(),
+                ));
+            }
+        }
+    }
+
+    fn queue_reviewed_at(
+        &self,
+        item: &QueueItem,
+        viewer: &str,
+        mut first_page: Option<serde_json::Value>,
+    ) -> Result<Option<String>, ClientError> {
+        let mut after = None;
+        let mut seen = HashSet::new();
+        let mut latest: Option<String> = None;
+        loop {
+            let reviews = match first_page.take() {
+                Some(page) => page,
+                None => {
+                    self.queue_pr_field(item, "reviews", queue_reviews(viewer, after.as_deref()))?
+                }
+            };
+            for review in connection_nodes(&reviews)? {
+                if matches!(
+                    review["state"].as_str(),
+                    Some("APPROVED" | "CHANGES_REQUESTED" | "COMMENTED" | "DISMISSED")
+                ) {
+                    if let Some(date) = review["submittedAt"]
+                        .as_str()
+                        .filter(|date| !date.is_empty())
+                    {
+                        if latest.as_deref().is_none_or(|current| date > current) {
+                            latest = Some(date.to_owned());
+                        }
+                    }
+                }
+            }
+            after = next_cursor(&reviews)?;
+            let Some(cursor) = &after else { break };
+            if !seen.insert(cursor.clone()) {
+                return Err(ClientError::Failed("repeated review history cursor".into()));
+            }
+        }
+        Ok(latest)
     }
 
     /// Only an outstanding *direct* request to the authenticated viewer counts.
@@ -1842,6 +1940,34 @@ fn enrich_query(plan: &EnrichPlan) -> String {
     query
 }
 
+fn past_review_item(node: &serde_json::Value) -> Result<QueueItem, ClientError> {
+    Ok(QueueItem {
+        number: decode_value(node["number"].clone())?,
+        title: decode_value(node["title"].clone())?,
+        author: node["author"]["login"]
+            .as_str()
+            .unwrap_or("ghost")
+            .to_owned(),
+        author_avatar_url: node["author"]["avatarUrl"].as_str().map(str::to_owned),
+        repository: decode_value(node["repository"]["nameWithOwner"].clone())?,
+        is_draft: decode_value(node["isDraft"].clone())?,
+        review_state: ReviewState::from_decision(node["reviewDecision"].as_str()),
+        ci: CiState::from_rollup_state(node["statusCheckRollup"]["state"].as_str()),
+        additions: decode_value(node["additions"].clone())?,
+        deletions: decode_value(node["deletions"].clone())?,
+        comments: decode_value(node["comments"]["totalCount"].clone())?,
+        labels: decode_value(node["labels"]["nodes"].clone())?,
+        created_at: decode_value(node["createdAt"].clone())?,
+        review_requested_at: None,
+        reviewed_at: None,
+        updated_at: decode_value(node["updatedAt"].clone())?,
+    })
+}
+
+fn queue_reviews(viewer: &str, after: Option<&str>) -> String {
+    format!("reviews(first:100,author:{}{}) {{ nodes {{ state submittedAt }} pageInfo {{ hasNextPage endCursor }} }}", json_string(viewer), after_arg(after))
+}
+
 fn queue_review_requests(after: Option<&str>) -> String {
     format!("reviewRequests(first:100{}) {{ nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(after))
 }
@@ -2135,6 +2261,7 @@ fn parse_queue(stdout: &str) -> Result<Vec<QueueItem>, ClientError> {
                         .collect(),
                     created_at: hit.created_at,
                     review_requested_at: None,
+                    reviewed_at: None,
                     updated_at: hit.updated_at,
                 })
                 .collect()
@@ -4255,6 +4382,207 @@ mod tests {
         assert_eq!(err, ClientError::Failed("exit code 70".to_string()));
     }
 
+    fn past_review_page(nodes: serde_json::Value, next: Option<&str>) -> String {
+        serde_json::json!({"data":{"repository":{"pullRequest":{"reviews":{
+            "nodes":nodes,"pageInfo":{"hasNextPage":next.is_some(),"endCursor":next}
+        }}}}})
+        .to_string()
+    }
+
+    fn past_search_node(number: u64) -> serde_json::Value {
+        serde_json::json!({
+            "number":number,"title":"Reviewed PR","author":{"login":"alice","avatarUrl":"https://example.com/avatar"},
+            "repository":{"nameWithOwner":"octocat/repo"},"isDraft":false,
+            "createdAt":"2026-01-01T00:00:00Z",
+            // Activity order is the reverse of review submission order.
+            "updatedAt":format!("2026-12-{:02}T00:00:00Z", 20 - number),
+            "comments":{"totalCount":3},"labels":{"nodes":[{"name":"bug","color":"ff0000"}]},
+            "additions":5,"deletions":2,"reviewDecision":"APPROVED","statusCheckRollup":{"state":"SUCCESS"},
+            "reviews":{"nodes":[{"state":if number == 12 {"PENDING"} else {"COMMENTED"},
+                "submittedAt":format!("2026-03-{number:02}T00:00:00Z")}],
+                "pageInfo":{"hasNextPage":false,"endCursor":null}}
+        })
+    }
+
+    fn past_search_page(nodes: Vec<serde_json::Value>, next: Option<&str>) -> String {
+        serde_json::json!({"data":{"search":{"nodes":nodes,
+            "pageInfo":{"hasNextPage":next.is_some(),"endCursor":next}}}})
+        .to_string()
+    }
+
+    #[test]
+    fn past_reviews_show_ten_latest_submissions_not_latest_pr_activity() {
+        let response = past_search_page((1..=12).map(past_search_node).collect(), None);
+        let responses = vec![
+            ok(Some(0), r#"{"login":"me","avatar_url":""}"#, ""),
+            ok(Some(0), &response, ""),
+        ];
+        let process = FakeGh::many(responses);
+        let calls = process.calls_handle();
+        let search = QueueSearch::review_requested()
+            .with_past_reviews(true)
+            .filtered_by(QueueFilter::org("octocat"));
+        let items = GhCliClient::with_process(process)
+            .search_prs(&search)
+            .unwrap();
+        assert_eq!(
+            items.iter().map(|item| item.number).collect::<Vec<_>>(),
+            (2..=11).rev().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            items[0].reviewed_at.as_deref(),
+            Some("2026-03-11T00:00:00Z")
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            2,
+            "one viewer check and one batched page, not one subprocess per PR"
+        );
+        assert!(calls[1][3].contains("is:pr reviewed-by:@me org:octocat sort:updated-desc"));
+        assert!(calls[1][3].contains("author:\"me\""));
+        assert!(!calls[1][3].contains("is:open"));
+        assert!(!calls[1][3].contains("timelineItems"));
+        assert_eq!(items[0].ci, CiState::Pass);
+        assert_eq!(items[0].additions, Some(5));
+        assert_eq!(items[0].comments, 3);
+        assert_eq!(items[0].labels[0].name, "bug");
+    }
+
+    #[test]
+    fn past_reviews_paginate_candidates_and_reuse_the_batched_review_page() {
+        let first = past_search_page((1..=6).map(past_search_node).collect(), Some("next-search"));
+        let mut nodes: Vec<_> = (7..=12).map(past_search_node).collect();
+        nodes[4]["reviews"]["pageInfo"] =
+            serde_json::json!({"hasNextPage":true,"endCursor":"next-reviews"});
+        let second = past_search_page(nodes, None);
+        let reviews = past_review_page(
+            serde_json::json!([
+                {"state":"APPROVED","submittedAt":"2026-03-15T00:00:00Z"}
+            ]),
+            None,
+        );
+        let process = FakeGh::many(vec![
+            ok(Some(0), r#"{"login":"me","avatar_url":""}"#, ""),
+            ok(Some(0), &first, ""),
+            ok(Some(0), &second, ""),
+            ok(Some(0), &reviews, ""),
+        ]);
+        let calls = process.calls_handle();
+        let items = GhCliClient::with_process(process)
+            .search_prs(&QueueSearch::review_requested().with_past_reviews(true))
+            .unwrap();
+        assert_eq!(items.len(), 10);
+        assert_eq!(items[0].number, 11);
+        assert_eq!(
+            items[0].reviewed_at.as_deref(),
+            Some("2026-03-15T00:00:00Z")
+        );
+        assert_eq!(items[9].number, 2);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[2][3].contains("after:\"next-search\""));
+        assert!(calls[3][3].contains("after:\"next-reviews\""));
+    }
+
+    #[test]
+    #[ignore = "requires authenticated gh and network; read-only review history"]
+    fn real_past_reviews_load() {
+        let start = std::time::Instant::now();
+        let items = GhCliClient::new()
+            .search_prs(&QueueSearch::review_requested().with_past_reviews(true))
+            .unwrap();
+        assert!(items.len() <= 10);
+        assert!(items.iter().all(|item| item.reviewed_at.is_some()));
+        assert!(items
+            .windows(2)
+            .all(|pair| pair[0].reviewed_at >= pair[1].reviewed_at));
+        eprintln!(
+            "Loaded {} past reviews in {:?}",
+            items.len(),
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn past_reviews_empty_and_failed_searches_finish_without_more_requests() {
+        for response in [
+            ok(Some(0), &past_search_page(Vec::new(), None), ""),
+            ok(Some(1), "", "offline"),
+        ] {
+            let process = FakeGh::many(vec![
+                ok(Some(0), r#"{"login":"me","avatar_url":""}"#, ""),
+                response,
+            ]);
+            let calls = process.calls_handle();
+            let result = GhCliClient::with_process(process)
+                .search_prs(&QueueSearch::review_requested().with_past_reviews(true));
+            assert!(result.is_err() || result.unwrap().is_empty());
+            assert_eq!(calls.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn past_review_timestamp_paginates_and_ignores_pending_reviews() {
+        let page1 = past_review_page(
+            serde_json::json!([
+                {"state":"PENDING","submittedAt":"2026-12-01T00:00:00Z"},
+                {"state":"APPROVED","submittedAt":"2026-03-01T00:00:00Z"}
+            ]),
+            Some("next"),
+        );
+        let page2 = past_review_page(
+            serde_json::json!([
+                {"state":"DISMISSED","submittedAt":"2026-03-03T00:00:00Z"},
+                {"state":"CHANGES_REQUESTED","submittedAt":"2026-03-02T00:00:00Z"}
+            ]),
+            None,
+        );
+        let process = FakeGh::many(vec![ok(Some(0), &page1, ""), ok(Some(0), &page2, "")]);
+        let calls = process.calls_handle();
+        let item = parse_queue(QUEUE_SUCCESS).unwrap().remove(0);
+        assert_eq!(
+            GhCliClient::with_process(process)
+                .queue_reviewed_at(&item, "me", None)
+                .unwrap()
+                .as_deref(),
+            Some("2026-03-03T00:00:00Z")
+        );
+        assert!(calls.lock().unwrap()[1][3].contains("after:\"next\""));
+
+        let process = FakeGh::many(vec![ok(Some(0), &page1, ""), ok(Some(0), &page1, "")]);
+        assert!(GhCliClient::with_process(process)
+            .queue_reviewed_at(&item, "me", None)
+            .is_err());
+        let process = FakeGh::one(ok(Some(1), "", "offline"));
+        assert!(GhCliClient::with_process(process)
+            .queue_reviewed_at(&item, "me", None)
+            .is_err());
+    }
+
+    #[test]
+    fn past_reviews_stop_when_older_activity_cannot_change_the_top_ten() {
+        let page1 = past_search_page((1..=10).map(past_search_node).collect(), Some("older"));
+        let mut old = past_search_node(11);
+        old["updatedAt"] = "2025-01-01T00:00:00Z".into();
+        old["reviews"] = serde_json::Value::Null; // must not request this history
+        let page2 = past_search_page(vec![old], Some("never-fetched"));
+        let process = FakeGh::many(vec![
+            ok(Some(0), r#"{"login":"me","avatar_url":""}"#, ""),
+            ok(Some(0), &page1, ""),
+            ok(Some(0), &page2, ""),
+        ]);
+        let calls = process.calls_handle();
+        let items = GhCliClient::with_process(process)
+            .search_prs(&QueueSearch::review_requested().with_past_reviews(true))
+            .unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert!(calls.lock().unwrap()[2][3].contains("after:\"older\""));
+        assert_eq!(items.len(), 10);
+        assert_eq!(items[0].number, 10);
+        assert_eq!(items[9].number, 1);
+    }
+
     #[test]
     fn search_prs_parses_the_recorded_queue_payload() {
         // The enrichment answered with nothing to say ("data": null), so
@@ -4750,6 +5078,7 @@ mod tests {
                 labels: Vec::new(),
                 created_at: String::new(),
                 review_requested_at: None,
+                reviewed_at: None,
                 updated_at: String::new(),
             })
             .collect();

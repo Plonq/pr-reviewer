@@ -60,8 +60,16 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - queue ordering is oldest review request first by default; `s` toggles to oldest
   PR creation first. Unknown request times sort last, with creation time breaking
   ties. Filter chips narrow by organization or repository, not author.
-- enter (or click) opens a queue row straight into its changes view; `u` comes
-  back to the queue with open PRs kept open behind the scenes
+- **Past reviews** toggles the queue to your 10 most recently reviewed PRs,
+  newest submitted review first, including closed and merged PRs. Toggle it off
+  to return to the current queue; new launches always start in the current view.
+- enter (or click) opens a new PR in its conversation view; `⇧⌘→` switches to
+  Changes and `⇧⌘←` back to Conversation. Reopening an already-open PR keeps
+  its selected view; `u` returns to the queue with open PRs kept open behind
+  the scenes. The description and discussion appear as soon as they arrive,
+  while the patch and file details continue loading in the background; diff
+  loading or failure does not block reading the conversation. Local repository
+  diffs open in Changes.
 - one file at a time: the whole file fills the pane — no `@@` markers, hunk
   boundaries read from the highlighting — revealed at its first change on
   first visit, with each file's scroll position remembered while the review is open;
@@ -96,7 +104,7 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   each PR remembers its own choices. Horizontal scrolling works in both views.
   Fold boundaries expand on click. Files of 20,000+ lines open behind an
   explanatory, click-to-expand safety banner, without whole-file highlighting.
-- tree-sitter highlighting (18 languages)
+- tree-sitter highlighting, including CSS and SCSS
 - word-level intra-line diffs
 - whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
 - standalone review queue without a sidebar; reviews have a permanent multi-item

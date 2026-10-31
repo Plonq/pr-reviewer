@@ -21,6 +21,7 @@ tree-sitter-toml-ng = "0.7"
 tree-sitter-yaml = "0.7"
 tree-sitter-html = "0.23"
 tree-sitter-css = "0.23"
+tree-sitter-scss = "1.0"
 tree-sitter-elixir = "0.3"
 tree-sitter-gleam = { git = "https://github.com/gleam-lang/tree-sitter-gleam", rev = "c610c282ef73f830d80c1f0999dce8e83f024ef5" }
 tree-sitter-heex = "0.8"

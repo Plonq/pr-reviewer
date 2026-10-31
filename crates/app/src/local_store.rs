@@ -357,6 +357,7 @@ pub fn queue_item(row: &CachedQueueRow) -> QueueItem {
             .collect(),
         created_at: row.created_at.clone(),
         review_requested_at: row.review_requested_at.clone(),
+        reviewed_at: None,
         updated_at: row.updated_at.clone(),
     }
 }
@@ -425,6 +426,7 @@ mod tests {
             }],
             created_at: "2026-10-15T10:00:00Z".into(),
             review_requested_at: Some("2026-10-19T09:00:00Z".into()),
+            reviewed_at: None,
             updated_at: "2026-10-20T08:07:08Z".into(),
         }
     }
