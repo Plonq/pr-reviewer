@@ -1675,7 +1675,7 @@ fn render_row_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::minimap::{minimap_rows, MinimapKind};
+    use crate::minimap::{minimap_rows, MinimapKind, MinimapLane};
     use crate::selection::row_side_text;
     use crate::test_util::{
         add, app_rc as rc, ctx, mrow, rem, row_name, sample_comments, sample_diff, two_file_diff,
@@ -2525,9 +2525,17 @@ mod tests {
             }
             other => panic!("expected file header, got {}", row_name(other)),
         }
-        // Comment rows are selectable-through and blank in the minimap.
+        // Comment rows are selectable-through and form a card in the minimap.
         assert!(row_side_text(&rows[4], SelSide::Unified).is_none());
-        assert_eq!(minimap_rows(&rows)[4], mrow(MinimapKind::Blank, 0.));
+        assert_eq!(
+            minimap_rows(&rows)[4],
+            mrow(
+                MinimapKind::Comment {
+                    lane: MinimapLane::Full,
+                },
+                1.,
+            )
+        );
     }
 
     #[test]
