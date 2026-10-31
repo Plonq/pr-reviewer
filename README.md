@@ -101,10 +101,15 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   GitHub's experimental revision-positioning API and may depend on its rollout.
   Left-side comments map back to the actual reviewed blob; upstream-only lines
   without a reviewed position must be commented on the new revision instead.
-- `cmd-f` searches the current file's diff (literal, case-sensitive); Enter cycles
-  highlighted matches, Shift-Enter goes back, and Esc restores the prior scroll
-  position. Folded context is temporarily revealed; large-file safety banners
-  still require explicit expansion.
+- `cmd-f` searches the current file; `cmd-shift-f` searches across the entire
+  diff (literal, case-sensitive). Selected diff text autofills the query and
+  searches immediately. Choose **Current file**, **All files** (full content of
+  changed files, including context and removals), or **Changed lines** (additions
+  and removals only). Enter / Shift-Enter cycle highlighted results
+  across files; Esc restores the original file and scroll position. Folded and
+  whitespace-hidden context is temporarily revealed. Large-file safety banners
+  still require explicit expansion; search reports excluded large files and
+  files where only patch content is available.
 - diff presentation controls: `W` hides whitespace changes, `K` folds unchanged
   regions, and `alt-z` toggles soft wrapping. All three start off for new PRs;
   each PR remembers its own choices. Horizontal scrolling works in both views.

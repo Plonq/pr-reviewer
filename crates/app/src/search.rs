@@ -1,9 +1,13 @@
-//! File-scoped literal search. Match coordinates stay in display-row byte
-//! space; wrapped fragments are joined before matching, never across lines.
+//! Literal search in source coordinates, projected onto the visible file's
+//! display rows. Indexing never builds/highlights off-screen files.
+#[cfg(test)]
+mod tests;
+
 use crate::local_store::ReviewPosition;
-use crate::rows::Row;
-use crate::selection::{row_side_text, SelSide};
+use crate::rows::{gap_span, source_row, FileUpgrade, LineKind, Row};
+use crate::selection::{row_side_text, selection_text, SelSide};
 use crate::{theme, ItemData, ItemPane, ReviewApp};
+use diff_core::{DiffRow, FileStatus, PrDiff};
 use gpui::component::{
     button::{Button, ButtonVariants as _},
     input::{Escape, Input, InputEvent, InputState},
@@ -12,19 +16,51 @@ use gpui::component::{
 use gpui::{
     div, prelude::*, px, Context, Entity, KeyBinding, ScrollStrategy, Subscription, Window,
 };
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-gpui::actions!(diff_search, [OpenSearch, NextMatch, PreviousMatch]);
+gpui::actions!(
+    diff_search,
+    [OpenSearch, OpenDiffSearch, NextMatch, PreviousMatch]
+);
 
-pub(crate) fn keybindings() -> [KeyBinding; 6] {
+pub(crate) fn keybindings() -> [KeyBinding; 8] {
     [
         KeyBinding::new("cmd-f", OpenSearch, Some("ReviewApp")),
         KeyBinding::new("cmd-f", OpenSearch, Some("DiffSearch")),
+        KeyBinding::new("cmd-shift-f", OpenDiffSearch, Some("ReviewApp")),
+        KeyBinding::new("cmd-shift-f", OpenDiffSearch, Some("DiffSearch")),
         KeyBinding::new("enter", NextMatch, Some("ReviewApp")),
         KeyBinding::new("enter", NextMatch, Some("DiffSearch > Input")),
         KeyBinding::new("shift-enter", PreviousMatch, Some("DiffSearch > Input")),
         KeyBinding::new("shift-enter", PreviousMatch, Some("ReviewApp")),
     ]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SearchScope {
+    CurrentFile,
+    AllFiles,
+    ChangedLines,
+}
+
+impl SearchScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CurrentFile => "Current file",
+            Self::AllFiles => "All files",
+            Self::ChangedLines => "Changed lines",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Occurrence {
+    file: usize,
+    // Shared context is indexed once, on the new side; removals use the old.
+    removed: bool,
+    line: u32,
+    range: Range<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,68 +72,163 @@ struct Span {
 
 #[derive(Default)]
 struct Matches {
-    occurrences: Vec<Vec<Span>>,
+    occurrences: Vec<Occurrence>,
     current: Option<usize>,
     by_row: Vec<Vec<(usize, Span)>>,
+    skipped_large: usize,
+    patch_only: usize,
 }
 
 impl Matches {
-    fn find(rows: &[Row], query: &str) -> Self {
-        let mut occurrences = Vec::new();
-        if !query.is_empty() {
-            for side in [SelSide::Unified, SelSide::Left, SelSide::Right] {
-                let mut ix = 0;
-                while ix < rows.len() {
-                    let Some(text) = row_side_text(&rows[ix], side) else {
-                        ix += 1;
-                        continue;
-                    };
-                    let mut text = text.to_string();
-                    let mut fragments = vec![(ix, 0..text.len())];
-                    ix += 1;
-                    while ix < rows.len() && matches!(rows[ix], Row::Continuation(_)) {
-                        if let Some(part) = row_side_text(&rows[ix], side) {
-                            let start = text.len();
-                            text.push_str(part);
-                            fragments.push((ix, start..text.len()));
+    fn find(
+        diff: &PrDiff,
+        upgrades: &HashMap<usize, FileUpgrade>,
+        expanded: &HashSet<(usize, u32)>,
+        scope: SearchScope,
+        origin: usize,
+        query: &str,
+    ) -> Self {
+        let mut result = Self::default();
+        for (file_ix, file) in diff.files.iter().enumerate() {
+            if (scope == SearchScope::CurrentFile && file_ix != origin)
+                || file.status == FileStatus::Binary
+            {
+                continue;
+            }
+            let upgrade = upgrades.get(&file_ix);
+            if crate::presentation::auto_collapse(crate::presentation::file_lines(file, upgrade))
+                && !expanded.contains(&(file_ix, 0))
+            {
+                result.skipped_large += 1;
+                continue;
+            }
+            if upgrade.is_none() && scope != SearchScope::ChangedLines {
+                result.patch_only += 1;
+            }
+            if query.is_empty() {
+                continue;
+            }
+            let mut line = |removed, line, text: &str| {
+                result
+                    .occurrences
+                    .extend(text.match_indices(query).map(|(start, _)| Occurrence {
+                        file: file_ix,
+                        removed,
+                        line,
+                        range: start..start + query.len(),
+                    }));
+            };
+            for gap in 0..=file.hunks.len() {
+                if scope != SearchScope::ChangedLines {
+                    if let Some(upgrade) = upgrade {
+                        let (_, new_lo, count) =
+                            gap_span(&file.hunks, gap, upgrade.new_lines.len() as u32);
+                        for no in new_lo..new_lo + count {
+                            line(false, no, &upgrade.new_lines[no as usize - 1]);
                         }
-                        ix += 1;
                     }
-                    for (start, _) in text.match_indices(query) {
-                        let end = start + query.len();
-                        occurrences.push(
-                            fragments
-                                .iter()
-                                .filter_map(|(row, fragment)| {
-                                    let lo = start.max(fragment.start);
-                                    let hi = end.min(fragment.end);
-                                    (lo < hi).then_some(Span {
-                                        row: *row,
-                                        side,
-                                        range: lo.saturating_sub(fragment.start)
-                                            ..hi.saturating_sub(fragment.start),
-                                    })
-                                })
-                                .collect::<Vec<_>>(),
-                        );
+                }
+                let Some(hunk) = file.hunks.get(gap) else {
+                    continue;
+                };
+                for row in &hunk.rows {
+                    match row {
+                        DiffRow::Added { new_no, text, .. } => line(false, *new_no, text),
+                        DiffRow::Removed { old_no, text, .. } => line(true, *old_no, text),
+                        DiffRow::Context { new_no, text, .. }
+                            if scope != SearchScope::ChangedLines =>
+                        {
+                            line(false, *new_no, text);
+                        }
+                        _ => {}
                     }
                 }
             }
         }
-        occurrences.sort_by_key(|spans| {
-            let span = &spans[0];
-            (span.row, span.side as u8, span.range.start)
+        result.current = (!result.occurrences.is_empty()).then(|| {
+            result
+                .occurrences
+                .iter()
+                .position(|m| m.file >= origin)
+                .unwrap_or(0)
         });
-        let mut by_row = vec![Vec::new(); rows.len()];
-        for (ix, spans) in occurrences.iter().enumerate() {
-            for span in spans {
-                by_row[span.row].push((ix, span.clone()));
-            }
+        result
+    }
+
+    /// Reproject without rescanning source text when comments, wrapping, or the
+    /// displayed file change. Split context gets two highlights, one result.
+    fn project(&mut self, rows: &[Row], file: usize) {
+        let mut lines: HashMap<(bool, u32), Vec<(usize, &Occurrence)>> = HashMap::new();
+        let lo = self.occurrences.partition_point(|m| m.file < file);
+        let hi = self.occurrences.partition_point(|m| m.file <= file);
+        for ix in lo..hi {
+            let m = &self.occurrences[ix];
+            lines.entry((m.removed, m.line)).or_default().push((ix, m));
         }
-        Self {
-            current: (!occurrences.is_empty()).then_some(0),
-            occurrences,
-            by_row,
+        self.by_row = vec![Vec::new(); rows.len()];
+        for side in [SelSide::Unified, SelSide::Left, SelSide::Right] {
+            let mut offset = 0;
+            for (row_ix, row) in rows.iter().enumerate() {
+                if !matches!(row, Row::Continuation(_)) {
+                    offset = 0;
+                }
+                let Some(text) = row_side_text(row, side) else {
+                    continue;
+                };
+                let key = match (source_row(row), side) {
+                    (
+                        Row::Line {
+                            kind: LineKind::Removed,
+                            old_no: Some(no),
+                            ..
+                        },
+                        SelSide::Unified,
+                    ) => Some((true, *no)),
+                    (
+                        Row::Line {
+                            new_no: Some(no), ..
+                        },
+                        SelSide::Unified,
+                    ) => Some((false, *no)),
+                    (
+                        Row::SplitLine {
+                            left: Some(cell),
+                            right,
+                        },
+                        SelSide::Left,
+                    ) => {
+                        if cell.kind == LineKind::Removed {
+                            Some((true, cell.no))
+                        } else {
+                            right.as_ref().map(|r| (false, r.no))
+                        }
+                    }
+                    (
+                        Row::SplitLine {
+                            right: Some(cell), ..
+                        },
+                        SelSide::Right,
+                    ) => Some((false, cell.no)),
+                    _ => None,
+                };
+                if let Some(matches) = key.and_then(|key| lines.get(&key)) {
+                    for (ix, m) in matches {
+                        let start = m.range.start.max(offset);
+                        let end = m.range.end.min(offset + text.len());
+                        if start < end {
+                            self.by_row[row_ix].push((
+                                *ix,
+                                Span {
+                                    row: row_ix,
+                                    side,
+                                    range: start - offset..end - offset,
+                                },
+                            ));
+                        }
+                    }
+                }
+                offset += text.len();
+            }
         }
     }
 
@@ -110,7 +241,12 @@ impl Matches {
     }
 
     fn current_span(&self) -> Option<&Span> {
-        self.occurrences.get(self.current?)?.first()
+        let current = self.current?;
+        self.by_row
+            .iter()
+            .flatten()
+            .find(|(ix, _)| *ix == current)
+            .map(|(_, span)| span)
     }
 }
 
@@ -118,7 +254,11 @@ pub(crate) struct Search {
     pub(crate) prior: ReviewPosition,
     input: Entity<InputState>,
     query: String,
+    scope: SearchScope,
+    origin: usize,
     matches: Matches,
+    dirty: bool,
+    expanded_large: HashSet<usize>,
     _subscription: Subscription,
 }
 
@@ -148,28 +288,45 @@ impl Search {
 }
 
 impl ItemData {
-    /// Every row rebuild (refresh, comments, wrap, etc.) reindexes the search.
+    /// Source data is immutable for a search's lifetime (refresh replaces the
+    /// item). Only query/scope/large-file expansion require a new source index.
     pub(crate) fn reindex_search(&mut self) {
-        if let Some(search) = &mut self.search {
-            if self.diff.files.get(self.file_ix).map(|f| f.display_path())
-                != Some(search.prior.path.as_str())
-            {
-                self.search = None;
-                return;
-            }
-            let previous = search.matches.current_span().cloned();
-            search.matches = Matches::find(&self.rows, &search.query);
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        let expanded_large = self
+            .expanded_regions
+            .iter()
+            .filter_map(|(file, key)| (*key == 0).then_some(*file))
+            .collect();
+        if search.dirty || search.expanded_large != expanded_large {
+            let previous = search
+                .matches
+                .current
+                .and_then(|ix| search.matches.occurrences.get(ix))
+                .cloned();
+            search.matches = Matches::find(
+                &self.diff,
+                &self.upgrades,
+                &self.expanded_regions,
+                search.scope,
+                search.origin,
+                &search.query,
+            );
             if let Some(previous) = previous {
                 if let Some(ix) = search
                     .matches
                     .occurrences
                     .iter()
-                    .position(|spans| spans.first() == Some(&previous))
+                    .position(|m| *m == previous)
                 {
                     search.matches.current = Some(ix);
                 }
             }
+            search.dirty = false;
+            search.expanded_large = expanded_large;
         }
+        search.matches.project(&self.rows, self.file_ix);
     }
 
     pub(crate) fn end_search(&mut self) {
@@ -188,6 +345,14 @@ impl ReviewApp {
                 .is_some_and(|item| item.pane == ItemPane::Changes)
     }
 
+    pub(crate) fn open_diff_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.search_visible() || self.composer.is_some() || self.review.is_some() {
+            return;
+        }
+        self.open_search(window, cx);
+        self.set_search_scope(SearchScope::AllFiles, window, cx);
+    }
+
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.search_visible() || self.composer.is_some() || self.review.is_some() {
             return;
@@ -195,16 +360,38 @@ impl ReviewApp {
         let Some(data) = self.active_data() else {
             return;
         };
-        if let Some(search) = &data.search {
-            search.input.update(cx, |input, cx| input.focus(window, cx));
+        // Read the selection before rebuilding rows clears it. Use the same
+        // source-text extraction as copy (Unicode, split sides, and wrapping).
+        let selected = data
+            .selection
+            .as_ref()
+            .map(|selection| selection_text(selection, &data.rows))
+            .filter(|text| !text.is_empty());
+        if let Some(input) = data.search.as_ref().map(|search| search.input.clone()) {
+            if let Some(query) = selected {
+                let data = self.active_data_mut().unwrap();
+                data.selection = None;
+                let search = data.search.as_mut().unwrap();
+                search.query = query.clone();
+                search.dirty = true;
+                data.reindex_search();
+                input.update(cx, |input, cx| input.set_value(query, window, cx));
+                self.reveal_search_match(window, cx);
+            }
+            input.update(cx, |input, cx| input.focus(window, cx));
             return;
         }
         let Some(prior) = data.review_position() else {
             return;
         };
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in current diff…"));
+        let query = selected.unwrap_or_default();
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("Find literal text…");
+            input.set_value(query.clone(), window, cx);
+            input
+        });
         let subscription = cx.subscribe_in(&input, window, |this, input, event, window, cx| {
-            // An input belonging to a background item must never search another file.
+            // An input belonging to a background item must never search another item.
             if !this.search_visible()
                 || !this
                     .active_data()
@@ -216,7 +403,9 @@ impl ReviewApp {
             if matches!(event, InputEvent::Change) {
                 let query = input.read(cx).value().to_string();
                 let data = this.active_data_mut().unwrap();
-                data.search.as_mut().unwrap().query = query;
+                let search = data.search.as_mut().unwrap();
+                search.query = query;
+                search.dirty = true;
                 data.reindex_search();
                 this.reveal_search_match(window, cx);
             }
@@ -225,15 +414,44 @@ impl ReviewApp {
         data.search = Some(Search {
             prior,
             input: input.clone(),
-            query: String::new(),
+            query,
+            scope: SearchScope::CurrentFile,
+            origin: data.file_ix,
             matches: Matches::default(),
+            dirty: true,
+            expanded_large: HashSet::new(),
             _subscription: subscription,
         });
-        // Search includes folded context, without changing the saved preference.
-        // The explicit large-file safety banner still requires a click to expand.
+        // Temporarily reveal folded/whitespace context, but keep explicit
+        // large-file safety banners until the reviewer clicks to expand them.
         data.rebuild_presentation();
+        self.reveal_search_match(window, cx);
         input.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
+    }
+
+    pub(crate) fn set_search_scope(
+        &mut self,
+        scope: SearchScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        let Some(search) = &mut data.search else {
+            return;
+        };
+        search.scope = scope;
+        if scope == SearchScope::CurrentFile {
+            search.origin = data.file_ix;
+        }
+        search.dirty = true;
+        data.reindex_search();
+        self.reveal_search_match(window, cx);
+        if let Some(search) = self.active_data().and_then(|d| d.search.as_ref()) {
+            search.input.update(cx, |input, cx| input.focus(window, cx));
+        }
     }
 
     pub(crate) fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -266,6 +484,18 @@ impl ReviewApp {
         let Some(data) = self.active_data_mut() else {
             return;
         };
+        let file = data
+            .search
+            .as_ref()
+            .and_then(|s| s.matches.current.map(|ix| s.matches.occurrences[ix].file));
+        if let Some(file) = file.filter(|file| *file != data.file_ix) {
+            // Unlike manual navigation, result navigation keeps the search and
+            // its original viewport, and does not overwrite per-file positions.
+            data.file_ix = file;
+            data.selection = None;
+            data.cursor_side = None;
+            data.set_rows(data.row_build());
+        }
         if let Some(span) = data.search.as_ref().and_then(|s| s.matches.current_span()) {
             let row = span.row;
             let side = span.side;
@@ -290,6 +520,8 @@ impl ReviewApp {
             state.deferred_scroll_to_item = None;
             drop(state);
             data.position_restore = None;
+            data.cursor = row;
+            data.cursor_side = Some(side);
             data.scroll
                 .scroll_to_item_strict(row, ScrollStrategy::Center);
         }
@@ -310,6 +542,19 @@ impl ReviewApp {
             None if search.query.is_empty() => "Enter: next · Esc: close".into(),
             None => "No matches".into(),
         };
+        let mut limitations = Vec::new();
+        if search.matches.skipped_large > 0 {
+            limitations.push(format!(
+                "{} large files excluded (expand to search)",
+                search.matches.skipped_large
+            ));
+        }
+        if search.matches.patch_only > 0 {
+            limitations.push(format!(
+                "{} files have patch content only",
+                search.matches.patch_only
+            ));
+        }
         div()
             .id("diff-search")
             .debug_selector(|| "diff-search".into())
@@ -325,6 +570,11 @@ impl ReviewApp {
             .border_1()
             .border_color(theme::surface0(cx))
             .on_action(cx.listener(|this, _: &OpenSearch, window, cx| this.open_search(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenDiffSearch, window, cx| {
+                    this.open_diff_search(window, cx)
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &NextMatch, window, cx| this.step_search(1, window, cx)),
             )
@@ -361,102 +611,39 @@ impl ReviewApp {
                             })),
                     ),
             )
+            .child(
+                div().flex().gap_1().mt_1().children(
+                    [
+                        SearchScope::CurrentFile,
+                        SearchScope::AllFiles,
+                        SearchScope::ChangedLines,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, scope)| {
+                        Button::new(("search-scope", ix))
+                            .ghost()
+                            .small()
+                            .label(format!(
+                                "{}{}",
+                                if search.scope == scope { "✓ " } else { "" },
+                                scope.label()
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_search_scope(scope, window, cx)
+                            }))
+                    }),
+                ),
+            )
+            .when(!limitations.is_empty(), |bar| {
+                bar.child(
+                    div()
+                        .mt_1()
+                        .text_size(px(11.))
+                        .text_color(theme::subtext(cx))
+                        .child(limitations.join(" · ")),
+                )
+            })
             .into_any_element()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rows::{build_presented_rows, RowOptions, RowsView, ViewMode};
-
-    fn rows(mode: ViewMode, wrap: bool) -> Vec<Row> {
-        let diff = diff_core::parse_patch("diff --git a/needle.txt b/needle.txt\n--- a/needle.txt\n+++ b/needle.txt\n@@ -1,3 +1,3 @@\n shared\n-old é世界 old\n+new é世界 new\n tail\ndiff --git a/other b/other\n--- a/other\n+++ b/other\n@@ -1 +1 @@\n-old\n+elsewhere\n");
-        build_presented_rows(
-            RowsView {
-                diff: &diff,
-                upgrades: &Default::default(),
-                comments: None,
-                options: RowOptions {
-                    mode,
-                    file_ix: 0,
-                    comments_visible: true,
-                    comment_wrap: 80,
-                },
-            },
-            store::DiffPreferences {
-                soft_wrap: Some(wrap),
-                ..Default::default()
-            },
-            &Default::default(),
-            6,
-        )
-        .rows
-    }
-
-    #[test]
-    fn literal_unicode_matches_cover_both_sides_but_not_headers_or_other_files() {
-        for mode in [ViewMode::Unified, ViewMode::Split] {
-            let rows = rows(mode, false);
-            for query in ["", "needle", "elsewhere", "NEW", ".*"] {
-                assert!(
-                    Matches::find(&rows, query).occurrences.is_empty(),
-                    "{query}"
-                );
-            }
-            let matches = Matches::find(&rows, "é世界");
-            assert_eq!(matches.occurrences.len(), 2);
-            for occurrence in &matches.occurrences {
-                let span = &occurrence[0];
-                assert_eq!(
-                    &row_side_text(&rows[span.row], span.side).unwrap()[span.range.clone()],
-                    "é世界"
-                );
-            }
-            let old = Matches::find(&rows, "old");
-            assert_eq!(old.occurrences.len(), 2);
-            assert!(old.occurrences.iter().all(|spans| spans[0].side
-                == if mode == ViewMode::Unified {
-                    SelSide::Unified
-                } else {
-                    SelSide::Left
-                }));
-        }
-    }
-
-    #[test]
-    fn navigation_wraps_both_ends_and_empty_results_are_safe() {
-        let mut found = Matches::find(&rows(ViewMode::Unified, false), "old");
-        assert_eq!(found.current, Some(0));
-        found.step(1);
-        assert_eq!(found.current, Some(1));
-        found.step(1);
-        assert_eq!(found.current, Some(0));
-        found.step(-1);
-        assert_eq!(found.current, Some(1));
-        let mut empty = Matches::find(&[], "old");
-        empty.step(1);
-        empty.step(-1);
-        assert_eq!(empty.current, None);
-    }
-
-    #[test]
-    fn wrapped_match_is_one_occurrence_with_highlights_on_each_fragment() {
-        for mode in [ViewMode::Unified, ViewMode::Split] {
-            let rows = rows(mode, true);
-            let matches = Matches::find(&rows, "é世界");
-            assert_eq!(matches.occurrences.len(), 2);
-            for spans in matches.occurrences {
-                assert_eq!(spans.len(), 2);
-                let text: String = spans
-                    .iter()
-                    .map(|span| {
-                        &row_side_text(&rows[span.row], span.side).unwrap()[span.range.clone()]
-                    })
-                    .collect();
-                assert_eq!(text, "é世界");
-            }
-            assert!(Matches::find(&rows, "sharedold").occurrences.is_empty());
-        }
     }
 }

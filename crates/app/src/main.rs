@@ -789,6 +789,7 @@ impl ItemData {
             if self.search.is_some() {
                 store::DiffPreferences {
                     collapse_unchanged: Some(false),
+                    hide_whitespace: Some(false),
                     ..self.preferences
                 }
             } else {
@@ -6115,6 +6116,9 @@ impl Render for ReviewApp {
                     this.open_search(window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &search::OpenDiffSearch, window, cx| {
+                this.open_diff_search(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &search::NextMatch, window, cx| {
                 this.step_search(1, window, cx)
             }))
@@ -7933,13 +7937,17 @@ mod tests {
                         .map(move |(_, color)| (row, color))
                 })
                 .collect();
-            assert_eq!(highlights.len(), 2, "the other file is not searched");
+            assert_eq!(data.file_ix, 0, "cmd-f stays in the current file");
+            assert_eq!(highlights.len(), 2);
             let active_color = theme::search_current_bg(cx);
-            highlights
-                .into_iter()
-                .find(|(_, color)| *color == active_color)
-                .unwrap()
-                .0
+            (
+                data.file_ix,
+                highlights
+                    .into_iter()
+                    .find(|(_, color)| *color == active_color)
+                    .unwrap()
+                    .0,
+            )
         };
         let first = vcx.update(|_, cx| active_match(cx));
         vcx.simulate_keystrokes("enter");
@@ -8004,6 +8012,208 @@ mod tests {
                 wrapped_prior
             );
         });
+    }
+
+    #[gpui::test]
+    fn diff_search_seeds_selected_text_on_open_and_refocus(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| cx.bind_keys(search::keybindings()));
+        let diff = diff_core::parse_patch("diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old é世界 old\n+new é世界 tail\ndiff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old\n+elsewhere\n");
+        let mut item = loop_pr_item(Vec::new());
+        item.state = ItemState::Ready(file_mode_data(diff));
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let select = |side, prefix: &str, start, end, data: &mut ItemData| {
+            let row = data
+                .rows
+                .iter()
+                .position(|row| {
+                    selection::row_side_text(row, side).is_some_and(|text| text.starts_with(prefix))
+                })
+                .unwrap();
+            data.selection = Some(Selection {
+                side,
+                anchor: RowCol { row, col: end },
+                head: RowCol { row, col: start },
+            });
+        };
+        let assert_query = |query: &str, count, cx: &App| {
+            let data = app.read(cx).active_data().unwrap();
+            let search = data.search.as_ref().unwrap();
+            let hits: Vec<_> = (0..data.rows.len())
+                .flat_map(|row| {
+                    [SelSide::Unified, SelSide::Left, SelSide::Right]
+                        .into_iter()
+                        .flat_map(move |side| {
+                            search
+                                .highlights(row, side, cx)
+                                .into_iter()
+                                .map(move |(range, _)| {
+                                    &selection::row_side_text(&data.rows[row], side).unwrap()[range]
+                                })
+                        })
+                })
+                .collect();
+            assert_eq!(hits, vec![query; count]);
+        };
+        for side in [SelSide::Unified, SelSide::Left, SelSide::Right] {
+            vcx.update(|window, cx| {
+                app.update(cx, |app, _| {
+                    let data = app.active_data_mut().unwrap();
+                    data.position_restore = None;
+                    data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+                    data.mode = if side == SelSide::Unified {
+                        ViewMode::Unified
+                    } else {
+                        ViewMode::Split
+                    };
+                    data.rebuild_presentation();
+                    select(
+                        side,
+                        if side == SelSide::Left { "old" } else { "new" },
+                        4,
+                        7,
+                        data,
+                    );
+                });
+                let _ = window.draw(cx);
+            });
+            vcx.simulate_keystrokes("cmd-f");
+            vcx.update(|_, cx| assert_query("é世界", 2, cx));
+            // Typing appends to the autofilled input, proving its value and focus
+            // agree with the search index (not just an invisible seeded query).
+            vcx.simulate_input(" tail");
+            vcx.update(|_, cx| assert_query("é世界 tail", 1, cx));
+            vcx.simulate_keystrokes("cmd-shift-f");
+            vcx.update(|_, cx| assert_query("é世界 tail", 1, cx));
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    let data = app.active_data_mut().unwrap();
+                    select(
+                        if side == SelSide::Unified {
+                            side
+                        } else {
+                            SelSide::Right
+                        },
+                        "new",
+                        8,
+                        12,
+                        data,
+                    );
+                    window.focus(&app.focus_handle, cx);
+                });
+            });
+            vcx.simulate_keystrokes("cmd-shift-f");
+            vcx.update(|_, cx| assert_query("tail", 1, cx));
+            vcx.update(|_, cx| {
+                app.update(cx, |app, _| {
+                    let data = app.active_data_mut().unwrap();
+                    select(
+                        if side == SelSide::Unified {
+                            side
+                        } else {
+                            SelSide::Right
+                        },
+                        "new",
+                        0,
+                        0,
+                        data,
+                    );
+                })
+            });
+            vcx.simulate_keystrokes("cmd-f");
+            vcx.update(|_, cx| assert_query("tail", 1, cx));
+            vcx.simulate_keystrokes("escape");
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn whole_diff_search_navigates_scopes_and_restores_original_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| cx.bind_keys(search::keybindings()));
+        let diff = diff_core::parse_patch("diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n needle shared\n-old\n+new\ndiff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old\n+needle added\n");
+        let mut item = loop_pr_item(Vec::new());
+        item.state = ItemState::Ready(file_mode_data(diff));
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            vcx.update(|window, cx| {
+                app.update(cx, |app, _| {
+                    let data = app.active_data_mut().unwrap();
+                    data.position_restore = None;
+                    data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+                    data.mode = mode;
+                    data.preferences.hide_whitespace = Some(true);
+                    data.preferences.collapse_unchanged = Some(true);
+                    data.rebuild_presentation();
+                });
+                let _ = window.draw(cx);
+            });
+            vcx.simulate_keystrokes("cmd-shift-f");
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            vcx.simulate_input("needle");
+            let assert_result = |file, cx: &App| {
+                let data = app.read(cx).active_data().unwrap();
+                assert_eq!(data.file_ix, file);
+                let search = data.search.as_ref().unwrap();
+                assert!((0..data.rows.len()).any(|row| {
+                    [SelSide::Unified, SelSide::Left, SelSide::Right]
+                        .into_iter()
+                        .any(|side| !search.highlights(row, side, cx).is_empty())
+                }));
+            };
+            vcx.update(|_, cx| assert_result(0, cx));
+            // Shared split context counts once; the next result is in b.txt.
+            vcx.simulate_keystrokes("enter");
+            vcx.update(|_, cx| assert_result(1, cx));
+            vcx.simulate_keystrokes("enter");
+            vcx.update(|_, cx| assert_result(0, cx));
+            vcx.simulate_keystrokes("shift-enter");
+            vcx.update(|_, cx| assert_result(1, cx));
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.set_search_scope(search::SearchScope::ChangedLines, window, cx);
+                    // Row rebuilds must preserve both the source result and search.
+                    let data = app.active_data_mut().unwrap();
+                    data.preferences.soft_wrap = Some(true);
+                    data.rebuild_presentation();
+                })
+            });
+            vcx.simulate_keystrokes("enter");
+            vcx.update(|_, cx| assert_result(1, cx));
+            // Current-file search can also be selected from whole-diff search.
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.set_search_scope(search::SearchScope::CurrentFile, window, cx);
+                })
+            });
+            vcx.simulate_keystrokes("cmd-f enter");
+            vcx.update(|_, cx| assert_result(1, cx));
+            // The whole-diff shortcut switches back to searching all files.
+            vcx.simulate_keystrokes("cmd-shift-f enter");
+            vcx.update(|_, cx| assert_result(0, cx));
+            vcx.simulate_keystrokes("escape");
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+                let data = app.read(cx).active_data().unwrap();
+                assert_eq!(data.file_ix, 0);
+                assert!(data.search.is_none());
+                assert!(
+                    data.file_positions.is_empty(),
+                    "search must not overwrite file memory"
+                );
+                assert!(data.preferences.hide_whitespace.unwrap());
+                assert!(data.preferences.collapse_unchanged.unwrap());
+                assert!(data.mode == mode);
+            });
+        }
     }
 
     #[gpui::test]
