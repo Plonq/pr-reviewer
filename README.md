@@ -73,8 +73,13 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - one file at a time: the whole file fills the pane — no `@@` markers, hunk
   boundaries read from the highlighting — revealed at its first change on
   first visit, with each file's scroll position remembered while the review is open;
-  `]`/`[` move between files and `n`/`p` between hunks (both wrap); returning
-  to a PR resumes its last file and scroll position, even after restarting
+  `]`/`[` move between files and `n`/`p` between hunks (both wrap), following
+  the sidebar's directory-first, name-sorted order. New reviews start at the top
+  file; returning to a PR resumes its last file and scroll position, even after restarting
+- file-selection history per open review: `cmd-[` / `cmd-]`, title-bar arrows,
+  or mouse back/forward buttons revisit files at their remembered scroll positions.
+  History survives refreshes and switching open reviews, but resets on close or
+  comparison-scope changes; selecting another file after going back clears forward history
 - unified + split views; double-click a word to select it, then drag to extend
   the selection by whole words (`cmd-c` copies the selection)
 - **All changes / Changed since last review** in the Changes pane: compare the
@@ -191,6 +196,7 @@ only by your account. Delete that directory to clear downloaded images.
 | `shift-cmd-left` / `shift-cmd-right` | conversation / changes |
 | `cmd-+` / `cmd--` / `cmd-0` | diff font size: bigger / smaller / reset |
 | `]` / `[` | next / previous file |
+| `cmd-[` / `cmd-]` | back / forward through file selections (Changes pane) |
 | `n` / `p` | next / previous hunk |
 | `v` | unified ↔ split view |
 | `V` | toggle current file viewed on GitHub |

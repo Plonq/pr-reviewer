@@ -4,6 +4,7 @@ mod comment_anchor;
 mod comment_editor;
 mod conversation;
 mod diff_media;
+mod file_history;
 mod http;
 #[cfg(target_os = "macos")]
 mod launch_env;
@@ -49,9 +50,9 @@ use gpui::{
     actions, canvas, div, fill, font, list, point, prelude::*, px, relative, size, uniform_list,
     App, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding, Keystroke,
     ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollStrategy,
-    SharedString, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window,
-    WindowBounds, WindowOptions,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point, ScrollHandle,
+    ScrollStrategy, SharedString, Subscription, Task, TitlebarOptions, UniformListScrollHandle,
+    Window, WindowBounds, WindowOptions,
 };
 use minimap::{
     minimap_rows, minimap_runs, minimap_scale, MinimapColor, MinimapLane, MinimapLayout,
@@ -213,6 +214,8 @@ actions!(
     [
         NextFile,
         PrevFile,
+        FileBack,
+        FileForward,
         NextHunk,
         PrevHunk,
         GoToTop,
@@ -374,6 +377,7 @@ fn main() {
             theme::apply_ui_theme(cx);
             cx.bind_keys(presentation::keybindings());
             cx.bind_keys(search::keybindings());
+            cx.bind_keys(file_history::keybindings());
             cx.bind_keys([
                 KeyBinding::new("]", NextFile, Some("ReviewApp")),
                 KeyBinding::new("[", PrevFile, Some("ReviewApp")),
@@ -564,6 +568,7 @@ pub(crate) struct ItemData {
     /// In-session viewport memory for files visited in this item, keyed by
     /// path so refreshes that reorder the diff do not mix up positions.
     file_positions: HashMap<String, local_store::ReviewPosition>,
+    file_history: file_history::FileHistory,
     search: Option<search::Search>,
     /// The conversation pane's scroll position. A pane-level container (not
     /// the TextView's own), so the wheel scrolls from anywhere over the pane
@@ -628,8 +633,8 @@ pub(crate) struct ItemData {
 }
 
 impl ItemData {
-    /// A fresh item's data, ready to show: `file_ix` on screen, revealed
-    /// at its first change.
+    /// A fresh item's data, showing the sidebar's first file at its first change.
+    /// `file_ix` identifies the supplied background-built rows, not tree order.
     fn new(
         pr_meta: Option<github::PrMeta>,
         diff: PrDiff,
@@ -659,6 +664,7 @@ impl ItemData {
             position_restore: None,
             saved_position: None,
             file_positions: HashMap::new(),
+            file_history: Default::default(),
             search: None,
             conv_scroll: ScrollHandle::new(),
             discussion: None,
@@ -694,8 +700,14 @@ impl ItemData {
         };
         data.additions = data.diff.files.iter().fold(0, |a, f| a + f.additions);
         data.deletions = data.diff.files.iter().fold(0, |d, f| d + f.deletions);
-        data.set_rows(built_rows);
         data.rebuild_tree();
+        let first_file = data.file_order().next().unwrap_or(0);
+        if data.file_ix == first_file {
+            data.set_rows(built_rows);
+        } else {
+            data.file_ix = first_file;
+            data.set_rows(data.row_build());
+        }
         data.reveal_hunk(None);
         data
     }
@@ -806,6 +818,18 @@ impl ItemData {
     /// Show `file_ix` alone in the pane. An explicit hunk takes precedence;
     /// otherwise resume its viewport, or reveal the first hunk on first visit.
     fn open_file(&mut self, file_ix: usize, hunk_ix: Option<usize>) {
+        let Some(target) = self.diff.files.get(file_ix) else {
+            return;
+        };
+        if let Some(current) = self.diff.files.get(self.file_ix) {
+            self.file_history
+                .record(current.display_path(), target.display_path());
+        }
+        self.show_file(file_ix, hunk_ix);
+    }
+
+    /// Restore/reload/history navigation must not create new history entries.
+    fn show_file(&mut self, file_ix: usize, hunk_ix: Option<usize>) {
         self.end_search();
         if let Some(position) = self.review_position() {
             self.file_positions.insert(position.path.clone(), position);
@@ -831,14 +855,25 @@ impl ItemData {
         self.reveal_hunk(hunk_ix);
     }
 
-    /// The next (delta = +1) or previous (delta = -1) file, wrapping over
-    /// the diff's file list; None when there is nothing to move to.
+    /// All files in the sidebar's depth-first, directories-first order.
+    /// Collapsing or filtering the tree must not skip files during a review.
+    fn file_order(&self) -> impl Iterator<Item = usize> + '_ {
+        self.tree.iter().filter_map(|entry| match entry.kind {
+            TreeEntryKind::File { file_ix } => Some(file_ix),
+            TreeEntryKind::Dir { .. } => None,
+        })
+    }
+
+    /// The next (delta = +1) or previous (delta = -1) file in sidebar order,
+    /// wrapping; None when there is nothing to move to.
     fn step_file(&self, delta: i32) -> Option<usize> {
-        let n = self.diff.files.len();
+        let files: Vec<_> = self.file_order().collect();
+        let n = files.len();
         if n < 2 {
             return None;
         }
-        Some(((self.file_ix as i32 + delta).rem_euclid(n as i32)) as usize)
+        let current = files.iter().position(|&file_ix| file_ix == self.file_ix)?;
+        Some(files[(current as i32 + delta).rem_euclid(n as i32) as usize])
     }
 
     /// The next (delta = +1) or previous (delta = -1) file *with hunks*,
@@ -846,13 +881,11 @@ impl ItemData {
     /// end of the current file, and which of its hunks to land on (the
     /// first when advancing, the last when retreating).
     fn step_hunk_file(&self, delta: i32) -> Option<(usize, usize)> {
-        let n = self.diff.files.len();
-        if n == 0 {
-            return None;
-        }
-        let start = self.file_ix as i32;
+        let files: Vec<_> = self.file_order().collect();
+        let n = files.len();
+        let start = files.iter().position(|&file_ix| file_ix == self.file_ix)? as i32;
         for step in 1..=n {
-            let file_ix = (start + delta * step as i32).rem_euclid(n as i32) as usize;
+            let file_ix = files[(start + delta * step as i32).rem_euclid(n as i32) as usize];
             let count = self.diff.files.get(file_ix)?.hunks.len();
             if count > 0 {
                 return Some((file_ix, if delta > 0 { 0 } else { count - 1 }));
@@ -1185,6 +1218,7 @@ impl ReviewItem {
                     data.review_position()
                 } else {
                     data.file_positions.clear();
+                    data.file_history = Default::default();
                     data.saved_position = None;
                     None
                 };
@@ -1205,14 +1239,23 @@ impl ReviewItem {
                     Some(local) => Some(local.index()),
                     None => comments,
                 };
+                if pr_meta.is_some() {
+                    data.pr_meta = pr_meta;
+                }
+                data.anchor_hunks = anchor_hunks;
+                data.diff = diff;
+                data.diff_loaded = true;
+                data.rebuild_tree();
+                let first_file = data.file_order().next().unwrap_or(0);
                 data.file_ix = position
                     .as_ref()
                     .and_then(|position| {
-                        diff.files
+                        data.diff
+                            .files
                             .iter()
                             .position(|file| file.display_path() == position.path)
                     })
-                    .unwrap_or(0);
+                    .unwrap_or(first_file);
                 // Reuse the background-built rows unless the displayed file
                 // or presentation drifted while the fetch was in flight.
                 if data.local_review.is_some()
@@ -1222,7 +1265,7 @@ impl ReviewItem {
                     || file_ix != data.file_ix
                 {
                     built_rows = build_rows(RowsView {
-                        diff: &diff,
+                        diff: &data.diff,
                         upgrades: &data.upgrades,
                         comments: data.comments.as_ref(),
                         options: RowOptions {
@@ -1233,22 +1276,22 @@ impl ReviewItem {
                         },
                     });
                 }
-                if pr_meta.is_some() {
-                    data.pr_meta = pr_meta;
-                }
-                data.anchor_hunks = anchor_hunks;
-                data.diff = diff;
-                data.diff_loaded = true;
                 data.set_rows(built_rows);
                 if !position.is_some_and(|position| data.restore_review_position(position, true)) {
-                    data.open_file(0, None);
+                    data.reveal_hunk(None);
                 }
+                data.file_history.retain(
+                    data.diff.files.iter().map(|file| file.display_path()),
+                    data.diff
+                        .files
+                        .get(data.file_ix)
+                        .map(|file| file.display_path()),
+                );
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.additions = additions;
                 data.deletions = deletions;
                 data.selection = None;
                 data.cursor_side = None;
-                data.rebuild_tree();
             }
             _ => {
                 let local_review =
@@ -1275,6 +1318,9 @@ impl ReviewItem {
                 data.review_base_files = review_base_files;
                 data.viewed.install(viewed);
                 data.set_rows(data.row_build());
+                // Full-file context may move the first change beyond the rows
+                // available while ItemData::new selected the top tree file.
+                data.reveal_hunk(None);
                 self.state = ItemState::Ready(data);
             }
         }
@@ -2815,6 +2861,41 @@ impl ReviewApp {
             data.open_file(file_ix, None);
         }
         cx.notify();
+    }
+
+    /// Browser-style history is local to the active review's Changes pane.
+    fn navigate_file_history(
+        &mut self,
+        direction: NavigationDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.show_queue
+            || !self
+                .active_item()
+                .is_some_and(|item| item.pane == ItemPane::Changes)
+        {
+            return;
+        }
+        let Some(data) = self.active_data_mut().filter(|data| data.diff_loaded) else {
+            return;
+        };
+        let Some(current) = data.diff.files.get(data.file_ix) else {
+            return;
+        };
+        let Some(path) = data.file_history.step(direction, current.display_path()) else {
+            return;
+        };
+        if let Some(file_ix) = data
+            .diff
+            .files
+            .iter()
+            .position(|file| file.display_path() == path)
+        {
+            data.show_file(file_ix, None);
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
     }
 
     /// Switch to changes, resume `file_ix` (first change on first visit),
@@ -4694,6 +4775,42 @@ impl ReviewApp {
                     ),
             );
         }
+        if let Some(data) = self.active_data().filter(|data| {
+            !self.show_queue
+                && data.diff_loaded
+                && self
+                    .active_item()
+                    .is_some_and(|item| item.pane == ItemPane::Changes)
+        }) {
+            for (id, icon, tooltip, direction) in [
+                (
+                    "file-back",
+                    IconName::ArrowLeft,
+                    "Previous file selection (⌘[)",
+                    NavigationDirection::Back,
+                ),
+                (
+                    "file-forward",
+                    IconName::ArrowRight,
+                    "Next file selection (⌘])",
+                    NavigationDirection::Forward,
+                ),
+            ] {
+                right = right.child(
+                    div().debug_selector(move || id.into()).child(
+                        Button::new(id)
+                            .small()
+                            .ghost()
+                            .icon(icon)
+                            .tooltip(tooltip)
+                            .disabled(!data.file_history.can_go(direction))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.navigate_file_history(direction, window, cx);
+                            })),
+                    ),
+                );
+            }
+        }
         if let Some(item) = self.active_item().filter(|item| {
             !self.show_queue
                 && matches!(item.source, Source::Pr(_))
@@ -5959,6 +6076,24 @@ impl Render for ReviewApp {
             .flex_col()
             .bg(theme::base(cx))
             .text_color(theme::text(cx))
+            .on_action(cx.listener(|this, _: &FileBack, window, cx| {
+                this.navigate_file_history(NavigationDirection::Back, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FileForward, window, cx| {
+                this.navigate_file_history(NavigationDirection::Forward, window, cx)
+            }))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, window, cx| {
+                    this.navigate_file_history(NavigationDirection::Back, window, cx)
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, window, cx| {
+                    this.navigate_file_history(NavigationDirection::Forward, window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
             .on_action(
                 cx.listener(|this, _: &search::OpenSearch, window, cx| {
@@ -7952,6 +8087,167 @@ mod tests {
         );
     }
 
+    /// Patch order deliberately differs from both path sorting and tree order.
+    fn sidebar_order_diff() -> PrDiff {
+        let mut diff = two_file_diff();
+        diff.files = [
+            "README.md",
+            "src/z.rs",
+            "src/core/flags/b.rs",
+            "src/core/flags/a.rs",
+            "src/a.rs",
+            "aaa.rs",
+        ]
+        .into_iter()
+        .map(|path| {
+            let mut file = two_file_diff().files.remove(0);
+            file.old_path = Some(path.into());
+            file.new_path = Some(path.into());
+            file
+        })
+        .collect();
+        diff
+    }
+
+    #[test]
+    fn files_open_and_wrap_in_sidebar_order_not_patch_or_path_order() {
+        let mut data = file_mode_data(sidebar_order_diff());
+        let order = [3, 2, 4, 1, 0, 5];
+        assert_eq!(data.file_order().collect::<Vec<_>>(), order);
+        assert_eq!(data.file_ix, order[0]);
+        assert_eq!(data.cursor, data.hunk_rows[0]);
+        assert!(
+            matches!(&data.rows[0], Row::FileHeader { path, .. } if path.as_ref() == "src/core/flags/a.rs")
+        );
+        // A collapsed directory still has to be reviewed, in the same order.
+        data.collapsed.insert("src".into());
+        for file_ix in order.into_iter().cycle().skip(1).take(order.len() * 2) {
+            assert_eq!(data.step_file(1), Some(file_ix));
+            data.open_file(file_ix, None);
+        }
+        for file_ix in order.into_iter().rev().cycle().take(order.len() * 2) {
+            assert_eq!(data.step_file(-1), Some(file_ix));
+            data.open_file(file_ix, None);
+        }
+    }
+
+    #[test]
+    fn cross_file_hunks_follow_sidebar_order_and_skip_files_without_hunks() {
+        let mut diff = sidebar_order_diff();
+        diff.files[2].hunks.clear();
+        diff.files[0].hunks.clear();
+        let mut data = file_mode_data(diff);
+        let order = [3, 4, 1, 5];
+        for file_ix in order.into_iter().cycle().skip(1).take(order.len() * 2) {
+            data.cursor = *data.hunk_rows.last().unwrap();
+            assert_eq!(
+                data.step_hunk(1),
+                Some(HunkNav::File {
+                    file_ix,
+                    hunk_ix: 0
+                })
+            );
+            data.open_file(file_ix, Some(0));
+        }
+        for file_ix in order.into_iter().rev().cycle().take(order.len() * 2) {
+            data.cursor = data.hunk_rows[0];
+            let hunk_ix = data.diff.files[file_ix].hunks.len() - 1;
+            assert_eq!(data.step_hunk(-1), Some(HunkNav::File { file_ix, hunk_ix }));
+            data.open_file(file_ix, Some(hunk_ix));
+        }
+        // Starting on a no-hunk file uses its location in the same tree order.
+        data.open_file(2, None);
+        assert_eq!(data.step_hunk_file(1), Some((4, 0)));
+        assert_eq!(data.step_hunk_file(-1), Some((3, 1)));
+        for file in &mut data.diff.files {
+            file.hunks.clear();
+        }
+        assert_eq!(data.step_hunk_file(1), None);
+        assert_eq!(data.step_hunk_file(-1), None);
+        let empty = file_mode_data(PrDiff::default());
+        assert_eq!(empty.step_file(1), None);
+        assert_eq!(empty.step_hunk_file(1), None);
+    }
+
+    #[test]
+    fn installing_diffs_uses_sidebar_first_file_unless_restoring_a_position() {
+        let fake = Arc::new(FakePr::default());
+        for conversation_first in [false, true] {
+            let mut item = loop_pr_item(Vec::new());
+            item.state = ItemState::Loading;
+            if conversation_first {
+                item.install_conversation(
+                    review_target::LoadedConversation {
+                        meta: loop_pr_meta(),
+                        discussion: github::PrDiscussion::default(),
+                    },
+                    ViewMode::Unified,
+                );
+            }
+            let mut loaded = fetch_item(fake.clone(), &item.source, ViewMode::Split, 0).unwrap();
+            loaded.diff = sidebar_order_diff();
+            let before = "unchanged\n".repeat(30) + "old\n";
+            let after = "unchanged\n".repeat(30) + "new\n";
+            loaded.diff.files[3].hunks = diff_texts(&before, &after, 3);
+            loaded.upgrades.clear();
+            loaded.upgrades.insert(
+                3,
+                FileUpgrade {
+                    new_lines: after.lines().map(|line| line.to_owned().into()).collect(),
+                    old_spans: Vec::new(),
+                    new_spans: Vec::new(),
+                },
+            );
+            item.install(loaded);
+            let ItemState::Ready(data) = &mut item.state else {
+                unreachable!()
+            };
+            assert_eq!(data.file_ix, 3);
+            assert!(
+                data.hunk_rows[0] > 1,
+                "full-file context precedes the first change"
+            );
+            assert_eq!(data.cursor, data.hunk_rows[0]);
+            assert_eq!(data.review_position().unwrap().row, data.hunk_rows[0]);
+            assert!(
+                matches!(&data.rows[0], Row::FileHeader { path, .. } if path.as_ref() == "src/core/flags/a.rs")
+            );
+            assert!(!data.file_history.can_go(NavigationDirection::Back));
+            data.open_file(1, None);
+            let position = data.review_position().unwrap();
+            let mut diff = sidebar_order_diff();
+            diff.files.reverse();
+            let mut loaded = fetch_item(fake.clone(), &item.source, ViewMode::Split, 0).unwrap();
+            loaded.diff = diff;
+            loaded.upgrades.clear();
+            item.install(loaded);
+            let ItemState::Ready(data) = &mut item.state else {
+                unreachable!()
+            };
+            assert_eq!(data.review_position().unwrap().path, position.path);
+            assert_eq!(
+                data.step_file(1),
+                Some(5),
+                "README follows src/z.rs even after patch reordering"
+            );
+            // If the selected file disappears, fall back to the tree's top leaf.
+            let mut diff = sidebar_order_diff();
+            diff.files
+                .retain(|file| file.display_path() != position.path);
+            let mut loaded = fetch_item(fake.clone(), &item.source, ViewMode::Split, 0).unwrap();
+            loaded.diff = diff;
+            loaded.upgrades.clear();
+            item.install(loaded);
+            let ItemState::Ready(data) = &item.state else {
+                unreachable!()
+            };
+            assert_eq!(
+                data.diff.files[data.file_ix].display_path(),
+                "src/core/flags/a.rs"
+            );
+        }
+    }
+
     #[test]
     fn file_navigation_wraps_over_the_file_list() {
         let mut data = file_mode_data(two_file_diff());
@@ -7969,6 +8265,28 @@ mod tests {
         assert_eq!(data.file_ix, 1);
         assert!(matches!(data.rows[0], Row::FileHeader { .. }));
         assert_eq!(data.cursor, data.hunk_rows[0]);
+    }
+
+    #[test]
+    fn file_history_starts_from_the_restored_file_and_ignores_same_file_hunks() {
+        let mut data = file_mode_data(two_file_diff());
+        assert!(data.restore_review_position(
+            local_store::ReviewPosition {
+                path: "b.rs".into(),
+                ..Default::default()
+            },
+            true,
+        ));
+        assert!(!data.file_history.can_go(NavigationDirection::Back));
+        data.open_file(0, Some(0));
+        data.open_file(0, Some(1));
+        assert_eq!(
+            data.file_history
+                .step(NavigationDirection::Back, "a.rs")
+                .as_deref(),
+            Some("b.rs")
+        );
+        assert!(!data.file_history.can_go(NavigationDirection::Back));
     }
 
     #[test]
@@ -11909,6 +12227,146 @@ mod tests {
     }
 
     #[gpui::test]
+    fn file_history_keyboard_buttons_and_mouse(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| cx.bind_keys(file_history::keybindings()));
+        install_item(&app, loop_pr_item(Vec::new()), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        draw_window(&mut vcx);
+        // Disabled back is a no-op at the start.
+        let back = vcx.debug_bounds("file-back").unwrap().center();
+        vcx.simulate_click(back, gpui::Modifiers::default());
+        vcx.update(|_, cx| assert_eq!(app.read(cx).active_data().unwrap().file_ix, 0));
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| this.jump_to_file(1, window, cx));
+        });
+        draw_window(&mut vcx);
+        vcx.simulate_keystrokes("cmd-[");
+        vcx.update(|_, cx| assert_eq!(app.read(cx).active_data().unwrap().file_ix, 0));
+        vcx.simulate_keystrokes("cmd-]");
+        vcx.update(|_, cx| assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1));
+        draw_window(&mut vcx);
+        let back = vcx.debug_bounds("file-back").unwrap().center();
+        vcx.simulate_click(back, gpui::Modifiers::default());
+        vcx.update(|_, cx| assert_eq!(app.read(cx).active_data().unwrap().file_ix, 0));
+        draw_window(&mut vcx);
+        let forward = vcx.debug_bounds("file-forward").unwrap().center();
+        vcx.simulate_click(forward, gpui::Modifiers::default());
+        vcx.update(|_, cx| assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1));
+        draw_window(&mut vcx);
+        for (direction, expected) in [
+            (NavigationDirection::Back, 0),
+            (NavigationDirection::Forward, 1),
+        ] {
+            vcx.simulate_mouse_down(
+                point(px(700.), px(300.)),
+                MouseButton::Navigate(direction),
+                gpui::Modifiers::default(),
+            );
+            vcx.simulate_mouse_up(
+                point(px(700.), px(300.)),
+                MouseButton::Navigate(direction),
+                gpui::Modifiers::default(),
+            );
+            vcx.update(|_, cx| assert_eq!(app.read(cx).active_data().unwrap().file_ix, expected));
+            draw_window(&mut vcx);
+        }
+        // A new selection after going back invalidates the forward branch.
+        vcx.simulate_keystrokes("cmd-[");
+        vcx.update(|_, cx| {
+            app.update(cx, |this, cx| this.step_file(1, cx));
+            assert!(!app
+                .read(cx)
+                .active_data()
+                .unwrap()
+                .file_history
+                .can_go(NavigationDirection::Forward));
+        });
+        vcx.simulate_keystrokes("cmd-]");
+        vcx.update(|_, cx| assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1));
+    }
+
+    #[gpui::test]
+    fn file_history_is_per_item_and_inactive_outside_changes(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        install_item(&app, loop_pr_item(Vec::new()), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|_, cx| app.update(cx, |this, cx| this.step_file(1, cx)));
+        vcx.dispatch_action(ShowConversation);
+        vcx.dispatch_action(FileBack);
+        vcx.update(|_, cx| assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1));
+        vcx.dispatch_action(BackToQueue);
+        vcx.dispatch_action(FileBack);
+        vcx.update(|window, cx| {
+            assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1);
+            app.update(cx, |this, cx| {
+                this.return_to_review(window, cx);
+                this.flip_pane(ItemPane::Changes, cx);
+                let mut other = loop_pr_item(Vec::new());
+                other.id = 1;
+                this.items.push(other);
+                this.active = 1;
+            });
+        });
+        vcx.dispatch_action(FileBack);
+        vcx.update(|_, cx| {
+            assert_eq!(app.read(cx).active_data().unwrap().file_ix, 0);
+            app.update(cx, |this, _| this.active = 0);
+        });
+        vcx.dispatch_action(FileBack);
+        vcx.update(|_, cx| assert_eq!(app.read(cx).active_data().unwrap().file_ix, 0));
+        vcx.dispatch_action(FileForward);
+        vcx.update(|_, cx| assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1));
+    }
+
+    #[test]
+    fn file_history_survives_refresh_but_resets_with_review_scope() {
+        let mut item = loop_pr_item(Vec::new());
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.open_file(1, None);
+        // A normal refresh reorders the files without changing their identity.
+        let fake = Arc::new(FakePr::default());
+        let mut loaded = fetch_item(fake.clone(), &item.source, ViewMode::Split, 0).unwrap();
+        loaded.diff = two_file_diff();
+        loaded.diff.files.swap(0, 1);
+        loaded.upgrades.clear();
+        item.install(loaded);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        assert_eq!(data.diff.files[data.file_ix].display_path(), "b.rs");
+        assert_eq!(
+            data.file_history
+                .step(NavigationDirection::Back, "b.rs")
+                .as_deref(),
+            Some("a.rs")
+        );
+        data.show_file(1, None);
+        // Removing b.rs prunes forward history; refresh itself adds no visit.
+        let loaded = fetch_item(fake.clone(), &item.source, ViewMode::Split, 0).unwrap();
+        item.install(loaded);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        assert!(!data.file_history.can_go(NavigationDirection::Back));
+        assert!(!data.file_history.can_go(NavigationDirection::Forward));
+        data.file_history.record("b.rs", "a.rs");
+        let mut loaded = fetch_item(fake, &item.source, ViewMode::Split, 0).unwrap();
+        // Both paths still exist, so only the scope reset can remove this stop.
+        loaded.diff = two_file_diff();
+        loaded.upgrades.clear();
+        loaded.review_base = Some("different-comparison".into());
+        item.install(loaded);
+        let ItemState::Ready(data) = &item.state else {
+            unreachable!()
+        };
+        assert!(!data.file_history.can_go(NavigationDirection::Back));
+        assert!(!data.file_history.can_go(NavigationDirection::Forward));
+    }
+
+    #[gpui::test]
     fn file_switching_restores_the_painted_viewport(cx: &mut gpui::TestAppContext) {
         let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
@@ -11969,6 +12427,26 @@ mod tests {
                     let _ = window.draw(cx);
                     assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1);
                     app.update(cx, |this, cx| this.jump_to_file(0, window, cx));
+                    let _ = window.draw(cx);
+                    assert_eq!(
+                        app.read(cx)
+                            .active_data()
+                            .unwrap()
+                            .scroll
+                            .0
+                            .borrow()
+                            .base_handle
+                            .offset(),
+                        prior
+                    );
+                    app.update(cx, |this, cx| {
+                        this.navigate_file_history(NavigationDirection::Back, window, cx)
+                    });
+                    let _ = window.draw(cx);
+                    assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1);
+                    app.update(cx, |this, cx| {
+                        this.navigate_file_history(NavigationDirection::Forward, window, cx)
+                    });
                     let _ = window.draw(cx);
                     assert_eq!(
                         app.read(cx)
