@@ -79,8 +79,8 @@ impl ItemData {
                     restore.offset.x.max(-max.x).min(px(0.)),
                     restore.offset.y.max(-max.y).min(px(0.)),
                 );
-                // A patch may not contain this line yet, or may be too short
-                // to put it at the top. Keep the requested anchor until phase 2,
+                // A patch fallback may not contain this line, or the file may
+                // be too short to put it at the top. Keep the requested anchor
                 // unless the user has moved the viewport in the meantime.
                 if offset == restore.offset || offset == clamped {
                     return Some(restore.position.clone());

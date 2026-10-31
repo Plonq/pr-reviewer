@@ -148,7 +148,7 @@ impl Search {
 }
 
 impl ItemData {
-    /// Every row rebuild (phase 2, comments, wrap, etc.) reindexes the search.
+    /// Every row rebuild (refresh, comments, wrap, etc.) reindexes the search.
     pub(crate) fn reindex_search(&mut self) {
         if let Some(search) = &mut self.search {
             if self.diff.files.get(self.file_ix).map(|f| f.display_path())
