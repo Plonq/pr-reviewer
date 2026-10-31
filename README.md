@@ -75,7 +75,8 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   first visit, with each file's scroll position remembered while the review is open;
   `]`/`[` move between files and `n`/`p` between hunks (both wrap); returning
   to a PR resumes its last file and scroll position, even after restarting
-- unified + split views
+- unified + split views; double-click a word to select it, then drag to extend
+  the selection by whole words (`cmd-c` copies the selection)
 - **All changes / Changed since last review** in the Changes pane: compare the
   commit from your latest submitted GitHub review with the current PR head,
   including reviews submitted on GitHub. No manual commit selection. The scope
