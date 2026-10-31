@@ -159,6 +159,7 @@ pub(crate) fn queued(number: u64, repository: &str, author: &str) -> github::Que
         labels: Vec::new(),
         created_at: String::new(),
         review_requested_at: None,
+        reviewed_at: None,
         updated_at: String::new(),
     }
 }

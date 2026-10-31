@@ -1577,8 +1577,7 @@ enum AccountStatus {
 /// it lands. The rows on screen therefore carry their origin — cached or
 /// fresh — which is what the status line says.
 struct QueueState {
-    /// The compiled search the queue runs. v1 always the review-requested
-    /// preset, oldest review request first.
+    /// The search the queue runs: review requests by default, or past reviews.
     search: github::QueueSearch,
     /// Queue rows in the search's order. Kept (stale) across refresh
     /// failures, so the screen stays useful offline.
@@ -1631,6 +1630,9 @@ impl QueueState {
     /// titles and labels may have changed. Preserve the viewport by row position.
     fn replace_rows(&mut self, mut prs: Vec<github::QueueItem>) {
         self.search.sort_items(&mut prs);
+        if self.search.is_past_reviews() {
+            prs.truncate(10);
+        }
         let offset = self.scroll.logical_scroll_top();
         self.selected = move_selection(self.selected, prs.len(), 0);
         self.scroll.reset(prs.len());
@@ -1870,7 +1872,7 @@ impl ReviewApp {
             // Coming back to the front is the moment the queue is most
             // likely to have moved on: refresh it, and let the poll run
             // again (the new poll ends the old one).
-            self.spawn_queue_refresh(cx);
+            self.refresh_queue_if_idle(cx);
             self.spawn_background_poll(cx);
         }
         cx.notify();
@@ -1905,7 +1907,8 @@ impl ReviewApp {
                 if !keep_going {
                     return;
                 }
-                this.update(cx, |app, cx| app.spawn_queue_refresh(cx)).ok();
+                this.update(cx, |app, cx| app.refresh_queue_if_idle(cx))
+                    .ok();
             }
         })
         .detach();
@@ -1965,14 +1968,22 @@ impl ReviewApp {
         .detach();
     }
 
+    /// Automatic refreshes must not invalidate a slow fetch before it can
+    /// land. Explicit refreshes and search changes can still supersede it.
+    fn refresh_queue_if_idle(&mut self, cx: &mut Context<Self>) {
+        if !self.queue.loading {
+            self.spawn_queue_refresh(cx);
+        }
+    }
+
     /// Run the queue search in the background and hot-swap the rows in.
     /// Failures are non-destructive: stale rows stay visible with the error
     /// surfaced beside them (see `render_queue`), and the next success
     /// clears it. The generation guard keeps a stale fetch from landing
     /// after a newer refresh started.
     ///
-    /// A successful fetch also lands in the local store, so the *next*
-    /// launch paints this queue before the network is asked at all.
+    /// A successful current-queue fetch also lands in the local store, so the
+    /// next launch paints this queue before the network is asked at all.
     fn spawn_queue_refresh(&mut self, cx: &mut Context<Self>) {
         self.queue.loading = true;
         self.queue_gen += 1;
@@ -2001,10 +2012,13 @@ impl ReviewApp {
                         let store = app.store.clone();
                         let search = app.queue.search.clone();
                         let prs = app.queue.prs.clone();
-                        cx.background_spawn(async move {
-                            store.cache_queue(&search, &prs);
-                        })
-                        .detach();
+                        // History must not replace the default queue's launch cache.
+                        if !search.is_past_reviews() {
+                            cx.background_spawn(async move {
+                                store.cache_queue(&search, &prs);
+                            })
+                            .detach();
+                        }
                     }
                     Err(err) => app.queue.error = Some(err.to_string()),
                 }
@@ -2076,12 +2090,35 @@ impl ReviewApp {
         cx.notify();
     }
 
+    /// A different view must never display the old view's rows, even while
+    /// loading or offline. Keep filters and the default queue's sort preference.
+    fn queue_toggle_past_reviews(&mut self, cx: &mut Context<Self>) {
+        if !self.show_queue {
+            return;
+        }
+        let past = !self.queue.search.is_past_reviews();
+        self.queue.search = self.queue.search.clone().with_past_reviews(past);
+        self.queue.replace_rows(Vec::new());
+        self.queue.origin = QueueOrigin::None;
+        self.queue.error = None;
+        if !past {
+            let cached = self.store.cached_queue();
+            let (sort, order) = self.queue.search.sort();
+            if cached.matches(&self.queue.search.query(), sort, order) {
+                self.queue
+                    .replace_rows(cached.prs.iter().map(local_store::queue_item).collect());
+                self.queue.origin = QueueOrigin::Cached;
+            }
+        }
+        self.queue_run_search(cx);
+    }
+
     /// `s` and the sort toggle: flip between review-request time and creation
     /// time, both oldest-first. Reorder existing rows immediately (even offline),
     /// then refresh. The selection starts over: a position in one order means nothing in the
     /// other.
     fn queue_toggle_sort(&mut self, cx: &mut Context<Self>) {
-        if !self.show_queue {
+        if !self.show_queue || self.queue.search.is_past_reviews() {
             return;
         }
         let flipped = match self.queue.search.ordering() {
@@ -5018,6 +5055,62 @@ impl ReviewApp {
     /// queue says so instead of a blank pane — an empty *filtered* one
     /// offers the way back out.
     fn render_queue(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let count = self.queue.prs.len();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .px_6()
+            .py_4()
+            .child(
+                div()
+                    .debug_selector(|| "queue-table".into())
+                    .w_full()
+                    .min_w(px(QUEUE_MIN_WIDTH))
+                    .max_w(px(QUEUE_MAX_WIDTH))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .text_size(px(13.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_4()
+                            .flex_shrink_0()
+                            .h(px(34.))
+                            .border_b_1()
+                            .border_color(theme::surface0(cx))
+                            .child(div().text_color(theme::text(cx)).child(
+                                if self.queue.search.is_past_reviews() {
+                                    "Past reviews"
+                                } else {
+                                    "Review queue"
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_right()
+                                    .text_size(px(12.))
+                                    .text_color(theme::subtext(cx))
+                                    .child(SharedString::from(format!(
+                                        "{count} {}",
+                                        if count == 1 { "PR" } else { "PRs" }
+                                    ))),
+                            ),
+                    )
+                    // Controls remain reachable when loading, empty, or offline.
+                    .child(self.queue_controls(cx.entity(), cx))
+                    .child(self.render_queue_body(cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_queue_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let queue = &self.queue;
         if queue.prs.is_empty() && queue.loading {
             return centered_message("loading review queue…".into(), theme::overlay0(cx));
@@ -5079,70 +5172,38 @@ impl ReviewApp {
                     )
                     .into_any_element();
             }
-            return centered_message("no PRs awaiting your review".into(), theme::overlay0(cx));
+            return centered_message(
+                if queue.search.is_past_reviews() {
+                    "no past reviews".into()
+                } else {
+                    "no PRs awaiting your review".into()
+                },
+                theme::overlay0(cx),
+            );
         }
         let entity = cx.entity();
         let now = now_unix();
-        let count = queue.prs.len();
         div()
-            .size_full()
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
-            .items_center()
-            .px_6()
-            .py_4()
+            // Outside the scrolling list, so headings stay aligned and visible.
+            .child(queue_header(cx))
             .child(
-                div()
-                    .debug_selector(|| "queue-table".into())
-                    .w_full()
-                    .min_w(px(QUEUE_MIN_WIDTH))
-                    .max_w(px(QUEUE_MAX_WIDTH))
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .text_size(px(13.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_4()
-                            .flex_shrink_0()
-                            .h(px(34.))
-                            .border_b_1()
-                            .border_color(theme::surface0(cx))
-                            .child(div().text_color(theme::text(cx)).child("Review queue"))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_right()
-                                    .text_size(px(12.))
-                                    .text_color(theme::subtext(cx))
-                                    .child(SharedString::from(format!(
-                                        "{count} {}",
-                                        if count == 1 { "PR" } else { "PRs" }
-                                    ))),
-                            ),
+                list(queue.scroll.clone(), move |pos, _window, cx| {
+                    let this = entity.read(cx);
+                    queue_row(
+                        &this.queue.prs[pos],
+                        pos,
+                        pos == this.queue.selected,
+                        now,
+                        entity.clone(),
+                        cx,
                     )
-                    .child(self.queue_controls(entity.clone(), cx))
-                    // Outside the scrolling list, so headings stay aligned and visible.
-                    .child(queue_header(cx))
-                    .child(
-                        list(queue.scroll.clone(), move |pos, _window, cx| {
-                            let this = entity.read(cx);
-                            queue_row(
-                                &this.queue.prs[pos],
-                                pos,
-                                pos == this.queue.selected,
-                                now,
-                                entity.clone(),
-                                cx,
-                            )
-                        })
-                        .flex_1()
-                        .min_h_0(),
-                    ),
+                })
+                .flex_1()
+                .min_h_0(),
             )
             .into_any_element()
     }
@@ -5158,6 +5219,7 @@ impl ReviewApp {
     fn queue_controls(&self, entity: gpui::Entity<Self>, cx: &gpui::App) -> gpui::AnyElement {
         let search = &self.queue.search;
         let created = search.ordering() == github::QueueSort::CreatedAscending;
+        let past = search.is_past_reviews();
         // The label names the active sort; both options are ascending.
         let mut row = div()
             .flex()
@@ -5170,25 +5232,52 @@ impl ReviewApp {
             .border_b_1()
             .border_color(theme::surface0(cx))
             .child(
-                Button::new("queue-sort-toggle")
-                    .debug_selector(|| "queue-sort-toggle".into())
+                Button::new("queue-past-reviews-toggle")
+                    .debug_selector(|| "queue-past-reviews-toggle".into())
                     .xsmall()
-                    .label(if created {
-                        "sort: created ↑"
-                    } else {
-                        "sort: review requested ↑"
-                    })
-                    .tooltip("Toggle queue order (s)")
+                    .selected(past)
+                    .label("Past reviews")
+                    .tooltip("Show your 10 most recently reviewed PRs, newest review first")
                     .on_click({
                         let entity = entity.clone();
                         move |_, window, cx| {
                             entity.update(cx, |this, cx| {
                                 window.focus(&this.focus_handle, cx);
-                                this.queue_toggle_sort(cx);
+                                this.queue_toggle_past_reviews(cx);
                             })
                         }
                     }),
-            );
+            )
+            .when(!past, |row| {
+                row.child(
+                    Button::new("queue-sort-toggle")
+                        .debug_selector(|| "queue-sort-toggle".into())
+                        .xsmall()
+                        .label(if created {
+                            "sort: created ↑"
+                        } else {
+                            "sort: review requested ↑"
+                        })
+                        .tooltip("Toggle queue order (s)")
+                        .on_click({
+                            let entity = entity.clone();
+                            move |_, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    window.focus(&this.focus_handle, cx);
+                                    this.queue_toggle_sort(cx);
+                                })
+                            }
+                        }),
+                )
+            })
+            .when(past, |row| {
+                row.child(
+                    div()
+                        .px_2()
+                        .text_color(theme::subtext(cx))
+                        .child("latest 10 · reviewed ↓"),
+                )
+            });
         // Chip ids run across the whole row: groups re-enumerated would
         // collide ("org"'s first chip and "repo"'s are both
         // ("queue-chip", 0)).
@@ -8163,10 +8252,20 @@ mod tests {
 
     impl FakeQueue {
         fn rows(&self, query: &str) -> Vec<github::QueueItem> {
-            let rows = vec![
-                queued(1, "acme/widgets", "alice"),
-                queued(2, "acme/gadgets", "bob"),
-            ];
+            let rows = if query.contains("reviewed-by:@me") {
+                (1..=14)
+                    .map(|number| {
+                        let mut pr = queued(number, "acme/widgets", "alice");
+                        pr.reviewed_at = Some(format!("2026-03-{number:02}T00:00:00Z"));
+                        pr
+                    })
+                    .collect()
+            } else {
+                vec![
+                    queued(1, "acme/widgets", "alice"),
+                    queued(2, "acme/gadgets", "bob"),
+                ]
+            };
             rows.into_iter()
                 .filter(|pr| {
                     !query.contains("repo:") || query.contains(&format!("repo:{}", pr.repository))
@@ -9941,6 +10040,160 @@ mod tests {
             fake.asked.lock().unwrap().len() > asked_after_focus,
             "the poll must refresh the queue while frontmost"
         );
+    }
+
+    #[gpui::test]
+    fn automatic_refreshes_do_not_restart_an_in_flight_queue_fetch(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (_window, app) = queue_window(cx, fake.clone());
+        let generation = cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue.loading = true; // model a fetch that outlasts the poll interval
+                app.queue.search = app.queue.search.clone().with_past_reviews(true);
+                app.set_frontmost(false, cx);
+                app.set_frontmost(true, cx);
+                app.queue_gen
+            })
+        });
+        let requests = fake.asked.lock().unwrap().len();
+        cx.run_until_parked();
+        cx.executor().advance_clock(BACKGROUND_POLL_INTERVAL * 2);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(app.read(cx).queue_gen, generation);
+            assert!(app.read(cx).queue.loading);
+        });
+        assert_eq!(fake.asked.lock().unwrap().len(), requests);
+    }
+
+    #[gpui::test]
+    fn past_reviews_toggle_orders_limits_and_returns_to_the_default_queue(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = Arc::new(FakeQueue {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1440.), px(900.)));
+        let click_toggle = |vcx: &mut gpui::VisualTestContext| {
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            let at = vcx
+                .debug_bounds("queue-past-reviews-toggle")
+                .unwrap()
+                .center();
+            vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+            vcx.simulate_mouse_down(at, gpui::MouseButton::Left, gpui::Modifiers::default());
+            vcx.simulate_mouse_up(at, gpui::MouseButton::Left, gpui::Modifiers::default());
+            vcx.run_until_parked();
+        };
+        vcx.cx.update(|cx| {
+            assert!(!app.read(cx).queue.search.is_past_reviews());
+            app.update(cx, |app, cx| app.queue_toggle_sort(cx));
+        });
+        vcx.run_until_parked();
+        click_toggle(&mut vcx);
+        vcx.cx.update(|cx| {
+            let this = app.read(cx);
+            assert!(this.queue.search.is_past_reviews());
+            assert_eq!(
+                this.queue
+                    .prs
+                    .iter()
+                    .map(|pr| pr.number)
+                    .collect::<Vec<_>>(),
+                (5..=14).rev().collect::<Vec<_>>()
+            );
+            assert_eq!(this.queue.selected, 0);
+            assert_eq!(this.queue.search.sort(), ("reviewed", "desc"));
+            // Neither history rows nor the mode overwrite launch state.
+            assert!(!this.restore_queue_search().is_past_reviews());
+            assert_eq!(this.store.cached_queue_items().len(), 2);
+            app.update(cx, |app, cx| app.queue_toggle_sort(cx));
+            assert_eq!(app.read(cx).queue.search.sort(), ("reviewed", "desc"));
+        });
+        click_toggle(&mut vcx);
+        vcx.cx.update(|cx| {
+            let app = app.read(cx);
+            assert!(!app.queue.search.is_past_reviews());
+            assert_eq!(app.queue.prs.len(), 2);
+            assert_eq!(
+                app.queue.search.ordering(),
+                github::QueueSort::CreatedAscending
+            );
+        });
+        assert!(fake
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(query, _)| query == "is:pr reviewed-by:@me"));
+    }
+
+    #[gpui::test]
+    fn past_reviews_controls_stay_visible_on_empty_loading_and_failed_queues(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(
+            cx,
+            Arc::new(OfflineQueue {
+                asked: std::sync::Mutex::new(0),
+            }),
+        );
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1440.), px(900.)));
+        vcx.cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue
+                    .replace_rows(vec![queued(1, "acme/widgets", "alice")]);
+                app.store.cache_queue(&app.queue.search, &app.queue.prs);
+                app.queue_toggle_past_reviews(cx);
+                assert!(
+                    app.queue.prs.is_empty(),
+                    "never show pending rows as history"
+                );
+                assert!(app.queue.loading);
+            })
+        });
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("queue-past-reviews-toggle").is_some());
+        vcx.run_until_parked();
+        vcx.cx
+            .update(|cx| assert!(app.read(cx).queue.error.is_some()));
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("queue-past-reviews-toggle").is_some());
+        vcx.cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue.error = None;
+                cx.notify();
+            })
+        });
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("queue-past-reviews-toggle").is_some());
+        vcx.cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue_toggle_past_reviews(cx);
+                assert!(!app.queue.search.is_past_reviews());
+                assert_eq!(
+                    app.queue.prs.len(),
+                    1,
+                    "return to the launch cache even offline"
+                );
+            })
+        });
+        vcx.run_until_parked();
+        vcx.cx
+            .update(|cx| assert_eq!(app.read(cx).queue.prs.len(), 1));
     }
 
     /// The mouse path itself: a real down-up click on a chip must narrow

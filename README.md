@@ -60,6 +60,9 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - queue ordering is oldest review request first by default; `s` toggles to oldest
   PR creation first. Unknown request times sort last, with creation time breaking
   ties. Filter chips narrow by organization or repository, not author.
+- **Past reviews** toggles the queue to your 10 most recently reviewed PRs,
+  newest submitted review first, including closed and merged PRs. Toggle it off
+  to return to the current queue; new launches always start in the current view.
 - enter (or click) opens a queue row straight into its changes view; `u` comes
   back to the queue with open PRs kept open behind the scenes
 - one file at a time: the whole file fills the pane — no `@@` markers, hunk
