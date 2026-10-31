@@ -531,6 +531,8 @@ enum ItemState {
 pub(crate) struct ItemData {
     pr_meta: Option<github::PrMeta>,
     pub(crate) diff: PrDiff,
+    /// False for conversation-only data, not a genuinely empty diff.
+    diff_loaded: bool,
     mode: ViewMode,
     /// The one file the pane shows (file mode is the only presentation).
     file_ix: usize,
@@ -637,6 +639,7 @@ impl ItemData {
             pr_meta,
             anchor_hunks: diff.files.iter().map(|file| file.hunks.clone()).collect(),
             diff,
+            diff_loaded: true,
             mode,
             file_ix,
             rows: Vec::new(),
@@ -957,8 +960,9 @@ impl ItemData {
 }
 
 /// Which pane an open item shows: the diff (changes), or the conversation
-/// — the PR description, rendered as GFM. Items open onto changes; ⇧⌘←/→
-/// flips between them. Per item, so ctrl-tab's other item keeps its own.
+/// — the PR description, rendered as GFM. PRs open onto conversation, local
+/// diffs onto changes; ⇧⌘←/→ flips between them. Per item, so ctrl-tab's
+/// other item keeps its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ItemPane {
     #[default]
@@ -1067,6 +1071,7 @@ impl ReviewItem {
             None,
             None,
         ));
+        data.diff_loaded = false;
         data.discussion = snapshot
             .discussion
             .and_then(|value| serde_json::from_value(value).ok());
@@ -1076,6 +1081,46 @@ impl ReviewItem {
         data.load_preferences(store, Some(loc));
         self.state = ItemState::Ready(data);
         true
+    }
+
+    /// Install the first conversation without waiting for any diff work.
+    /// Refreshes retain their existing data until the complete fetch lands.
+    fn install_conversation(&mut self, loaded: review_target::LoadedConversation, mode: ViewMode) {
+        if matches!(self.state, ItemState::Ready(_)) {
+            return;
+        }
+        let diff = PrDiff::default();
+        let comments = group_comments(
+            loaded
+                .discussion
+                .review_comments()
+                .into_iter()
+                .map(ReviewComment::from)
+                .collect(),
+        );
+        let built = build_rows(RowsView {
+            diff: &diff,
+            upgrades: &HashMap::new(),
+            comments: Some(&comments),
+            options: RowOptions {
+                mode,
+                file_ix: 0,
+                comments_visible: true,
+                comment_wrap: COMMENT_WRAP_CHARS,
+            },
+        });
+        let mut data = ItemData::new(
+            Some(loaded.meta),
+            diff,
+            mode,
+            0,
+            built,
+            Some(comments),
+            None,
+        );
+        data.diff_loaded = false;
+        data.discussion = Some(loaded.discussion);
+        self.state = ItemState::Ready(Box::new(data));
     }
 
     fn dot_color(&self, cx: &gpui::App) -> gpui::Rgba {
@@ -1190,6 +1235,7 @@ impl ReviewItem {
                 }
                 data.anchor_hunks = diff.files.iter().map(|file| file.hunks.clone()).collect();
                 data.diff = diff;
+                data.diff_loaded = true;
                 data.set_rows(built_rows);
                 if !position.is_some_and(|position| data.restore_review_position(position, true)) {
                     data.open_file(0, None);
@@ -2358,10 +2404,10 @@ impl ReviewApp {
             reloading: false,
             refresh_error: None,
             upgrade_gen: 0,
-            // PRs still open onto changes — the tracer decision; whether
-            // the default flips to conversation-first is a one-line change
-            // revisited at dogfood (task 28).
-            pane: ItemPane::default(),
+            pane: match &source {
+                Source::Pr(_) => ItemPane::Conversation,
+                Source::Local(_) => ItemPane::Changes,
+            },
         });
         if let Source::Pr(loc) = &source {
             self.sessions.insert(
@@ -2415,11 +2461,29 @@ impl ReviewApp {
             _ => 0,
         };
         cx.spawn(async move |this, cx| {
-            let fetched = cx
-                .background_spawn(async move {
-                    review_target::fetch_item_scoped(github, &source, mode, file_ix, since_review)
-                })
-                .await;
+            let (conversation_tx, conversation_rx) = futures::channel::oneshot::channel();
+            let fetch = cx.background_spawn(async move {
+                review_target::fetch_item_with_conversation(
+                    github, &source, mode, file_ix, since_review, Some(conversation_tx),
+                )
+            });
+            if let Ok(conversation) = conversation_rx.await {
+                this.update(cx, |app, cx| {
+                    let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
+                        return;
+                    };
+                    if item.upgrade_gen != fetch_gen || matches!(item.state, ItemState::Ready(_)) {
+                        return;
+                    }
+                    item.install_conversation(conversation, mode);
+                    if let (Source::Pr(loc), ItemState::Ready(data)) = (&item.source, &mut item.state) {
+                        data.load_preferences(&app.store, Some(loc));
+                    }
+                    app.sync_pending_comments(id);
+                    cx.notify();
+                }).ok();
+            }
+            let fetched = fetch.await;
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
                     return;
@@ -4619,7 +4683,13 @@ impl ReviewApp {
         } else {
             self.active_item().and_then(|item| {
                 if item.reloading {
-                    Some("reloading…".into())
+                    Some(
+                        if matches!(&item.state, ItemState::Ready(data) if !data.diff_loaded) {
+                            "loading changes…".into()
+                        } else {
+                            "reloading…".into()
+                        },
+                    )
                 } else {
                     item.refresh_error
                         .as_ref()
@@ -5453,6 +5523,14 @@ impl ReviewApp {
                 ItemState::Ready(data) if item.pane == ItemPane::Conversation => {
                     self.render_conversation(item, data, window, cx)
                 }
+                ItemState::Ready(data) if !data.diff_loaded => centered_message(
+                    if item.reloading {
+                        "loading changes…".into()
+                    } else {
+                        "Changes unavailable — refresh to try again.".into()
+                    },
+                    theme::overlay0(cx),
+                ),
                 ItemState::Ready(data) => div()
                     .size_full()
                     .flex()
@@ -5762,6 +5840,7 @@ impl ReviewApp {
             .child(
                 div()
                     .id("conversation")
+                    .debug_selector(|| "conversation".into())
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&data.conv_scroll)
@@ -9350,7 +9429,7 @@ mod tests {
     }
 
     /// ⇧⌘←/→ flip the open item between its changes and its conversation
-    /// (user stories 22, 11). The flip is per item, PRs open onto changes,
+    /// (user stories 22, 11). The flip is per item, PRs open onto conversation,
     /// re-opening an item keeps it where it was, and the conversation —
     /// whose text comes from the store snapshot here — paints through the
     /// real render (the Kit TextView's markdown setup plus the
@@ -9386,32 +9465,20 @@ mod tests {
             repo: "widgets".into(),
             number: 7,
         };
-        let mut item = ReviewItem {
-            id: 1,
-            source: Source::Pr(loc.clone()),
-            state: ItemState::Loading,
-            reloading: false,
-            refresh_error: None,
-            upgrade_gen: 0,
-            pane: ItemPane::default(),
-        };
-        assert!(item.install_offline_snapshot(&store));
-        install_item(&app, item, cx);
-
-        // PRs open onto changes — the tracer decision — and ⇧⌘← lands on
-        // the conversation, ⇧⌘→ back on the changes, through the real
-        // action handlers the keys dispatch.
-        let pane = |cx: &gpui::TestAppContext| cx.update(|cx| app.read(cx).items[0].pane);
-        assert_eq!(pane(cx), ItemPane::Changes);
-        vcx.update(|window, cx| {
-            let _ = window.draw(cx);
+        cx.update(|cx| {
+            app.update(cx, |this, cx| this.open_item(Source::Pr(loc.clone()), cx));
         });
-        vcx.dispatch_action(ShowConversation);
+        cx.run_until_parked();
+
+        // PRs open onto conversation, including when the fetch falls back
+        // to an offline snapshot. The keyboard actions switch both ways.
+        let pane = |cx: &gpui::TestAppContext| cx.update(|cx| app.read(cx).items[0].pane);
         assert_eq!(pane(cx), ItemPane::Conversation);
+        cx.update(|cx| assert!(matches!(app.read(cx).items[0].state, ItemState::Ready(_))));
 
         // The pane paints from the snapshot's body — full GFM plus the
-        // expanded @mention, :shortcode:, and #ref — with no fetch in
-        // flight (the fake would have recorded one).
+        // expanded @mention, :shortcode:, and #ref — after the fake's
+        // failed fetch falls back to the stored snapshot.
         vcx.update(|window, cx| {
             let _ = window.draw(cx);
         });
@@ -9419,18 +9486,176 @@ mod tests {
         vcx.dispatch_action(ShowChanges);
         assert_eq!(pane(cx), ItemPane::Changes);
 
-        // Re-opening the item the session already has brings it forward
-        // with its pane intact — flipping isn't something `u` resets.
-        vcx.dispatch_action(ShowConversation);
-        cx.update(|cx| {
-            app.update(cx, |this, cx| this.open_item(Source::Pr(loc), cx));
-        });
-        assert_eq!(pane(cx), ItemPane::Conversation);
+        // Re-opening the item keeps either selected pane, rather than
+        // resetting it to the conversation default.
+        for expected in [ItemPane::Changes, ItemPane::Conversation] {
+            if expected == ItemPane::Conversation {
+                vcx.dispatch_action(ShowConversation);
+            }
+            cx.update(|cx| {
+                app.update(cx, |this, cx| this.open_item(Source::Pr(loc.clone()), cx));
+            });
+            assert_eq!(pane(cx), expected);
+        }
         assert_eq!(
             cx.update(|cx| app.read(cx).items.len()),
             1,
             "re-opening forwards the item, never a duplicate"
         );
+    }
+
+    #[gpui::test]
+    fn new_prs_open_in_conversation_and_local_diffs_in_changes(cx: &mut gpui::TestAppContext) {
+        let (_window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.open_item(Source::Pr(loop_loc()), cx);
+                assert_eq!(this.active_item().unwrap().pane, ItemPane::Conversation);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let item = app.read(cx).active_item().unwrap();
+            assert!(matches!(item.state, ItemState::Ready(_)));
+            assert_eq!(item.pane, ItemPane::Conversation);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.open_item(
+                    Source::Local(git::LocalSource {
+                        repo_root: dir.path().to_path_buf(),
+                        branch: "feature".into(),
+                        base_ref: None,
+                        base_label: "HEAD".into(),
+                        base_oid: None,
+                    }),
+                    cx,
+                );
+                assert_eq!(this.active_item().unwrap().pane, ItemPane::Changes);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn conversation_renders_before_patch_and_keeps_its_view_when_changes_land(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (patch_tx, patch_rx) = std::sync::mpsc::channel();
+        let fake = Arc::new(FakePr {
+            patch_gate: std::sync::Mutex::new(Some(patch_rx)),
+            ..Default::default()
+        });
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let client = fake.clone();
+        // A real thread lets this test hold the blocking patch request while
+        // driving the UI; GPUI's test background executor is single-threaded.
+        let fetch = std::thread::spawn(move || {
+            review_target::fetch_item_with_conversation(
+                client,
+                &Source::Pr(loop_loc()),
+                ViewMode::Split,
+                0,
+                false,
+                Some(tx),
+            )
+        });
+        let conversation =
+            futures::executor::block_on(rx).expect("conversation arrives before the patch");
+        assert!(!fetch.is_finished(), "patch must still be loading");
+        let (window, app) = queue_window(cx, fake);
+        let mut item = loop_pr_item(Vec::new());
+        item.state = ItemState::Loading;
+        item.pane = ItemPane::Conversation;
+        item.reloading = true;
+        item.install_conversation(conversation, ViewMode::Split);
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert!(!data.diff_loaded);
+            assert!(data.discussion.is_some());
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("conversation").is_some());
+        vcx.dispatch_action(ShowChanges);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        vcx.dispatch_action(ShowConversation);
+        let offset = point(px(0.), px(-42.));
+        cx.update(|cx| {
+            app.update(cx, |app, _| {
+                app.active_data_mut()
+                    .unwrap()
+                    .conv_scroll
+                    .set_offset(offset);
+            })
+        });
+
+        patch_tx
+            .send(Ok(
+                "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n"
+                    .into(),
+            ))
+            .unwrap();
+        let loaded = fetch.join().unwrap().unwrap();
+        cx.update(|cx| {
+            app.update(cx, |app, _| {
+                let item = &mut app.items[0];
+                item.install(loaded);
+                item.reloading = false;
+                assert_eq!(item.pane, ItemPane::Conversation);
+                let ItemState::Ready(data) = &item.state else {
+                    panic!("ready")
+                };
+                assert!(data.diff_loaded);
+                assert_eq!(data.diff.files.len(), 1);
+                assert_eq!(data.conv_scroll.offset(), offset);
+            })
+        });
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn patch_failure_keeps_the_fetched_conversation_readable(cx: &mut gpui::TestAppContext) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err(github::ClientError::Failed("patch unavailable".into())))
+            .unwrap();
+        let fake = Arc::new(FakePr {
+            patch_gate: std::sync::Mutex::new(Some(rx)),
+            ..Default::default()
+        });
+        let (window, app) = queue_window(cx, fake);
+        cx.update(|cx| app.update(cx, |app, cx| app.open_item(Source::Pr(loop_loc()), cx)));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let item = app.read(cx).active_item().unwrap();
+            assert!(!item.reloading);
+            assert!(item
+                .refresh_error
+                .as_ref()
+                .unwrap()
+                .contains("patch unavailable"));
+            let ItemState::Ready(data) = &item.state else {
+                panic!("conversation stays ready")
+            };
+            assert!(!data.diff_loaded);
+            assert!(data.discussion.is_some());
+            assert_eq!(item.pane, ItemPane::Conversation);
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("conversation").is_some());
+        vcx.dispatch_action(ShowChanges);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
     }
 
     #[gpui::test]
@@ -10452,6 +10677,10 @@ mod tests {
         fail_review_history: std::sync::atomic::AtomicBool,
         commit_fetches: std::sync::atomic::AtomicUsize,
         patch: Option<String>,
+        /// Hold patch completion independently of the conversation in staged-load tests.
+        patch_gate: std::sync::Mutex<
+            Option<std::sync::mpsc::Receiver<Result<String, github::ClientError>>>,
+        >,
         file_contents: HashMap<(String, String), String>,
         viewed_files: std::sync::Mutex<HashMap<String, github::FileViewedState>>,
         viewed_writes: std::sync::Mutex<Vec<(String, bool)>>,
@@ -10469,6 +10698,12 @@ mod tests {
 
         fn posts(&self) -> Vec<Post> {
             self.posted.lock().unwrap().clone()
+        }
+
+        fn patch_text(&self) -> String {
+            self.patch.clone().unwrap_or_else(|| {
+                "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n".into()
+            })
         }
     }
 
@@ -10564,7 +10799,7 @@ mod tests {
 
         fn viewed_files(
             &self,
-            loc: &github::PrLocator,
+            _loc: &github::PrLocator,
         ) -> Result<github::ViewedFiles, github::ClientError> {
             if self
                 .fail_viewed_fetch
@@ -10572,7 +10807,7 @@ mod tests {
             {
                 return Err(github::ClientError::Failed("viewed fetch failed".into()));
             }
-            let mut files: HashMap<_, _> = diff_core::parse_patch(&self.pr_patch(loc).unwrap())
+            let mut files: HashMap<_, _> = diff_core::parse_patch(&self.patch_text())
                 .files
                 .iter()
                 .map(|file| {
@@ -10938,9 +11173,14 @@ mod tests {
         }
 
         fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
-            Ok(self.patch.clone().unwrap_or_else(|| {
-                "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n".into()
-            }))
+            if let Some(gate) = self.patch_gate.lock().unwrap().take() {
+                return gate
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap_or_else(|error| {
+                        Err(github::ClientError::Failed(format!("patch gate: {error}")))
+                    });
+            }
+            Ok(self.patch_text())
         }
 
         fn review_comments(
@@ -11242,6 +11482,7 @@ mod tests {
         cx.update(|cx| app.update(cx, |this, cx| this.open_item(Source::Pr(loop_loc()), cx)));
         cx.run_until_parked();
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.dispatch_action(ShowChanges);
         for mode in [ViewMode::Unified, ViewMode::Split] {
             vcx.update(|window, cx| {
                 app.update(cx, |this, cx| {
@@ -11450,6 +11691,7 @@ mod tests {
         cx.update(|cx| app.update(cx, |this, cx| this.open_item(Source::Pr(loop_loc()), cx)));
         cx.run_until_parked();
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.dispatch_action(ShowChanges);
         let (bounds, resumed) = vcx.update(|window, cx| {
             let _ = window.draw(cx);
             let data = app.read(cx).active_data().unwrap();
@@ -11494,6 +11736,7 @@ mod tests {
             })
         });
         cx.run_until_parked();
+        vcx.dispatch_action(ShowChanges);
         vcx.update(|window, cx| {
             let _ = window.draw(cx);
             assert_eq!(
@@ -11521,6 +11764,7 @@ mod tests {
             assert_eq!(data.review_position().unwrap().new_line, Some(197));
         });
         let mut second_vcx = gpui::VisualTestContext::from_window(second_window, cx);
+        second_vcx.dispatch_action(ShowChanges);
         second_vcx.update(|window, cx| {
             let _ = window.draw(cx);
             second.update(cx, |this, cx| {
