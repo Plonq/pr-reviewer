@@ -1297,6 +1297,7 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
         _ => None,
     };
     let url = meta.url.clone();
+    let copy_url = meta.url.clone();
     div()
         .flex()
         .items_center()
@@ -1366,10 +1367,23 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                         .child(SharedString::from(format!("−{}", meta.deletions))),
                 )
                 .child(
+                    Button::new("copy-pr-link")
+                        .debug_selector(|| "copy-pr-link".into())
+                        .icon(gpui_kit_assets::IconName::Copy)
+                        .ghost()
+                        .xsmall()
+                        .tooltip("Copy PR link")
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
+                        }),
+                )
+                .child(
                     Button::new("open-in-browser")
+                        .debug_selector(|| "open-in-browser".into())
                         .icon(IconName::ExternalLink)
                         .ghost()
                         .xsmall()
+                        .tooltip("Open PR in GitHub")
                         .on_click(move |_, _, cx| cx.open_url(&url)),
                 )
                 .when(meta.state == "OPEN", |row| {
@@ -7251,6 +7265,44 @@ mod tests {
             fake.commit_fetches
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
+        );
+    }
+
+    #[gpui::test]
+    fn titlebar_copies_the_pr_url_next_to_the_github_button(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for state in ["OPEN", "CLOSED", "MERGED"] {
+            for pane in [ItemPane::Conversation, ItemPane::Changes] {
+                let mut item = loop_pr_item(Vec::new());
+                item.pane = pane;
+                let ItemState::Ready(data) = &mut item.state else {
+                    unreachable!()
+                };
+                let meta = data.pr_meta.as_mut().unwrap();
+                meta.state = state.into();
+                // Use metadata's URL, not a URL reconstructed from the locator.
+                let url = format!("https://github.com/another/repo/pull/42?state={state}");
+                meta.url = url.clone();
+                install_item(&app, item, &mut vcx);
+                vcx.update(|_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string("previous clipboard".into()));
+                });
+                click_commenting(&mut vcx, "copy-pr-link");
+                vcx.update(|_, cx| {
+                    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), url);
+                });
+                let open = vcx.debug_bounds("open-in-browser").unwrap();
+                let copy = vcx.debug_bounds("copy-pr-link").unwrap();
+                assert_eq!(copy.top(), open.top());
+                assert!(copy.left() >= open.right());
+            }
+        }
+        assert!(cx.opened_url().is_none(), "copying must not open a browser");
+        click_commenting(&mut vcx, "open-in-browser");
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/another/repo/pull/42?state=MERGED")
         );
     }
 
