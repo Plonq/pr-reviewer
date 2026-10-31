@@ -7295,7 +7295,7 @@ mod tests {
                 let open = vcx.debug_bounds("open-in-browser").unwrap();
                 let copy = vcx.debug_bounds("copy-pr-link").unwrap();
                 assert_eq!(copy.top(), open.top());
-                assert!(copy.left() >= open.right());
+                assert!(copy.right() <= open.left());
             }
         }
         assert!(cx.opened_url().is_none(), "copying must not open a browser");
