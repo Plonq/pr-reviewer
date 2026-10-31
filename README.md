@@ -60,8 +60,13 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - queue ordering is oldest review request first by default; `s` toggles to oldest
   PR creation first. Unknown request times sort last, with creation time breaking
   ties. Filter chips narrow by organization or repository, not author.
-- enter (or click) opens a queue row straight into its changes view; `u` comes
-  back to the queue with open PRs kept open behind the scenes
+- enter (or click) opens a new PR in its conversation view; `⇧⌘→` switches to
+  Changes and `⇧⌘←` back to Conversation. Reopening an already-open PR keeps
+  its selected view; `u` returns to the queue with open PRs kept open behind
+  the scenes. The description and discussion appear as soon as they arrive,
+  while the patch and file details continue loading in the background; diff
+  loading or failure does not block reading the conversation. Local repository
+  diffs open in Changes.
 - one file at a time: the whole file fills the pane — no `@@` markers, hunk
   boundaries read from the highlighting — revealed at its first change on
   first visit, with each file's scroll position remembered while the review is open;

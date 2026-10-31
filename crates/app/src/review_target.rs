@@ -44,6 +44,12 @@ pub(crate) enum LoadedMeta {
     Local(git::LocalSource),
 }
 
+/// Enough data to read the conversation before the patch and file details land.
+pub(crate) struct LoadedConversation {
+    pub(crate) meta: github::PrMeta,
+    pub(crate) discussion: github::PrDiscussion,
+}
+
 pub(crate) struct Loaded {
     pub(crate) meta: LoadedMeta,
     pub(crate) diff: PrDiff,
@@ -82,12 +88,27 @@ pub(crate) fn fetch_item(
 ///
 /// The local snapshot records last-seen bookkeeping, independently of the
 /// submitted GitHub review that determines the incremental diff's baseline.
+#[cfg(test)]
 pub(crate) fn fetch_item_scoped(
     github: Arc<dyn github::GitHubClient>,
     source: &Source,
     mode: ViewMode,
     file_ix: usize,
     since_review: bool,
+) -> anyhow::Result<Loaded> {
+    fetch_item_with_conversation(github, source, mode, file_ix, since_review, None)
+}
+
+/// Publish conversation data independently of the patch, commits, viewed state,
+/// and review-baseline work. The final result still contains one consistent
+/// metadata/discussion pair; there is no duplicate API fetch.
+pub(crate) fn fetch_item_with_conversation(
+    github: Arc<dyn github::GitHubClient>,
+    source: &Source,
+    mode: ViewMode,
+    file_ix: usize,
+    since_review: bool,
+    conversation: Option<futures::channel::oneshot::Sender<LoadedConversation>>,
 ) -> anyhow::Result<Loaded> {
     let mut review_changes = github::ReviewChanges::default();
     let mut review_base = None;
@@ -108,13 +129,26 @@ pub(crate) fn fetch_item_scoped(
             let viewed_client = github.clone();
             let viewed_loc = loc.clone();
             let viewed_thread = std::thread::spawn(move || viewed_client.viewed_files(&viewed_loc));
-            let patch = github.pr_patch(loc)?;
+            let patch_client = github.clone();
+            let patch_loc = loc.clone();
+            let patch_thread = std::thread::spawn(move || patch_client.pr_patch(&patch_loc));
             let meta = meta_thread
                 .join()
                 .map_err(|_| anyhow!("GitHub metadata fetch panicked"))??;
             let discussion = comments_thread
                 .join()
                 .map_err(|_| anyhow!("GitHub comments fetch panicked"))??;
+            // Send from the background-executor task, not a raw API thread:
+            // GPUI's deterministic test scheduler owns the receiver's waker.
+            if let Some(sender) = conversation {
+                let _ = sender.send(LoadedConversation {
+                    meta: meta.clone(),
+                    discussion: discussion.clone(),
+                });
+            }
+            let patch = patch_thread
+                .join()
+                .map_err(|_| anyhow!("GitHub patch fetch panicked"))??;
             // Both the timeline and inline index derive from this discussion;
             // never fetch a second, potentially inconsistent comment collection.
             let comments = discussion.review_comments();
