@@ -12062,6 +12062,67 @@ mod tests {
     }
 
     #[gpui::test]
+    fn unified_diff_highlights_fill_the_row_width(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for long_line in [false, true] {
+            let last = if long_line {
+                "abcdefghij".repeat(60)
+            } else {
+                "short".to_string()
+            };
+            let mut diff = two_file_diff();
+            diff.files[0].hunks = diff_texts("old\n\nremoved\n", &format!("new\n\n{last}\n"), 3);
+            let mut data = file_mode_data(diff);
+            data.mode = ViewMode::Unified;
+            data.set_rows(data.row_build());
+            let mut item = loop_pr_item(Vec::new());
+            item.state = ItemState::Ready(data);
+            install_item(&app, item, &mut vcx);
+            for wrap in [false, true] {
+                for width in [1100., 800.] {
+                    vcx.simulate_resize(size(px(width), px(600.)));
+                    vcx.update(|_, cx| {
+                        app.update(cx, |this, cx| {
+                            let data = this.active_data_mut().unwrap();
+                            data.preferences.soft_wrap = Some(wrap);
+                            data.rebuild_presentation();
+                            cx.notify();
+                        });
+                    });
+                    for _ in 0..2 {
+                        vcx.update(|window, cx| {
+                            let _ = window.draw(cx);
+                        });
+                    }
+                    let (viewport, rows) = vcx.update(|_, cx| {
+                        let data = app.read(cx).active_data().unwrap();
+                        let rows = data
+                            .rows
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(ix, row)| {
+                                matches!(row, Row::Line { .. } | Row::Continuation(_)).then_some(ix)
+                            })
+                            .collect::<Vec<_>>();
+                        (data.scroll.0.borrow().base_handle.bounds(), rows)
+                    });
+                    assert!(!rows.is_empty());
+                    for ix in rows {
+                        let selector = Box::leak(format!("diff-line-{ix}").into_boxed_str());
+                        let row = vcx.debug_bounds(selector).unwrap();
+                        assert_eq!(row.left(), viewport.left());
+                        assert!(
+                            row.right() >= viewport.right(),
+                            "every unified line background must fill the viewport, including empty and wrapped lines: row {ix}: {row:?}, viewport {viewport:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
     fn horizontal_scroll_is_default_and_wrap_fits_both_views(cx: &mut gpui::TestAppContext) {
         let long = "abcdefghij".repeat(60);
         let client = Arc::new(FakePr {
