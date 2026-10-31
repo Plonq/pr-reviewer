@@ -172,6 +172,11 @@ impl ReviewApp {
             let (Source::Pr(loc), ItemState::Ready(data)) = (&item.source, &mut item.state) else {
                 continue;
             };
+            // Saved positions reopen in All changes. Incremental LEFT line
+            // numbers belong to a different revision and must not leak there.
+            if data.review_base.is_some() {
+                continue;
+            }
             let Some(position) = data
                 .search
                 .as_ref()

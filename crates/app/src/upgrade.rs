@@ -18,6 +18,8 @@ pub(crate) enum UpgradeSource {
         loc: github::PrLocator,
         base_oid: String,
         head_oid: String,
+        base_files:
+            Option<std::sync::Arc<std::collections::HashMap<String, github::ComparisonBase>>>,
     },
     Local(git::LocalSource),
 }
@@ -53,12 +55,14 @@ pub(crate) fn run_upgrade(
             loc,
             base_oid,
             head_oid,
+            base_files,
         } => run_with_source(
             &PrContent {
                 github,
                 loc,
                 base_oid,
                 head_oid,
+                base_files: base_files.as_deref(),
             },
             jobs,
         ),
@@ -84,10 +88,16 @@ struct PrContent<'a> {
     loc: &'a github::PrLocator,
     base_oid: &'a str,
     head_oid: &'a str,
+    base_files: Option<&'a std::collections::HashMap<String, github::ComparisonBase>>,
 }
 
 impl ContentSource for PrContent<'_> {
     fn fetch(&self, path: &str, side: Side) -> Option<String> {
+        if side == Side::Old {
+            if let Some(files) = self.base_files {
+                return files.get(path).map(|base| base.text.clone());
+            }
+        }
         let oid = match side {
             Side::Old => self.base_oid,
             Side::New => self.head_oid,
@@ -800,6 +810,7 @@ mod tests {
             loc,
             base_oid: "captured-base".into(),
             head_oid: "captured-head".into(),
+            base_files: None,
         };
         let results = run_upgrade(
             &client,
@@ -842,10 +853,46 @@ mod tests {
             loc: &loc,
             base_oid: "base",
             head_oid: "head",
+            base_files: None,
         };
         assert_eq!(source.fetch("empty", Side::Old), Some(String::new()));
         assert_eq!(source.fetch("missing", Side::Old), None);
         assert_eq!(source.fetch("error", Side::New), None);
+    }
+
+    #[test]
+    fn virtual_baseline_never_falls_back_to_raw_reviewed_contents() {
+        let client = FileClient::default();
+        let loc = github::PrLocator {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 1,
+        };
+        let files = std::collections::HashMap::from([(
+            "shared".into(),
+            github::ComparisonBase {
+                text: "upstream\nreviewed\n".into(),
+                reviewed_lines: vec![None, Some(1)],
+            },
+        )]);
+        let source = PrContent {
+            github: &client,
+            loc: &loc,
+            base_oid: "reviewed",
+            head_oid: "head",
+            base_files: Some(&files),
+        };
+        assert_eq!(
+            source.fetch("shared", Side::Old).as_deref(),
+            Some("upstream\nreviewed\n")
+        );
+        assert_eq!(source.fetch("missing", Side::Old), None);
+        assert!(client.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            source.fetch("shared", Side::New).as_deref(),
+            Some("head:shared\n")
+        );
+        assert_eq!(client.calls.lock().unwrap().len(), 1);
     }
 
     struct TempRepo(std::path::PathBuf);

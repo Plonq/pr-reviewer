@@ -7,7 +7,5 @@ edition = "2021"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-
-[dev-dependencies]
-# file_at's disk cache test redirects $HOME into a throwaway directory.
+diff-core = { path = "../diff-core" }
 tempfile = "3"
