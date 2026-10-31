@@ -1294,13 +1294,13 @@ fn render_row_content(
                 .into_any_element()
         }
         Row::CommentHeader {
+            comment_id,
             author,
             when,
             is_reply,
             half,
             top,
             collapsed,
-            ..
         } => {
             let mut inner = div().flex().items_center().gap_2().min_w_0().w_full();
             if *is_reply {
@@ -1312,6 +1312,12 @@ fn render_row_content(
             }
             comment_row(
                 inner
+                    .child(
+                        crate::threads::author_avatar(author, &entity.read(cx).account)
+                            // Header rows share the diff's zoom-dependent height.
+                            .with_size(px((crate::row_height() - 2.).min(20.)))
+                            .debug_selector(|| format!("inline-avatar-{comment_id}")),
+                    )
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::BOLD)
