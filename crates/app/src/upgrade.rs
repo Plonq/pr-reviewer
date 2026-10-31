@@ -1,4 +1,4 @@
-//! Phase-2 full-content upgrade: background refetch and re-diff of whole files.
+//! Full-content loading and re-diffing, completed before publishing the diff.
 
 use crate::rows::FileUpgrade;
 use diff_core::{diff_texts, DiffRow, FileStatus, Hunk};

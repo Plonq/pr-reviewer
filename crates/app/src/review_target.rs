@@ -2,8 +2,9 @@
 //! and the blocking fetch that loads one.
 
 use crate::local_store;
-use crate::rows::{build_rows, BuiltRows, RowOptions, RowsView, ViewMode};
+use crate::rows::{build_rows, BuiltRows, FileUpgrade, RowOptions, RowsView, ViewMode};
 use crate::threads::{group_comments, CommentIndex, ReviewComment, COMMENT_WRAP_CHARS};
+use crate::upgrade::{run_upgrade, UpgradeJob, UpgradeSource};
 use anyhow::anyhow;
 use diff_core::PrDiff;
 use std::collections::HashMap;
@@ -53,6 +54,9 @@ pub(crate) struct LoadedConversation {
 pub(crate) struct Loaded {
     pub(crate) meta: LoadedMeta,
     pub(crate) diff: PrDiff,
+    /// Original patch coordinates, before re-diffing full file contents.
+    pub(crate) anchor_hunks: Vec<Vec<diff_core::Hunk>>,
+    pub(crate) upgrades: HashMap<usize, FileUpgrade>,
     pub(crate) built_rows: BuiltRows,
     pub(crate) mode: ViewMode,
     /// The file the rows were built for (file mode).
@@ -204,10 +208,49 @@ pub(crate) fn fetch_item_with_conversation(
             index.hide_left_anchors();
         }
     }
-    let diff = diff_core::parse_patch(&patch);
+    let mut diff = diff_core::parse_patch(&patch);
+    let anchor_hunks = diff.files.iter().map(|file| file.hunks.clone()).collect();
+    let jobs: Vec<_> = diff
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| file.status != diff_core::FileStatus::Binary && !file.hunks.is_empty())
+        .map(|(file_ix, file)| UpgradeJob {
+            file_ix,
+            old_path: file.old_path.clone(),
+            new_path: file.new_path.clone(),
+            status: file.status,
+        })
+        .collect();
+    let content_source = match (&meta, source) {
+        (LoadedMeta::Pr(meta), Source::Pr(loc))
+            if !meta.base_ref_oid.is_empty() && !meta.head_ref_oid.is_empty() =>
+        {
+            Some(UpgradeSource::Pr {
+                loc: loc.clone(),
+                base_oid: review_base.as_ref().unwrap_or(&meta.base_ref_oid).clone(),
+                head_oid: meta.head_ref_oid.clone(),
+                base_files: review_base_files.clone(),
+            })
+        }
+        (LoadedMeta::Local(src), _) => Some(UpgradeSource::Local(src.clone())),
+        _ => None,
+    };
+    // Finish full-content loading before publishing any diff rows. Unavailable
+    // or oversized files keep their patch fallback, but never flash it first.
+    let mut upgrades = HashMap::new();
+    if let Some(source) = content_source.filter(|_| !jobs.is_empty()) {
+        for file in run_upgrade(github.as_ref(), &source, jobs) {
+            let target = &mut diff.files[file.file_ix];
+            target.hunks = file.hunks;
+            target.additions = file.additions;
+            target.deletions = file.deletions;
+            upgrades.insert(file.file_ix, file.upgrade);
+        }
+    }
     let built_rows = build_rows(RowsView {
         diff: &diff,
-        upgrades: &HashMap::new(),
+        upgrades: &upgrades,
         comments: comments.as_ref(),
         options: RowOptions {
             mode,
@@ -219,6 +262,8 @@ pub(crate) fn fetch_item_with_conversation(
     Ok(Loaded {
         meta,
         diff,
+        anchor_hunks,
+        upgrades,
         built_rows,
         mode,
         file_ix,

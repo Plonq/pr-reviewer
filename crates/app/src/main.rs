@@ -32,7 +32,9 @@ mod test_util;
 
 use chrome::{app_title, centered_message};
 use comment_actions::CommentTarget;
-use diff_core::{FileStatus, PrDiff};
+#[cfg(test)]
+use diff_core::FileStatus;
+use diff_core::PrDiff;
 use github::review_session::{Command as SessionCommand, ReviewSession};
 use gpui::component::{
     avatar::Avatar,
@@ -78,6 +80,7 @@ use threads::{
 use tree::{
     build_tree, fuzzy_file_matches, render_tree_row, TreeEntry, TreeEntryKind, TreeListRow,
 };
+#[cfg(test)]
 use upgrade::{run_upgrade, UpgradeJob, UpgradeSource};
 
 #[derive(Default)]
@@ -550,7 +553,7 @@ pub(crate) struct ItemData {
     minimap_cache: RefCell<Option<(f32, usize, Rc<MinimapLayout>)>>,
     cursor: usize,
     cursor_side: Option<SelSide>,
-    /// Original server-patch hunks, retained when phase 2 replaces display
+    /// Original server-patch hunks, retained when full contents replace display
     /// hunks. Determines when comments need the experimental positioning API.
     anchor_hunks: Vec<Vec<diff_core::Hunk>>,
     scroll: UniformListScrollHandle,
@@ -581,7 +584,7 @@ pub(crate) struct ItemData {
     /// switching); cleared on view-mode toggle and refresh, where row indices
     /// change meaning.
     selection: Option<Selection>,
-    /// Phase-2 upgrades by file index into `diff.files`: whole-file span
+    /// Full-file contents by file index into `diff.files`: whole-file span
     /// tables and full new-side lines. The re-diffed hunks themselves
     /// replace `diff.files[ix].hunks`. Reset on refresh.
     upgrades: HashMap<usize, FileUpgrade>,
@@ -609,7 +612,7 @@ pub(crate) struct ItemData {
     /// The one-time background mentionable-user fetch has been kicked off.
     mentions_fetched: bool,
     /// Sidebar file tree, rebuilt whenever the diff itself changes (load,
-    /// refresh, blob upgrade) — but not on view-mode toggles: entries map to
+    /// refresh) — but not on view-mode toggles: entries map to
     /// file indices, not row indices, so they survive row rebuilds.
     pub(crate) tree: Vec<TreeEntry>,
     /// Collapsed directory paths, preserved across rebuilds where the
@@ -976,8 +979,7 @@ struct ReviewItem {
     /// A refresh is in flight while the old data stays visible.
     reloading: bool,
     refresh_error: Option<SharedString>,
-    /// Bumped whenever fresh data is installed; an in-flight Phase-2 upgrade
-    /// only lands if the generation it captured is still current.
+    /// Bumped at fetch start; only the latest fetch may install its result.
     upgrade_gen: u64,
     /// Which pane the item shows; lives here — not in `ItemData` — so a
     /// refresh (which swaps the data in) never flips the reviewer's view.
@@ -1148,6 +1150,8 @@ impl ReviewItem {
         let Loaded {
             meta,
             diff,
+            anchor_hunks,
+            upgrades,
             mut built_rows,
             mode,
             file_ix,
@@ -1187,9 +1191,7 @@ impl ReviewItem {
                 data.review_base = review_base;
                 data.review_base_files = review_base_files;
                 data.discussion_generation += 1;
-                // Fresh patch-derived data: any previous upgrade is stale —
-                // the upgrade re-runs from scratch.
-                data.upgrades.clear();
+                data.upgrades = upgrades;
                 data.expanded_regions.clear();
                 data.discussion = discussion;
                 if let Some(discussion) = &data.discussion {
@@ -1232,7 +1234,7 @@ impl ReviewItem {
                 if pr_meta.is_some() {
                     data.pr_meta = pr_meta;
                 }
-                data.anchor_hunks = diff.files.iter().map(|file| file.hunks.clone()).collect();
+                data.anchor_hunks = anchor_hunks;
                 data.diff = diff;
                 data.diff_loaded = true;
                 data.set_rows(built_rows);
@@ -1262,6 +1264,8 @@ impl ReviewItem {
                     comments,
                     local_review,
                 ));
+                data.anchor_hunks = anchor_hunks;
+                data.upgrades = upgrades;
                 data.discussion = discussion;
                 data.commits = commits;
                 data.review_changes = review_changes;
@@ -2105,7 +2109,7 @@ impl ReviewApp {
     }
 
     /// Enter (or a click) on a queue row: that PR opens into the changes
-    /// view — its own tab, fresh (fetch + phase-2 upgrade) or straight
+    /// view — its own tab, fresh (including full-file loading) or straight
     /// from the snapshot when offline — with the sidebar's file tree
     /// showing. A PR that's already open behind the scenes just comes
     /// forward ([`ReviewApp::open_item`]'s one-item-per-source rule), so
@@ -2491,7 +2495,7 @@ impl ReviewApp {
             return;
         };
         item.reloading = true;
-        // Invalidate upgrades immediately, not only when the replacement lands.
+        // Supersede any older fetch before starting its replacement.
         item.upgrade_gen += 1;
         let fetch_gen = item.upgrade_gen;
         let github = self.github.clone();
@@ -2573,48 +2577,6 @@ impl ReviewApp {
                         if let Some(snapshot) = snapshot {
                             app.store.save_snapshot(&snapshot);
                         }
-                        // Phase 2: after the instant patch-derived paint,
-                        // upgrade every eligible file to full contents in the
-                        // background. The bumped generation cancels any
-                        // still-running upgrade from before a refresh.
-                        item.upgrade_gen += 1;
-                        let gen = item.upgrade_gen;
-                        if let ItemState::Ready(data) = &item.state {
-                            let jobs: Vec<UpgradeJob> = data
-                                .diff
-                                .files
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, f)| {
-                                    f.status != FileStatus::Binary && !f.hunks.is_empty()
-                                })
-                                .map(|(ix, f)| UpgradeJob {
-                                    file_ix: ix,
-                                    old_path: f.old_path.clone(),
-                                    new_path: f.new_path.clone(),
-                                    status: f.status,
-                                })
-                                .collect();
-                            let source = match &item.source {
-                                Source::Pr(loc) => data
-                                    .pr_meta
-                                    .as_ref()
-                                    .filter(|meta| {
-                                        !meta.base_ref_oid.is_empty()
-                                            && !meta.head_ref_oid.is_empty()
-                                    })
-                                    .map(|meta| UpgradeSource::Pr {
-                                        loc: loc.clone(),
-                                        base_oid: data.diff_base().to_string(),
-                                        head_oid: meta.head_ref_oid.clone(),
-                                        base_files: data.review_base_files.clone(),
-                                    }),
-                                Source::Local(src) => Some(UpgradeSource::Local(src.clone())),
-                            };
-                            if let (Some(source), false) = (source, jobs.is_empty()) {
-                                app.spawn_upgrade(id, gen, source, jobs, cx);
-                            }
-                        }
                     }
                     Err(err) => {
                         let msg = format!("{err:#}");
@@ -2638,68 +2600,6 @@ impl ReviewApp {
                     }
                 }
                 app.sync_pending_comments(id);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Phase 2, per item: fetch every file's full contents, re-diff, and
-    /// re-highlight in the background, then rebuild rows once and swap
-    /// atomically. Source-line anchors preserve the viewport even when phase
-    /// 2 inserts whole-file context above it; selections use transient rows
-    /// and are cleared.
-    fn spawn_upgrade(
-        &self,
-        id: u64,
-        gen: u64,
-        source: UpgradeSource,
-        jobs: Vec<UpgradeJob>,
-        cx: &mut Context<Self>,
-    ) {
-        let github = self.github.clone();
-        cx.spawn(async move |this, cx| {
-            let upgraded = cx
-                .background_spawn(async move { run_upgrade(github.as_ref(), &source, jobs) })
-                .await;
-            this.update(cx, |app, cx| {
-                let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
-                    return;
-                };
-                if item.upgrade_gen != gen {
-                    return;
-                }
-                let ItemState::Ready(data) = &mut item.state else {
-                    return;
-                };
-                let position = data.review_position();
-                for file in upgraded {
-                    let Some(target) = data.diff.files.get_mut(file.file_ix) else {
-                        continue;
-                    };
-                    target.hunks = file.hunks;
-                    target.additions = file.additions;
-                    target.deletions = file.deletions;
-                    data.upgrades.insert(file.file_ix, file.upgrade);
-                }
-                (data.additions, data.deletions) = data
-                    .diff
-                    .files
-                    .iter()
-                    .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
-                // Comment anchors live in the same absolute line-number space
-                // the re-diff produces, so threads re-insert at the re-diffed
-                // rows without translation.
-                data.set_rows(data.row_build());
-                data.selection = None;
-                data.cursor_side = None;
-                if let Some(position) = position {
-                    data.restore_review_position(position, false);
-                }
-                // Paths can't change in an upgrade, but stats did; rebuilding
-                // keeps the tree in lockstep with every row rebuild.
-                data.rebuild_tree();
                 cx.notify();
             })
             .ok();
@@ -6823,9 +6723,9 @@ mod tests {
                 assert_eq!(
                     this.items[this.active].upgrade_gen,
                     old_gen + 2,
-                    "cancel old upgrades at fetch start"
+                    "supersede old fetches at fetch start"
                 );
-                expected_gen = old_gen + 3; // Only the final fetch may install/start an upgrade.
+                expected_gen = old_gen + 2; // Installing a result does not start another phase.
             })
         });
         vcx.run_until_parked();
@@ -8105,8 +8005,8 @@ mod tests {
         let jumped = data.review_position().unwrap();
         assert_ne!(jumped.new_line, position.new_line);
         assert_eq!(jumped.row, data.hunk_rows[1]);
-        // Even after the short patch clamps the jump to its top, phase 2
-        // must retain the requested hunk, not resurrect the restored anchor.
+        // Even after a short file clamps the jump to its top, retain the
+        // requested hunk rather than resurrecting the restored anchor.
         data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
         data.scroll
             .0
@@ -9974,6 +9874,107 @@ mod tests {
     }
 
     #[gpui::test]
+    fn diff_waits_for_full_contents_on_open_and_refresh(cx: &mut gpui::TestAppContext) {
+        for refresh in [false, true] {
+            let old: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+            let new = old.replace("line 10\n", "changed 10\n");
+            let patch = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +10 @@\n-line 10\n+changed 10\ndiff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-old\n+new\n";
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let fake = Arc::new(FakePr {
+                patch: Some(patch.into()),
+                file_gate: std::sync::Mutex::new(Some((started_tx, release_rx))),
+                file_contents: HashMap::from([
+                    (("ba5ec0de".into(), "a.rs".into()), old),
+                    (("dead10cc".into(), "a.rs".into()), new),
+                ]),
+                ..Default::default()
+            });
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let client = fake.clone();
+            let fetch = std::thread::spawn(move || {
+                review_target::fetch_item_with_conversation(
+                    client,
+                    &Source::Pr(loop_loc()),
+                    ViewMode::Unified,
+                    0,
+                    false,
+                    Some(tx),
+                )
+            });
+            let conversation = futures::executor::block_on(rx).unwrap();
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(
+                !fetch.is_finished(),
+                "full contents must finish before the diff is published"
+            );
+
+            let (window, app) = queue_window(cx, fake);
+            let mut item = loop_pr_item(Vec::new());
+            let old_view = match &item.state {
+                ItemState::Ready(data) => (data.diff.files[0].hunks[0].new_start, data.rows.len()),
+                _ => unreachable!(),
+            };
+            if !refresh {
+                item.state = ItemState::Loading;
+                item.install_conversation(conversation, ViewMode::Unified);
+            }
+            item.reloading = true;
+            install_item(&app, item, cx);
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            vcx.update(|window, cx| {
+                let data = app.read(cx).active_data().unwrap();
+                assert_eq!(data.diff_loaded, refresh);
+                if refresh {
+                    assert_eq!(
+                        (data.diff.files[0].hunks[0].new_start, data.rows.len()),
+                        old_view,
+                        "keep the previous diff while refreshing"
+                    );
+                } else {
+                    assert!(
+                        data.diff.files.is_empty(),
+                        "never show the intermediate patch"
+                    );
+                }
+                let _ = window.draw(cx);
+            });
+
+            release_tx.send(()).unwrap();
+            let loaded = fetch.join().unwrap().unwrap();
+            assert_eq!(loaded.anchor_hunks[0][0].new_start, 10);
+            assert_eq!(loaded.diff.files[0].hunks[0].new_start, 7);
+            cx.update(|cx| {
+                app.update(cx, |app, _| {
+                    app.items[0].install(loaded);
+                    let data = app.active_data().unwrap();
+                    assert!(data.diff_loaded);
+                    assert_eq!(data.upgrades[&0].new_lines.len(), 20);
+                    assert_eq!(data.anchor_hunks[0][0].new_start, 10);
+                    assert_eq!(data.diff.files[0].hunks[0].new_start, 7);
+                    assert!(
+                        data.rows.iter().any(|row| matches!(
+                            row,
+                            Row::Line {
+                                new_no: Some(20),
+                                ..
+                            }
+                        )),
+                        "the first installed view includes full-file context"
+                    );
+                    assert!(
+                        !data.upgrades.contains_key(&1),
+                        "missing full contents keep the patch fallback"
+                    );
+                    assert_eq!(data.diff.files[1].additions, 1);
+                })
+            });
+        }
+    }
+
+    #[gpui::test]
     fn patch_failure_keeps_the_fetched_conversation_readable(cx: &mut gpui::TestAppContext) {
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Err(github::ClientError::Failed("patch unavailable".into())))
@@ -11186,6 +11187,9 @@ mod tests {
         patch_gate: std::sync::Mutex<
             Option<std::sync::mpsc::Receiver<Result<String, github::ClientError>>>,
         >,
+        /// Signal and hold the first full-content request in staged-load tests.
+        file_gate:
+            std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
         file_contents: HashMap<(String, String), String>,
         viewed_files: std::sync::Mutex<HashMap<String, github::FileViewedState>>,
         viewed_writes: std::sync::Mutex<Vec<(String, bool)>>,
@@ -11717,6 +11721,14 @@ mod tests {
             commit_oid: &str,
             path: &str,
         ) -> Result<Option<String>, github::ClientError> {
+            if path == "a.rs" {
+                if let Some((started, release)) = self.file_gate.lock().unwrap().take() {
+                    started.send(()).unwrap();
+                    release
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }
+            }
             Ok(self
                 .file_contents
                 .get(&(commit_oid.into(), path.into()))
@@ -12178,10 +12190,11 @@ mod tests {
     }
 
     #[gpui::test]
-    fn pr_position_resumes_through_fetch_upgrade_wheel_queue_and_reopen(
+    fn pr_position_resumes_through_full_fetch_wheel_queue_and_reopen(
         cx: &mut gpui::TestAppContext,
     ) {
-        // The saved line is outside the patch: only phase 2 can restore it.
+        // The saved line is outside the patch: full contents must be ready
+        // before the initial position is restored.
         let old: String = (1..=400).map(|n| format!("line {n}\n")).collect();
         let new = old.replace("line 200\n", "changed 200\n");
         let mut patch = String::new();
@@ -14933,7 +14946,7 @@ mod tests {
                 assert_eq!((composer.start_line, composer.line), (Some(1), 10));
                 assert_eq!(composer.position.as_ref().unwrap().commit_id, "dead10cc");
                 this.close_composer(window, cx);
-                // Simulate a phase-2 display hunk that merges both server hunks.
+                // Simulate a full-content display hunk that merges both server hunks.
                 let data = this.active_data_mut().unwrap();
                 data.diff.files[0].hunks[0].new_count = 10;
                 for line in 4..=10 {

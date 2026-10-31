@@ -370,7 +370,7 @@ fn hunk_syntax(
         .collect()
 }
 
-/// Phase-2 result for one file: full new-side lines and whole-file syntax
+/// Full-content result for one file: full new-side lines and whole-file syntax
 /// span tables (per line, both sides). The authoritative re-diffed hunks
 /// live in `diff.files[ix].hunks` — this is the extra state needed to render
 /// spans and fill in the context around the hunks. Lives in
