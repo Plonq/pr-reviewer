@@ -55,27 +55,43 @@ pub(crate) struct Loaded {
     pub(crate) comments: Option<CommentIndex>,
     pub(crate) discussion: Option<github::PrDiscussion>,
     pub(crate) commits: Option<github::PrCommits>,
+    pub(crate) review_changes: github::ReviewChanges,
+    /// Active incremental diff's old revision; None means the full PR diff.
+    pub(crate) review_base: Option<String>,
+    pub(crate) review_base_files: Option<Arc<HashMap<String, github::ComparisonBase>>>,
     pub(crate) viewed: Option<Result<github::ViewedFiles, github::ClientError>>,
     /// The snapshot of a PR's fetch, for the local store: what the app
     /// saw of the PR, and when. None for local items.
     pub(crate) snapshot: Option<local_store::StoredPrSnapshot>,
 }
 
-/// Blocking fetch + parse + row building for one item; runs on the background
-/// executor, so subprocess waits and tree-sitter work stay off the main thread.
-/// PR items fetch meta, patch, discussion, commits, and viewed state concurrently — five
-/// facade calls, one error vocabulary.
-///
-/// A PR's fetch also produces the snapshot the local store keeps: what the
-/// app saw of the PR (its head SHA, its threads), so the next launch knows
-/// what "since I last looked" means, and an offline launch can still read
-/// the PR.
+#[cfg(test)]
 pub(crate) fn fetch_item(
     github: Arc<dyn github::GitHubClient>,
     source: &Source,
     mode: ViewMode,
     file_ix: usize,
 ) -> anyhow::Result<Loaded> {
+    fetch_item_scoped(github, source, mode, file_ix, false)
+}
+
+/// Blocking fetch, parse, and row building on the background executor. PR
+/// metadata, patch, discussion, commits, and viewed state fetch concurrently;
+/// the review baseline is then validated against the captured metadata head.
+/// Optional comparison failures keep the complete PR diff usable.
+///
+/// The local snapshot records last-seen bookkeeping, independently of the
+/// submitted GitHub review that determines the incremental diff's baseline.
+pub(crate) fn fetch_item_scoped(
+    github: Arc<dyn github::GitHubClient>,
+    source: &Source,
+    mode: ViewMode,
+    file_ix: usize,
+    since_review: bool,
+) -> anyhow::Result<Loaded> {
+    let mut review_changes = github::ReviewChanges::default();
+    let mut review_base = None;
+    let mut review_base_files = None;
     let (meta, patch, comments, discussion, commits, viewed, snapshot) = match source {
         Source::Pr(loc) => {
             let meta_client = github.clone();
@@ -109,6 +125,26 @@ pub(crate) fn fetch_item(
                     "viewed-state fetch panicked".into(),
                 ))
             });
+            review_changes = github.review_changes(loc, &meta.head_ref_oid).unwrap_or_else(|error| {
+                github::ReviewChanges::Unavailable(format!(
+                    "Couldn't verify changes since your last review: {error}. View all changes instead."
+                ))
+            });
+            let mut patch = patch;
+            if since_review {
+                if let Some(review) = review_changes.baseline() {
+                    match github.comparison_patch(loc, &review.commit, &meta.head_ref_oid, &meta.base_ref_oid) {
+                        Ok(comparison) => {
+                            review_base = Some(review.commit.clone());
+                            patch = comparison.patch;
+                            review_base_files = comparison.base_files.map(Arc::new);
+                        }
+                        Err(error) => review_changes = github::ReviewChanges::Unavailable(format!(
+                            "Couldn't load changes since your last review: {error}. Showing all changes instead."
+                        )),
+                    }
+                }
+            }
             let snapshot = discussion_snapshot(loc, &meta, &discussion, commits.as_ref())?;
             (
                 LoadedMeta::Pr(meta),
@@ -128,6 +164,12 @@ pub(crate) fn fetch_item(
             (LoadedMeta::Local(src), patch, None, None, None, None, None)
         }
     };
+    let mut comments = comments;
+    if review_base.is_some() {
+        if let Some(index) = &mut comments {
+            index.hide_left_anchors();
+        }
+    }
     let diff = diff_core::parse_patch(&patch);
     let built_rows = build_rows(RowsView {
         diff: &diff,
@@ -149,6 +191,9 @@ pub(crate) fn fetch_item(
         comments,
         discussion,
         commits,
+        review_changes,
+        review_base,
+        review_base_files,
         viewed,
         snapshot,
     })

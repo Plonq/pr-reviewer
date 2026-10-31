@@ -2070,6 +2070,7 @@ dependencies = [
 name = "github"
 version = "0.1.0"
 dependencies = [
+ "diff-core",
  "serde",
  "serde_json",
  "sha2 0.10.9",

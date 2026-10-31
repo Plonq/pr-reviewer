@@ -92,6 +92,25 @@ pub(crate) struct CommentIndex {
 }
 
 impl CommentIndex {
+    /// GitHub's current LEFT coordinates refer to the full PR's base, not a
+    /// previous review commit. Retain counts/history, but never paint these at
+    /// coincidentally matching incremental-diff line numbers.
+    pub(crate) fn hide_left_anchors(&mut self) {
+        let threads = std::mem::take(&mut self.threads);
+        let mut all: Vec<_> = threads
+            .into_values()
+            .flat_map(|anchors| anchors.into_values().flatten())
+            .chain(std::mem::take(&mut self.unanchored))
+            .collect();
+        for thread in &mut all {
+            if thread.root.side == CommentSide::Left {
+                thread.root.line = None;
+                thread.root.start_line = None;
+            }
+        }
+        *self = index_threads(all);
+    }
+
     /// Replace only the pending-review layer. GitHub may also include these
     /// ids in its comments response; the session's copy wins without duplicates.
     pub(crate) fn replace_pending(&mut self, pending: Option<&github::PendingReview>) {
