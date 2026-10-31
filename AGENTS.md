@@ -1,15 +1,13 @@
 # Project Overview
 
-This is a tool for reviewing GitHub pull requests, tailored to a specific workflow. It is personal software, made by and for a single developer to streamline doing code reviews. Its architecture revolves around one flow: view pending review requests, and review them (view diff, make comments, submit review).
+This is personal software for reviewing a PR. It revolves around a single workflow: view pending review requests, and review them. Every part of it supports one goal: make it as easy as possible to understand PRs and perform good reviews. It is laser focused on one job, and actively avoids being general-purpose.
 
-Its purpose is to improve upon the GitHub UI in the following ways. These points are the whole reason it was built:
+This was built to be better than GitHub's web UI in two important ways:
 
-1. Fast to navigate the PR/diff (switch files, etc)
-2. Shows whole files, one at a time, providing the necessary context for a good review
+1. Speed of navigating the diff
+2. Viewing full files, to provide proper context
 
-The UI/UX design philosophy is:
+## Guiding Principles
 
-- Optimised for both mouse and keyboard
-- Only displays the information required, no more
-- Only has the features that are needed, no more
-- Clean, easy on the eyes, but information dense where it helps
+- Only the features required, no more
+- Information dense, but nothing that doesn't further the goal
