@@ -24,6 +24,7 @@ gpui-component = "=0.8.1"
 gpui-kit-assets = "=0.8.1"
 lsp-types = "=0.97.0"
 fuzzy-matcher = "0.3"
+unicode-segmentation = "1"
 # GitHub's emoji shortcode table (gemoji), for the conversation pane's
 # `:rocket:` → 🚀 pipe.
 emojis = "0.9"

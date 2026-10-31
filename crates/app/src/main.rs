@@ -63,7 +63,9 @@ use rows::{
     build_rows, comment_anchor, cursor_anchor, is_comment_row, now_unix, nth_noncomment_row,
     render_row, widest_row_ix, BuiltRows, FileUpgrade, Row, RowOptions, RowsView, ViewMode,
 };
-use selection::{row_selection_range, selection_text, RowCol, SelSide, Selection};
+use selection::{
+    row_selection_range, selection_text, word_selection, RowCol, SelSide, Selection, SelectionDrag,
+};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -1715,7 +1717,7 @@ pub(crate) struct ReviewApp {
     next_id: u64,
     /// Where the current selection drag started (side locked at mouse-down);
     /// None when no drag is in progress.
-    drag_anchor: Option<(SelSide, RowCol)>,
+    drag_anchor: Option<SelectionDrag>,
     /// `m` toggles the minimap column for every item.
     minimap_visible: bool,
     /// A minimap scrub drag is in progress (mouse went down on the minimap).
@@ -2380,6 +2382,43 @@ impl ReviewApp {
         let (side, row, text_x) = self.pane_text_hit(position, locked)?;
         let col = (f32::from(text_x) / f32::from(char_width)).round().max(0.) as usize;
         Some((side, RowCol { row, col }))
+    }
+
+    /// Word selection targets the glyph under the pointer (floor), whereas
+    /// character drags target the nearest caret (round). Ignore gutters and the
+    /// blank tail rather than selecting a word on the clamped first/last row.
+    fn pane_word_selection(
+        &self,
+        position: Point<Pixels>,
+        char_width: Pixels,
+    ) -> Option<Selection> {
+        let data = self.active_data()?;
+        let scroll = data.scroll.0.borrow();
+        let bounds = scroll.base_handle.bounds();
+        let y = f32::from(position.y - bounds.top() - scroll.base_handle.offset().y);
+        if !bounds.contains(&position) || y < 0. || y >= data.rows.len() as f32 * row_height() {
+            return None;
+        }
+        let (side, row, text_x) = self.pane_text_hit(position, None)?;
+        if text_x < px(0.) {
+            return None;
+        }
+        if data.mode == ViewMode::Split {
+            // Split gutters stay fixed while the code scrolls horizontally.
+            let half = (bounds.size.width - px(SPLIT_DIVIDER)) / 2.;
+            let cell_x = position.x
+                - bounds.left()
+                - if side == SelSide::Right {
+                    half + px(SPLIT_DIVIDER)
+                } else {
+                    px(0.)
+                };
+            if cell_x < px(SPLIT_GUTTER) || cell_x >= half {
+                return None;
+            }
+        }
+        let col = (f32::from(text_x) / f32::from(char_width)).floor() as usize;
+        word_selection(&data.rows, side, RowCol { row, col })
     }
 
     fn pane_text_hit(
@@ -5652,12 +5691,23 @@ impl ReviewApp {
                                         this.extend_comment_selection(side, head, window, cx);
                                         return;
                                     }
-                                    this.drag_anchor =
-                                        this.pane_hit(event.position, char_width, None);
+                                    let hit = this.pane_hit(event.position, char_width, None);
+                                    let selection = if event.click_count == 2 {
+                                        this.pane_word_selection(event.position, char_width)
+                                    } else {
+                                        None
+                                    };
+                                    this.drag_anchor = if event.click_count == 2 {
+                                        selection.map(SelectionDrag::Word)
+                                    } else {
+                                        hit.map(|(side, anchor)| SelectionDrag::Character {
+                                            side,
+                                            anchor,
+                                        })
+                                    };
                                     // A plain click also moves the keyboard cursor:
                                     // `C` and `n`/`p` follow the line the reviewer
                                     // last touched, mouse or keyboard alike.
-                                    let hit = this.drag_anchor;
                                     if let Some(data) = this.active_data_mut() {
                                         let previous = (data.cursor, data.cursor_side);
                                         if let Some((side, hit)) = hit {
@@ -5666,8 +5716,9 @@ impl ReviewApp {
                                         }
                                         // Repaint even without a text selection: the
                                         // gutter cue follows a plain click immediately.
-                                        let cleared_selection = data.selection.take().is_some();
-                                        if cleared_selection
+                                        let selection_changed = data.selection != selection;
+                                        data.selection = selection;
+                                        if selection_changed
                                             || previous != (data.cursor, data.cursor_side)
                                         {
                                             cx.notify();
@@ -5687,21 +5738,31 @@ impl ReviewApp {
                                         this.minimap_scrub_to(event.position, cx);
                                         return;
                                     }
-                                    let Some((side, anchor)) = this.drag_anchor else {
+                                    let Some(drag) = this.drag_anchor else {
                                         return;
                                     };
                                     let char_width = this.char_width(window);
-                                    let Some((_, head)) =
-                                        this.pane_hit(event.position, char_width, Some(side))
-                                    else {
+                                    let hit = match drag {
+                                        SelectionDrag::Character { .. } => this.pane_hit(
+                                            event.position,
+                                            char_width,
+                                            Some(drag.side()),
+                                        ),
+                                        SelectionDrag::Word(_) => this
+                                            .pane_text_hit(event.position, Some(drag.side()))
+                                            .map(|(side, row, x)| {
+                                                let col = (f32::from(x) / f32::from(char_width))
+                                                    .floor()
+                                                    .max(0.)
+                                                    as usize;
+                                                (side, RowCol { row, col })
+                                            }),
+                                    };
+                                    let Some((_, head)) = hit else {
                                         return;
                                     };
-                                    let selection = (head != anchor).then_some(Selection {
-                                        side,
-                                        anchor,
-                                        head,
-                                    });
                                     if let Some(data) = this.active_data_mut() {
+                                        let selection = drag.selection(&data.rows, head);
                                         if data.selection != selection {
                                             data.selection = selection;
                                             cx.notify();
@@ -15034,6 +15095,157 @@ mod tests {
                         assert!(app.composer.is_none());
                     });
                 }
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn double_click_selects_and_copies_words_through_the_diff_mouse_handlers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, FakePr::with_threads(Vec::new()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = range_pr_item();
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old_word héllo end\n+new_word héllo end\n");
+        install_item(&app, item, cx);
+        for (mode, side, row, expected) in [
+            (ViewMode::Unified, SelSide::Unified, 1, "old_word"),
+            (ViewMode::Unified, SelSide::Unified, 2, "new_word"),
+            (ViewMode::Split, SelSide::Left, 1, "old_word"),
+            (ViewMode::Split, SelSide::Right, 1, "new_word"),
+        ] {
+            vcx.update(|_, cx| {
+                app.update(cx, |this, cx| {
+                    let data = this.active_data_mut().unwrap();
+                    data.mode = mode;
+                    data.set_rows(data.row_build());
+                    cx.notify();
+                })
+            });
+            vcx.run_until_parked();
+            let at = |col: f32, vcx: &mut gpui::VisualTestContext| {
+                vcx.update(|window, cx| {
+                    app.update(cx, |this, _| {
+                        let width = this.char_width(window);
+                        let data = this.active_data().unwrap();
+                        let scroll = data.scroll.0.borrow();
+                        let bounds = scroll.base_handle.bounds();
+                        let gutter = if mode == ViewMode::Unified {
+                            UNIFIED_GUTTER
+                        } else {
+                            SPLIT_GUTTER
+                        };
+                        let half = if side == SelSide::Right {
+                            (bounds.size.width - px(SPLIT_DIVIDER)) / 2. + px(SPLIT_DIVIDER)
+                        } else {
+                            px(0.)
+                        };
+                        point(
+                            bounds.left()
+                                + half
+                                + px(gutter)
+                                + scroll.base_handle.offset().x
+                                + width * col,
+                            bounds.top()
+                                + scroll.base_handle.offset().y
+                                + px((row as f32 + 0.5) * row_height()),
+                        )
+                    })
+                })
+            };
+            // The right half of the last glyph must still select its word,
+            // rather than rounding to the following space/caret.
+            for (col, expected) in [(7.8, expected), (13.8, "héllo")] {
+                let position = at(col, &mut vcx);
+                vcx.simulate_mouse_down(position, MouseButton::Left, gpui::Modifiers::default());
+                vcx.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
+                vcx.simulate_event(MouseDownEvent {
+                    position,
+                    button: MouseButton::Left,
+                    click_count: 2,
+                    ..Default::default()
+                });
+                // Even a small held-button movement must preserve whole-word selection.
+                vcx.simulate_mouse_move(
+                    position,
+                    Some(MouseButton::Left),
+                    gpui::Modifiers::default(),
+                );
+                vcx.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
+                vcx.update(|window, cx| {
+                    let this = app.read(cx);
+                    let data = this.active_data().unwrap();
+                    let selection = data.selection.expect("double click selects a word");
+                    assert_eq!(selection.side, side);
+                    assert_eq!(selection_text(&selection, &data.rows), expected);
+                    assert_eq!((data.cursor, data.cursor_side), (row, Some(side)));
+                    assert!(this.drag_anchor.is_none());
+                    assert!(this.composer.is_none());
+                    assert!(this.focus_handle.is_focused(window));
+                });
+                vcx.dispatch_action(CopySelection);
+                vcx.update(|_, cx| {
+                    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), expected);
+                });
+            }
+            let start = at(2., &mut vcx);
+            let end = at(15., &mut vcx);
+            vcx.simulate_event(MouseDownEvent {
+                position: start,
+                button: MouseButton::Left,
+                click_count: 2,
+                ..Default::default()
+            });
+            vcx.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::default());
+            vcx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+            vcx.update(|_, cx| {
+                let data = app.read(cx).active_data().unwrap();
+                let selection = data.selection.unwrap();
+                assert_eq!(selection.side, side);
+                assert_eq!(
+                    selection_text(&selection, &data.rows),
+                    format!("{expected} héllo end")
+                );
+            });
+            // Gutters, the blank area after code, and the virtual tail do not
+            // select the first/last word merely because caret hits are clamped.
+            let gutter = at(-1., &mut vcx);
+            let after_text = at(40., &mut vcx);
+            let mut tail = at(2., &mut vcx);
+            tail.y += px(5. * row_height());
+            for position in [gutter, after_text, tail] {
+                vcx.simulate_event(MouseDownEvent {
+                    position,
+                    button: MouseButton::Left,
+                    click_count: 2,
+                    ..Default::default()
+                });
+                vcx.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
+                vcx.update(|_, cx| {
+                    assert!(app.read(cx).active_data().unwrap().selection.is_none());
+                });
+            }
+            if mode == ViewMode::Split {
+                vcx.update(|window, cx| {
+                    app.update(cx, |this, _| {
+                        let width = this.char_width(window);
+                        let scroll = this.active_data().unwrap().scroll.clone();
+                        let previous = scroll.0.borrow().base_handle.offset();
+                        scroll
+                            .0
+                            .borrow_mut()
+                            .base_handle
+                            .set_offset(point(-width * 4., previous.y));
+                        assert!(
+                            this.pane_word_selection(gutter, width).is_none(),
+                            "a frozen gutter is not code even when scrolled"
+                        );
+                        scroll.0.borrow_mut().base_handle.set_offset(previous);
+                    })
+                });
             }
         }
     }

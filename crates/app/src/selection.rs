@@ -1,6 +1,7 @@
 //! Selection state over the diff rows: drag anchoring, per-row range math, and copy text.
 
 use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::rows::Row;
 
@@ -39,6 +40,112 @@ impl Selection {
             (self.head, self.anchor)
         }
     }
+}
+
+/// A drag retains its original point or word, even when the pointer reverses.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SelectionDrag {
+    Character { side: SelSide, anchor: RowCol },
+    Word(Selection),
+}
+
+impl SelectionDrag {
+    pub(crate) fn side(self) -> SelSide {
+        match self {
+            Self::Character { side, .. } => side,
+            Self::Word(selection) => selection.side,
+        }
+    }
+
+    pub(crate) fn selection(self, rows: &[Row], head: RowCol) -> Option<Selection> {
+        match self {
+            Self::Character { side, anchor } => {
+                (head != anchor).then_some(Selection { side, anchor, head })
+            }
+            Self::Word(initial) => {
+                // A drag can move past a line's end or through non-text rows.
+                let col = rows
+                    .get(head.row)
+                    .and_then(|row| row_side_text(row, initial.side))
+                    .map(|text| head.col.min(text.chars().count().saturating_sub(1)))
+                    .unwrap_or(head.col);
+                let word = word_selection(rows, initial.side, RowCol { col, ..head });
+                let (start, end) = word.map(|word| word.ordered()).unwrap_or((head, head));
+                Some(if head < initial.anchor {
+                    Selection {
+                        anchor: initial.head,
+                        head: start,
+                        ..initial
+                    }
+                } else {
+                    Selection {
+                        head: end.max(initial.head),
+                        ..initial
+                    }
+                })
+            }
+        }
+    }
+}
+
+/// Select the Unicode word-boundary segment under a character, not the nearest
+/// caret. Periods always delimit words; punctuation and whitespace are selectable
+/// too. Wrapped fragments are joined before finding boundaries, so a visual line
+/// break never splits a word.
+pub(crate) fn word_selection(rows: &[Row], side: SelSide, hit: RowCol) -> Option<Selection> {
+    let text = row_side_text(rows.get(hit.row)?, side)?;
+    if hit.col >= text.chars().count() {
+        return None;
+    }
+    let mut first = hit.row;
+    while first > 0 && matches!(rows[first], Row::Continuation(_)) {
+        first -= 1;
+    }
+    let mut last = hit.row + 1;
+    while last < rows.len() && matches!(rows[last], Row::Continuation(_)) {
+        last += 1;
+    }
+    let mut text = String::new();
+    let mut hit_col = hit.col;
+    let mut fragments = Vec::new();
+    for (ix, row) in rows.iter().enumerate().take(last).skip(first) {
+        if let Some(fragment) = row_side_text(row, side) {
+            let len = fragment.chars().count();
+            if ix < hit.row {
+                hit_col += len;
+            }
+            fragments.push((ix, len));
+            text.push_str(fragment);
+        }
+    }
+    let mut start = 0;
+    // Unicode word boundaries retain internal periods in e.g. `foo.bar` and
+    // `3.14`. Split after periods first so each becomes trailing punctuation,
+    // which Unicode segmentation separates from the preceding word.
+    for segment in text
+        .split_inclusive('.')
+        .flat_map(|part| part.split_word_bounds())
+    {
+        let end = start + segment.chars().count();
+        if hit_col < end {
+            let point = |mut col: usize, is_end: bool| {
+                for &(row, len) in &fragments {
+                    if col < len || (is_end && col == len) {
+                        return RowCol { row, col };
+                    }
+                    col -= len;
+                }
+                unreachable!("word boundary is within the source line")
+            };
+            return Some(Selection {
+                side,
+                anchor: point(start, false),
+                head: point(end, true),
+            });
+        }
+        start = end;
+    }
+    None
 }
 
 /// The text a selection on `side` runs through for this row, if any. Rows
@@ -154,6 +261,129 @@ mod tests {
                 col: head.1,
             },
         }
+    }
+
+    #[test]
+    fn words_use_unicode_boundaries_and_character_columns() {
+        for (text, ranges) in [
+            ("foo_bar42(x)", vec![0..9, 9..10, 10..11, 11..12]),
+            ("foo.bar", vec![0..3, 3..4, 4..7]),
+            ("3.14", vec![0..1, 1..2, 2..4]),
+            (".foo..bar.", vec![0..1, 1..4, 4..5, 5..6, 6..9, 9..10]),
+            ("héllo.world", vec![0..5, 5..6, 6..11]),
+            ("héllo 世界", vec![0..5, 5..6, 6..7, 7..8]),
+            ("cafe\u{301} ok", vec![0..5, 5..6, 6..8]),
+            ("  one\t two", vec![0..2, 2..5, 5..6, 6..7, 7..10]),
+        ] {
+            let rows = vec![line(text)];
+            for range in ranges {
+                for col in range.clone() {
+                    let word =
+                        word_selection(&rows, SelSide::Unified, RowCol { row: 0, col }).unwrap();
+                    assert_eq!(
+                        word,
+                        sel(SelSide::Unified, (0, range.start), (0, range.end)),
+                        "{text:?}, col {col}"
+                    );
+                    let bytes = char_to_byte(text, range.start)..char_to_byte(text, range.end);
+                    assert_eq!(selection_text(&word, &rows), &text[bytes]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn periods_delimit_wrapped_words_and_word_drag_endpoints() {
+        let rows = vec![line("foo.ba"), Row::Continuation(Box::new(line("r.baz")))];
+        let bar = word_selection(&rows, SelSide::Unified, RowCol { row: 1, col: 0 }).unwrap();
+        assert_eq!(bar, sel(SelSide::Unified, (0, 4), (1, 1)));
+        assert_eq!(selection_text(&bar, &rows), "bar");
+        let period = word_selection(&rows, SelSide::Unified, RowCol { row: 1, col: 1 }).unwrap();
+        assert_eq!(selection_text(&period, &rows), ".");
+        let foo = word_selection(&rows, SelSide::Unified, RowCol { row: 0, col: 0 }).unwrap();
+        let dragged = SelectionDrag::Word(foo)
+            .selection(&rows, RowCol { row: 0, col: 4 })
+            .unwrap();
+        assert_eq!(selection_text(&dragged, &rows), "foo.bar");
+    }
+
+    #[test]
+    fn words_ignore_non_text_empty_and_out_of_range_hits() {
+        let rows = vec![
+            line(""),
+            line("word"),
+            Row::Binary,
+            split(None, Some("right")),
+        ];
+        for (side, row, col) in [
+            (SelSide::Unified, 0, 0),
+            (SelSide::Unified, 1, 4),
+            (SelSide::Unified, 1, usize::MAX),
+            (SelSide::Unified, 2, 0),
+            (SelSide::Unified, 99, 0),
+            (SelSide::Left, 3, 0),
+        ] {
+            assert!(word_selection(&rows, side, RowCol { row, col }).is_none());
+        }
+        let word = word_selection(&rows, SelSide::Right, RowCol { row: 3, col: 2 }).unwrap();
+        assert_eq!(selection_text(&word, &rows), "right");
+    }
+
+    #[test]
+    fn words_span_wrapped_fragments_but_not_source_lines_or_split_sides() {
+        for side in [SelSide::Unified, SelSide::Left, SelSide::Right] {
+            let row = |text: &str| match side {
+                SelSide::Unified => line(text),
+                SelSide::Left => split(Some(text), Some("other")),
+                SelSide::Right => split(Some("other"), Some(text)),
+            };
+            let rows = vec![
+                row("a hel"),
+                Row::Continuation(Box::new(row("lo_w"))),
+                Row::Continuation(Box::new(row("orld!"))),
+                row("next"),
+            ];
+            for (row, col) in [(0, 3), (1, 0), (2, 2)] {
+                let word = word_selection(&rows, side, RowCol { row, col }).unwrap();
+                assert_eq!(word, sel(side, (0, 2), (2, 4)));
+                assert_eq!(selection_text(&word, &rows), "hello_world");
+            }
+            let word = word_selection(&rows, side, RowCol { row: 2, col: 4 }).unwrap();
+            assert_eq!(selection_text(&word, &rows), "!");
+        }
+        // Exact wrap boundaries: start on the next fragment, end on the prior one.
+        let rows = vec![
+            line("one "),
+            Row::Continuation(Box::new(line("two "))),
+            Row::Continuation(Box::new(line("three"))),
+        ];
+        let word = word_selection(&rows, SelSide::Unified, RowCol { row: 1, col: 0 }).unwrap();
+        assert_eq!(word, sel(SelSide::Unified, (1, 0), (1, 3)));
+    }
+
+    #[test]
+    fn word_drags_extend_in_whole_words_and_retain_the_initial_word() {
+        let rows = vec![line("one two three"), Row::Binary, line("four")];
+        let initial = word_selection(&rows, SelSide::Unified, RowCol { row: 0, col: 5 }).unwrap();
+        let drag = SelectionDrag::Word(initial);
+        for (row, col, expected) in [
+            (0, 5, "two"),
+            (0, 0, "one two"),
+            (0, 11, "two three"),
+            (0, 99, "two three"),
+            (2, 1, "two three\nfour"),
+            (0, 4, "two"),
+        ] {
+            let selection = drag.selection(&rows, RowCol { row, col }).unwrap();
+            assert_eq!(selection_text(&selection, &rows), expected);
+        }
+        let drag = SelectionDrag::Character {
+            side: SelSide::Unified,
+            anchor: RowCol { row: 0, col: 4 },
+        };
+        assert!(drag.selection(&rows, RowCol { row: 0, col: 4 }).is_none());
+        let selection = drag.selection(&rows, RowCol { row: 0, col: 5 }).unwrap();
+        assert_eq!(selection_text(&selection, &rows), "t");
     }
 
     #[test]
