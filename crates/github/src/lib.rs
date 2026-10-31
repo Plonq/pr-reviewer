@@ -160,6 +160,9 @@ pub struct QueueItem {
     /// Unknown for team-only requests or unavailable timeline data.
     #[serde(default)]
     pub review_requested_at: Option<String>,
+    /// The viewer's latest submitted review, used by the past-reviews queue.
+    #[serde(default)]
+    pub reviewed_at: Option<String>,
     /// When the PR last saw activity, ISO 8601 (GitHub's format).
     pub updated_at: String,
 }
@@ -170,6 +173,8 @@ pub enum QueuePreset {
     /// Every open PR where the viewer's review is requested — directly or
     /// via a team she belongs to; the one search qualifier covers both.
     ReviewRequested,
+    /// PRs the viewer has reviewed, including closed and merged PRs.
+    PastReviews,
 }
 
 /// How a queue search orders its results.
@@ -275,12 +280,28 @@ impl QueueSearch {
         }
     }
 
+    /// Switch queue views without losing the current filters or pending sort.
+    pub fn with_past_reviews(self, past: bool) -> Self {
+        Self {
+            preset: if past {
+                QueuePreset::PastReviews
+            } else {
+                QueuePreset::ReviewRequested
+            },
+            ..self
+        }
+    }
+
+    pub fn is_past_reviews(&self) -> bool {
+        self.preset == QueuePreset::PastReviews
+    }
+
     /// A search rebuilt from the parts it is made of: the filters that
     /// were active and the order they ran in.
     ///
     /// This is how a search survives a restart: the app remembers the
     /// chips and the sort, not the compiled string, so a rebuilt search is
-    /// the same search — the preset is the only one there is, and the
+    /// the same search. Restarts use the review-requested preset, and the
     /// filters land in kind order however they were restored.
     pub fn from_parts(filters: Vec<QueueFilter>, sort: QueueSort) -> Self {
         let mut search = Self {
@@ -332,8 +353,8 @@ impl QueueSearch {
         &self.filters
     }
 
-    /// How the search currently orders its results — the sort toggle's
-    /// state.
+    /// The current queue's sort preference. Past reviews always use latest
+    /// submission first, leaving this preference intact for switching back.
     pub fn ordering(&self) -> QueueSort {
         self.sort
     }
@@ -345,6 +366,7 @@ impl QueueSearch {
     pub fn query(&self) -> String {
         let mut query = match self.preset {
             QueuePreset::ReviewRequested => "is:pr is:open review-requested:@me".to_string(),
+            QueuePreset::PastReviews => "is:pr reviewed-by:@me".to_string(),
         };
         for filter in &self.filters {
             query.push(' ');
@@ -357,6 +379,9 @@ impl QueueSearch {
     /// GitHub cannot sort by review-request time; backends must apply
     /// [`Self::sort_items`] after enriching results with request timestamps.
     pub fn sort(&self) -> (&'static str, &'static str) {
+        if self.is_past_reviews() {
+            return ("reviewed", "desc");
+        }
         match self.sort {
             QueueSort::ReviewRequestedAscending => ("review-requested", "asc"),
             QueueSort::CreatedAscending => ("created", "asc"),
@@ -367,6 +392,15 @@ impl QueueSearch {
     /// sort last, with creation time breaking ties (also ordering unknowns).
     /// Activity time is deliberately never used as a proxy for either age.
     pub fn sort_items(&self, items: &mut [QueueItem]) {
+        if self.is_past_reviews() {
+            items.sort_by(|a, b| {
+                b.reviewed_at
+                    .cmp(&a.reviewed_at)
+                    .then_with(|| a.repository.cmp(&b.repository))
+                    .then_with(|| a.number.cmp(&b.number))
+            });
+            return;
+        }
         items.sort_by(|a, b| {
             let created = || a.created_at.cmp(&b.created_at);
             match self.sort {

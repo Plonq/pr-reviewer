@@ -388,14 +388,18 @@ pub(crate) fn queue_chips(
         .collect()
 }
 
-/// The PR's age and the age of the viewer's outstanding direct review request.
+/// The PR's age and the viewer's request (or past submission) age.
 /// Missing history and old caches stay unknown rather than using PR activity.
 fn queue_ages(pr: &github::QueueItem, now: i64) -> [String; 2] {
     [
-        (
-            "Requested",
-            pr.review_requested_at.as_deref().unwrap_or_default(),
-        ),
+        if let Some(reviewed_at) = pr.reviewed_at.as_deref() {
+            ("Reviewed", reviewed_at)
+        } else {
+            (
+                "Requested",
+                pr.review_requested_at.as_deref().unwrap_or_default(),
+            )
+        },
         ("Opened", pr.created_at.as_str()),
     ]
     .map(|(label, timestamp)| {
@@ -586,8 +590,9 @@ pub(crate) fn queue_row(
                                 .when(
                                     ix == 0
                                         && pr
-                                            .review_requested_at
+                                            .reviewed_at
                                             .as_deref()
+                                            .or(pr.review_requested_at.as_deref())
                                             .is_some_and(|timestamp| !timestamp.is_empty()),
                                     |age| age.text_color(theme::text(cx)),
                                 )
@@ -611,6 +616,18 @@ mod tests {
         pr.updated_at = "1970-01-04T11:59:00Z".into();
         let now = 3 * 86400 + 12 * 3600; // 1970-01-04T12:00:00Z
         assert_eq!(queue_ages(&pr, now), ["Requested 45m ago", "Opened 3d ago"]);
+    }
+
+    #[test]
+    fn past_review_ages_show_the_submission_not_the_request() {
+        let mut pr = queued(1, "acme/repo", "alice");
+        pr.reviewed_at = Some("1970-01-04T11:00:00Z".into());
+        pr.review_requested_at = Some("1970-01-04T11:45:00Z".into());
+        pr.created_at = "1970-01-01T12:00:00Z".into();
+        assert_eq!(
+            queue_ages(&pr, 3 * 86400 + 12 * 3600),
+            ["Reviewed 1h ago", "Opened 3d ago"]
+        );
     }
 
     #[test]
