@@ -4661,6 +4661,7 @@ impl ReviewApp {
                                     Hsla::from(theme::overlay0(cx)).opacity(0.35)
                                 }
                                 MinimapColor::Header => Hsla::from(theme::blue(cx)).opacity(0.5),
+                                MinimapColor::Comment => Hsla::from(theme::blue(cx)).opacity(0.8),
                             };
                             window.paint_quad(fill(
                                 Bounds::new(

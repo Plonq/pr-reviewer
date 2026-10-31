@@ -1,6 +1,7 @@
 //! The diff-pane minimap: display rows reduced to bars, downsampled into coalesced paint runs.
 
 use crate::rows::{Cell, LineKind, Row};
+use crate::threads::CommentSide;
 
 /// Width of the minimap column on the right edge of the diff pane.
 pub(crate) const MINIMAP_WIDTH: f32 = 100.0;
@@ -37,6 +38,10 @@ pub(crate) enum MinimapKind {
         right: bool,
     },
     Header,
+    /// A comment card fills its lane, independent of the comment's text length.
+    Comment {
+        lane: MinimapLane,
+    },
     Blank,
 }
 
@@ -50,18 +55,24 @@ fn line_frac(text: &str) -> f32 {
 pub(crate) fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
     rows.iter()
         .map(|row| match crate::rows::source_row(row) {
-            // Comment rows stay blank in the minimap: threads are short and
-            // already flagged by the file-header counts.
-            Row::Binary
-            | Row::Continuation(_)
-            | Row::Fold { .. }
-            | Row::LargeFile { .. }
-            | Row::CommentHeader { .. }
-            | Row::CommentEditor { .. }
-            | Row::CommentBody { .. }
-            | Row::CommentActions { .. } => MinimapRow {
-                kind: MinimapKind::Blank,
-                len_frac: 0.,
+            Row::Binary | Row::Continuation(_) | Row::Fold { .. } | Row::LargeFile { .. } => {
+                MinimapRow {
+                    kind: MinimapKind::Blank,
+                    len_frac: 0.,
+                }
+            }
+            Row::CommentHeader { half, .. }
+            | Row::CommentEditor { half }
+            | Row::CommentBody { half, .. }
+            | Row::CommentActions { half, .. } => MinimapRow {
+                kind: MinimapKind::Comment {
+                    lane: match half {
+                        None => MinimapLane::Full,
+                        Some(CommentSide::Left) => MinimapLane::Left,
+                        Some(CommentSide::Right) => MinimapLane::Right,
+                    },
+                },
+                len_frac: 1.,
             },
             Row::FileHeader { .. } => MinimapRow {
                 kind: MinimapKind::Header,
@@ -96,7 +107,7 @@ pub(crate) fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MinimapLane {
     /// Bar from the left edge across the full usable width (unified rows and
-    /// header/gap ticks).
+    /// header ticks and unified comment cards).
     Full,
     /// Left half-column (split view's left cell).
     Left,
@@ -112,12 +123,14 @@ pub(crate) enum MinimapColor {
     Removed,
     Context,
     Header,
+    Comment,
 }
 
 /// Downsample priority: when several rows share one pixel-row, the highest
 /// wins (Blank rows contribute nothing and lose to everything).
 fn minimap_priority(color: MinimapColor) -> u8 {
     match color {
+        MinimapColor::Comment => 6,
         MinimapColor::Removed => 5,
         MinimapColor::Added => 4,
         MinimapColor::Header => 3,
@@ -188,6 +201,7 @@ pub(crate) fn minimap_runs(rows: &[MinimapRow], pane_px: f32, tail_rows: usize) 
             match row.kind {
                 MinimapKind::Blank => {}
                 MinimapKind::Header => fold(MinimapLane::Full, MinimapColor::Header, 1.),
+                MinimapKind::Comment { lane } => fold(lane, MinimapColor::Comment, 1.),
                 MinimapKind::Context => {
                     fold(MinimapLane::Full, MinimapColor::Context, row.len_frac)
                 }
@@ -219,6 +233,12 @@ pub(crate) fn minimap_runs(rows: &[MinimapRow], pane_px: f32, tail_rows: usize) 
                     }
                 }
             }
+        }
+        // A full-width card must not be overpainted by split code sharing
+        // its downsampled slot. Half-width cards already paint above it.
+        if winner[MinimapLane::Full as usize] == Some(MinimapColor::Comment) {
+            winner[MinimapLane::Left as usize] = None;
+            winner[MinimapLane::Right as usize] = None;
         }
         for ix in 0..3 {
             let (Some(color), f) = (winner[ix], frac[ix]) else {
@@ -263,7 +283,7 @@ pub(crate) fn minimap_runs(rows: &[MinimapRow], pane_px: f32, tail_rows: usize) 
 mod tests {
     use super::*;
     use crate::rows::{build_rows, BuiltRows, RowOptions, RowsView, ViewMode};
-    use crate::test_util::{mrow, sample_diff};
+    use crate::test_util::{mrow, sample_comments, sample_diff};
     use crate::threads::COMMENT_WRAP_CHARS;
     use std::collections::HashMap;
 
@@ -347,6 +367,124 @@ mod tests {
                 right: true,
             }
         );
+    }
+
+    #[test]
+    fn minimap_comment_rows_fill_their_card_lane() {
+        let index = sample_comments();
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let BuiltRows { mut rows, .. } = build_rows(RowsView {
+                diff: &sample_diff(),
+                upgrades: &HashMap::new(),
+                comments: Some(&index),
+                options: RowOptions {
+                    mode,
+                    file_ix: 0,
+                    comments_visible: true,
+                    comment_wrap: COMMENT_WRAP_CHARS,
+                },
+            });
+            // Also cover in-place editors and collapsed headers, which can
+            // occupy just one row and still need a visible marker.
+            rows.extend([
+                Row::CommentEditor { half: None },
+                Row::CommentEditor {
+                    half: Some(CommentSide::Left),
+                },
+                Row::CommentEditor {
+                    half: Some(CommentSide::Right),
+                },
+                Row::CommentHeader {
+                    comment_id: 99,
+                    author: "alice".into(),
+                    when: "now".into(),
+                    timestamp: None,
+                    is_reply: false,
+                    half: None,
+                    top: true,
+                    collapsed: true,
+                },
+            ]);
+            let mm = minimap_rows(&rows);
+            assert_eq!(mm.len(), rows.len());
+            let mut count = 0;
+            for (row, reduced) in rows.iter().zip(&mm) {
+                let half = match row {
+                    Row::CommentHeader { half, .. }
+                    | Row::CommentBody { half, .. }
+                    | Row::CommentActions { half, .. }
+                    | Row::CommentEditor { half } => half,
+                    _ => continue,
+                };
+                let lane = match half {
+                    None => MinimapLane::Full,
+                    Some(CommentSide::Left) => MinimapLane::Left,
+                    Some(CommentSide::Right) => MinimapLane::Right,
+                };
+                assert_eq!(*reduced, mrow(MinimapKind::Comment { lane }, 1.));
+                count += 1;
+            }
+            assert!(count > 4, "fixture should include a thread and reply");
+        }
+    }
+
+    #[test]
+    fn minimap_comment_cards_coalesce_into_rectangles() {
+        for lane in [MinimapLane::Full, MinimapLane::Left, MinimapLane::Right] {
+            let rows = vec![
+                mrow(MinimapKind::Comment { lane }, 1.),
+                mrow(MinimapKind::Comment { lane }, 1.),
+                mrow(MinimapKind::Comment { lane }, 1.),
+                mrow(MinimapKind::Blank, 0.),
+                mrow(MinimapKind::Comment { lane }, 1.),
+            ];
+            let layout = minimap_runs(&rows, 100., 0);
+            assert_eq!(layout.slot_h, 3.);
+            let card = |start, end| MinimapRun {
+                start,
+                end,
+                lane,
+                color: MinimapColor::Comment,
+                frac: 1.,
+                tick: false,
+            };
+            assert_eq!(layout.runs, vec![card(0, 3), card(4, 5)]);
+        }
+    }
+
+    #[test]
+    fn minimap_comments_survive_downsampling_with_changes() {
+        for lane in [MinimapLane::Full, MinimapLane::Left, MinimapLane::Right] {
+            let rows = vec![
+                mrow(MinimapKind::Header, 1.),
+                mrow(MinimapKind::Removed, 0.5),
+                mrow(MinimapKind::Added, 0.5),
+                mrow(MinimapKind::Context, 0.5),
+                mrow(
+                    MinimapKind::SplitPair {
+                        left_frac: 0.5,
+                        right_frac: 0.5,
+                        left: true,
+                        right: true,
+                    },
+                    0.5,
+                ),
+                mrow(MinimapKind::Comment { lane }, 1.),
+            ];
+            let layout = minimap_runs(&rows, 1., 0);
+            assert_eq!((layout.slot_h, layout.group), (1., 6));
+            assert!(layout.runs.contains(&MinimapRun {
+                start: 0,
+                end: 1,
+                lane,
+                color: MinimapColor::Comment,
+                frac: 1.,
+                tick: false,
+            }));
+            if lane == MinimapLane::Full {
+                assert_eq!(layout.runs.len(), 1, "split code must not obscure the card");
+            }
+        }
     }
 
     #[test]
