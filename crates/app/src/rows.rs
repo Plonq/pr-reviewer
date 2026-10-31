@@ -404,7 +404,7 @@ impl FileUpgrade {
 /// are shared, so the count is the same on both sides and old numbers stay a
 /// constant offset from new ones across the gap. Handles git's zero-count
 /// convention (a zero-count side's start is the line *before* the hunk).
-fn gap_span(hunks: &[Hunk], gap_ix: usize, total_new: u32) -> (u32, u32, u32) {
+pub(crate) fn gap_span(hunks: &[Hunk], gap_ix: usize, total_new: u32) -> (u32, u32, u32) {
     let (old_lo, new_lo) = if gap_ix == 0 {
         (1, 1)
     } else {
