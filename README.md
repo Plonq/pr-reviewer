@@ -53,6 +53,9 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   when the network answers (works offline, too)
 - queue rows show when each PR was opened and when your review was last requested
   directly (team-only requests or unavailable history show an unknown request age)
+- queue ordering is oldest review request first by default; `s` toggles to oldest
+  PR creation first. Unknown request times sort last, with creation time breaking
+  ties. Filter chips narrow by organization or repository, not author.
 - enter (or click) opens a queue row straight into its changes view; `u` comes
   back to the queue with open PRs kept open behind the scenes
 - one file at a time: the whole file fills the pane — no `@@` markers, hunk
@@ -167,6 +170,7 @@ only by your account. Delete that directory to clear downloaded images.
 | `cmd-t` / `cmd-w` / `cmd-b` | quick-open input / close item / toggle sidebar |
 | `ctrl-tab` | cycle open items |
 | `j` / `k` + `enter` | queue: move the selection, open the selected PR |
+| `s` | queue: toggle review requested / created ordering (both ascending) |
 | `u` | back to the queue (open PRs stay open) |
 | `shift-cmd-left` / `shift-cmd-right` | conversation / changes |
 | `cmd-+` / `cmd--` / `cmd-0` | diff font size: bigger / smaller / reset |

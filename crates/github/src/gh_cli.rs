@@ -242,6 +242,7 @@ impl<P: GhProcess> GhCliClient<P> {
             };
             apply_enrichment(self, &mut items, &plan, stdout);
         }
+        search.sort_items(&mut items);
         Ok(items)
     }
 
@@ -1971,10 +1972,13 @@ fn apply_enrichment<P: GhProcess>(
 /// The exact `gh` invocation a queue search compiles to. The search string
 /// becomes one argument *per qualifier* — a single quoted string is
 /// keyword-searched, not qualifier-parsed — chip qualifiers included,
-/// followed by the sort spec. The query is owned (chips compile into it),
+/// followed by the supported server sort; logical ordering runs after
+/// enrichment. The query is owned (chips compile into it),
 /// so the arguments are too.
 fn search_prs_args(search: &QueueSearch) -> Vec<String> {
-    let (sort, order) = search.sort();
+    // GitHub has no review-request-time sort. Fetch oldest-created first
+    // for both modes, then apply the logical order after enrichment.
+    let (sort, order) = ("created", "asc");
     let mut args: Vec<String> = vec!["search".into(), "prs".into()];
     args.extend(search.query().split_whitespace().map(str::to_string));
     args.extend(
@@ -4264,7 +4268,7 @@ mod tests {
             .search_prs(&QueueSearch::review_requested())
             .expect("the recorded queue payload must parse");
         assert_eq!(queue.len(), 2);
-        let first = &queue[0];
+        let first = &queue[1];
         assert_eq!(first.number, 4781);
         assert_eq!(
             first.title,
@@ -4280,16 +4284,15 @@ mod tests {
         assert_eq!(first.labels.len(), 1);
         assert_eq!(first.labels[0].name, "api");
         assert_eq!(first.labels[0].color, "1D76DB");
-        let second = &queue[1];
+        let second = &queue[0];
         assert_eq!(second.repository, "octocat/Spoon-Knife");
         assert!(!second.is_draft);
         assert_eq!(second.created_at, "2026-10-10T09:00:00Z");
         assert_eq!(second.comments, 1);
         assert_eq!(second.labels.len(), 3);
         assert_eq!(second.labels[2].name, "migrations");
-        // Order preserved as recorded: the compiled sort (updated, desc)
-        // already ran server-side.
-        assert!(first.updated_at > second.updated_at);
+        // With both request times unknown, creation time orders the rows.
+        assert!(queue[0].created_at < queue[1].created_at);
         // Honest defaults until an enrichment answers for each PR.
         for item in &queue {
             assert_eq!(item.review_state, ReviewState::Awaiting);
@@ -4360,7 +4363,7 @@ mod tests {
         assert_eq!(
             calls[0].join(" "),
             "search prs is:pr is:open review-requested:@me \
-             --sort updated --order desc --limit 1000 \
+             --sort created --order asc --limit 1000 \
              --json number,title,author,repository,isDraft,createdAt,updatedAt,commentsCount,labels"
         );
     }
@@ -4378,8 +4381,7 @@ mod tests {
                 &QueueSearch::review_requested()
                     .filtered_by(QueueFilter::org("acme"))
                     .filtered_by(QueueFilter::repo("acme/widgets"))
-                    .filtered_by(QueueFilter::author("octocat"))
-                    .sorted_by(QueueSort::OldestUpdated),
+                    .sorted_by(QueueSort::CreatedAscending),
             )
             .expect("the recorded empty queue must parse");
         let calls = calls.lock().unwrap();
@@ -4387,7 +4389,7 @@ mod tests {
         assert_eq!(
             calls[0].join(" "),
             "search prs is:pr is:open review-requested:@me org:acme repo:acme/widgets \
-             author:octocat --sort updated --order asc --limit 1000 \
+             --sort created --order asc --limit 1000 \
              --json number,title,author,repository,isDraft,createdAt,updatedAt,commentsCount,labels"
         );
     }
@@ -4403,7 +4405,7 @@ mod tests {
             .expect("a search plus its enrichment both succeeded");
         // Each PR's answer landed on the PR that asked for it — alias
         // mapping is position-sensitive, and the whole point of the plan.
-        let first = &queue[0];
+        let first = &queue[1];
         assert_eq!(first.number, 4781);
         assert_eq!(first.additions, Some(151));
         assert_eq!(first.deletions, Some(30));
@@ -4413,7 +4415,7 @@ mod tests {
             first.author_avatar_url.as_deref(),
             Some("https://avatars.githubusercontent.com/u/583231?s=64&v=4")
         );
-        let second = &queue[1];
+        let second = &queue[0];
         assert_eq!(second.number, 4761);
         assert_eq!(second.additions, Some(1459));
         assert_eq!(second.deletions, Some(17));
@@ -4512,6 +4514,45 @@ mod tests {
     }
 
     #[test]
+    fn queue_order_uses_enriched_request_times_not_creation_or_activity() {
+        // The newer PR has the older request, despite the search returning
+        // it second. Sorting must happen after enrichment, not before it.
+        let mut hits: serde_json::Value = serde_json::from_str(QUEUE_SUCCESS).unwrap();
+        hits.as_array_mut().unwrap().reverse();
+        let mut enrichment: serde_json::Value = serde_json::from_str(ENRICH_SUCCESS).unwrap();
+        enrichment["data"]["viewer"] = serde_json::json!({"login": "octocat"});
+        for (repo, pr, time) in [
+            ("r0", "p4761", "2026-10-19T00:00:00Z"),
+            ("r1", "p4781", "2026-10-16T00:00:00Z"),
+        ] {
+            let source_repo = if pr == "p4781" { "r0" } else { "r1" };
+            let original: serde_json::Value = serde_json::from_str(ENRICH_SUCCESS).unwrap();
+            let mut answer = original["data"][source_repo][pr].clone();
+            let node = queue_request_node("octocat", time);
+            answer["reviewRequests"] = queue_requests(vec![node.clone()], None);
+            answer["timelineItems"] = queue_request_events(vec![node], None);
+            enrichment["data"][repo] = serde_json::json!({pr: answer});
+        }
+        for (sort, expected) in [
+            (QueueSort::ReviewRequestedAscending, vec![4781, 4761]),
+            (QueueSort::CreatedAscending, vec![4761, 4781]),
+        ] {
+            let (client, _) = rich_client(
+                ok(Some(0), &hits.to_string(), ""),
+                vec![ok(Some(0), &enrichment.to_string(), "")],
+            );
+            let queue = client
+                .search_prs(&QueueSearch::review_requested().sorted_by(sort))
+                .unwrap();
+            assert_eq!(
+                queue.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+                expected
+            );
+            assert!(queue.iter().all(|pr| pr.review_requested_at.is_some()));
+        }
+    }
+
+    #[test]
     fn queue_request_age_does_not_reuse_removed_or_completed_direct_requests() {
         let old = queue_request_node("octocat", "2026-10-16T00:00:00Z");
         let other = queue_request_node("hubot", "2026-10-19T00:00:00Z");
@@ -4526,8 +4567,9 @@ mod tests {
                 vec![ok(Some(0), &enrichment, "")],
             );
             let queue = client.search_prs(&QueueSearch::review_requested()).unwrap();
-            assert_eq!(queue[0].review_requested_at, None);
-            assert_eq!(queue[0].additions, Some(151));
+            let pr = queue.iter().find(|pr| pr.number == 4781).unwrap();
+            assert_eq!(pr.review_requested_at, None);
+            assert_eq!(pr.additions, Some(151));
         }
     }
 
@@ -4581,8 +4623,9 @@ mod tests {
                 vec![ok(Some(0), &enrichment, ""), ok(Some(1), "", NETWORK_DOWN)],
             );
             let queue = client.search_prs(&QueueSearch::review_requested()).unwrap();
-            assert_eq!(queue[0].review_requested_at, None);
-            assert_eq!(queue[0].additions, Some(151));
+            let pr = queue.iter().find(|pr| pr.number == 4781).unwrap();
+            assert_eq!(pr.review_requested_at, None);
+            assert_eq!(pr.additions, Some(151));
         }
     }
 
@@ -4623,7 +4666,7 @@ mod tests {
             .expect("the search succeeded, so the queue must come back");
         assert_eq!(queue.len(), 2);
         assert_eq!(
-            queue[0].title,
+            queue[1].title,
             "Add deactivation filters to the users manage list"
         );
         for item in &queue {
@@ -4761,14 +4804,12 @@ mod tests {
         let queue = GhCliClient::new()
             .search_prs(&QueueSearch::review_requested())
             .expect("gh on this machine is installed and signed in");
-        // The compiled sort holds on real data: most recently updated first
-        // (ISO 8601 timestamps in one format compare chronologically).
-        for pair in queue.windows(2) {
-            assert!(
-                pair[0].updated_at >= pair[1].updated_at,
-                "the queue must come back recently-updated first"
-            );
-        }
+        let mut sorted = queue.clone();
+        QueueSearch::review_requested().sort_items(&mut sorted);
+        assert_eq!(
+            queue, sorted,
+            "the queue must come back oldest request first"
+        );
         // The live enrichment answered: a non-empty queue comes back with
         // its check-sized fields on at least one row (all-null answers are
         // the degrade path, and would mean the live contract broke).
@@ -4785,7 +4826,7 @@ mod tests {
     /// --ignored` whenever the search contract is in question.
     #[test]
     #[ignore = "needs gh installed, authenticated, and network"]
-    fn the_real_backend_narrows_by_author() {
+    fn the_real_backend_narrows_by_repo() {
         let client = GhCliClient::new();
         let full = client
             .search_prs(&QueueSearch::review_requested())
@@ -4793,17 +4834,16 @@ mod tests {
         if full.len() < 2 {
             return; // nothing to narrow on this account today
         }
-        let author = full[0].author.clone();
+        let repository = full[0].repository.clone();
         let narrowed = client
             .search_prs(
-                &QueueSearch::review_requested().filtered_by(QueueFilter::author(author.clone())),
+                &QueueSearch::review_requested().filtered_by(QueueFilter::repo(repository.clone())),
             )
             .expect("the narrowed search must succeed like the full one");
-        assert!(narrowed.iter().all(|pr| pr.author == author));
+        assert!(narrowed.iter().all(|pr| pr.repository == repository));
         assert!(!narrowed.is_empty());
-        // Narrowing means fewer rows whenever the author isn't the whole
-        // queue.
-        if full.iter().any(|pr| pr.author != author) {
+        // Narrowing means fewer rows whenever the repository isn't the whole queue.
+        if full.iter().any(|pr| pr.repository != repository) {
             assert!(narrowed.len() < full.len());
         }
     }

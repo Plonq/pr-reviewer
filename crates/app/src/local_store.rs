@@ -439,8 +439,8 @@ mod tests {
         let cached = store.cached_queue();
         assert_eq!(cached.prs.len(), 1);
         assert_eq!(cached.search, "is:pr is:open review-requested:@me");
-        assert_eq!(cached.sort, "updated");
-        assert_eq!(cached.order, "desc");
+        assert_eq!(cached.sort, "review-requested");
+        assert_eq!(cached.order, "asc");
         assert!(cached.fetched_at_ms > 0);
         let items = store.cached_queue_items();
         assert_eq!(items, vec![item(4781)]);
@@ -453,8 +453,12 @@ mod tests {
         let store = LocalStore::in_memory();
         store.cache_queue(&QueueSearch::review_requested(), &[item(1)]);
         let cached = store.cached_queue();
-        assert!(cached.matches("is:pr is:open review-requested:@me", "updated", "desc"));
-        assert!(!cached.matches("is:pr is:open review-requested:@me", "updated", "asc"));
+        assert!(cached.matches(
+            "is:pr is:open review-requested:@me",
+            "review-requested",
+            "asc"
+        ));
+        assert!(!cached.matches("is:pr is:open review-requested:@me", "created", "asc"));
     }
 
     /// An empty store caches nothing and reads an empty queue — the app

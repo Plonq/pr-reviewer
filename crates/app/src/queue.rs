@@ -5,15 +5,69 @@ use crate::{theme, ReviewApp};
 use gpui::component::{avatar::Avatar, tag::Tag, Icon, IconName, Sizable as _};
 use gpui::{div, prelude::*, px, Hsla, Rgba, SharedString};
 
-/// Queue rows stay compact — avatar and author, title, badges, size, counts, chips,
-/// and stacked timestamps — with
-/// the uniform list keeping scroll math simple and rows virtualized.
-const QUEUE_ROW_HEIGHT: f32 = 36.0;
+/// A bounded reading surface, not an edge-to-edge spreadsheet. Below the
+/// minimum width the queue deliberately keeps its desktop column layout.
+pub(crate) const QUEUE_MAX_WIDTH: f32 = 1200.;
+pub(crate) const QUEUE_MIN_WIDTH: f32 = 1040.;
+const AUTHOR_WIDTH: f32 = 152.;
+const STATUS_WIDTH: f32 = 160.;
+const CHANGES_WIDTH: f32 = 112.;
+const AGE_WIDTH: f32 = 136.;
 
-/// The CI dot's paint, per verdict: green opens without fear, red means
+/// Shared geometry for the header and every row. Only the PR column grows;
+/// descriptive content wraps vertically instead of stealing another column's space.
+fn columns() -> gpui::Div {
+    div().w_full().flex().items_start().gap(px(20.)).px_3()
+}
+
+fn cell(width: f32) -> gpui::Div {
+    div()
+        .w(px(width))
+        .flex_shrink_0()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1()
+}
+
+pub(crate) fn queue_header(cx: &gpui::App) -> gpui::AnyElement {
+    columns()
+        .py_2()
+        .flex_shrink_0()
+        .border_b_1()
+        .border_color(theme::surface0(cx))
+        .text_size(px(11.))
+        .text_color(theme::subtext(cx))
+        .child(div().flex_1().min_w_0().child("Pull request"))
+        .child(
+            cell(AUTHOR_WIDTH)
+                .debug_selector(|| "queue-header-author".into())
+                .child("Author"),
+        )
+        .child(
+            cell(STATUS_WIDTH)
+                .debug_selector(|| "queue-header-status".into())
+                .child("Status"),
+        )
+        .child(
+            cell(CHANGES_WIDTH)
+                .debug_selector(|| "queue-header-changes".into())
+                .text_right()
+                .child("Changes"),
+        )
+        .child(
+            cell(AGE_WIDTH)
+                .debug_selector(|| "queue-header-age".into())
+                .text_right()
+                .child("Age"),
+        )
+        .into_any_element()
+}
+
+/// The CI verdict's paint: green opens without fear, red means
 /// expect breakage, yellow means checks still running, gray means no
 /// signal — no checks configured, or the enrichment couldn't see them.
-fn ci_dot_color(ci: github::CiState, cx: &gpui::App) -> Rgba {
+fn ci_color(ci: github::CiState, cx: &gpui::App) -> Rgba {
     match ci {
         github::CiState::Pass => theme::green(cx),
         github::CiState::Fail => theme::red(cx),
@@ -22,29 +76,74 @@ fn ci_dot_color(ci: github::CiState, cx: &gpui::App) -> Rgba {
     }
 }
 
-/// The review-state bit of a queue row: a green ✓ or red ✕ for the decided
-/// states, plain muted text for the queue's default "awaiting" posture —
-/// so the row never keeps quiet about where a PR stands.
-fn review_state_view(state: github::ReviewState, cx: &gpui::App) -> gpui::AnyElement {
-    let (icon, label, color) = match state {
-        github::ReviewState::Approved => {
-            (Some(IconName::CircleCheck), "approved", theme::green(cx))
-        }
-        github::ReviewState::ChangesRequested => {
-            (Some(IconName::CircleX), "changes requested", theme::red(cx))
-        }
-        github::ReviewState::Awaiting => (None, "awaiting review", theme::subtext(cx)),
-    };
+/// A CI verdict needs a label and a distinct icon, not color alone.
+fn ci_label(ci: github::CiState) -> (IconName, &'static str) {
+    match ci {
+        github::CiState::Pass => (IconName::CircleCheck, "CI passed"),
+        github::CiState::Fail => (IconName::CircleX, "CI failed"),
+        github::CiState::Pending => (IconName::LoaderCircle, "CI running"),
+        github::CiState::NoChecks => (IconName::Minus, "No CI signal"),
+    }
+}
+
+/// Both status lines reserve the same icon slot, even when there is no icon.
+/// Text stays aligned across CI/review lines and across every verdict.
+fn status_line(
+    kind: &'static str,
+    pos: usize,
+    icon: Option<gpui_kit_assets::IconName>,
+    label: &'static str,
+    color: Rgba,
+) -> gpui::Div {
     div()
-        .flex_shrink_0()
         .flex()
         .items_center()
         .gap_1()
-        .when_some(icon, |state, icon| {
-            state.child(Icon::new(icon).xsmall().text_color(color))
-        })
-        .child(div().text_size(px(12.)).text_color(color).child(label))
-        .into_any_element()
+        .text_color(color)
+        .child(
+            div()
+                .size(px(12.))
+                .flex_shrink_0()
+                .when_some(icon, |slot, icon| {
+                    slot.debug_selector(move || format!("queue-{kind}-icon-{pos}"))
+                        .child(Icon::new(icon).size(px(12.)))
+                }),
+        )
+        .child(
+            div()
+                .debug_selector(move || format!("queue-{kind}-label-{pos}"))
+                .flex_1()
+                .min_w_0()
+                .child(label),
+        )
+}
+
+fn ci_view(ci: github::CiState, pos: usize, cx: &gpui::App) -> impl IntoElement {
+    let (icon, label) = ci_label(ci);
+    status_line("ci", pos, Some(icon.into()), label, ci_color(ci, cx))
+}
+
+/// Review states use outlined icons like CI; an undecided review gets a
+/// muted open circle so every state has a visible marker.
+fn review_state_view(state: github::ReviewState, pos: usize, cx: &gpui::App) -> gpui::Div {
+    let (icon, label, color) = match state {
+        github::ReviewState::Approved => (
+            Some(gpui_kit_assets::IconName::CircleCheck),
+            "approved",
+            theme::green(cx),
+        ),
+        github::ReviewState::ChangesRequested => (
+            Some(gpui_kit_assets::IconName::CircleX),
+            "changes requested",
+            theme::red(cx),
+        ),
+        github::ReviewState::Awaiting => (
+            Some(gpui_kit_assets::IconName::Circle),
+            "awaiting review",
+            theme::subtext(cx),
+        ),
+    };
+    status_line("review", pos, icon, label, color)
 }
 
 /// The diff size at a glance — `+151 −30`, additions in green, deletions
@@ -58,18 +157,22 @@ fn size_view(
     let (additions, deletions) = (additions?, deletions?);
     Some(
         div()
-            .flex_shrink_0()
+            .w_full()
             .flex()
+            .flex_wrap()
+            .justify_end()
             .items_center()
             .gap_1()
             .text_size(px(12.))
             .child(
                 div()
+                    .max_w_full()
                     .text_color(theme::green(cx))
                     .child(SharedString::from(format!("+{additions}"))),
             )
             .child(
                 div()
+                    .max_w_full()
                     .text_color(theme::red(cx))
                     .child(SharedString::from(format!("−{deletions}"))),
             )
@@ -189,21 +292,9 @@ pub(crate) fn label_chip_colors(
     )
 }
 
-/// How many label chips a row shows before the rest collapse into a
-/// muted `+n` — enough to recognize, not enough to crowd the row.
-const QUEUE_LABELS_SHOWN: usize = 3;
-
-/// The chips to paint plus how many more labels exist: the budget the row
-/// gives labels before size and state start competing for space.
-fn label_budget(labels: &[github::QueueLabel]) -> (&[github::QueueLabel], usize) {
-    let shown = labels.len().min(QUEUE_LABELS_SHOWN);
-    (&labels[..shown], labels.len() - shown)
-}
-
 /// How many chips one filter dimension shows before its `+n` overflow: the
 /// chip bar stays a bounded strip over the queue however wide the day's
-/// contexts spread, the way a row's label budget keeps room for size and
-/// state. The active chip is pinned to the front of its group, so it can
+/// contexts spread. The active chip is pinned to the front of its group, so it can
 /// never fall off the capped end.
 const QUEUE_CHIPS_SHOWN: usize = 8;
 
@@ -229,7 +320,7 @@ pub(crate) struct QueueChipGroup {
 }
 
 /// The chip groups for the queue as it stands: one per dimension — org,
-/// repo, author — its values derived from the rows the queue is currently
+/// repo — its values derived from the rows the queue is currently
 /// showing, each carrying the rows it covers and whether it's active.
 /// Deriving from the current rows is what keeps the bar honest: a filtered
 /// queue offers the values it still contains — the active chip included,
@@ -243,8 +334,8 @@ pub(crate) fn queue_chips(
     prs: &[github::QueueItem],
     search: &github::QueueSearch,
 ) -> Vec<QueueChipGroup> {
-    use github::QueueFilterKind::{Author, Org, Repo};
-    [Org, Repo, Author]
+    use github::QueueFilterKind::{Org, Repo};
+    [Org, Repo]
         .into_iter()
         .filter_map(|kind| {
             let mut counts: std::collections::BTreeMap<&str, usize> =
@@ -257,7 +348,6 @@ pub(crate) fn queue_chips(
                         .map(|(owner, _)| owner)
                         .unwrap_or(pr.repository.as_str()),
                     Repo => pr.repository.as_str(),
-                    Author => pr.author.as_str(),
                 };
                 *counts.entry(value).or_insert(0) += 1;
             }
@@ -287,7 +377,6 @@ pub(crate) fn queue_chips(
                         filter: match kind {
                             Org => github::QueueFilter::org(*value),
                             Repo => github::QueueFilter::repo(*value),
-                            Author => github::QueueFilter::author(*value),
                         },
                         count: *count,
                         active: active.is_some_and(|f| f.value() == *value),
@@ -303,11 +392,11 @@ pub(crate) fn queue_chips(
 /// Missing history and old caches stay unknown rather than using PR activity.
 fn queue_ages(pr: &github::QueueItem, now: i64) -> [String; 2] {
     [
-        ("Opened", pr.created_at.as_str()),
         (
             "Requested",
             pr.review_requested_at.as_deref().unwrap_or_default(),
         ),
+        ("Opened", pr.created_at.as_str()),
     ]
     .map(|(label, timestamp)| {
         let age = if timestamp.is_empty() {
@@ -319,11 +408,9 @@ fn queue_ages(pr: &github::QueueItem, now: i64) -> [String; 2] {
     })
 }
 
-/// One review-queue row, carrying everything needed to triage without
-/// opening anything: CI verdict as a colored dot, author avatar and login, `#number`
-/// and title (drafts badged and muted), review state, diff size,
-/// conversation count, label chips, repository, and opened/requested ages. Clicking selects
-/// the row (opening from the queue arrives with the PR screen).
+/// Multi-line, variable-height table rows: every field keeps its column,
+/// while titles, identities and labels can grow without ellipses. All labels
+/// are shown for this prototype, inline with the repository and PR number.
 pub(crate) fn queue_row(
     pr: &github::QueueItem,
     pos: usize,
@@ -332,148 +419,181 @@ pub(crate) fn queue_row(
     entity: gpui::Entity<ReviewApp>,
     cx: &gpui::App,
 ) -> gpui::AnyElement {
-    let (labels, overflow) = label_budget(&pr.labels);
-    div()
+    columns()
         .id(("queue-row", pos))
         .debug_selector(move || format!("queue-row-{pos}"))
-        .mx_1()
-        .px_3()
-        .h(px(QUEUE_ROW_HEIGHT))
-        .rounded_md()
-        .flex()
-        .items_center()
-        .gap_2()
+        .relative()
+        .py_2()
+        .border_b_1()
+        .border_color(Hsla::from(theme::surface0(cx)).opacity(0.6))
+        .text_size(px(12.))
+        .line_height(px(18.))
+        .whitespace_normal()
         .cursor_pointer()
-        .when(selected, |row| row.bg(theme::surface0(cx)))
+        .when(selected, |row| {
+            row.bg(theme::surface0(cx)).child(
+                div()
+                    .debug_selector(move || format!("queue-selection-{pos}"))
+                    .absolute()
+                    .left_0()
+                    .top_2()
+                    .bottom_2()
+                    .w(px(2.))
+                    .rounded_full()
+                    .bg(theme::blue(cx)),
+            )
+        })
         .when(!selected, |row| {
-            row.hover(|style| style.bg(Hsla::from(theme::surface0(cx)).opacity(0.5)))
+            row.hover(|style| style.bg(Hsla::from(theme::surface0(cx)).opacity(0.3)))
         })
         .on_click(move |_, window, cx| {
             entity.update(cx, |this, cx| {
-                // Focus lands on the pane so the keyboard keeps working —
-                // j/k from a click still move the (new) selection.
                 window.focus(&this.focus_handle, cx);
                 this.queue_open(pos, cx);
             });
         })
-        // The CI verdict sits at the very edge: green rows open without
-        // fear, red ones expect breakage — the first thing to catch the eye.
-        .child(
-            div()
-                .flex_shrink_0()
-                .size(px(8.))
-                .rounded_full()
-                .bg(ci_dot_color(pr.ci, cx))
-                .when(pr.ci == github::CiState::Pending, |dot| {
-                    dot.border_1()
-                        .border_color(theme::yellow(cx))
-                        .bg(Hsla::from(theme::yellow(cx)).opacity(0.35))
-                }),
-        )
-        .child(
-            // `name` covers the slot the enrichment couldn't fill: the
-            // author's initials on a tinted circle instead of a face.
-            match &pr.author_avatar_url {
-                Some(url) => Avatar::new().src(url.clone()),
-                None => Avatar::new(),
-            }
-            .name(pr.author.clone())
-            .xsmall(),
-        )
-        .child(
-            div()
-                .debug_selector(move || format!("queue-author-{pos}"))
-                .flex_shrink_0()
-                .max_w(px(160.))
-                .truncate()
-                .text_color(theme::subtext(cx))
-                .child(SharedString::from(pr.author.clone())),
-        )
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_color(theme::subtext(cx))
-                .child(SharedString::from(format!("#{}", pr.number))),
-        )
         .child(
             div()
                 .flex_1()
                 .min_w_0()
-                .truncate()
-                // Drafts read muted with a badge beside them — visibly
-                // not-ready while still fully triageable.
-                .text_color(if pr.is_draft {
-                    theme::subtext(cx)
-                } else {
-                    theme::text(cx)
-                })
-                .child(SharedString::from(pr.title.clone())),
-        )
-        .when(pr.is_draft, |row| {
-            row.child(
-                div()
-                    .flex_shrink_0()
-                    .px_1p5()
-                    .text_size(px(10.))
-                    .rounded_sm()
-                    .bg(Hsla::from(theme::overlay0(cx)).opacity(0.2))
-                    .border_1()
-                    .border_color(Hsla::from(theme::overlay0(cx)).opacity(0.5))
-                    .text_color(theme::subtext(cx))
-                    .child("Draft"),
-            )
-        })
-        .child(review_state_view(pr.review_state, cx))
-        .when_some(size_view(pr.additions, pr.deletions, cx), |row, size| {
-            row.child(size)
-        })
-        .child(comment_count_view(pr.comments, cx))
-        .when(!labels.is_empty(), |row| {
-            row.child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .max_w(px(360.))
-                    .overflow_hidden()
-                    .children(labels.iter().map(|label| {
-                        let (bg, text, border) =
-                            label_chip_colors(label_color(&label.color), theme::is_light(cx), cx);
-                        Tag::custom(bg, text, border)
-                            .xsmall()
-                            .max_w(px(120.))
-                            .truncate()
-                            .child(SharedString::from(label.name.clone()))
-                    }))
-                    .when(overflow > 0, |chips| {
-                        chips.child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(theme::overlay0(cx))
-                                .child(SharedString::from(format!("+{overflow}"))),
-                        )
-                    }),
-            )
-        })
-        .child(
-            div()
-                .flex_shrink_0()
-                .max_w(px(220.))
-                .truncate()
-                .text_color(theme::blue(cx))
-                .child(SharedString::from(pr.repository.clone())),
-        )
-        .child(
-            div()
-                .flex_shrink_0()
                 .flex()
                 .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .debug_selector(move || format!("queue-title-{pos}"))
+                        .w_full()
+                        .text_size(px(14.))
+                        .line_height(px(20.))
+                        .text_color(if pr.is_draft {
+                            theme::subtext(cx)
+                        } else {
+                            theme::text(cx)
+                        })
+                        .child(SharedString::from(pr.title.clone())),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_x_2()
+                        .gap_y_1()
+                        .child(
+                            div()
+                                .debug_selector(move || format!("queue-repository-{pos}"))
+                                .flex_shrink_0()
+                                .max_w_full()
+                                .text_color(theme::subtext(cx))
+                                .child(SharedString::from(format!(
+                                    "{} · #{}",
+                                    pr.repository, pr.number
+                                ))),
+                        )
+                        .when(pr.is_draft, |metadata| {
+                            metadata.child(Tag::secondary().xsmall().child("Draft"))
+                        })
+                        .children(pr.labels.iter().enumerate().map(|(ix, label)| {
+                            let (bg, text, border) = label_chip_colors(
+                                label_color(&label.color),
+                                theme::is_light(cx),
+                                cx,
+                            );
+                            div()
+                                .debug_selector(move || format!("queue-label-{pos}-{ix}"))
+                                .max_w_full()
+                                .child(
+                                    Tag::custom(bg, text, border).xsmall().max_w_full().child(
+                                        div()
+                                            .min_w_0()
+                                            .child(SharedString::from(label.name.clone())),
+                                    ),
+                                )
+                        })),
+                ),
+        )
+        .child(
+            cell(AUTHOR_WIDTH)
+                .debug_selector(move || format!("queue-author-cell-{pos}"))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .child(
+                            div().flex_shrink_0().child(
+                                match &pr.author_avatar_url {
+                                    Some(url) => Avatar::new().src(url.clone()),
+                                    None => Avatar::new(),
+                                }
+                                .name(pr.author.clone())
+                                .xsmall(),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(move || format!("queue-author-{pos}"))
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(theme::subtext(cx))
+                                .child(SharedString::from(pr.author.clone())),
+                        ),
+                ),
+        )
+        .child(
+            cell(STATUS_WIDTH)
+                .debug_selector(move || format!("queue-status-{pos}"))
+                .child(ci_view(pr.ci, pos, cx))
+                .child(review_state_view(pr.review_state, pos, cx)),
+        )
+        .child(
+            cell(CHANGES_WIDTH)
+                .debug_selector(move || format!("queue-changes-{pos}"))
                 .items_end()
-                .text_size(px(10.))
-                .line_height(px(14.))
-                .text_color(theme::overlay0(cx))
-                .children(queue_ages(pr, now).map(|age| div().child(SharedString::from(age)))),
+                .child(
+                    div()
+                        .debug_selector(move || format!("queue-size-{pos}"))
+                        .w_full()
+                        .min_h(px(18.))
+                        .text_right()
+                        .when_some(size_view(pr.additions, pr.deletions, cx), |cell, size| {
+                            cell.child(size)
+                        })
+                        .when(pr.additions.is_none() || pr.deletions.is_none(), |cell| {
+                            cell.text_color(theme::overlay0(cx)).child("—")
+                        }),
+                )
+                .child(
+                    div()
+                        .debug_selector(move || format!("queue-comments-{pos}"))
+                        .child(comment_count_view(pr.comments, cx)),
+                ),
+        )
+        .child(
+            cell(AGE_WIDTH)
+                .debug_selector(move || format!("queue-age-{pos}"))
+                .text_right()
+                .text_color(theme::subtext(cx))
+                .children(
+                    queue_ages(pr, now)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ix, age)| {
+                            div()
+                                .debug_selector(move || format!("queue-age-{pos}-{ix}"))
+                                .w_full()
+                                .when(
+                                    ix == 0
+                                        && pr
+                                            .review_requested_at
+                                            .as_deref()
+                                            .is_some_and(|timestamp| !timestamp.is_empty()),
+                                    |age| age.text_color(theme::text(cx)),
+                                )
+                                .child(SharedString::from(age))
+                        }),
+                ),
         )
         .into_any_element()
 }
@@ -490,7 +610,7 @@ mod tests {
         pr.review_requested_at = Some("1970-01-04T11:15:00Z".into());
         pr.updated_at = "1970-01-04T11:59:00Z".into();
         let now = 3 * 86400 + 12 * 3600; // 1970-01-04T12:00:00Z
-        assert_eq!(queue_ages(&pr, now), ["Opened 3d ago", "Requested 45m ago"]);
+        assert_eq!(queue_ages(&pr, now), ["Requested 45m ago", "Opened 3d ago"]);
     }
 
     #[test]
@@ -500,7 +620,7 @@ mod tests {
         let now = 3 * 86400 + 12 * 3600;
         assert_eq!(
             queue_ages(&pr, now),
-            ["Opened unknown", "Requested unknown"]
+            ["Requested unknown", "Opened unknown"]
         );
     }
 
@@ -586,39 +706,36 @@ mod tests {
         assert_eq!(mix_hsla(red, Hsla { a: 0.0, ..yellow }, 0.5).a, 0.5);
     }
 
-    /// The label budget: three chips, then a count — the row keeps its
-    /// room for size and state no matter how many labels a PR carries.
     #[test]
-    fn queue_rows_show_capped_labels_with_an_overflow_count() {
-        let label = |name: &str| github::QueueLabel {
-            name: name.to_string(),
-            color: String::new(),
-        };
-        let few = vec![label("api"), label("frontend")];
-        assert_eq!(label_budget(&few).0.len(), 2);
-        assert_eq!(label_budget(&few).1, 0);
-        let many: Vec<_> = (0..5).map(|_| label("x")).collect();
-        let (shown, overflow) = label_budget(&many);
-        assert_eq!(shown.len(), QUEUE_LABELS_SHOWN);
-        assert_eq!(overflow, 2);
+    fn ci_verdicts_have_distinct_icons_and_explicit_labels() {
+        assert!(matches!(
+            ci_label(github::CiState::Pass),
+            (IconName::CircleCheck, "CI passed")
+        ));
+        assert!(matches!(
+            ci_label(github::CiState::Fail),
+            (IconName::CircleX, "CI failed")
+        ));
+        assert!(matches!(
+            ci_label(github::CiState::Pending),
+            (IconName::LoaderCircle, "CI running")
+        ));
+        assert!(matches!(
+            ci_label(github::CiState::NoChecks),
+            (IconName::Minus, "No CI signal")
+        ));
     }
 
-    /// The CI dot's palette wiring: each verdict paints its own color —
+    /// The CI palette wiring: each verdict paints its own color —
     /// the acceptance "green vs red" rides on exactly these mappings.
     #[gpui::test]
-    fn queue_ci_dots_paint_their_verdicts(cx: &mut gpui::TestAppContext) {
+    fn queue_ci_verdicts_paint_their_colors(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             gpui::init(cx);
-            assert_eq!(ci_dot_color(github::CiState::Pass, cx), theme::green(cx));
-            assert_eq!(ci_dot_color(github::CiState::Fail, cx), theme::red(cx));
-            assert_eq!(
-                ci_dot_color(github::CiState::Pending, cx),
-                theme::yellow(cx)
-            );
-            assert_eq!(
-                ci_dot_color(github::CiState::NoChecks, cx),
-                theme::overlay0(cx)
-            );
+            assert_eq!(ci_color(github::CiState::Pass, cx), theme::green(cx));
+            assert_eq!(ci_color(github::CiState::Fail, cx), theme::red(cx));
+            assert_eq!(ci_color(github::CiState::Pending, cx), theme::yellow(cx));
+            assert_eq!(ci_color(github::CiState::NoChecks, cx), theme::overlay0(cx));
         });
     }
 
@@ -656,15 +773,11 @@ mod tests {
             queued(4, "globex/thing", "bob"),
         ];
         let groups = queue_chips(&prs, &github::QueueSearch::review_requested());
-        // Orgs in kind order first, then repos, then authors — every
+        // Orgs in kind order first, then repos — every
         // dimension here has two or more values.
         assert_eq!(
             groups.iter().map(|group| group.kind).collect::<Vec<_>>(),
-            vec![
-                github::QueueFilterKind::Org,
-                github::QueueFilterKind::Repo,
-                github::QueueFilterKind::Author,
-            ]
+            vec![github::QueueFilterKind::Org, github::QueueFilterKind::Repo]
         );
         // Heaviest first, whatever the alphabetical order would say.
         let org = group(&groups, github::QueueFilterKind::Org);
@@ -686,13 +799,6 @@ mod tests {
             repo.chips[2].filter,
             github::QueueFilter::repo("globex/thing")
         );
-        // alice and bob both cover 2 rows: the tie breaks alphabetically.
-        let authors = group(&groups, github::QueueFilterKind::Author);
-        assert_eq!(
-            authors.chips[0].filter,
-            github::QueueFilter::author("alice")
-        );
-        assert_eq!(authors.chips[1].filter, github::QueueFilter::author("bob"));
         assert_eq!(groups.iter().map(|group| group.hidden).sum::<usize>(), 0);
     }
 
@@ -706,11 +812,9 @@ mod tests {
             queued(1, "acme/widgets", "alice"),
             queued(2, "acme/widgets", "bob"),
         ];
-        // One org, one repo, two authors: only the authors offer a choice.
+        // One org, one repo: different authors must not offer filters.
         let groups = queue_chips(&prs, &github::QueueSearch::review_requested());
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].kind, github::QueueFilterKind::Author);
-        assert_eq!(groups[0].chips.len(), 2);
+        assert!(groups.is_empty());
         // Active brings a single-value dimension back — marked, and the
         // only chip in its group.
         let search =
@@ -733,24 +837,26 @@ mod tests {
             queued(2, "acme/widgets", "alice"),
             queued(3, "acme/gadgets", "bob"),
         ];
-        let search =
-            github::QueueSearch::review_requested().filtered_by(github::QueueFilter::author("bob"));
+        let search = github::QueueSearch::review_requested()
+            .filtered_by(github::QueueFilter::repo("acme/gadgets"));
         let groups = queue_chips(&prs, &search);
-        let authors = group(&groups, github::QueueFilterKind::Author);
-        assert_eq!(authors.chips[0].filter, github::QueueFilter::author("bob"));
-        assert_eq!(authors.chips[0].count, 1);
-        assert!(authors.chips[0].active);
+        let repos = group(&groups, github::QueueFilterKind::Repo);
         assert_eq!(
-            authors.chips[1].filter,
-            github::QueueFilter::author("alice")
+            repos.chips[0].filter,
+            github::QueueFilter::repo("acme/gadgets")
         );
-        assert!(!authors.chips[1].active);
+        assert_eq!(repos.chips[0].count, 1);
+        assert!(repos.chips[0].active);
+        assert_eq!(
+            repos.chips[1].filter,
+            github::QueueFilter::repo("acme/widgets")
+        );
+        assert!(!repos.chips[1].active);
     }
 
     /// What the queue holds after narrowing to one repo: the bar offers
-    /// only that repo — the active chip, visible and marked. The org and
-    /// author dimensions now hold a single value each with nothing
-    /// active, so they leave the bar: nothing left to narrow.
+    /// only that repo — the active chip, visible and marked. The org
+    /// dimension has one value and nothing active, so it leaves the bar.
     #[test]
     fn queue_chips_derive_from_the_filtered_queue() {
         let prs = vec![queued(3, "acme/gadgets", "alice")];
@@ -776,25 +882,25 @@ mod tests {
         );
     }
 
-    /// Ten authors: the bar shows the cap and reports the rest — bounded
+    /// Ten repositories: the bar shows the cap and reports the rest — bounded
     /// strip, honest count. All counts equal here, so alphabetical order
     /// decides what shows.
     #[test]
     fn queue_chips_cap_each_group_with_an_overflow_count() {
         let prs: Vec<_> = (0..10)
-            .map(|n| queued(n, "acme/widgets", &format!("user{n:02}")))
+            .map(|n| queued(n, &format!("acme/repo{n:02}"), "alice"))
             .collect();
         let groups = queue_chips(&prs, &github::QueueSearch::review_requested());
-        let authors = group(&groups, github::QueueFilterKind::Author);
-        assert_eq!(authors.chips.len(), QUEUE_CHIPS_SHOWN);
-        assert_eq!(authors.hidden, 10 - QUEUE_CHIPS_SHOWN);
+        let repos = group(&groups, github::QueueFilterKind::Repo);
+        assert_eq!(repos.chips.len(), QUEUE_CHIPS_SHOWN);
+        assert_eq!(repos.hidden, 10 - QUEUE_CHIPS_SHOWN);
         assert_eq!(
-            authors.chips[0].filter,
-            github::QueueFilter::author("user00")
+            repos.chips[0].filter,
+            github::QueueFilter::repo("acme/repo00")
         );
         assert_eq!(
-            authors.chips[QUEUE_CHIPS_SHOWN - 1].filter,
-            github::QueueFilter::author("user07")
+            repos.chips[QUEUE_CHIPS_SHOWN - 1].filter,
+            github::QueueFilter::repo("acme/repo07")
         );
     }
 

@@ -175,23 +175,22 @@ pub enum QueuePreset {
 /// How a queue search orders its results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueSort {
-    /// Most recently updated first — the default, so fresh activity
-    /// surfaces first.
-    RecentlyUpdated,
-    /// Oldest first, for clearing backlog.
-    OldestUpdated,
+    /// Oldest outstanding review request first (the default).
+    /// Requests with unknown timestamps follow known ones.
+    ReviewRequestedAscending,
+    /// Oldest PR creation time first.
+    CreatedAscending,
 }
 
 /// Which dimension of the queue a filter chip narrows: the organization a
-/// PR belongs to, the repository it lives in, or who wrote it. The order
-/// fixes the order chips compile in — org, then repo, then author — so the
+/// PR belongs to or the repository it lives in. The order
+/// fixes the order chips compile in — org, then repo — so the
 /// compiled search string depends on what's active, never on how it got
 /// there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum QueueFilterKind {
     Org,
     Repo,
-    Author,
 }
 
 impl QueueFilterKind {
@@ -201,14 +200,13 @@ impl QueueFilterKind {
         match self {
             Self::Org => "org",
             Self::Repo => "repo",
-            Self::Author => "author",
         }
     }
 }
 
 /// One quick filter over the queue: a chip in the UI, a search qualifier
-/// server-side. Values compile verbatim — GitHub's orgs, repositories, and
-/// logins can't contain spaces or colons, so no quoting is needed and none
+/// server-side. Values compile verbatim — GitHub's orgs and repositories
+/// can't contain spaces or colons, so no quoting is needed and none
 /// is invented; the queue derives chips from well-formed queue rows, so
 /// verbatim is honest.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -217,8 +215,6 @@ pub enum QueueFilter {
     Org(String),
     /// Every PR in one repository: `repo:<owner>/<name>`.
     Repo(String),
-    /// Every PR by one author: `author:<login>`.
-    Author(String),
 }
 
 impl QueueFilter {
@@ -232,17 +228,11 @@ impl QueueFilter {
         Self::Repo(name_with_owner.into())
     }
 
-    /// An author filter: PRs written by `login`.
-    pub fn author(login: impl Into<String>) -> Self {
-        Self::Author(login.into())
-    }
-
     /// Which dimension this narrows.
     pub fn kind(&self) -> QueueFilterKind {
         match self {
             Self::Org(_) => QueueFilterKind::Org,
             Self::Repo(_) => QueueFilterKind::Repo,
-            Self::Author(_) => QueueFilterKind::Author,
         }
     }
 
@@ -250,21 +240,20 @@ impl QueueFilter {
     /// `org:acme`.
     pub fn value(&self) -> &str {
         match self {
-            Self::Org(value) | Self::Repo(value) | Self::Author(value) => value,
+            Self::Org(value) | Self::Repo(value) => value,
         }
     }
 
     /// The exact search qualifier this compiles to, one word: `org:acme`,
-    /// `repo:acme/widgets`, `author:octocat`.
+    /// `repo:acme/widgets`.
     pub fn qualifier(&self) -> String {
         format!("{}:{}", self.kind().prefix(), self.value())
     }
 }
 
 /// A queue search — the reviewer-facing query the review queue runs.
-/// Compiles to exact GitHub search syntax ([`Self::query`]) plus the search
-/// API's sort spec ([`Self::sort`]); backends never see a preset or a
-/// chip. Filters are one chip per dimension at most — a second chip of a
+/// Compiles to exact GitHub search syntax ([`Self::query`]) plus the logical
+/// order ([`Self::sort`]). Filters are one chip per dimension at most — a second chip of a
 /// kind replaces the first, the way the queue's chip bar works — kept in
 /// kind order, so the compiled string is a function of the search, never
 /// of the clicks that built it.
@@ -277,11 +266,11 @@ pub struct QueueSearch {
 
 impl QueueSearch {
     /// The default queue: every open PR where the viewer's review is
-    /// requested, most recently updated first, nothing filtered.
+    /// requested, oldest request first, nothing filtered.
     pub fn review_requested() -> Self {
         Self {
             preset: QueuePreset::ReviewRequested,
-            sort: QueueSort::RecentlyUpdated,
+            sort: QueueSort::ReviewRequestedAscending,
             filters: Vec::new(),
         }
     }
@@ -338,7 +327,7 @@ impl QueueSearch {
     }
 
     /// The chips currently narrowing the search, in compile order: org,
-    /// then repo, then author.
+    /// then repo.
     pub fn filters(&self) -> &[QueueFilter] {
         &self.filters
     }
@@ -364,12 +353,40 @@ impl QueueSearch {
         query
     }
 
-    /// The search API sort spec: `(field, order)`.
+    /// The logical sort spec: `(field, order)`, also used to identify caches.
+    /// GitHub cannot sort by review-request time; backends must apply
+    /// [`Self::sort_items`] after enriching results with request timestamps.
     pub fn sort(&self) -> (&'static str, &'static str) {
         match self.sort {
-            QueueSort::RecentlyUpdated => ("updated", "desc"),
-            QueueSort::OldestUpdated => ("updated", "asc"),
+            QueueSort::ReviewRequestedAscending => ("review-requested", "asc"),
+            QueueSort::CreatedAscending => ("created", "asc"),
         }
+    }
+
+    /// Apply the queue's order to fresh or cached rows. Unknown request times
+    /// sort last, with creation time breaking ties (also ordering unknowns).
+    /// Activity time is deliberately never used as a proxy for either age.
+    pub fn sort_items(&self, items: &mut [QueueItem]) {
+        items.sort_by(|a, b| {
+            let created = || a.created_at.cmp(&b.created_at);
+            match self.sort {
+                QueueSort::CreatedAscending => created(),
+                QueueSort::ReviewRequestedAscending => {
+                    fn request(item: &QueueItem) -> Option<&str> {
+                        item.review_requested_at
+                            .as_deref()
+                            .filter(|time| !time.is_empty())
+                    }
+                    match (request(a), request(b)) {
+                        (Some(a), Some(b)) => a.cmp(b),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                    .then_with(created)
+                }
+            }
+        });
     }
 }
 
@@ -837,26 +854,27 @@ mod tests {
 
     /// Golden string: the review-requested preset must compile to exactly
     /// this search — open PRs, review requested of the viewer (teams
-    /// included by the qualifier) — sorted recently-updated. Every backend
-    /// runs this verbatim, so the queue's contents are pinned here.
+    /// included by the qualifier) — sorted oldest review request first.
+    /// The queue's query and logical order are pinned here.
     #[test]
     fn review_requested_compiles_to_the_exact_queue_search() {
         let search = QueueSearch::review_requested();
         assert_eq!(search.query(), "is:pr is:open review-requested:@me");
-        assert_eq!(search.sort(), ("updated", "desc"));
+        assert_eq!(search.sort(), ("review-requested", "asc"));
+        assert_eq!(search.ordering(), QueueSort::ReviewRequestedAscending);
     }
 
     /// Re-sorting changes the sort spec, never the set of PRs.
     #[test]
     fn sorting_flips_the_order_not_the_search() {
-        let search = QueueSearch::review_requested().sorted_by(QueueSort::OldestUpdated);
+        let search = QueueSearch::review_requested().sorted_by(QueueSort::CreatedAscending);
         assert_eq!(search.query(), "is:pr is:open review-requested:@me");
-        assert_eq!(search.sort(), ("updated", "asc"));
+        assert_eq!(search.sort(), ("created", "asc"));
     }
 
     /// Golden strings for chips: each kind compiles to its one qualifier
-    /// after the preset's, and a search carrying all three pins the exact
-    /// order — org, then repo, then author — however the chips were
+    /// after the preset's, and a search carrying both pins the exact
+    /// order — org, then repo — however the chips were
     /// applied.
     #[test]
     fn chips_compile_to_exact_search_qualifiers() {
@@ -873,21 +891,14 @@ mod tests {
                 .query(),
             format!("{preset} repo:acme/widgets")
         );
-        assert_eq!(
-            QueueSearch::review_requested()
-                .filtered_by(QueueFilter::author("octocat"))
-                .query(),
-            format!("{preset} author:octocat")
-        );
-        // All three, applied in reverse order: the compiled string still
-        // runs org, repo, author.
+        // Both, applied in reverse order: the compiled string still
+        // runs org, repo.
         let search = QueueSearch::review_requested()
-            .filtered_by(QueueFilter::author("octocat"))
             .filtered_by(QueueFilter::repo("acme/widgets"))
             .filtered_by(QueueFilter::org("acme"));
         assert_eq!(
             search.query(),
-            format!("{preset} org:acme repo:acme/widgets author:octocat")
+            format!("{preset} org:acme repo:acme/widgets")
         );
     }
 
@@ -899,18 +910,18 @@ mod tests {
     fn chips_and_sorts_compile_together() {
         let search = QueueSearch::review_requested()
             .filtered_by(QueueFilter::org("acme"))
-            .filtered_by(QueueFilter::author("octocat"))
-            .sorted_by(QueueSort::OldestUpdated);
+            .filtered_by(QueueFilter::repo("acme/widgets"))
+            .sorted_by(QueueSort::CreatedAscending);
         assert_eq!(
             search.query(),
-            "is:pr is:open review-requested:@me org:acme author:octocat"
+            "is:pr is:open review-requested:@me org:acme repo:acme/widgets"
         );
-        assert_eq!(search.sort(), ("updated", "asc"));
-        assert_eq!(search.ordering(), QueueSort::OldestUpdated);
+        assert_eq!(search.sort(), ("created", "asc"));
+        assert_eq!(search.ordering(), QueueSort::CreatedAscending);
         // Re-sorting a filtered search flips the spec, never the chips.
-        let search = search.sorted_by(QueueSort::RecentlyUpdated);
-        assert_eq!(search.ordering(), QueueSort::RecentlyUpdated);
-        assert_eq!(search.sort(), ("updated", "desc"));
+        let search = search.sorted_by(QueueSort::ReviewRequestedAscending);
+        assert_eq!(search.ordering(), QueueSort::ReviewRequestedAscending);
+        assert_eq!(search.sort(), ("review-requested", "asc"));
         assert_eq!(search.filters().len(), 2);
     }
 
@@ -926,29 +937,28 @@ mod tests {
             search.query(),
             "is:pr is:open review-requested:@me org:globex"
         );
-        // Lifting the org leaves the author.
+        // Lifting the org leaves the repo.
         let search = search
-            .filtered_by(QueueFilter::author("octocat"))
+            .filtered_by(QueueFilter::repo("globex/widgets"))
             .without_filter(QueueFilterKind::Org);
         assert_eq!(
             search.filters().to_vec(),
-            vec![QueueFilter::author("octocat")]
+            vec![QueueFilter::repo("globex/widgets")]
         );
         // Unfiltered lifts every chip at once, keeping the order — the
         // preset queue again, backlog-first or not.
-        let search = search.sorted_by(QueueSort::OldestUpdated).unfiltered();
+        let search = search.sorted_by(QueueSort::CreatedAscending).unfiltered();
         assert!(search.filters().is_empty());
         assert_eq!(search.query(), "is:pr is:open review-requested:@me");
-        assert_eq!(search.ordering(), QueueSort::OldestUpdated);
+        assert_eq!(search.ordering(), QueueSort::CreatedAscending);
     }
 
-    /// A filter's own vocabulary: kinds order as org < repo < author (the
+    /// A filter's own vocabulary: kinds order as org < repo (the
     /// compile order), prefixes match the compiled qualifier, and values
     /// read back without them.
     #[test]
     fn filters_expose_kind_value_and_qualifier() {
         assert!(QueueFilterKind::Org < QueueFilterKind::Repo);
-        assert!(QueueFilterKind::Repo < QueueFilterKind::Author);
         let org = QueueFilter::org("acme");
         assert_eq!(org.kind(), QueueFilterKind::Org);
         assert_eq!(org.value(), "acme");
@@ -958,7 +968,6 @@ mod tests {
             QueueFilter::repo("acme/widgets").qualifier(),
             "repo:acme/widgets"
         );
-        assert_eq!(QueueFilter::author("octocat").qualifier(), "author:octocat");
     }
 
     /// A search rebuilt from its parts is the same search: the chips come
@@ -968,20 +977,16 @@ mod tests {
     #[test]
     fn a_search_rebuilt_from_its_parts_is_the_same_search() {
         let search = QueueSearch::from_parts(
-            vec![
-                QueueFilter::author("octocat"),
-                QueueFilter::org("acme"),
-                QueueFilter::repo("acme/widgets"),
-            ],
-            QueueSort::OldestUpdated,
+            vec![QueueFilter::org("acme"), QueueFilter::repo("acme/widgets")],
+            QueueSort::CreatedAscending,
         );
         assert_eq!(
             search.query(),
-            "is:pr is:open review-requested:@me org:acme repo:acme/widgets author:octocat"
+            "is:pr is:open review-requested:@me org:acme repo:acme/widgets"
         );
-        assert_eq!(search.sort(), ("updated", "asc"));
+        assert_eq!(search.sort(), ("created", "asc"));
         // No parts, no chips: the default queue.
-        let empty = QueueSearch::from_parts(Vec::new(), QueueSort::RecentlyUpdated);
+        let empty = QueueSearch::from_parts(Vec::new(), QueueSort::ReviewRequestedAscending);
         assert_eq!(empty.query(), "is:pr is:open review-requested:@me");
         assert!(empty.filters().is_empty());
     }
