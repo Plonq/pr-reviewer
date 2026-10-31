@@ -121,9 +121,11 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   cross-hunk ranges, use GitHub's experimental positioning API and may depend
   on GitHub's rollout for the repository
 - pending reviews: start/add to a review without posting, resume drafts started
-  on GitHub, and edit/delete them inline or in the pending-review tray before submitting;
-   replies join the pending review too; **Add single comment** is available
-   only without a pending review and posts immediately
+  on GitHub, and edit/delete them inline or in the pending-review tray before submitting.
+  The tray starts collapsed, keeping the comment count, Refresh drafts, and
+  Finish review controls visible; Show comments expands the draft list.
+  Replies join the pending review too; **Add single comment** is available
+  only without a pending review and posts immediately
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
 - dark-only theme with soft blue-grey surfaces and pastel accents
 

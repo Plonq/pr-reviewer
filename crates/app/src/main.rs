@@ -81,6 +81,8 @@ struct SessionUi {
     state: ReviewSession,
     busy: bool,
     error: Option<SharedString>,
+    /// Per-open-PR disclosure state; drafts start collapsed, not persisted.
+    comments_expanded: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3040,14 +3042,13 @@ impl ReviewApp {
         cx: &mut Context<Self>,
     ) {
         if self.items.iter().any(|item| item.id == item_id) {
-            self.sessions.insert(
-                item_id,
-                SessionUi {
-                    state,
-                    busy: false,
-                    error: result.as_ref().err().map(|error| error.to_string().into()),
-                },
-            );
+            let ui = self.sessions.entry(item_id).or_default();
+            // Reconciliation must not collapse a tray the user has expanded.
+            // Once the review ends, the next review starts collapsed again.
+            ui.comments_expanded &= state.pending.is_some();
+            ui.state = state;
+            ui.busy = false;
+            ui.error = result.as_ref().err().map(|error| error.to_string().into());
         } else {
             self.sessions.remove(&item_id);
         }
@@ -4268,6 +4269,14 @@ impl ReviewApp {
             _ => String::new(),
         };
         let pending = ui.state.pending.is_some();
+        // A fallback editor for an outdated/unanchorable draft lives here.
+        // Keep it visible until it is submitted or cancelled, even if the
+        // user had not expanded the tray before opening that editor.
+        let editing_in_tray = self.composer.as_ref().is_some_and(|composer| {
+            composer.item_id == id
+                && matches!(composer.placement, ComposerPlacement::PendingTray(_))
+        });
+        let expanded = ui.comments_expanded || editing_in_tray;
         let label = if pending {
             format!(
                 "Pending review · {} comment{}{}",
@@ -4301,9 +4310,35 @@ impl ReviewApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().child(SharedString::from(label)))
+                    .child(
+                        div()
+                            .debug_selector(|| "pending-status".into())
+                            .flex_1()
+                            .child(SharedString::from(label)),
+                    )
+                    .when(ui.state.count() > 0, |row| {
+                        row.child(
+                            Button::new("pending-comments-toggle")
+                                .debug_selector(|| "pending-comments-toggle".into())
+                                .label(if expanded {
+                                    "Hide comments"
+                                } else {
+                                    "Show comments"
+                                })
+                                .ghost()
+                                .small()
+                                .disabled(editing_in_tray)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(ui) = this.sessions.get_mut(&id) {
+                                        ui.comments_expanded = !ui.comments_expanded;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("pending-refresh")
+                            .debug_selector(|| "pending-refresh".into())
                             .label("Refresh drafts")
                             .ghost()
                             .small()
@@ -4314,6 +4349,7 @@ impl ReviewApp {
                     )
                     .child(
                         Button::new("pending-review")
+                            .debug_selector(|| "pending-review".into())
                             .label(if pending {
                                 "Finish review · ⌘↵"
                             } else {
@@ -4341,9 +4377,10 @@ impl ReviewApp {
         if let Some(error) = &ui.error {
             tray = tray.child(div().text_color(theme::red(cx)).child(error.clone()));
         }
-        if let Some(review) = &ui.state.pending {
+        if let Some(review) = ui.state.pending.as_ref().filter(|_| expanded) {
             let mut comments = div()
                 .id("pending-comments")
+                .debug_selector(|| "pending-comments".into())
                 .max_h(px(160.))
                 .overflow_y_scroll()
                 .flex()
@@ -12852,6 +12889,112 @@ mod tests {
     }
 
     #[gpui::test]
+    fn pending_tray_starts_collapsed_and_keeps_controls_and_per_pr_disclosure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![]);
+        *fake.pending.lock().unwrap() = Some(github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: String::new(),
+            comments: vec![github::PendingComment {
+                id: 13,
+                node_id: "draft".into(),
+                path: "gone.rs".into(),
+                side: CommentSide::Left,
+                line: None,
+                start_line: None,
+                body: "outdated draft".into(),
+                in_reply_to_id: None,
+            }],
+        });
+        let (window, app) = queue_window(cx, fake);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(&app, loop_pr_item(vec![]), cx);
+        cx.update(|cx| app.update(cx, |this, cx| this.resume_session(0, cx)));
+        cx.run_until_parked();
+        let draw = |vcx: &mut gpui::VisualTestContext| {
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        };
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("pending-status").is_some());
+        assert!(vcx.debug_bounds("pending-refresh").is_some());
+        assert!(vcx.debug_bounds("pending-review").is_some());
+        assert!(vcx.debug_bounds("pending-comments").is_none());
+        cx.update(|cx| assert_eq!(app.read(cx).sessions[&0].state.count(), 1));
+
+        click_commenting(&mut vcx, "pending-comments-toggle");
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("pending-comments").is_some());
+        click_commenting(&mut vcx, "pending-refresh");
+        draw(&mut vcx);
+        assert!(
+            vcx.debug_bounds("pending-comments").is_some(),
+            "refresh preserves expansion"
+        );
+
+        // Another PR starts collapsed, without changing the first PR's choice.
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                let mut other = loop_pr_item(vec![]);
+                other.id = 1;
+                this.items.push(other);
+                let state = this.sessions[&0].state.clone();
+                this.sessions.insert(
+                    1,
+                    SessionUi {
+                        state,
+                        ..Default::default()
+                    },
+                );
+                this.active = 1;
+                cx.notify();
+            })
+        });
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("pending-comments").is_none());
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.active = 0;
+                cx.notify();
+            })
+        });
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("pending-comments").is_some());
+
+        // The same disclosure works in the conversation pane.
+        vcx.dispatch_action(ShowConversation);
+        click_commenting(&mut vcx, "pending-comments-toggle");
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("pending-comments").is_none());
+        click_commenting(&mut vcx, "pending-refresh");
+        draw(&mut vcx);
+        assert!(
+            vcx.debug_bounds("pending-comments").is_none(),
+            "refresh preserves collapse"
+        );
+        click_commenting(&mut vcx, "pending-review");
+        cx.update(|cx| {
+            assert!(
+                app.read(cx).review.is_some(),
+                "Finish review still opens the modal"
+            )
+        });
+        vcx.update(|window, cx| app.update(cx, |this, cx| this.close_review(window, cx)));
+
+        // Finishing/losing a review resets the disclosure for the next review.
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.sessions.get_mut(&0).unwrap().comments_expanded = true;
+                this.finish_session(0, ReviewSession::default(), &Ok(()), cx);
+                assert!(!this.sessions[&0].comments_expanded);
+            })
+        });
+    }
+
+    #[gpui::test]
     fn pending_reply_edits_stay_in_the_conversation_and_outdated_drafts_edit_in_the_tray(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -12916,11 +13059,27 @@ mod tests {
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.items[0].pane = ItemPane::Changes;
+                assert!(!this.sessions[&0].comments_expanded);
                 this.edit_pending(13, window, cx);
                 assert_eq!(
                     this.composer.as_ref().unwrap().placement,
                     ComposerPlacement::PendingTray(13)
                 );
+            });
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("pending-comments").is_some());
+        assert!(
+            vcx.debug_bounds("composer-card").is_some(),
+            "fallback editor is not hidden in the collapsed tray"
+        );
+        click_commenting(&mut vcx, "pending-comments-toggle");
+        assert!(
+            vcx.debug_bounds("composer-card").is_some(),
+            "cannot collapse an active tray editor"
+        );
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
                 this.composer
                     .as_ref()
                     .unwrap()
