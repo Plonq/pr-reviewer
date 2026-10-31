@@ -91,7 +91,7 @@ fn ci_label(ci: github::CiState) -> (IconName, &'static str) {
 fn status_line(
     kind: &'static str,
     pos: usize,
-    icon: Option<IconName>,
+    icon: Option<gpui_kit_assets::IconName>,
     label: &'static str,
     color: Rgba,
 ) -> gpui::Div {
@@ -104,7 +104,10 @@ fn status_line(
             div()
                 .size(px(12.))
                 .flex_shrink_0()
-                .when_some(icon, |slot, icon| slot.child(Icon::new(icon).size(px(12.)))),
+                .when_some(icon, |slot, icon| {
+                    slot.debug_selector(move || format!("queue-{kind}-icon-{pos}"))
+                        .child(Icon::new(icon).size(px(12.)))
+                }),
         )
         .child(
             div()
@@ -117,20 +120,28 @@ fn status_line(
 
 fn ci_view(ci: github::CiState, pos: usize, cx: &gpui::App) -> impl IntoElement {
     let (icon, label) = ci_label(ci);
-    status_line("ci", pos, Some(icon), label, ci_color(ci, cx))
+    status_line("ci", pos, Some(icon.into()), label, ci_color(ci, cx))
 }
 
-/// Decided review states use the same outlined icons as CI. Awaiting keeps
-/// an empty icon slot rather than drawing an extra attention-seeking mark.
+/// Review states use outlined icons like CI; an undecided review gets a
+/// muted open circle so every state has a visible marker.
 fn review_state_view(state: github::ReviewState, pos: usize, cx: &gpui::App) -> gpui::Div {
     let (icon, label, color) = match state {
-        github::ReviewState::Approved => {
-            (Some(IconName::CircleCheck), "approved", theme::green(cx))
-        }
-        github::ReviewState::ChangesRequested => {
-            (Some(IconName::CircleX), "changes requested", theme::red(cx))
-        }
-        github::ReviewState::Awaiting => (None, "awaiting review", theme::subtext(cx)),
+        github::ReviewState::Approved => (
+            Some(gpui_kit_assets::IconName::CircleCheck),
+            "approved",
+            theme::green(cx),
+        ),
+        github::ReviewState::ChangesRequested => (
+            Some(gpui_kit_assets::IconName::CircleX),
+            "changes requested",
+            theme::red(cx),
+        ),
+        github::ReviewState::Awaiting => (
+            Some(gpui_kit_assets::IconName::Circle),
+            "awaiting review",
+            theme::subtext(cx),
+        ),
     };
     status_line("review", pos, icon, label, color)
 }

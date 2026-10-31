@@ -269,13 +269,16 @@ fn git_env() -> [(&'static str, &'static str); 6] {
     ]
 }
 
-/// The app's own assets, layered over gpui-component's icon bundle. Today
-/// that's the speech bubble the queue's comment count rides on — an
-/// Octicon (comment-16, © GitHub, MIT: https://github.com/primer/octicons),
-/// which gpui renders as a monochrome mask so it tints with the palette.
-/// The app's icons live under `icons/gander/` so they can never shadow an
-/// upstream name.
+/// The app's assets, layered over gpui-component's default icon bundle.
+/// The queue uses an extra Lucide icon plus an Octicon speech bubble
+/// (comment-16, © GitHub, MIT: https://github.com/primer/octicons).
+/// GPUI renders these as monochrome masks so they tint with the palette.
+/// App-owned icons live under `icons/gander/` to avoid upstream collisions.
 struct AppAssets;
+
+// Catalog entries alone do not bundle SVGs. Explicitly include the review
+// queue's open circle, which is not part of the default component bundle.
+gpui_kit_assets::icon_assets!(QueueIcons, [Circle]);
 
 /// (asset path, embedded bytes) — served exactly as an `AssetSource`
 /// expects, so the icon renders like any bundled one.
@@ -289,11 +292,15 @@ impl AssetSource for AppAssets {
         if let Some((_, bytes)) = OWNED_ASSETS.iter().find(|(known, _)| *known == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
+        if let Some(bytes) = QueueIcons.load(path)? {
+            return Ok(Some(bytes));
+        }
         gpui::assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
         let mut all = gpui::assets::Assets.list(path)?;
+        all.extend(QueueIcons.list(path)?);
         all.extend(
             OWNED_ASSETS
                 .iter()
@@ -8338,6 +8345,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn queue_status_icons_are_bundled_in_the_application_assets() {
+        use gpui_kit_assets::IconName;
+        let listed = AppAssets.list("icons/").unwrap();
+        for icon in [
+            IconName::Circle,
+            IconName::CircleCheck,
+            IconName::CircleX,
+            IconName::LoaderCircle,
+            IconName::Minus,
+        ] {
+            let path = icon.path();
+            let svg = AppAssets
+                .load(path.as_ref())
+                .unwrap()
+                .unwrap_or_else(|| panic!("queue status SVG is missing from AppAssets: {path}"));
+            assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"));
+            assert!(
+                listed.contains(&path),
+                "queue status SVG is not listed: {path}"
+            );
+        }
+    }
+
     #[gpui::test]
     fn queue_polish_keeps_rows_dense_and_status_labels_aligned(cx: &mut gpui::TestAppContext) {
         let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
@@ -8369,6 +8400,11 @@ mod tests {
         vcx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+        let awaiting_icon = vcx
+            .debug_bounds("queue-review-icon-0")
+            .expect("awaiting review has a visible icon");
+        let changes_icon = vcx.debug_bounds("queue-review-icon-1").unwrap();
+        assert_eq!(awaiting_icon.size, changes_icon.size);
         let first_status = vcx.debug_bounds("queue-ci-label-0").unwrap();
         for (row, title, ci, review) in [
             (
