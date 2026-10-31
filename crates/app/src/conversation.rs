@@ -900,6 +900,10 @@ impl ReviewApp {
                     .text_color(theme::subtext(cx))
                     .text_size(px(text_size() - 1.))
                     .child(
+                        crate::threads::author_avatar(&comment.author, &self.account)
+                            .debug_selector(|| format!("discussion-avatar-{item_id}-{key}")),
+                    )
+                    .child(
                         div()
                             .id("heading")
                             .flex_1()

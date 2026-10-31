@@ -14,13 +14,17 @@
 //! text is the user-facing message and moves with the backend (it carries
 //! v0.1's `gh`-CLI wording today, including the `gh auth login` fix).
 pub mod commits;
+mod comparison;
 pub use commits::{ActionsRun, PrCommit, PrCommits};
+pub use comparison::{ComparisonBase, ReviewComparison};
 pub mod discussion;
 pub mod gh_cli;
 pub use discussion::{
     CommentPermissions, CommentTarget, DiscussionComment, PrDiscussion, Reaction,
     ReviewCodeContext, ReviewThread,
 };
+pub mod review_changes;
+pub use review_changes::{ReviewBaseline, ReviewChanges};
 pub mod review_session;
 pub use review_session::{CommentAnchor, CommentPosition, DiffSide, PendingComment, PendingReview};
 
@@ -550,6 +554,28 @@ pub trait GitHubClient: Send + Sync {
     ) -> Result<(), ClientError> {
         Err(ClientError::Failed(
             "viewed files are not supported by this backend".into(),
+        ))
+    }
+
+    /// Latest submitted review by the authenticated viewer, checked against
+    /// an immutable head. Optional detail failure must not prevent PR loading.
+    fn review_changes(&self, _loc: &PrLocator, _head: &str) -> Result<ReviewChanges, ClientError> {
+        Err(ClientError::Failed(
+            "review comparison is not supported by this backend".into(),
+        ))
+    }
+
+    /// An ancestry-validated review range, excluding upstream changes already
+    /// merged into the head. `upstream` is the captured PR target branch tip.
+    fn comparison_patch(
+        &self,
+        _loc: &PrLocator,
+        _base: &str,
+        _head: &str,
+        _upstream: &str,
+    ) -> Result<ReviewComparison, ClientError> {
+        Err(ClientError::Failed(
+            "review comparison is not supported by this backend".into(),
         ))
     }
 

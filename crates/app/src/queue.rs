@@ -5,7 +5,7 @@ use crate::{theme, ReviewApp};
 use gpui::component::{avatar::Avatar, tag::Tag, Icon, IconName, Sizable as _};
 use gpui::{div, prelude::*, px, Hsla, Rgba, SharedString};
 
-/// Queue rows stay compact — avatar, title, badges, size, counts, chips,
+/// Queue rows stay compact — avatar and author, title, badges, size, counts, chips,
 /// and stacked timestamps — with
 /// the uniform list keeping scroll math simple and rows virtualized.
 const QUEUE_ROW_HEIGHT: f32 = 36.0;
@@ -320,7 +320,7 @@ fn queue_ages(pr: &github::QueueItem, now: i64) -> [String; 2] {
 }
 
 /// One review-queue row, carrying everything needed to triage without
-/// opening anything: CI verdict as a colored dot, author avatar, `#number`
+/// opening anything: CI verdict as a colored dot, author avatar and login, `#number`
 /// and title (drafts badged and muted), review state, diff size,
 /// conversation count, label chips, repository, and opened/requested ages. Clicking selects
 /// the row (opening from the queue arrives with the PR screen).
@@ -335,6 +335,7 @@ pub(crate) fn queue_row(
     let (labels, overflow) = label_budget(&pr.labels);
     div()
         .id(("queue-row", pos))
+        .debug_selector(move || format!("queue-row-{pos}"))
         .mx_1()
         .px_3()
         .h(px(QUEUE_ROW_HEIGHT))
@@ -378,6 +379,15 @@ pub(crate) fn queue_row(
             }
             .name(pr.author.clone())
             .xsmall(),
+        )
+        .child(
+            div()
+                .debug_selector(move || format!("queue-author-{pos}"))
+                .flex_shrink_0()
+                .max_w(px(160.))
+                .truncate()
+                .text_color(theme::subtext(cx))
+                .child(SharedString::from(pr.author.clone())),
         )
         .child(
             div()

@@ -5,6 +5,46 @@ use crate::{rows::ViewMode, SPLIT_DIVIDER};
 use std::collections::HashMap;
 use std::ops::Range;
 
+/// Comments (including old cached ones) already carry a GitHub login. The
+/// public avatar endpoint accepts both user and bot logins, so displaying a
+/// face needs no extra API request or cache schema change. The shared image
+/// loader caches these URLs for offline use; initials remain the fallback.
+pub(crate) fn author_avatar(
+    author: &str,
+    account: &crate::AccountStatus,
+) -> gpui::component::avatar::Avatar {
+    use gpui::{component::Sizable as _, prelude::*};
+    gpui::component::avatar::Avatar::new()
+        .name(author.to_owned())
+        .xsmall()
+        .when_some(author_avatar_url(author, account), |avatar, url| {
+            avatar.src(url)
+        })
+}
+
+fn author_avatar_url(author: &str, account: &crate::AccountStatus) -> Option<String> {
+    // Pending and local drafts say "you", not a GitHub login. Never fetch the
+    // avatar of the unrelated GitHub account literally named "you".
+    if author == "you" {
+        return match account {
+            crate::AccountStatus::SignedIn(viewer) => Some(viewer.avatar_url.clone()),
+            _ => None,
+        };
+    }
+    let login = author.strip_suffix("[bot]").unwrap_or(author);
+    if login.is_empty()
+        || !login
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    {
+        return None;
+    }
+    let author = author.replace("[bot]", "%5Bbot%5D");
+    Some(format!(
+        "https://avatars.githubusercontent.com/{author}?s=64"
+    ))
+}
+
 /// Which diff side a review comment anchors to, GitHub's LEFT/RIGHT.
 pub(crate) use github::DiffSide as CommentSide;
 
@@ -92,6 +132,25 @@ pub(crate) struct CommentIndex {
 }
 
 impl CommentIndex {
+    /// GitHub's current LEFT coordinates refer to the full PR's base, not a
+    /// previous review commit. Retain counts/history, but never paint these at
+    /// coincidentally matching incremental-diff line numbers.
+    pub(crate) fn hide_left_anchors(&mut self) {
+        let threads = std::mem::take(&mut self.threads);
+        let mut all: Vec<_> = threads
+            .into_values()
+            .flat_map(|anchors| anchors.into_values().flatten())
+            .chain(std::mem::take(&mut self.unanchored))
+            .collect();
+        for thread in &mut all {
+            if thread.root.side == CommentSide::Left {
+                thread.root.line = None;
+                thread.root.start_line = None;
+            }
+        }
+        *self = index_threads(all);
+    }
+
     /// Replace only the pending-review layer. GitHub may also include these
     /// ids in its comments response; the session's copy wins without duplicates.
     pub(crate) fn replace_pending(&mut self, pending: Option<&github::PendingReview>) {
@@ -296,6 +355,34 @@ pub(crate) fn short_age(iso: &str, now: i64) -> String {
 mod tests {
     use super::*;
     use crate::test_util::{app_rc as rc, rc as api_rc};
+
+    #[test]
+    fn comment_avatar_urls_support_users_and_bots_but_not_missing_authors() {
+        let account = crate::AccountStatus::Checking;
+        assert_eq!(
+            author_avatar_url("octocat", &account).as_deref(),
+            Some("https://avatars.githubusercontent.com/octocat?s=64")
+        );
+        assert_eq!(
+            author_avatar_url("dependabot[bot]", &account).as_deref(),
+            Some("https://avatars.githubusercontent.com/dependabot%5Bbot%5D?s=64")
+        );
+        for author in ["", "[bot]", "a/b", "a?b", "a b", "you"] {
+            assert_eq!(author_avatar_url(author, &account), None);
+        }
+    }
+
+    #[test]
+    fn draft_avatars_use_the_viewer_not_the_account_named_you() {
+        let account = crate::AccountStatus::SignedIn(github::Viewer {
+            login: "alice".into(),
+            avatar_url: "https://avatars.githubusercontent.com/u/1?s=64".into(),
+        });
+        assert_eq!(
+            author_avatar_url("you", &account).as_deref(),
+            Some("https://avatars.githubusercontent.com/u/1?s=64")
+        );
+    }
 
     #[test]
     fn review_comment_conversion_preserves_raw_fields_and_defaults_side() {

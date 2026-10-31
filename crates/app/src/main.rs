@@ -13,6 +13,7 @@ mod presentation;
 mod queue;
 mod resolution;
 mod review_dialog;
+mod review_scope;
 mod review_target;
 mod rows;
 mod search;
@@ -51,7 +52,9 @@ use minimap::{
     MinimapRow, MINIMAP_GAP, MINIMAP_PAD, MINIMAP_WIDTH,
 };
 use queue::{queue_chips, queue_row};
-use review_target::{dir_name, fetch_item, sources_match, Loaded, LoadedMeta, Source};
+#[cfg(test)]
+use review_target::fetch_item;
+use review_target::{dir_name, sources_match, Loaded, LoadedMeta, Source};
 use rows::{
     build_rows, comment_anchor, cursor_anchor, is_comment_row, now_unix, nth_noncomment_row,
     render_row, widest_row_ix, BuiltRows, FileUpgrade, Row, RowOptions, RowsView, ViewMode,
@@ -78,6 +81,8 @@ struct SessionUi {
     state: ReviewSession,
     busy: bool,
     error: Option<SharedString>,
+    /// Per-open-PR disclosure state; drafts start collapsed, not persisted.
+    comments_expanded: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -118,6 +123,13 @@ fn row_height_for(size: f32) -> f32 {
 /// row; every scroll/hit-test/minimap calculation keys off this.
 fn row_height() -> f32 {
     row_height_for(text_size())
+}
+
+/// Uniform-list slots for half a viewport of blank space below the diff.
+/// Round up so the padding is never shorter than half the pane (at most one
+/// row taller). These are presentation-only slots, not source/display rows.
+fn diff_padding_rows(pane_height: f32, row_height: f32) -> usize {
+    (pane_height.max(0.) / (2. * row_height)).ceil() as usize
 }
 
 /// Gutter widths in px, matching render_row's fixed-width children: unified is
@@ -521,9 +533,9 @@ pub(crate) struct ItemData {
     split_columns: usize,
     /// Minimap model, index-aligned with `rows`; rebuilt with them.
     minimap: Vec<MinimapRow>,
-    /// Coalesced minimap quad runs for one pane height, computed lazily on
-    /// paint and reused until the height changes or the rows are rebuilt.
-    minimap_cache: RefCell<Option<(f32, Rc<MinimapLayout>)>>,
+    /// Coalesced minimap quad runs for one pane height and blank tail, computed
+    /// lazily on paint and reused until either changes or the rows are rebuilt.
+    minimap_cache: RefCell<Option<(f32, usize, Rc<MinimapLayout>)>>,
     cursor: usize,
     cursor_side: Option<SelSide>,
     /// Original server-patch hunks, retained when phase 2 replaces display
@@ -546,6 +558,9 @@ pub(crate) struct ItemData {
     posts: conversation::posting::Posts,
     commits: Option<github::PrCommits>,
     commits_expanded: bool,
+    review_changes: github::ReviewChanges,
+    review_base: Option<String>,
+    review_base_files: Option<Arc<HashMap<String, github::ComparisonBase>>>,
     viewed: viewed::Viewed,
     expanded_threads: HashSet<String>,
     additions: u32,
@@ -633,6 +648,9 @@ impl ItemData {
             posts: Default::default(),
             commits: None,
             commits_expanded: false,
+            review_changes: github::ReviewChanges::default(),
+            review_base: None,
+            review_base_files: None,
             viewed: Default::default(),
             expanded_threads: HashSet::new(),
             additions: 0,
@@ -899,17 +917,17 @@ impl ItemData {
         }
     }
 
-    /// The minimap quad runs for this pane height, from the cache when the
-    /// height hasn't changed since the last paint.
-    fn minimap_layout(&self, pane_px: f32) -> Rc<MinimapLayout> {
+    /// The minimap quad runs for this pane height and blank tail, from the
+    /// cache when neither has changed since the last paint.
+    fn minimap_layout(&self, pane_px: f32, tail_rows: usize) -> Rc<MinimapLayout> {
         let mut cache = self.minimap_cache.borrow_mut();
-        if let Some((h, layout)) = &*cache {
-            if *h == pane_px {
+        if let Some((h, tail, layout)) = &*cache {
+            if *h == pane_px && *tail == tail_rows {
                 return layout.clone();
             }
         }
-        let layout = Rc::new(minimap_runs(&self.minimap, pane_px));
-        *cache = Some((pane_px, layout.clone()));
+        let layout = Rc::new(minimap_runs(&self.minimap, pane_px, tail_rows));
+        *cache = Some((pane_px, tail_rows, layout.clone()));
         layout
     }
 
@@ -1081,6 +1099,9 @@ impl ReviewItem {
             comments,
             discussion,
             commits,
+            review_changes,
+            review_base,
+            review_base_files,
             viewed,
             snapshot,
         } = loaded;
@@ -1099,7 +1120,18 @@ impl ReviewItem {
         self.refresh_error = None;
         match &mut self.state {
             ItemState::Ready(data) => {
-                let position = data.review_position();
+                let position = if data.review_base == review_base {
+                    data.review_position()
+                } else {
+                    data.file_positions.clear();
+                    data.saved_position = None;
+                    None
+                };
+                data.search = None;
+                data.review_changes = review_changes;
+                data.review_base = review_base;
+                data.review_base_files = review_base_files;
+                data.discussion_generation += 1;
                 // Fresh patch-derived data: any previous upgrade is stale —
                 // the upgrade re-runs from scratch.
                 data.upgrades.clear();
@@ -1176,6 +1208,9 @@ impl ReviewItem {
                 ));
                 data.discussion = discussion;
                 data.commits = commits;
+                data.review_changes = review_changes;
+                data.review_base = review_base;
+                data.review_base_files = review_base_files;
                 data.viewed.install(viewed);
                 data.set_rows(data.row_build());
                 self.state = ItemState::Ready(data);
@@ -2322,7 +2357,28 @@ impl ReviewApp {
         cx.notify();
     }
 
-    fn spawn_fetch(&self, id: u64, source: Source, mode: ViewMode, cx: &mut Context<Self>) {
+    fn spawn_fetch(&mut self, id: u64, source: Source, mode: ViewMode, cx: &mut Context<Self>) {
+        let since_review = self.items.iter().find(|item| item.id == id).is_some_and(
+            |item| matches!(&item.state, ItemState::Ready(data) if data.review_base.is_some()),
+        );
+        self.spawn_fetch_scoped(id, source, mode, since_review, cx);
+    }
+
+    fn spawn_fetch_scoped(
+        &mut self,
+        id: u64,
+        source: Source,
+        mode: ViewMode,
+        since_review: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return;
+        };
+        item.reloading = true;
+        // Invalidate upgrades immediately, not only when the replacement lands.
+        item.upgrade_gen += 1;
+        let fetch_gen = item.upgrade_gen;
         let github = self.github.clone();
         // Build rows for what the item will show when they land: the ready
         // item's displayed file, or the first file for a first load.
@@ -2337,19 +2393,24 @@ impl ReviewApp {
         };
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { fetch_item(github, &source, mode, file_ix) })
+                .background_spawn(async move {
+                    review_target::fetch_item_scoped(github, &source, mode, file_ix, since_review)
+                })
                 .await;
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
                     return;
                 };
+                if item.upgrade_gen != fetch_gen {
+                    return;
+                }
                 item.reloading = false;
                 match fetched {
                     Ok(loaded) => {
                         // An offline metadata-only copy has no viewport and
                         // must not replace the last real diff anchor.
                         let needs_restore = !matches!(&item.state,
-                            ItemState::Ready(data) if !data.diff.files.is_empty());
+                            ItemState::Ready(data) if !data.diff.files.is_empty() || data.review_base.is_some());
                         let position = if needs_restore {
                             match &item.source {
                                 Source::Pr(loc) => app.store.position(loc),
@@ -2411,8 +2472,9 @@ impl ReviewApp {
                                     })
                                     .map(|meta| UpgradeSource::Pr {
                                         loc: loc.clone(),
-                                        base_oid: meta.base_ref_oid.clone(),
+                                        base_oid: data.diff_base().to_string(),
                                         head_oid: meta.head_ref_oid.clone(),
+                                        base_files: data.review_base_files.clone(),
                                     }),
                                 Source::Local(src) => Some(UpgradeSource::Local(src.clone())),
                             };
@@ -2748,6 +2810,10 @@ impl ReviewApp {
     /// by setting the scroll offset directly. Pure mouse math — verified
     /// manually, like the selection hit test.
     fn minimap_scrub_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let pane_h = self.active_data().map_or(0., |data| {
+            f32::from(data.scroll.0.borrow().base_handle.bounds().size.height)
+        });
+        let tail_rows = self.diff_tail_rows(pane_h);
         let Some(data) = self.active_data_mut() else {
             return;
         };
@@ -2767,6 +2833,7 @@ impl ReviewApp {
         }
         // The minimap column is the same height as the list, so its y space
         // starts at the list's top.
+        let total = total + tail_rows;
         let (slot_h, group) = minimap_scale(total, pane_h);
         let px_per_row = slot_h / group as f32;
         let y = f32::from(position.y - bounds.top());
@@ -2886,17 +2953,7 @@ impl ReviewApp {
                 }
                 None => vec![(anchor_side, line)],
             };
-            match comment_anchor::selection_anchor(
-                &data.diff.files[data.file_ix],
-                data.pr_meta
-                    .as_ref()
-                    .map_or("", |meta| meta.head_ref_oid.as_str()),
-                data.pr_meta
-                    .as_ref()
-                    .map_or("", |meta| meta.base_ref_oid.as_str()),
-                &data.anchor_hunks[data.file_ix],
-                &points,
-            ) {
+            match data.selection_anchor(&points) {
                 Ok(anchor) => Some(anchor),
                 Err(error) => {
                     self.items[self.active].refresh_error = Some(error.into());
@@ -2985,14 +3042,13 @@ impl ReviewApp {
         cx: &mut Context<Self>,
     ) {
         if self.items.iter().any(|item| item.id == item_id) {
-            self.sessions.insert(
-                item_id,
-                SessionUi {
-                    state,
-                    busy: false,
-                    error: result.as_ref().err().map(|error| error.to_string().into()),
-                },
-            );
+            let ui = self.sessions.entry(item_id).or_default();
+            // Reconciliation must not collapse a tray the user has expanded.
+            // Once the review ends, the next review starts collapsed again.
+            ui.comments_expanded &= state.pending.is_some();
+            ui.state = state;
+            ui.busy = false;
+            ui.error = result.as_ref().err().map(|error| error.to_string().into());
         } else {
             self.sessions.remove(&item_id);
         }
@@ -3015,6 +3071,7 @@ impl ReviewApp {
         data.comments
             .get_or_insert_with(CommentIndex::default)
             .replace_pending(ui.state.pending.as_ref());
+        data.filter_scope_comments();
         data.rebuild_rows_anchored();
     }
 
@@ -3107,9 +3164,10 @@ impl ReviewApp {
                         .find(|item| item.id == item_id)
                         .map(|item| item.source.clone())
                     {
-                        app.refetch_comments(item_id, loc.clone(), cx);
                         if submitted {
                             app.refetch_meta(item_id, loc, cx);
+                        } else {
+                            app.refetch_comments(item_id, loc, cx);
                         }
                     }
                 }
@@ -3156,6 +3214,9 @@ impl ReviewApp {
         let Some(item) = self.items.get(self.active) else {
             return;
         };
+        if item.reloading && placement == ComposerPlacement::Diff {
+            return;
+        }
         let item_id = item.id;
         let pr_loc = match &item.source {
             Source::Pr(loc) => Some(loc.clone()),
@@ -3167,6 +3228,7 @@ impl ReviewApp {
             .map(|meta| meta.head_ref_oid.clone())
             .unwrap_or_default();
         let mut position = None;
+        let mut line = line;
         if reply_to.is_none() && placement != ComposerPlacement::ConversationMain {
             match &item.source {
                 Source::Pr(_) if commit_id.is_empty() => return,
@@ -3179,16 +3241,11 @@ impl ReviewApp {
                 if data.diff.files.get(data.file_ix).is_none() {
                     return;
                 }
-                match comment_anchor::selection_anchor(
-                    &data.diff.files[data.file_ix],
-                    &commit_id,
-                    data.pr_meta
-                        .as_ref()
-                        .map_or("", |meta| meta.base_ref_oid.as_str()),
-                    &data.anchor_hunks[data.file_ix],
-                    &[(side, line)],
-                ) {
-                    Ok(anchor) => position = anchor.position,
+                match data.selection_anchor(&[(side, line)]) {
+                    Ok(anchor) => {
+                        position = anchor.position;
+                        line = anchor.line;
+                    }
                     Err(error) => {
                         self.items[self.active].refresh_error = Some(error.into());
                         cx.notify();
@@ -3641,6 +3698,7 @@ impl ReviewApp {
                                 .unwrap()
                                 .replace_pending(ui.state.pending.as_ref());
                         }
+                        data.filter_scope_comments();
                         data.rebuild_rows_anchored();
                     }
                     Err(err) => {
@@ -3801,33 +3859,17 @@ impl ReviewApp {
         );
     }
 
-    /// Refetch only the PR meta — the post-review counterpart of
-    /// `refetch_comments`, so the titlebar reflects the new review decision
-    /// without reloading the whole diff.
+    /// A submitted review changes the comparison baseline as well as the
+    /// titlebar. Reload them together; never pair a new head with an old diff.
     fn refetch_meta(&mut self, item_id: u64, loc: github::PrLocator, cx: &mut Context<Self>) {
-        let github = self.github.clone();
-        cx.spawn(async move |this, cx| {
-            let fetched = cx
-                .background_spawn(async move { github.pr_meta(&loc) })
-                .await;
-            this.update(cx, |app, cx| {
-                let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) else {
-                    return;
-                };
-                let ItemState::Ready(data) = &mut item.state else {
-                    return;
-                };
-                match fetched {
-                    Ok(meta) => data.pr_meta = Some(meta),
-                    Err(err) => {
-                        item.refresh_error = Some(format!("meta refresh failed: {err}").into());
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        let Some(item) = self.items.iter().find(|item| item.id == item_id) else {
+            return;
+        };
+        let ItemState::Ready(data) = &item.state else {
+            return;
+        };
+        let mode = data.mode;
+        self.spawn_fetch(item_id, Source::Pr(loc), mode, cx);
     }
 
     /// The hover "+" affordance: a small blue box at the far left of the
@@ -4227,6 +4269,14 @@ impl ReviewApp {
             _ => String::new(),
         };
         let pending = ui.state.pending.is_some();
+        // A fallback editor for an outdated/unanchorable draft lives here.
+        // Keep it visible until it is submitted or cancelled, even if the
+        // user had not expanded the tray before opening that editor.
+        let editing_in_tray = self.composer.as_ref().is_some_and(|composer| {
+            composer.item_id == id
+                && matches!(composer.placement, ComposerPlacement::PendingTray(_))
+        });
+        let expanded = ui.comments_expanded || editing_in_tray;
         let label = if pending {
             format!(
                 "Pending review · {} comment{}{}",
@@ -4260,9 +4310,35 @@ impl ReviewApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().child(SharedString::from(label)))
+                    .child(
+                        div()
+                            .debug_selector(|| "pending-status".into())
+                            .flex_1()
+                            .child(SharedString::from(label)),
+                    )
+                    .when(ui.state.count() > 0, |row| {
+                        row.child(
+                            Button::new("pending-comments-toggle")
+                                .debug_selector(|| "pending-comments-toggle".into())
+                                .label(if expanded {
+                                    "Hide comments"
+                                } else {
+                                    "Show comments"
+                                })
+                                .ghost()
+                                .small()
+                                .disabled(editing_in_tray)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(ui) = this.sessions.get_mut(&id) {
+                                        ui.comments_expanded = !ui.comments_expanded;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("pending-refresh")
+                            .debug_selector(|| "pending-refresh".into())
                             .label("Refresh drafts")
                             .ghost()
                             .small()
@@ -4273,6 +4349,7 @@ impl ReviewApp {
                     )
                     .child(
                         Button::new("pending-review")
+                            .debug_selector(|| "pending-review".into())
                             .label(if pending {
                                 "Finish review · ⌘↵"
                             } else {
@@ -4300,9 +4377,10 @@ impl ReviewApp {
         if let Some(error) = &ui.error {
             tray = tray.child(div().text_color(theme::red(cx)).child(error.clone()));
         }
-        if let Some(review) = &ui.state.pending {
+        if let Some(review) = ui.state.pending.as_ref().filter(|_| expanded) {
             let mut comments = div()
                 .id("pending-comments")
+                .debug_selector(|| "pending-comments".into())
                 .max_h(px(160.))
                 .overflow_y_scroll()
                 .flex()
@@ -4415,7 +4493,9 @@ impl ReviewApp {
                         if total == 0 || pane_h <= 0. {
                             return;
                         }
-                        let layout = data.minimap_layout(pane_h);
+                        let tail_rows = this.diff_tail_rows(pane_h);
+                        let total = total + tail_rows;
+                        let layout = data.minimap_layout(pane_h, tail_rows);
                         let (x0, y0) = (f32::from(bounds.left()), f32::from(bounds.top()));
                         let usable = f32::from(bounds.size.width) - 2. * MINIMAP_PAD;
                         let half = (usable - MINIMAP_GAP) / 2.;
@@ -5291,13 +5371,9 @@ impl ReviewApp {
         }
         footer
     }
-    /// The pane for an open item — loading, failure message, the
-    /// conversation, or the diff itself — everything the main pane shows
-    /// when the queue screen isn't up.
-    fn render_item_pane(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let entity = cx.entity();
-        // Blank tail rows make room to scroll a floating composer below EOF
-        // without changing source-row indices or the list's visible area.
+    /// Blank list slots shared by the diff's scroll range and minimap. Keep
+    /// composer space in addition to the half-viewport scroll-past-end area.
+    fn diff_tail_rows(&self, pane_height: f32) -> usize {
         let composer_rows = self
             .composer
             .as_ref()
@@ -5310,7 +5386,14 @@ impl ReviewApp {
             .map_or(0, |composer| {
                 (f32::from(composer.height.get()) / row_height()).ceil() as usize
             });
-        let diff_rows = self.active_data().map_or(0, |data| data.rows.len()) + composer_rows;
+        diff_padding_rows(pane_height, row_height()) + composer_rows
+    }
+
+    /// The pane for an open item — loading, failure message, the
+    /// conversation, or the diff itself — everything the main pane shows
+    /// when the queue screen isn't up.
+    fn render_item_pane(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let entity = cx.entity();
         match self.active_item() {
             None => self.render_empty_pane(cx),
             Some(item) => match &item.state {
@@ -5335,6 +5418,9 @@ impl ReviewApp {
                     .size_full()
                     .flex()
                     .flex_col()
+                    .when(matches!(item.source, Source::Pr(_)), |pane| {
+                        pane.child(self.render_review_scope(item, data, cx))
+                    })
                     .child(self.render_presentation_controls(data, cx))
                     .child(
                         div()
@@ -5440,105 +5526,131 @@ impl ReviewApp {
                                 }),
                             )
                             .child(
-                                uniform_list("diff", diff_rows, move |range, _window, cx| {
-                                    let this = entity.read(cx);
-                                    match this.active_data() {
-                                        Some(data) => {
-                                            let sel = data.selection;
-                                            range
-                                                .map(|ix| {
-                                                    let Some(row) = data.rows.get(ix) else {
-                                                        return div()
-                                                            .h(px(row_height()))
-                                                            .into_any_element();
-                                                    };
-                                                    let row_sel = sel.and_then(|sel| {
-                                                        row_selection_range(&sel, ix, row)
-                                                            .filter(|range| !range.is_empty())
-                                                            .map(|range| (sel.side, range))
-                                                    });
-                                                    let active = (ix == data.cursor)
-                                                        .then_some(data.cursor_side)
-                                                        .flatten();
-                                                    let commenting = this
-                                                        .composer
-                                                        .as_ref()
-                                                        .and_then(|composer| {
-                                                            composer.highlighted_side(
-                                                                this.items[this.active].id,
-                                                                data,
+                                // Resolve the actual list viewport before creating its
+                                // blank tail, including on the first frame and resize.
+                                // Padding the list's style would shrink its rendered
+                                // viewport; extra virtual slots leave it full-height.
+                                canvas(
+                                    move |bounds, window, cx| {
+                                        let this = entity.read(cx);
+                                        let data = this.active_data().expect("ready diff pane");
+                                        let diff_rows = data.rows.len()
+                                            + this.diff_tail_rows(f32::from(bounds.size.height));
+                                        let rows_entity = entity.clone();
+                                        let mut list = uniform_list(
+                                            "diff",
+                                            diff_rows,
+                                            move |range, _window, cx| {
+                                                let this = rows_entity.read(cx);
+                                                let Some(data) = this.active_data() else {
+                                                    return Vec::new();
+                                                };
+                                                let sel = data.selection;
+                                                range
+                                                    .map(|ix| {
+                                                        let Some(row) = data.rows.get(ix) else {
+                                                            return div()
+                                                                .h(px(row_height()))
+                                                                .into_any_element();
+                                                        };
+                                                        let row_sel = sel.and_then(|sel| {
+                                                            row_selection_range(&sel, ix, row)
+                                                                .filter(|range| !range.is_empty())
+                                                                .map(|range| (sel.side, range))
+                                                        });
+                                                        let active = (ix == data.cursor)
+                                                            .then_some(data.cursor_side)
+                                                            .flatten();
+                                                        let commenting = this
+                                                            .composer
+                                                            .as_ref()
+                                                            .and_then(|composer| {
+                                                                composer.highlighted_side(
+                                                                    this.items[this.active].id,
+                                                                    data,
+                                                                    row,
+                                                                )
+                                                            });
+                                                        let split_layout = ((data.mode
+                                                            == ViewMode::Split
+                                                            || matches!(
                                                                 row,
+                                                                Row::CommentBody { .. }
+                                                                    | Row::CommentHeader { .. }
+                                                                    | Row::CommentEditor { .. }
+                                                            ))
+                                                            && !data
+                                                                .preferences
+                                                                .soft_wrap
+                                                                .unwrap_or(false))
+                                                        .then(|| {
+                                                            data.split_layout(
+                                                                this.char_width.unwrap_or(px(
+                                                                    text_size() * 0.6,
+                                                                )),
                                                             )
                                                         });
-                                                    let split_layout = ((data.mode
-                                                        == ViewMode::Split
-                                                        || matches!(
+                                                        render_row(
+                                                            ix,
                                                             row,
-                                                            Row::CommentBody { .. }
-                                                                | Row::CommentHeader { .. }
-                                                                | Row::CommentEditor { .. }
-                                                        ))
-                                                        && !data
-                                                            .preferences
-                                                            .soft_wrap
-                                                            .unwrap_or(false))
-                                                    .then(|| {
-                                                        data.split_layout(
-                                                            this.char_width
-                                                                .unwrap_or(px(text_size() * 0.6)),
+                                                            row_sel,
+                                                            active,
+                                                            commenting,
+                                                            split_layout,
+                                                            data.search.as_ref(),
+                                                            &rows_entity,
+                                                            if let Row::CommentHeader {
+                                                                comment_id,
+                                                                top,
+                                                                ..
+                                                            } = row
+                                                            {
+                                                                Some(this.diff_comment_controls(
+                                                                    *comment_id,
+                                                                    *top,
+                                                                    &rows_entity,
+                                                                    cx,
+                                                                ))
+                                                            } else {
+                                                                None
+                                                            },
+                                                            cx,
                                                         )
-                                                    });
-                                                    render_row(
-                                                        ix,
-                                                        row,
-                                                        row_sel,
-                                                        active,
-                                                        commenting,
-                                                        split_layout,
-                                                        data.search.as_ref(),
-                                                        &entity,
-                                                        if let Row::CommentHeader {
-                                                            comment_id,
-                                                            top,
-                                                            ..
-                                                        } = row
-                                                        {
-                                                            Some(this.diff_comment_controls(
-                                                                *comment_id,
-                                                                *top,
-                                                                &entity,
-                                                                cx,
-                                                            ))
-                                                        } else {
-                                                            None
-                                                        },
-                                                        cx,
-                                                    )
-                                                })
-                                                .collect()
-                                        }
-                                        None => Vec::new(),
-                                    }
-                                })
-                                .with_decoration(diff_media::InlineText(cx.entity()))
-                                .track_scroll(&data.scroll)
-                                .with_horizontal_sizing_behavior(
-                                    if data.preferences.soft_wrap.unwrap_or(false) {
-                                        ListHorizontalSizingBehavior::FitList
-                                    } else {
-                                        ListHorizontalSizingBehavior::Unconstrained
+                                                    })
+                                                    .collect()
+                                            },
+                                        )
+                                        .with_decoration(diff_media::InlineText(entity.clone()))
+                                        .track_scroll(&data.scroll)
+                                        .with_horizontal_sizing_behavior(
+                                            if data.preferences.soft_wrap.unwrap_or(false) {
+                                                ListHorizontalSizingBehavior::FitList
+                                            } else {
+                                                ListHorizontalSizingBehavior::Unconstrained
+                                            },
+                                        )
+                                        // Unconstrained sizing turns on horizontal overflow,
+                                        // but gpui sizes the scroll range from one measured
+                                        // item — row 0, the file header, which never exceeds
+                                        // the viewport, so `offset.x` was clamped to zero and
+                                        // long lines were unreachable. Measure the widest
+                                        // row instead. Split rows expose their scroll
+                                        // extent without widening the visible panes.
+                                        .with_width_from_item(
+                                            (!data.preferences.soft_wrap.unwrap_or(false))
+                                                .then_some(data.wide_row),
+                                        )
+                                        .size_full()
+                                        .into_any_element();
+                                        list.layout_as_root(
+                                            bounds.size.map(gpui::AvailableSpace::Definite),
+                                            window,
+                                            cx,
+                                        );
+                                        list.prepaint_at(bounds.origin, window, cx);
+                                        list
                                     },
-                                )
-                                // Unconstrained sizing turns on horizontal overflow,
-                                // but gpui sizes the scroll range from one measured
-                                // item — row 0, the file header, which never exceeds
-                                // the viewport, so `offset.x` was clamped to zero and
-                                // long lines were unreachable. Measure the widest
-                                // row instead. Split rows expose their scroll
-                                // extent without widening the visible panes.
-                                .with_width_from_item(
-                                    (!data.preferences.soft_wrap.unwrap_or(false))
-                                        .then_some(data.wide_row),
+                                    |_, mut list, window, cx| list.paint(window, cx),
                                 )
                                 .h_full()
                                 .flex_1()
@@ -6164,6 +6276,390 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    const SINCE_PATCH: &str =
+        "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-reviewed\n+new\n";
+    const FULL_PATCH: &str = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/earlier.rs b/earlier.rs\nnew file mode 100644\n--- /dev/null\n+++ b/earlier.rs\n@@ -0,0 +1 @@\n+already reviewed\n";
+
+    fn since_review_fake() -> Arc<FakePr> {
+        Arc::new(FakePr {
+            patch: Some(FULL_PATCH.into()),
+            review_changes: std::sync::Mutex::new(github::ReviewChanges::Available(
+                github::ReviewBaseline {
+                    commit: "reviewed-sha".into(),
+                    submitted_at: "2026-03-01T00:00:00Z".into(),
+                },
+            )),
+            comparison_patch: std::sync::Mutex::new(Some(SINCE_PATCH.into())),
+            file_contents: HashMap::from([
+                (("reviewed-sha".into(), "a.rs".into()), "reviewed\n".into()),
+                (("ba5ec0de".into(), "a.rs".into()), "old\n".into()),
+                (("dead10cc".into(), "a.rs".into()), "new\n".into()),
+            ]),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn since_review_is_a_real_range_and_upgrades_and_comments_use_that_range() {
+        let fake = since_review_fake();
+        let mut item = loop_pr_item(Vec::new());
+        let full = fetch_item(fake.clone(), &item.source, ViewMode::Split, 0).unwrap();
+        assert_eq!(full.diff.files.len(), 2);
+        assert!(full.review_base.is_none());
+        assert!(
+            fake.comparison_requests.lock().unwrap().is_empty(),
+            "don't fetch comparison patches for All changes"
+        );
+        item.install(full);
+        item.install(
+            review_target::fetch_item_scoped(fake.clone(), &item.source, ViewMode::Split, 0, true)
+                .unwrap(),
+        );
+        let ItemState::Ready(data) = &item.state else {
+            panic!()
+        };
+        assert_eq!(data.diff.files.len(), 1);
+        assert_eq!(data.diff_base(), "reviewed-sha");
+        assert_eq!(
+            *fake.comparison_requests.lock().unwrap(),
+            [("reviewed-sha".into(), "dead10cc".into(), "ba5ec0de".into())]
+        );
+        let upgraded = run_upgrade(
+            fake.as_ref(),
+            &UpgradeSource::Pr {
+                loc: loop_loc(),
+                base_oid: data.diff_base().into(),
+                head_oid: "dead10cc".into(),
+                base_files: data.review_base_files.clone(),
+            },
+            vec![UpgradeJob {
+                file_ix: 0,
+                old_path: Some("a.rs".into()),
+                new_path: Some("a.rs".into()),
+                status: FileStatus::Modified,
+            }],
+        );
+        assert_eq!(upgraded.len(), 1);
+        assert!(upgraded[0].hunks.iter().flat_map(|h| &h.rows).any(
+            |row| matches!(row, diff_core::DiffRow::Removed { text, .. } if text == "reviewed")
+        ));
+        for side in [github::DiffSide::Left, github::DiffSide::Right] {
+            let anchor = comment_anchor::selection_anchor(
+                &data.diff.files[0],
+                "dead10cc",
+                data.diff_base(),
+                data.comment_hunks(),
+                &[(side, 1)],
+            )
+            .unwrap();
+            assert_eq!(
+                anchor.position.unwrap().commit_id,
+                if side == github::DiffSide::Left {
+                    "reviewed-sha"
+                } else {
+                    "dead10cc"
+                }
+            );
+        }
+        item.install(fetch_item(fake, &item.source, ViewMode::Split, 0).unwrap());
+        let ItemState::Ready(data) = &item.state else {
+            panic!()
+        };
+        assert_eq!(data.diff.files.len(), 2);
+        assert_eq!(data.diff_base(), "ba5ec0de");
+        assert!(!data.comment_hunks().is_empty());
+    }
+
+    #[test]
+    fn upstream_adjusted_baseline_survives_upgrades_and_maps_left_comments() {
+        let mut fake = since_review_fake();
+        Arc::get_mut(&mut fake)
+            .unwrap()
+            .file_contents
+            .insert(("dead10cc".into(), "a.rs".into()), "upstream\nnew\n".into());
+        *fake.comparison_patch.lock().unwrap() = Some(github::ReviewComparison {
+            patch: "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n upstream\n-reviewed\n+new\n".into(),
+            base_files: Some(HashMap::from([("a.rs".into(), github::ComparisonBase {
+                text: "upstream\nreviewed\n".into(), reviewed_lines: vec![None, Some(1)],
+            })])),
+        });
+        let mut item = loop_pr_item(Vec::new());
+        item.install(
+            review_target::fetch_item_scoped(fake.clone(), &item.source, ViewMode::Split, 0, true)
+                .unwrap(),
+        );
+        let ItemState::Ready(data) = &item.state else {
+            panic!()
+        };
+        let upgraded = run_upgrade(
+            fake.as_ref(),
+            &UpgradeSource::Pr {
+                loc: loop_loc(),
+                base_oid: data.diff_base().into(),
+                head_oid: "dead10cc".into(),
+                base_files: data.review_base_files.clone(),
+            },
+            vec![UpgradeJob {
+                file_ix: 0,
+                old_path: Some("a.rs".into()),
+                new_path: Some("a.rs".into()),
+                status: FileStatus::Modified,
+            }],
+        );
+        assert_eq!(upgraded.len(), 1);
+        assert_eq!((upgraded[0].additions, upgraded[0].deletions), (1, 1));
+        let left = data
+            .selection_anchor(&[(github::DiffSide::Left, 2)])
+            .unwrap();
+        assert_eq!(left.line, 1);
+        assert_eq!(left.position.unwrap().commit_id, "reviewed-sha");
+        assert!(data
+            .selection_anchor(&[(github::DiffSide::Left, 1)])
+            .is_err());
+        assert!(data
+            .selection_anchor(&[(github::DiffSide::Left, 1), (github::DiffSide::Left, 2)])
+            .is_err());
+        let right = data
+            .selection_anchor(&[(github::DiffSide::Right, 2)])
+            .unwrap();
+        assert_eq!(right.line, 2);
+        assert_eq!(right.position.unwrap().commit_id, "dead10cc");
+        item.install(fetch_item(fake, &item.source, ViewMode::Split, 0).unwrap());
+        let ItemState::Ready(data) = &item.state else {
+            panic!()
+        };
+        assert!(data.review_base.is_none());
+        assert!(data.review_base_files.is_none());
+    }
+
+    #[test]
+    fn since_review_unavailable_history_or_patch_falls_back_without_hiding_the_pr() {
+        for failure in ["rebase", "history", "patch"] {
+            let fake = since_review_fake();
+            match failure {
+                "rebase" => {
+                    *fake.review_changes.lock().unwrap() = github::ReviewChanges::Unavailable(
+                        "History rewritten by a rebase or force-push".into(),
+                    )
+                }
+                "history" => fake
+                    .fail_review_history
+                    .store(true, std::sync::atomic::Ordering::SeqCst),
+                _ => *fake.comparison_patch.lock().unwrap() = None,
+            }
+            let loaded = review_target::fetch_item_scoped(
+                fake.clone(),
+                &Source::Pr(loop_loc()),
+                ViewMode::Split,
+                0,
+                true,
+            )
+            .unwrap();
+            assert_eq!(loaded.diff.files.len(), 2);
+            assert!(loaded.review_base.is_none());
+            let github::ReviewChanges::Unavailable(reason) = loaded.review_changes else {
+                panic!()
+            };
+            assert!(!reason.is_empty());
+            if failure != "patch" {
+                assert!(fake.comparison_requests.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn since_review_keeps_right_threads_but_does_not_reuse_full_pr_left_coordinates() {
+        let fake = since_review_fake();
+        *fake.comments.lock().unwrap() = vec![
+            rc(
+                1,
+                "a.rs",
+                Some("LEFT"),
+                Some(1),
+                "old revision",
+                "alice",
+                "2026-03-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                2,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "current revision",
+                "alice",
+                "2026-03-01T00:00:00Z",
+                None,
+            ),
+        ];
+        let mut item = loop_pr_item(Vec::new());
+        item.install(
+            review_target::fetch_item_scoped(fake, &item.source, ViewMode::Split, 0, true).unwrap(),
+        );
+        let ItemState::Ready(data) = &mut item.state else {
+            panic!()
+        };
+        assert_eq!(data.discussion.as_ref().unwrap().threads.len(), 2);
+        assert!(
+            !data.comments.as_ref().unwrap().threads["a.rs"].contains_key(&(CommentSide::Left, 1))
+        );
+        assert!(
+            data.comments.as_ref().unwrap().threads["a.rs"].contains_key(&(CommentSide::Right, 1))
+        );
+        let pending = github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: String::new(),
+            comments: vec![github::PendingComment {
+                id: 9,
+                node_id: "draft".into(),
+                path: "a.rs".into(),
+                side: CommentSide::Left,
+                line: Some(1),
+                start_line: None,
+                body: "draft".into(),
+                in_reply_to_id: None,
+            }],
+        };
+        data.comments
+            .as_mut()
+            .unwrap()
+            .replace_pending(Some(&pending));
+        data.filter_scope_comments();
+        assert!(
+            !data.comments.as_ref().unwrap().threads["a.rs"].contains_key(&(CommentSide::Left, 1))
+        );
+    }
+
+    #[gpui::test]
+    fn since_review_scope_survives_refresh_and_rebase_disables_it(cx: &mut gpui::TestAppContext) {
+        let fake = since_review_fake();
+        let (window, app) = queue_window(cx, fake.clone());
+        cx.update(|cx| app.update(cx, |this, cx| this.open_item(Source::Pr(loop_loc()), cx)));
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                assert!(this.active_data().unwrap().review_base.is_none());
+                this.switch_review_scope(true, window, cx);
+            })
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            assert_eq!(
+                app.read(cx).active_data().unwrap().diff_base(),
+                "reviewed-sha"
+            );
+            let _ = window.draw(cx);
+            app.update(cx, |this, cx| this.refresh(cx));
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| assert!(app.read(cx).active_data().unwrap().review_base.is_some()));
+        *fake.review_changes.lock().unwrap() = github::ReviewChanges::Unavailable(
+            "History rewritten by a rebase or force-push".into(),
+        );
+        vcx.update(|_, cx| app.update(cx, |this, cx| this.refresh(cx)));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert!(data.review_base.is_none());
+            assert_eq!(data.diff.files.len(), 2);
+            assert!(data.review_changes.baseline().is_none());
+            let _ = window.draw(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn since_review_new_baseline_can_be_empty_and_switching_back_restores_full_diff(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = since_review_fake();
+        let (window, app) = queue_window(cx, fake.clone());
+        cx.update(|cx| app.update(cx, |this, cx| this.open_item(Source::Pr(loop_loc()), cx)));
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| this.switch_review_scope(true, window, cx))
+        });
+        vcx.run_until_parked();
+        *fake.review_changes.lock().unwrap() =
+            github::ReviewChanges::Available(github::ReviewBaseline {
+                commit: "dead10cc".into(),
+                submitted_at: "2026-03-02T00:00:00Z".into(),
+            });
+        *fake.comparison_patch.lock().unwrap() = Some(String::new().into());
+        vcx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                this.refetch_meta(this.items[this.active].id, loop_loc(), cx)
+            })
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert_eq!(data.diff_base(), "dead10cc");
+            assert!(data.diff.files.is_empty());
+            let _ = window.draw(cx);
+            app.update(cx, |this, cx| this.switch_review_scope(false, window, cx));
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let data = app.read(cx).active_data().unwrap();
+            assert!(data.review_base.is_none());
+            assert_eq!(data.diff.files.len(), 2);
+        });
+    }
+
+    #[gpui::test]
+    fn since_review_ignores_superseded_fetches_and_does_not_persist_range_coordinates(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = since_review_fake();
+        let (window, app) = queue_window(cx, fake);
+        cx.update(|cx| app.update(cx, |this, cx| this.open_item(Source::Pr(loop_loc()), cx)));
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut expected_gen = 0;
+        vcx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                let id = this.items[this.active].id;
+                let old_gen = this.items[this.active].upgrade_gen;
+                this.spawn_fetch_scoped(id, Source::Pr(loop_loc()), ViewMode::Split, true, cx);
+                this.spawn_fetch_scoped(id, Source::Pr(loop_loc()), ViewMode::Split, false, cx);
+                assert_eq!(
+                    this.items[this.active].upgrade_gen,
+                    old_gen + 2,
+                    "cancel old upgrades at fetch start"
+                );
+                expected_gen = old_gen + 3; // Only the final fetch may install/start an upgrade.
+            })
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                assert_eq!(this.items[this.active].upgrade_gen, expected_gen);
+                assert!(this.active_data().unwrap().review_base.is_none());
+                this.switch_review_scope(true, window, cx);
+            })
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            app.update(cx, |this, _| {
+                let saved = this.store.position(&loop_loc());
+                assert!(saved.is_some());
+                let data = this.active_data_mut().unwrap();
+                assert!(data.review_base.is_some());
+                data.cursor = 0;
+                data.remember_jump();
+                this.persist_positions();
+                assert_eq!(
+                    this.store.position(&loop_loc()),
+                    saved,
+                    "incremental positions must not overwrite All changes anchors"
+                );
+            })
+        });
     }
 
     #[test]
@@ -6804,6 +7300,12 @@ mod tests {
                     })
                 });
                 draw(&mut vcx);
+                for selector in ["inline-avatar-11", "inline-avatar-12", "inline-avatar-13"] {
+                    let avatar = vcx.debug_bounds(selector).expect("comment author avatar");
+                    assert!(avatar.size.width > px(0.));
+                    assert_eq!(avatar.size.width, avatar.size.height);
+                    assert!(avatar.size.height < px(row_height()));
+                }
                 // Stock Markdown owns list markers; assert the host's measured
                 // content and anchor geometry, not a private block widget tree.
                 let root = vcx.debug_bounds("inline-text-0-11-0-card").unwrap();
@@ -7716,6 +8218,40 @@ mod tests {
         let app = stash.borrow().clone().unwrap();
         cx.run_until_parked();
         (window.into(), app)
+    }
+
+    #[gpui::test]
+    fn queue_author_names_are_visible_without_avatars_and_stay_bounded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue.prs = vec![
+                    queued(1, "acme/repo", "alice"),
+                    queued(2, "acme/repo", "a-very-long-automation-account-name[bot]"),
+                ];
+                cx.notify();
+            });
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        for (author_id, row_id) in [
+            ("queue-author-0", "queue-row-0"),
+            ("queue-author-1", "queue-row-1"),
+        ] {
+            let author = vcx
+                .debug_bounds(author_id)
+                .expect("the author login is rendered even without an avatar URL");
+            let row = vcx.debug_bounds(row_id).unwrap();
+            assert!(author.size.width > px(0.));
+            assert!(author.size.width <= px(160.));
+            assert!(author.size.height > px(0.));
+            assert!(row.contains(&author.center()));
+            assert_eq!(row.size.height, px(36.));
+        }
     }
 
     /// The whole chain a chip click runs — handler → search update →
@@ -9434,6 +9970,10 @@ mod tests {
         next_id: std::sync::atomic::AtomicU64,
         pending: std::sync::Mutex<Option<github::PendingReview>>,
         commits: std::sync::Mutex<Option<github::PrCommits>>,
+        review_changes: std::sync::Mutex<github::ReviewChanges>,
+        comparison_patch: std::sync::Mutex<Option<github::ReviewComparison>>,
+        comparison_requests: std::sync::Mutex<Vec<(String, String, String)>>,
+        fail_review_history: std::sync::atomic::AtomicBool,
         commit_fetches: std::sync::atomic::AtomicUsize,
         patch: Option<String>,
         file_contents: HashMap<(String, String), String>,
@@ -9726,6 +10266,39 @@ mod tests {
                 .unwrap()
                 .clone()
                 .ok_or_else(|| github::ClientError::Failed("commits unavailable".into()))
+        }
+
+        fn review_changes(
+            &self,
+            _loc: &github::PrLocator,
+            _head: &str,
+        ) -> Result<github::ReviewChanges, github::ClientError> {
+            if self
+                .fail_review_history
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(github::ClientError::Failed("history unavailable".into()));
+            }
+            Ok(self.review_changes.lock().unwrap().clone())
+        }
+
+        fn comparison_patch(
+            &self,
+            _loc: &github::PrLocator,
+            base: &str,
+            head: &str,
+            upstream: &str,
+        ) -> Result<github::ReviewComparison, github::ClientError> {
+            self.comparison_requests.lock().unwrap().push((
+                base.into(),
+                head.into(),
+                upstream.into(),
+            ));
+            self.comparison_patch
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| github::ClientError::Failed("comparison unavailable".into()))
         }
 
         fn pending_review(
@@ -10101,6 +10674,81 @@ mod tests {
                         prior
                     );
                 });
+            }
+        }
+    }
+
+    #[test]
+    fn diff_padding_tracks_half_the_viewport_at_any_zoom() {
+        for row_px in [12., 22., 48.] {
+            for pane_px in [0., 1., 300., 441., 900.] {
+                let padding = diff_padding_rows(pane_px, row_px) as f32 * row_px;
+                assert!(padding >= pane_px / 2.);
+                assert!(padding < pane_px / 2. + row_px);
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn diff_padding_and_minimap_share_the_full_scroll_range(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let mut diff = two_file_diff();
+            diff.files[0].hunks = diff_texts("", &"line\n".repeat(200), 3);
+            let mut data = file_mode_data(diff);
+            data.mode = mode;
+            data.set_rows(data.row_build());
+            let source_rows = data.rows.len();
+            let mut item = loop_pr_item(Vec::new());
+            item.state = ItemState::Ready(data);
+            install_item(&app, item, &mut vcx);
+            for height in [600., 900., 450.] {
+                vcx.simulate_resize(size(px(1100.), px(height)));
+                for minimap_visible in [true, false] {
+                    vcx.update(|window, cx| {
+                        app.update(cx, |this, cx| {
+                            this.minimap_visible = minimap_visible;
+                            cx.notify();
+                        });
+                        let _ = window.draw(cx);
+                        let this = app.read(cx);
+                        let data = this.active_data().unwrap();
+                        let state = data.scroll.0.borrow();
+                        let bounds = state.base_handle.bounds();
+                        let pane_h = f32::from(bounds.size.height);
+                        let tail = diff_padding_rows(pane_h, row_height());
+                        let total = source_rows + tail;
+                        assert_eq!(data.rows.len(), source_rows, "padding is not source data");
+                        assert_eq!(data.minimap.len(), source_rows);
+                        assert_eq!(
+                            state.last_item_size.unwrap().contents.height,
+                            px(total as f32 * row_height())
+                        );
+                        assert_eq!(
+                            state.last_item_size.unwrap().item.height,
+                            bounds.size.height,
+                            "the list must still render a full viewport"
+                        );
+                        let layout = data.minimap_layout(pane_h, tail);
+                        assert_eq!((layout.slot_h, layout.group), minimap_scale(total, pane_h));
+                        drop(state);
+
+                        app.update(cx, |this, cx| {
+                            // Scrubbing into the minimap's blank tail must reach
+                            // the same bottom as the actual list/scrollbar.
+                            this.minimap_scrub_to(bounds.bottom_right(), cx);
+                        });
+                        let _ = window.draw(cx);
+                        let data = app.read(cx).active_data().unwrap();
+                        let state = data.scroll.0.borrow();
+                        let bottom = -state.base_handle.offset().y;
+                        assert_eq!(bottom, state.base_handle.max_offset().y);
+                        let code_bottom = source_rows as f32 * row_height() - f32::from(bottom);
+                        assert!(code_bottom <= pane_h / 2. + 0.01);
+                        assert!(code_bottom > pane_h / 2. - row_height() - 0.01);
+                    });
+                }
             }
         }
     }
@@ -10526,6 +11174,73 @@ mod tests {
         data.commits = Some(github::PrCommits { commits: vec![] });
         data.discussion = Some(github::PrDiscussion::from_review_comments(comments));
         item
+    }
+
+    #[gpui::test]
+    fn conversation_comments_reviews_and_replies_show_author_avatars(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![
+            rc(
+                11,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "Question",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                12,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "Reply",
+                "dependabot[bot]",
+                "2026-01-02T00:00:00Z",
+                Some(11),
+            ),
+        ]);
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut item = commenting_item(&fake);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        let discussion = data.discussion.as_mut().unwrap();
+        for (id, review_state) in [(21, None), (22, Some("APPROVED"))] {
+            discussion.comments.push(github::DiscussionComment {
+                id,
+                permissions: Default::default(),
+                author: "alice".into(),
+                body: "Looks good".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                reactions: vec![],
+                review_state: review_state.map(str::to_owned),
+                review_id: None,
+            });
+        }
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1100.), px(1800.)));
+        for _ in 0..3 {
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            vcx.run_until_parked();
+        }
+        for selector in [
+            "discussion-avatar-0-review-false-11",
+            "discussion-avatar-0-review-false-12",
+            "discussion-avatar-0-main-false-21",
+            "discussion-avatar-0-main-true-22",
+        ] {
+            let avatar = vcx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing comment author avatar: {selector}"));
+            assert!(avatar.size.width > px(0.));
+            assert_eq!(avatar.size.width, avatar.size.height);
+        }
     }
 
     fn click_commenting(vcx: &mut gpui::VisualTestContext, selector: &'static str) {
@@ -12250,6 +12965,112 @@ mod tests {
     }
 
     #[gpui::test]
+    fn pending_tray_starts_collapsed_and_keeps_controls_and_per_pr_disclosure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![]);
+        *fake.pending.lock().unwrap() = Some(github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: String::new(),
+            comments: vec![github::PendingComment {
+                id: 13,
+                node_id: "draft".into(),
+                path: "gone.rs".into(),
+                side: CommentSide::Left,
+                line: None,
+                start_line: None,
+                body: "outdated draft".into(),
+                in_reply_to_id: None,
+            }],
+        });
+        let (window, app) = queue_window(cx, fake);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        install_item(&app, loop_pr_item(vec![]), cx);
+        cx.update(|cx| app.update(cx, |this, cx| this.resume_session(0, cx)));
+        cx.run_until_parked();
+        let draw = |vcx: &mut gpui::VisualTestContext| {
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        };
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("pending-status").is_some());
+        assert!(vcx.debug_bounds("pending-refresh").is_some());
+        assert!(vcx.debug_bounds("pending-review").is_some());
+        assert!(vcx.debug_bounds("pending-comments").is_none());
+        cx.update(|cx| assert_eq!(app.read(cx).sessions[&0].state.count(), 1));
+
+        click_commenting(&mut vcx, "pending-comments-toggle");
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("pending-comments").is_some());
+        click_commenting(&mut vcx, "pending-refresh");
+        draw(&mut vcx);
+        assert!(
+            vcx.debug_bounds("pending-comments").is_some(),
+            "refresh preserves expansion"
+        );
+
+        // Another PR starts collapsed, without changing the first PR's choice.
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                let mut other = loop_pr_item(vec![]);
+                other.id = 1;
+                this.items.push(other);
+                let state = this.sessions[&0].state.clone();
+                this.sessions.insert(
+                    1,
+                    SessionUi {
+                        state,
+                        ..Default::default()
+                    },
+                );
+                this.active = 1;
+                cx.notify();
+            })
+        });
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("pending-comments").is_none());
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.active = 0;
+                cx.notify();
+            })
+        });
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("pending-comments").is_some());
+
+        // The same disclosure works in the conversation pane.
+        vcx.dispatch_action(ShowConversation);
+        click_commenting(&mut vcx, "pending-comments-toggle");
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("pending-comments").is_none());
+        click_commenting(&mut vcx, "pending-refresh");
+        draw(&mut vcx);
+        assert!(
+            vcx.debug_bounds("pending-comments").is_none(),
+            "refresh preserves collapse"
+        );
+        click_commenting(&mut vcx, "pending-review");
+        cx.update(|cx| {
+            assert!(
+                app.read(cx).review.is_some(),
+                "Finish review still opens the modal"
+            )
+        });
+        vcx.update(|window, cx| app.update(cx, |this, cx| this.close_review(window, cx)));
+
+        // Finishing/losing a review resets the disclosure for the next review.
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.sessions.get_mut(&0).unwrap().comments_expanded = true;
+                this.finish_session(0, ReviewSession::default(), &Ok(()), cx);
+                assert!(!this.sessions[&0].comments_expanded);
+            })
+        });
+    }
+
+    #[gpui::test]
     fn pending_reply_edits_stay_in_the_conversation_and_outdated_drafts_edit_in_the_tray(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -12314,11 +13135,27 @@ mod tests {
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.items[0].pane = ItemPane::Changes;
+                assert!(!this.sessions[&0].comments_expanded);
                 this.edit_pending(13, window, cx);
                 assert_eq!(
                     this.composer.as_ref().unwrap().placement,
                     ComposerPlacement::PendingTray(13)
                 );
+            });
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("pending-comments").is_some());
+        assert!(
+            vcx.debug_bounds("composer-card").is_some(),
+            "fallback editor is not hidden in the collapsed tray"
+        );
+        click_commenting(&mut vcx, "pending-comments-toggle");
+        assert!(
+            vcx.debug_bounds("composer-card").is_some(),
+            "cannot collapse an active tray editor"
+        );
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
                 this.composer
                     .as_ref()
                     .unwrap()

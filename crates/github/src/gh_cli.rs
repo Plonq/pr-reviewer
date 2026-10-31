@@ -1082,6 +1082,111 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             .map_err(|err| ClientError::Failed(format!("unexpected GitHub response: {err}")))
     }
 
+    fn review_changes(
+        &self,
+        loc: &PrLocator,
+        head: &str,
+    ) -> Result<crate::ReviewChanges, ClientError> {
+        use crate::review_changes::{latest_review, valid_oid, validate_comparison};
+        if !valid_oid(head) {
+            return Err(ClientError::Failed("the PR head is unavailable".into()));
+        }
+        let viewer = self.viewer()?;
+        let pages = self.review_api(&[
+            "api".into(),
+            "--paginate".into(),
+            "--slurp".into(),
+            format!(
+                "repos/{}/pulls/{}/reviews?per_page=100",
+                loc.repo_slug(),
+                loc.number
+            ),
+        ])?;
+        let Some(review) = latest_review(pages, &viewer.login)? else {
+            return Ok(crate::ReviewChanges::Unavailable(
+                "Submit a GitHub review to use Changed since last review.".into(),
+            ));
+        };
+        if review.commit == head {
+            return Ok(crate::ReviewChanges::Available(review));
+        }
+        let comparison = match self.review_api(&[
+            "api".into(),
+            format!(
+                "repos/{}/compare/{}...{head}?per_page=1",
+                loc.repo_slug(),
+                review.commit
+            ),
+        ]) {
+            Ok(value) => value,
+            Err(ClientError::Failed(cause)) if cause.contains("HTTP 404") => {
+                return Ok(crate::ReviewChanges::Unavailable(
+                    "Unavailable: the commit from your last review can no longer be compared with this PR. It may have been removed by a rebase or force-push. View all changes instead.".into(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        validate_comparison(review, &comparison)
+    }
+
+    fn comparison_patch(
+        &self,
+        loc: &PrLocator,
+        base: &str,
+        head: &str,
+        upstream: &str,
+    ) -> Result<crate::ReviewComparison, ClientError> {
+        use crate::review_changes::valid_oid;
+        if ![base, head, upstream].into_iter().all(valid_oid) {
+            return Err(ClientError::Invalid("invalid comparison revision".into()));
+        }
+        if base == head {
+            return Ok(crate::ReviewComparison::default());
+        }
+        // Both merge bases come from immutable revisions captured for this
+        // fetch, not mutable branch names. The PR may not include the target's
+        // latest commits, so never merge its tip directly into the baseline.
+        let merge_base = |revision: &str| -> Result<String, ClientError> {
+            let comparison = self.review_api(&[
+                "api".into(),
+                format!(
+                    "repos/{}/compare/{upstream}...{revision}?per_page=1",
+                    loc.repo_slug()
+                ),
+            ])?;
+            comparison["merge_base_commit"]["sha"]
+                .as_str()
+                .filter(|oid| valid_oid(oid))
+                .map(str::to_owned)
+                .ok_or_else(|| ClientError::Failed("GitHub returned no upstream merge base".into()))
+        };
+        let old_upstream = merge_base(base)?;
+        let new_upstream = merge_base(head)?;
+        if old_upstream != new_upstream {
+            return crate::comparison::fetch_comparison(
+                loc,
+                base,
+                head,
+                &old_upstream,
+                &new_upstream,
+            );
+        }
+        let endpoint = format!("repos/{}/compare/{base}...{head}", loc.repo_slug());
+        let out = self
+            .process
+            .run(&[
+                "api",
+                &endpoint,
+                "-H",
+                "Accept: application/vnd.github.diff",
+            ])
+            .map_err(spawn_failure)?;
+        if out.code != Some(0) {
+            return Err(classify_failure(&out));
+        }
+        Ok(out.text()?.to_string().into())
+    }
+
     fn pr_patch(&self, loc: &PrLocator) -> Result<String, ClientError> {
         let number = loc.number.to_string();
         let slug = loc.repo_slug();
@@ -2432,11 +2537,202 @@ mod tests {
             .contains("rate limited"));
     }
 
-    /// The fake `gh` backend: each invocation pops the next recorded outcome,
-    /// and an invocation beyond what the test scripted fails — a stray
-    /// subprocess would be a behavior change worth noticing. Every
-    /// invocation's argv is recorded, so a test can pin the exact `gh`
-    /// command an operation compiles to.
+    #[test]
+    fn review_changes_uses_paginated_reviews_and_raw_diff_despite_capped_json_files() {
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
+        let reviews = serde_json::json!([[{"id":1,"user":{"login":"me"},"state":"APPROVED","submitted_at":"2026-03-01T00:00:00Z","commit_id":base}]]).to_string();
+        // The metadata listing is capped, but is not our diff source. A
+        // base-branch merge can make this much larger than the PR's own diff.
+        let comparison = serde_json::json!({"status":"ahead","merge_base_commit":{"sha":base},"files":vec![serde_json::json!({});300]}).to_string();
+        let patch: String = (0..326).map(|ix| format!(
+            "diff --git a/file-{ix} b/file-{ix}\n--- a/file-{ix}\n+++ b/file-{ix}\n@@ -1 +1 @@\n-old\n+new\n"
+        )).collect();
+        let fake = FakeGh::many(vec![
+            ok(Some(0), r#"{"login":"me","avatar_url":""}"#, ""),
+            ok(Some(0), &reviews, ""),
+            ok(Some(0), &comparison, ""),
+            ok(Some(0), &comparison, ""),
+            ok(Some(0), &comparison, ""),
+            ok(Some(0), &patch, ""),
+        ]);
+        let calls = fake.calls_handle();
+        let client = GhCliClient::with_process(fake);
+        let loc = PrLocator {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 7,
+        };
+        let changes = client.review_changes(&loc, &head).unwrap();
+        assert_eq!(changes.baseline().unwrap().commit, base);
+        let upstream = "c".repeat(40);
+        let received = client
+            .comparison_patch(&loc, &base, &head, &upstream)
+            .unwrap();
+        assert_eq!(received.patch, patch);
+        assert!(received.base_files.is_none());
+        assert_eq!(
+            received
+                .patch
+                .lines()
+                .filter(|line| line.starts_with("diff --git "))
+                .count(),
+            326
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls[1],
+            vec![
+                "api",
+                "--paginate",
+                "--slurp",
+                "repos/acme/widgets/pulls/7/reviews?per_page=100"
+            ]
+        );
+        assert_eq!(
+            calls[2],
+            vec![
+                "api".to_string(),
+                format!("repos/acme/widgets/compare/{base}...{head}?per_page=1")
+            ]
+        );
+        assert_eq!(
+            calls[3],
+            vec![
+                "api".to_string(),
+                format!("repos/acme/widgets/compare/{upstream}...{base}?per_page=1")
+            ]
+        );
+        assert_eq!(
+            calls[4],
+            vec![
+                "api".to_string(),
+                format!("repos/acme/widgets/compare/{upstream}...{head}?per_page=1")
+            ]
+        );
+        assert_eq!(
+            calls[5],
+            vec![
+                "api".to_string(),
+                format!("repos/acme/widgets/compare/{base}...{head}"),
+                "-H".into(),
+                "Accept: application/vnd.github.diff".into()
+            ]
+        );
+    }
+
+    #[test]
+    fn review_changes_no_review_and_current_head_do_not_compare() {
+        let sha = "a".repeat(40);
+        let loc = PrLocator {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 7,
+        };
+        for reviewed in [false, true] {
+            let reviews = if reviewed {
+                serde_json::json!([[{"id":1,"user":{"login":"me"},"state":"COMMENTED","submitted_at":"2026-03-01T00:00:00Z","commit_id":sha}]]).to_string()
+            } else {
+                "[[]]".into()
+            };
+            let client = GhCliClient::with_process(FakeGh::many(vec![
+                ok(Some(0), r#"{"login":"me","avatar_url":""}"#, ""),
+                ok(Some(0), &reviews, ""),
+            ]));
+            assert_eq!(
+                client
+                    .review_changes(&loc, &sha)
+                    .unwrap()
+                    .baseline()
+                    .is_some(),
+                reviewed
+            );
+            assert_eq!(
+                client
+                    .comparison_patch(&loc, &sha, &sha, &sha)
+                    .unwrap()
+                    .patch,
+                ""
+            );
+        }
+    }
+
+    #[test]
+    fn review_comparison_errors_are_not_empty_or_fabricated_rebases() {
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
+        let loc = PrLocator {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            number: 7,
+        };
+        let reviews = serde_json::json!([[{"id":1,"user":{"login":"me"},"state":"APPROVED","submitted_at":"2026-03-01T00:00:00Z","commit_id":base}]]).to_string();
+        let client = GhCliClient::with_process(FakeGh::many(vec![
+            ok(Some(0), r#"{"login":"me","avatar_url":""}"#, ""),
+            ok(Some(0), &reviews, ""),
+            ok(Some(1), "", "network unavailable"),
+        ]));
+        assert!(client
+            .review_changes(&loc, &head)
+            .unwrap_err()
+            .to_string()
+            .contains("network unavailable"));
+        let missing = GhCliClient::with_process(FakeGh::many(vec![
+            ok(Some(0), r#"{"login":"me","avatar_url":""}"#, ""),
+            ok(Some(0), &reviews, ""),
+            ok(Some(1), "", "gh: Not Found (HTTP 404)"),
+        ]));
+        let crate::ReviewChanges::Unavailable(reason) =
+            missing.review_changes(&loc, &head).unwrap()
+        else {
+            panic!()
+        };
+        assert!(reason.contains("rebase or force-push"));
+        let failed = GhCliClient::with_process(FakeGh::one(ok(Some(1), "", "diff unavailable")));
+        assert!(failed.comparison_patch(&loc, &base, &head, &base).is_err());
+        assert!(failed
+            .comparison_patch(&loc, "--invalid", &head, &base)
+            .is_err());
+        for response in [r#"{}"#, r#"{"merge_base_commit":{"sha":"--invalid"}}"#] {
+            let client = GhCliClient::with_process(FakeGh::one(ok(Some(0), response, "")));
+            assert!(client.comparison_patch(&loc, &base, &head, &base).is_err());
+        }
+    }
+
+    /// Compare an authenticated web view's exported per-file counts against
+    /// the production path. Inputs stay external (including private PR data).
+    #[test]
+    #[ignore = "requires gh authentication, network, and GANDER_COMPARE_* inputs"]
+    fn real_upstream_aware_comparison_matches_web_file_counts() {
+        let input = |name: &str| std::env::var(format!("GANDER_COMPARE_{name}")).expect(name);
+        let client = GhCliClient::new();
+        let loc = client.resolve_pr(&input("PR")).unwrap();
+        let comparison = client
+            .comparison_patch(&loc, &input("REVIEWED"), &input("HEAD"), &input("UPSTREAM"))
+            .unwrap();
+        let expected: std::collections::BTreeMap<String, (u32, u32)> =
+            serde_json::from_slice(&std::fs::read(input("EXPECTED")).unwrap()).unwrap();
+        let actual: std::collections::BTreeMap<_, _> = diff_core::parse_patch(&comparison.patch)
+            .files
+            .into_iter()
+            .map(|file| {
+                (
+                    file.display_path().to_owned(),
+                    (file.additions, file.deletions),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        let files = comparison
+            .base_files
+            .expect("exercise an upstream-adjusted baseline");
+        for base in files.values() {
+            assert_eq!(base.text.lines().count(), base.reviewed_lines.len());
+        }
+    }
+
+    /// Each invocation pops the next recorded outcome and records argv;
+    /// an invocation beyond the script fails the test.
     struct FakeGh {
         results: Mutex<VecDeque<Result<GhOutput, io::Error>>>,
         calls: std::sync::Arc<Mutex<Vec<Vec<String>>>>,

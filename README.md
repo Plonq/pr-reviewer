@@ -61,6 +61,25 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   `]`/`[` move between files and `n`/`p` between hunks (both wrap); returning
   to a PR resumes its last file and scroll position, even after restarting
 - unified + split views
+- **All changes / Changed since last review** in the Changes pane: compare the
+  commit from your latest submitted GitHub review with the current PR head,
+  including reviews submitted on GitHub. No manual commit selection. The scope
+  stays selected while the PR is open; new opens default to All changes.
+  Rebases/force-pushes that remove the reviewed commit from the head's ancestry
+  disable the filter with an explanation. Missing review history or failed
+  comparisons also disable it rather than guessing. Upstream/base-branch merges
+  are excluded, including upstream-only edits inside files changed by the PR:
+  the reviewed tree is brought forward to the upstream revision already merged
+  into the current head before comparing. This uses Git 2.43+ in an isolated,
+  temporary bare repository, with `gh`'s credential helper and lazy blob fetching;
+  no local checkout is required or modified. Neither comparison path relies on
+  GitHub's JSON file list (which is capped at 300 files).
+  Reviewing the current head shows “No changes since your
+  last review.” Existing full-PR left-side threads remain in Conversation, since
+  their coordinates refer to a different revision; new incremental comments use
+  GitHub's experimental revision-positioning API and may depend on its rollout.
+  Left-side comments map back to the actual reviewed blob; upstream-only lines
+  without a reviewed position must be commented on the new revision instead.
 - `cmd-f` searches the current file's diff (literal, case-sensitive); Enter cycles
   highlighted matches, Shift-Enter goes back, and Esc restores the prior scroll
   position. Folded context is temporarily revealed; large-file safety banners
@@ -102,9 +121,11 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   cross-hunk ranges, use GitHub's experimental positioning API and may depend
   on GitHub's rollout for the repository
 - pending reviews: start/add to a review without posting, resume drafts started
-  on GitHub, and edit/delete them inline or in the pending-review tray before submitting;
-   replies join the pending review too; **Add single comment** is available
-   only without a pending review and posts immediately
+  on GitHub, and edit/delete them inline or in the pending-review tray before submitting.
+  The tray starts collapsed, keeping the comment count, Refresh drafts, and
+  Finish review controls visible; Show comments expands the draft list.
+  Replies join the pending review too; **Add single comment** is available
+  only without a pending review and posts immediately
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
 - dark-only theme with soft blue-grey surfaces and pastel accents
 
