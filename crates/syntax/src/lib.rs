@@ -50,6 +50,7 @@ const CAPTURES: &[(&str, Token)] = &[
     ("import", Token::Keyword),
     ("keyframes", Token::Keyword),
     ("keyword", Token::Keyword),
+    ("keyword.function", Token::Keyword),
     ("label", Token::Label),
     ("media", Token::Keyword),
     ("module", Token::Namespace),
@@ -67,6 +68,7 @@ const CAPTURES: &[(&str, Token)] = &[
     ("type", Token::Type),
     ("variable.builtin", Token::Constant),
     ("variable.parameter", Token::Parameter),
+    ("variable.scss", Token::Variable),
 ];
 
 /// A lazily-built highlight configuration for one language. Building compiles
@@ -336,6 +338,28 @@ static CSS: Language = Language::new(|| {
     .ok()
 });
 
+static SCSS: Language = Language::new(|| {
+    // SCSS extends CSS. Later patterns win for the same node, so layer SCSS
+    // over CSS and put our $variable captures last. Keep them SCSS-specific:
+    // bare variables in other languages stay uncoloured. The grammar aliases
+    // variable declarations to property_name. Drop the unsupported @spell
+    // capture: it otherwise overrides @comment on the same node.
+    let scss = tree_sitter_scss::HIGHLIGHTS_QUERY.replace(" @spell", "");
+    let highlights = format!(
+        r#"{}
+{}
+(mixin_statement name: (identifier) @function)
+(function_statement name: (identifier) @function)
+(include_statement (identifier) @function)
+(variable) @variable.scss
+((property_name) @variable.scss
+ (#match? @variable.scss "^\\$"))"#,
+        tree_sitter_css::HIGHLIGHTS_QUERY,
+        scss
+    );
+    HighlightConfiguration::new(tree_sitter_scss::language(), "scss", &highlights, "", "").ok()
+});
+
 /// Resolve a language from a path's extension. `None` means "render plain".
 pub fn language_for_path(path: &str) -> Option<&'static Language> {
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -360,6 +384,7 @@ pub fn language_for_path(path: &str) -> Option<&'static Language> {
         "yml" | "yaml" => &YAML,
         "html" | "htm" => &HTML,
         "css" => &CSS,
+        "scss" => &SCSS,
         _ => return None,
     };
     Some(lang)
@@ -460,6 +485,7 @@ mod tests {
             ("yaml", &YAML),
             ("html", &HTML),
             ("css", &CSS),
+            ("scss", &SCSS),
         ];
         for (name, lang) in all {
             assert!(lang.config().is_some(), "{name} config failed to build");
@@ -473,6 +499,16 @@ mod tests {
         assert!(language_for_path("lib/foo/bar.ex").is_some());
         assert!(language_for_path("mix.EXS").is_some()); // case-insensitive
         assert!(language_for_path("index.d.ts").is_some());
+        assert!(std::ptr::eq(
+            language_for_path("styles/_buttons.scss").unwrap(),
+            &SCSS
+        ));
+        assert!(std::ptr::eq(
+            language_for_path("styles/main.SCSS").unwrap(),
+            &SCSS
+        ));
+        assert!(std::ptr::eq(language_for_path("main.css").unwrap(), &CSS));
+        assert!(language_for_path("main.sass").is_none());
         assert!(language_for_path("Makefile").is_none());
         assert!(language_for_path("logo.png").is_none());
         assert!(language_for_path(".gitignore").is_none());
@@ -525,6 +561,110 @@ mod tests {
         assert!(lines[0].iter().any(|&(_, t)| t == Token::Namespace));
         // :ok is an atom → string.special.symbol → Constant.
         assert!(lines[1].iter().any(|&(_, t)| t == Token::Constant));
+    }
+
+    fn assert_token(source: &str, line: usize, text: &str, token: Token) {
+        let lang = language_for_path("styles.scss").unwrap();
+        let lines = highlight_lines(lang, source);
+        let content = source.lines().nth(line).unwrap();
+        let start = content.find(text).unwrap();
+        let end = start + text.len();
+        assert!(
+            lines[line]
+                .iter()
+                .any(|(range, t)| range.start <= start && range.end >= end && *t == token),
+            "expected {text:?} to be {token:?} on line {line}: {:?}",
+            lines[line]
+        );
+    }
+
+    #[test]
+    fn scss_highlights_variables_mixins_and_functions() {
+        let source = "\
+@use \"sass:math\";
+$accent: #ff00aa;
+@mixin button($gap: 8px) {
+  // café
+  padding: $gap;
+  color: $accent;
+  &:hover { opacity: 0.5; }
+}
+.button {
+  @include button(4px);
+}
+@function double($value) {
+  @return $value * 2;
+}";
+        for (line, text, token) in [
+            (0, "@use", Token::Keyword),
+            (0, "\"sass:math\"", Token::String),
+            (1, "$accent", Token::Variable),
+            (1, "ff00aa", Token::String),
+            (2, "@mixin", Token::Keyword),
+            (2, "button", Token::Function),
+            (2, "$gap", Token::Variable),
+            (3, "// café", Token::Comment),
+            (4, "padding", Token::Property),
+            (4, "$gap", Token::Variable),
+            (5, "$accent", Token::Variable),
+            (6, "&", Token::Function),
+            (6, "hover", Token::Property),
+            (6, "opacity", Token::Property),
+            (6, "0.5", Token::Number),
+            (8, "button", Token::Property),
+            (9, "@include", Token::Keyword),
+            (9, "button", Token::Function),
+            (11, "@function", Token::Keyword),
+            (11, "double", Token::Function),
+            (12, "@return", Token::Keyword),
+            (12, "$value", Token::Variable),
+            (12, "*", Token::Operator),
+        ] {
+            assert_token(source, line, text, token);
+        }
+    }
+
+    #[test]
+    fn scss_inherits_css_highlights() {
+        let source = "/* comment */\n@media screen {\n  .button { color: red; margin: 12px; }\n}";
+        for (line, text, token) in [
+            (0, "/* comment */", Token::Comment),
+            (1, "@media", Token::Keyword),
+            (2, "button", Token::Property),
+            (2, "color", Token::Property),
+            (2, "red", Token::String),
+            (2, "12", Token::Number),
+            (2, "px", Token::Type),
+        ] {
+            assert_token(source, line, text, token);
+        }
+    }
+
+    #[test]
+    fn scss_interpolation_and_multiline_comments_have_valid_spans() {
+        let source = "$name: \"active\";\n/* café\n   日本語 */\n.#{$name} {\n  color: $name;\n  content: \"héllo\";\n}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_scss::language()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let lang = language_for_path("styles.scss").unwrap();
+        let lines = highlight_lines(lang, source);
+        assert_token(source, 1, "/* café", Token::Comment);
+        assert_token(source, 2, "   日本語 */", Token::Comment);
+        assert_token(source, 3, "$name", Token::Variable);
+        assert_token(source, 4, "$name", Token::Variable);
+        assert_token(source, 5, "\"héllo\"", Token::String);
+        assert_eq!(lines.len(), source.split('\n').count());
+        for (text, spans) in source.split('\n').zip(&lines) {
+            for (range, _) in spans {
+                assert!(range.start < range.end && range.end <= text.len());
+                assert!(text.is_char_boundary(range.start));
+                assert!(text.is_char_boundary(range.end));
+            }
+            for pair in spans.windows(2) {
+                assert!(pair[0].0.end <= pair[1].0.start, "overlapping spans");
+            }
+        }
     }
 
     #[test]

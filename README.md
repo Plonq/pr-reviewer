@@ -96,7 +96,7 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   each PR remembers its own choices. Horizontal scrolling works in both views.
   Fold boundaries expand on click. Files of 20,000+ lines open behind an
   explanatory, click-to-expand safety banner, without whole-file highlighting.
-- tree-sitter highlighting (18 languages)
+- tree-sitter highlighting, including CSS and SCSS
 - word-level intra-line diffs
 - whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
 - multi-item sidebar with file tree; drag its right edge to resize (width is remembered)
