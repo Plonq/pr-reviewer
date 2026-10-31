@@ -11263,6 +11263,82 @@ mod tests {
         vcx.run_until_parked();
     }
 
+    #[gpui::test]
+    fn inline_comment_times_build_tooltips_on_hover_in_both_views(cx: &mut gpui::TestAppContext) {
+        let tooltips = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = tooltips.clone();
+        let _subscription = cx.update(|cx| {
+            cx.observe_new::<gpui::component::tooltip::Tooltip>(move |_, _, _| {
+                observed.set(observed.get() + 1);
+            })
+        });
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let fake = Arc::new(FakeQueue {
+                asked: std::sync::Mutex::new(Vec::new()),
+            });
+            let (window, app) = queue_window(cx, fake);
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            let mut item = loop_pr_item(vec![
+                rc(
+                    11,
+                    "a.rs",
+                    Some("RIGHT"),
+                    Some(1),
+                    "root",
+                    "alice",
+                    "2026-01-02T00:00:00Z",
+                    None,
+                ),
+                rc(
+                    12,
+                    "a.rs",
+                    Some("RIGHT"),
+                    Some(1),
+                    "reply",
+                    "bob",
+                    "2026-01-02T00:01:00Z",
+                    Some(11),
+                ),
+            ]);
+            let ItemState::Ready(data) = &mut item.state else {
+                unreachable!()
+            };
+            data.mode = mode;
+            data.set_rows(data.row_build());
+            install_item(&app, item, cx);
+            for selector in ["inline-comment-time-11", "inline-comment-time-12"] {
+                vcx.simulate_mouse_move(
+                    gpui::point(px(0.), px(0.)),
+                    None,
+                    gpui::Modifiers::default(),
+                );
+                vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+                vcx.run_until_parked();
+                vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+                let bounds = vcx
+                    .debug_bounds(selector)
+                    .expect("inline timestamp is visible");
+                let before = tooltips.get();
+                vcx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+                vcx.run_until_parked();
+                vcx.executor()
+                    .advance_clock(std::time::Duration::from_secs(1));
+                vcx.run_until_parked();
+                vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+                assert!(
+                    tooltips.get() > before,
+                    "hovering {selector} must build a timestamp tooltip"
+                );
+            }
+        }
+    }
+
     #[test]
     fn resolved_diff_threads_are_one_row_in_both_modes_and_keep_navigation_counts() {
         let comments = vec![

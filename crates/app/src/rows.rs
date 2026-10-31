@@ -8,6 +8,7 @@ use diff_core::{DiffRow, FileStatus, Hunk, PrDiff};
 use gpui::component::{
     button::{Button, ButtonVariants as _},
     tag::Tag,
+    tooltip::Tooltip,
     Sizable as _,
 };
 use gpui::{div, prelude::*, px, HighlightStyle, Hsla, SharedString, StyledText};
@@ -91,6 +92,8 @@ pub(crate) enum Row {
         comment_id: u64,
         author: SharedString,
         when: SharedString,
+        /// Full posted time for hover; local and pending drafts have no date.
+        timestamp: Option<SharedString>,
         is_reply: bool,
         half: Option<CommentSide>,
         /// First row of the whole thread, so it draws the card's top edge.
@@ -244,6 +247,10 @@ fn push_thread_rows(
                 comment_id: comment.id,
                 author: comment.author.clone().into(),
                 when: comment.time.short_age(now).into(),
+                timestamp: match &comment.time {
+                    CommentTime::Posted(raw) => Some(raw.clone().into()),
+                    CommentTime::Draft | CommentTime::Pending => None,
+                },
                 is_reply: ix > 0,
                 half,
                 // A thread always opens with its root's header and closes with
@@ -1297,6 +1304,7 @@ fn render_row_content(
             comment_id,
             author,
             when,
+            timestamp,
             is_reply,
             half,
             top,
@@ -1326,9 +1334,16 @@ fn render_row_content(
                     )
                     .child(
                         div()
+                            .id(("comment-time", ix))
+                            .debug_selector(|| format!("inline-comment-time-{comment_id}"))
                             .text_color(theme::overlay0(cx))
                             .text_size(px(11.))
-                            .child(when.clone()),
+                            .child(when.clone())
+                            .when_some(timestamp.clone(), |label, timestamp| {
+                                label.tooltip(move |window, cx| {
+                                    Tooltip::new(timestamp.clone()).build(window, cx)
+                                })
+                            }),
                     )
                     .child(div().flex_1())
                     .children(controls)
@@ -2339,6 +2354,91 @@ mod tests {
             .count();
         assert_eq!(unified_lines, 11);
         assert_eq!(split_lines, 8); // 4 (hunk 1) + 4 (hunk 2)
+    }
+
+    #[test]
+    fn inline_headers_keep_full_posted_times_for_hover_but_not_draft_dates() {
+        let posted = "2026-01-02T00:00:00Z";
+        let mut comments = vec![
+            rc(
+                1,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "root",
+                "alice",
+                posted,
+                None,
+            ),
+            rc(
+                2,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "reply",
+                "bob",
+                posted,
+                Some(1),
+            ),
+            rc(
+                3,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "local",
+                "you",
+                posted,
+                None,
+            ),
+            rc(
+                4,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "pending",
+                "you",
+                posted,
+                None,
+            ),
+        ];
+        comments[2].time = CommentTime::Draft;
+        comments[3].time = CommentTime::Pending;
+        let index = group_comments(comments);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let mut rows = Vec::new();
+            push_thread_rows(
+                &mut rows,
+                index.threads.get("a.rs"),
+                "a.rs",
+                CommentSide::Right,
+                Some(2),
+                1_767_312_120, // two minutes after the posted time
+                mode,
+                COMMENT_WRAP_CHARS,
+            );
+            let headers: Vec<_> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    Row::CommentHeader {
+                        comment_id,
+                        when,
+                        timestamp,
+                        is_reply,
+                        ..
+                    } => Some((*comment_id, when.as_ref(), timestamp.as_deref(), *is_reply)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                headers,
+                vec![
+                    (1, "2m ago", Some(posted), false),
+                    (2, "2m ago", Some(posted), true),
+                    (3, "draft", None, false),
+                    (4, "draft", None, false),
+                ]
+            );
+        }
     }
 
     #[test]

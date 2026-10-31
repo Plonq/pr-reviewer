@@ -259,6 +259,7 @@ use crate::{
 use gpui::component::{
     button::{Button, ButtonVariants},
     link::Link,
+    tooltip::Tooltip,
     Disableable, Sizable,
 };
 use gpui::{
@@ -872,13 +873,7 @@ impl ReviewApp {
         {
             return self.render_composer_card(cx);
         }
-        let verdict = match comment.review_state.as_deref() {
-            Some("APPROVED") => " · approved",
-            Some("CHANGES_REQUESTED") => " · requested changes",
-            Some("DISMISSED") => " · review dismissed",
-            Some(_) => " · reviewed",
-            None => "",
-        };
+        let timestamp = comment.created_at.clone();
         let key = self
             .items
             .iter()
@@ -908,10 +903,15 @@ impl ReviewApp {
                         crate::threads::author_avatar(&comment.author, &self.account)
                             .debug_selector(|| format!("discussion-avatar-{item_id}-{key}")),
                     )
-                    .child(div().flex_1().child(format!(
-                        "@{} · {}{verdict}",
-                        comment.author, comment.created_at
-                    )))
+                    .child(
+                        div()
+                            .id("heading")
+                            .flex_1()
+                            .child(discussion_heading(comment, crate::rows::now_unix()))
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(timestamp.clone()).build(window, cx)
+                            }),
+                    )
                     .children(
                         (kind != "optimistic")
                             .then(|| self.comment_controls(target, placement, &cx.entity())),
@@ -944,6 +944,23 @@ impl ReviewApp {
         }
         card.into_any_element()
     }
+}
+
+/// Shared by issue comments, inline roots/replies, and submitted reviews.
+/// Only the presentation is relative; timeline ordering keeps the raw date.
+fn discussion_heading(comment: &github::DiscussionComment, now: i64) -> String {
+    let verdict = match comment.review_state.as_deref() {
+        Some("APPROVED") => " · approved",
+        Some("CHANGES_REQUESTED") => " · requested changes",
+        Some("DISMISSED") => " · review dismissed",
+        Some(_) => " · reviewed",
+        None => "",
+    };
+    format!(
+        "@{} · {}{verdict}",
+        comment.author,
+        crate::threads::short_age(&comment.created_at, now)
+    )
 }
 
 fn commit_ci(ci: github::CiState, cx: &gpui::App) -> (&'static str, gpui::Rgba) {
@@ -1188,6 +1205,45 @@ pub(crate) mod tests {
                 ],
             }],
         }
+    }
+
+    #[test]
+    fn discussion_headings_use_relative_times_and_preserve_review_verdicts() {
+        let discussion = sample_discussion();
+        let mut comment = discussion.comments[0].clone();
+        // 2026-01-02T00:00:00Z, matching the fixture's creation time.
+        let posted = 1_767_312_000;
+        for (elapsed, expected) in [
+            (0, "just now"),
+            (60, "1m ago"),
+            (3600, "1h ago"),
+            (86400, "1d ago"),
+            (365 * 86400, "1y ago"),
+        ] {
+            assert_eq!(
+                discussion_heading(&comment, posted + elapsed),
+                format!("@alice · {expected}")
+            );
+        }
+        for (state, verdict) in [
+            ("APPROVED", "approved"),
+            ("CHANGES_REQUESTED", "requested changes"),
+            ("DISMISSED", "review dismissed"),
+            ("COMMENTED", "reviewed"),
+        ] {
+            comment.review_state = Some(state.into());
+            assert_eq!(
+                discussion_heading(&comment, posted + 120),
+                format!("@alice · 2m ago · {verdict}")
+            );
+        }
+        assert_eq!(comment.created_at, "2026-01-02T00:00:00Z");
+        comment.review_state = None;
+        comment.created_at = "unknown date".into();
+        assert_eq!(
+            discussion_heading(&comment, posted),
+            "@alice · unknown date"
+        );
     }
 
     #[test]
