@@ -25,7 +25,11 @@ Changes at the fork point relative to upstream lgtm:
 ## Setup
 
 Requires the [GitHub CLI](https://cli.github.com/) (`gh auth login` first) for
-PR reviews; local repo diffs work without it.
+PR reviews; local repo diffs work without it. Finder/Dock launches recover
+PATH from your interactive login shell (`$SHELL`, or `/bin/zsh`) and also
+search standard Homebrew/MacPorts locations. The inherited PATH takes precedence;
+only PATH is imported, and shell startup is limited to two seconds so a broken
+startup script cannot prevent the app from opening.
 
 Or build from source:
 

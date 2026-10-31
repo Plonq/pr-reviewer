@@ -5,6 +5,8 @@ mod comment_editor;
 mod conversation;
 mod diff_media;
 mod http;
+#[cfg(target_os = "macos")]
+mod launch_env;
 mod local_store;
 mod mentions;
 mod minimap;
@@ -314,6 +316,8 @@ impl AssetSource for AppAssets {
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    launch_env::init();
     // Before any thread or child exists: set_var is process-global and not
     // thread-safe, and every subprocess needs to inherit this.
     for (key, value) in git_env() {
