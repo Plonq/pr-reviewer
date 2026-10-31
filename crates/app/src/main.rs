@@ -2751,20 +2751,21 @@ impl ReviewApp {
         let Some(data) = self.active_data_mut() else {
             return;
         };
-        // Position preservation: stay on the same hunk (hunk indices are
-        // identical across modes).
-        let hunk = data.hunk_rows.iter().rposition(|&ix| ix <= data.cursor);
+        // The keyboard cursor can be far from the viewport after scrolling.
+        // Anchor to source coordinates: split/unified rows have different indices.
+        let position = data.review_position();
         data.selection = None;
+        data.cursor_side = None;
         data.mode = match data.mode {
             ViewMode::Unified => ViewMode::Split,
             ViewMode::Split => ViewMode::Unified,
         };
         data.set_rows(data.row_build());
-        let target = hunk
-            .and_then(|ix| data.hunk_rows.get(ix).copied())
-            .or_else(|| data.hunk_rows.first().copied())
-            .unwrap_or(0);
-        self.jump(target, cx);
+        if let Some(mut position) = position {
+            position.split = data.mode == ViewMode::Split;
+            data.restore_review_position(position, true);
+        }
+        cx.notify();
     }
 
     fn jump(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -7947,6 +7948,112 @@ mod tests {
         vcx.update(|_, cx| app.update(cx, |app, cx| app.back_to_queue(cx)));
         vcx.simulate_keystrokes("cmd-f");
         vcx.update(|_, cx| assert!(app.read(cx).active_data().unwrap().search.is_none()));
+    }
+
+    #[gpui::test]
+    fn toggling_view_keeps_the_scrolled_source_line_not_the_last_hunk(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| {
+            cx.bind_keys([
+                KeyBinding::new("n", NextHunk, Some("ReviewApp")),
+                KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
+                KeyBinding::new("v", ToggleView, Some("ReviewApp")),
+            ]);
+        });
+        let context = |range: std::ops::RangeInclusive<u32>| {
+            range.map(|n| format!(" line {n}\n")).collect::<String>()
+        };
+        let diff = diff_core::parse_patch(&format!(
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,80 +1,80 @@\n-old\n+new\n{}@@ -100,120 +100,120 @@\n-old\n+new\n{}",
+            context(2..=80),
+            context(101..=219),
+        ));
+        let mut item = loop_pr_item(Vec::new());
+        item.state = ItemState::Ready(file_mode_data(diff));
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        vcx.update(|window, cx| {
+            let focus = app.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        // Exercise both directions, after both next- and previous-hunk jumps.
+        for (navigation, hunk) in [("n", 1), ("p p", 0)] {
+            vcx.simulate_keystrokes(navigation);
+            let bounds = vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+                let data = app.read(cx).active_data().unwrap();
+                assert_eq!(data.cursor, data.hunk_rows[hunk]);
+                data.scroll.0.borrow().base_handle.bounds()
+            });
+            vcx.simulate_event(gpui::ScrollEvent {
+                position: bounds.center(),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-137.))),
+                ..Default::default()
+            });
+            let prior = vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+                let data = app.read(cx).active_data().unwrap();
+                let position = data.review_position().unwrap();
+                assert_ne!(position.row, data.cursor, "wheel moved away from the hunk");
+                assert!(position.fraction > 0., "retain partial rows too");
+                position
+            });
+            for _ in 0..2 {
+                vcx.simulate_keystrokes("v");
+                vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                    let data = app.read(cx).active_data().unwrap();
+                    let position = data.review_position().unwrap();
+                    assert_eq!(position.new_line, prior.new_line);
+                    assert_eq!(position.fraction, prior.fraction);
+                    // Check the actual painted viewport, not just restore memory.
+                    let top =
+                        f32::from(-data.scroll.0.borrow().base_handle.offset().y) / row_height();
+                    assert_eq!(top.fract(), prior.fraction);
+                    assert_eq!(
+                        rows::comment_anchor(&data.rows, top.floor() as usize, SelSide::Right),
+                        Some((CommentSide::Right, prior.new_line.unwrap() as u64))
+                    );
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn toggling_view_preserves_a_hunk_jump_before_it_paints(cx: &mut gpui::TestAppContext) {
+        let (_, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut item = loop_pr_item(Vec::new());
+        // The second hunk starts on a removed line, so restoration must also
+        // work with an old-side-only anchor, not just new-side line numbers.
+        item.state = ItemState::Ready(file_mode_data(test_util::sample_diff()));
+        install_item(&app, item, cx);
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                let target = this.active_data().unwrap().hunk_rows[1];
+                this.jump(target, cx);
+                let prior = this.active_data().unwrap().review_position().unwrap();
+                assert_eq!(prior.old_line, Some(10));
+                assert_eq!(prior.new_line, None);
+                for split in [true, false] {
+                    this.toggle_view(cx);
+                    let data = this.active_data().unwrap();
+                    assert_eq!(data.mode == ViewMode::Split, split);
+                    assert_eq!(
+                        rows::comment_anchor(&data.rows, data.cursor, SelSide::Left),
+                        Some((CommentSide::Left, 10))
+                    );
+                    let position = data.review_position().unwrap();
+                    assert_eq!(position.old_line, prior.old_line);
+                    assert_eq!(position.fraction, prior.fraction);
+                    assert!(data.scroll.0.borrow().deferred_scroll_to_item.is_none());
+                }
+            });
+        });
     }
 
     #[test]
