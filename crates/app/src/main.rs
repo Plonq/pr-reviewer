@@ -120,6 +120,13 @@ fn row_height() -> f32 {
     row_height_for(text_size())
 }
 
+/// Uniform-list slots for half a viewport of blank space below the diff.
+/// Round up so the padding is never shorter than half the pane (at most one
+/// row taller). These are presentation-only slots, not source/display rows.
+fn diff_padding_rows(pane_height: f32, row_height: f32) -> usize {
+    (pane_height.max(0.) / (2. * row_height)).ceil() as usize
+}
+
 /// Gutter widths in px, matching render_row's fixed-width children: unified is
 /// two 44px line-number columns + a 28px marker; each split cell is one of
 /// each. Mouse→column math depends on these.
@@ -521,9 +528,9 @@ pub(crate) struct ItemData {
     split_columns: usize,
     /// Minimap model, index-aligned with `rows`; rebuilt with them.
     minimap: Vec<MinimapRow>,
-    /// Coalesced minimap quad runs for one pane height, computed lazily on
-    /// paint and reused until the height changes or the rows are rebuilt.
-    minimap_cache: RefCell<Option<(f32, Rc<MinimapLayout>)>>,
+    /// Coalesced minimap quad runs for one pane height and blank tail, computed
+    /// lazily on paint and reused until either changes or the rows are rebuilt.
+    minimap_cache: RefCell<Option<(f32, usize, Rc<MinimapLayout>)>>,
     cursor: usize,
     cursor_side: Option<SelSide>,
     /// Original server-patch hunks, retained when phase 2 replaces display
@@ -899,17 +906,17 @@ impl ItemData {
         }
     }
 
-    /// The minimap quad runs for this pane height, from the cache when the
-    /// height hasn't changed since the last paint.
-    fn minimap_layout(&self, pane_px: f32) -> Rc<MinimapLayout> {
+    /// The minimap quad runs for this pane height and blank tail, from the
+    /// cache when neither has changed since the last paint.
+    fn minimap_layout(&self, pane_px: f32, tail_rows: usize) -> Rc<MinimapLayout> {
         let mut cache = self.minimap_cache.borrow_mut();
-        if let Some((h, layout)) = &*cache {
-            if *h == pane_px {
+        if let Some((h, tail, layout)) = &*cache {
+            if *h == pane_px && *tail == tail_rows {
                 return layout.clone();
             }
         }
-        let layout = Rc::new(minimap_runs(&self.minimap, pane_px));
-        *cache = Some((pane_px, layout.clone()));
+        let layout = Rc::new(minimap_runs(&self.minimap, pane_px, tail_rows));
+        *cache = Some((pane_px, tail_rows, layout.clone()));
         layout
     }
 
@@ -2748,6 +2755,10 @@ impl ReviewApp {
     /// by setting the scroll offset directly. Pure mouse math — verified
     /// manually, like the selection hit test.
     fn minimap_scrub_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let pane_h = self.active_data().map_or(0., |data| {
+            f32::from(data.scroll.0.borrow().base_handle.bounds().size.height)
+        });
+        let tail_rows = self.diff_tail_rows(pane_h);
         let Some(data) = self.active_data_mut() else {
             return;
         };
@@ -2767,6 +2778,7 @@ impl ReviewApp {
         }
         // The minimap column is the same height as the list, so its y space
         // starts at the list's top.
+        let total = total + tail_rows;
         let (slot_h, group) = minimap_scale(total, pane_h);
         let px_per_row = slot_h / group as f32;
         let y = f32::from(position.y - bounds.top());
@@ -4415,7 +4427,9 @@ impl ReviewApp {
                         if total == 0 || pane_h <= 0. {
                             return;
                         }
-                        let layout = data.minimap_layout(pane_h);
+                        let tail_rows = this.diff_tail_rows(pane_h);
+                        let total = total + tail_rows;
+                        let layout = data.minimap_layout(pane_h, tail_rows);
                         let (x0, y0) = (f32::from(bounds.left()), f32::from(bounds.top()));
                         let usable = f32::from(bounds.size.width) - 2. * MINIMAP_PAD;
                         let half = (usable - MINIMAP_GAP) / 2.;
@@ -5291,13 +5305,9 @@ impl ReviewApp {
         }
         footer
     }
-    /// The pane for an open item — loading, failure message, the
-    /// conversation, or the diff itself — everything the main pane shows
-    /// when the queue screen isn't up.
-    fn render_item_pane(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let entity = cx.entity();
-        // Blank tail rows make room to scroll a floating composer below EOF
-        // without changing source-row indices or the list's visible area.
+    /// Blank list slots shared by the diff's scroll range and minimap. Keep
+    /// composer space in addition to the half-viewport scroll-past-end area.
+    fn diff_tail_rows(&self, pane_height: f32) -> usize {
         let composer_rows = self
             .composer
             .as_ref()
@@ -5310,7 +5320,14 @@ impl ReviewApp {
             .map_or(0, |composer| {
                 (f32::from(composer.height.get()) / row_height()).ceil() as usize
             });
-        let diff_rows = self.active_data().map_or(0, |data| data.rows.len()) + composer_rows;
+        diff_padding_rows(pane_height, row_height()) + composer_rows
+    }
+
+    /// The pane for an open item — loading, failure message, the
+    /// conversation, or the diff itself — everything the main pane shows
+    /// when the queue screen isn't up.
+    fn render_item_pane(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let entity = cx.entity();
         match self.active_item() {
             None => self.render_empty_pane(cx),
             Some(item) => match &item.state {
@@ -5440,105 +5457,131 @@ impl ReviewApp {
                                 }),
                             )
                             .child(
-                                uniform_list("diff", diff_rows, move |range, _window, cx| {
-                                    let this = entity.read(cx);
-                                    match this.active_data() {
-                                        Some(data) => {
-                                            let sel = data.selection;
-                                            range
-                                                .map(|ix| {
-                                                    let Some(row) = data.rows.get(ix) else {
-                                                        return div()
-                                                            .h(px(row_height()))
-                                                            .into_any_element();
-                                                    };
-                                                    let row_sel = sel.and_then(|sel| {
-                                                        row_selection_range(&sel, ix, row)
-                                                            .filter(|range| !range.is_empty())
-                                                            .map(|range| (sel.side, range))
-                                                    });
-                                                    let active = (ix == data.cursor)
-                                                        .then_some(data.cursor_side)
-                                                        .flatten();
-                                                    let commenting = this
-                                                        .composer
-                                                        .as_ref()
-                                                        .and_then(|composer| {
-                                                            composer.highlighted_side(
-                                                                this.items[this.active].id,
-                                                                data,
+                                // Resolve the actual list viewport before creating its
+                                // blank tail, including on the first frame and resize.
+                                // Padding the list's style would shrink its rendered
+                                // viewport; extra virtual slots leave it full-height.
+                                canvas(
+                                    move |bounds, window, cx| {
+                                        let this = entity.read(cx);
+                                        let data = this.active_data().expect("ready diff pane");
+                                        let diff_rows = data.rows.len()
+                                            + this.diff_tail_rows(f32::from(bounds.size.height));
+                                        let rows_entity = entity.clone();
+                                        let mut list = uniform_list(
+                                            "diff",
+                                            diff_rows,
+                                            move |range, _window, cx| {
+                                                let this = rows_entity.read(cx);
+                                                let Some(data) = this.active_data() else {
+                                                    return Vec::new();
+                                                };
+                                                let sel = data.selection;
+                                                range
+                                                    .map(|ix| {
+                                                        let Some(row) = data.rows.get(ix) else {
+                                                            return div()
+                                                                .h(px(row_height()))
+                                                                .into_any_element();
+                                                        };
+                                                        let row_sel = sel.and_then(|sel| {
+                                                            row_selection_range(&sel, ix, row)
+                                                                .filter(|range| !range.is_empty())
+                                                                .map(|range| (sel.side, range))
+                                                        });
+                                                        let active = (ix == data.cursor)
+                                                            .then_some(data.cursor_side)
+                                                            .flatten();
+                                                        let commenting = this
+                                                            .composer
+                                                            .as_ref()
+                                                            .and_then(|composer| {
+                                                                composer.highlighted_side(
+                                                                    this.items[this.active].id,
+                                                                    data,
+                                                                    row,
+                                                                )
+                                                            });
+                                                        let split_layout = ((data.mode
+                                                            == ViewMode::Split
+                                                            || matches!(
                                                                 row,
+                                                                Row::CommentBody { .. }
+                                                                    | Row::CommentHeader { .. }
+                                                                    | Row::CommentEditor { .. }
+                                                            ))
+                                                            && !data
+                                                                .preferences
+                                                                .soft_wrap
+                                                                .unwrap_or(false))
+                                                        .then(|| {
+                                                            data.split_layout(
+                                                                this.char_width.unwrap_or(px(
+                                                                    text_size() * 0.6,
+                                                                )),
                                                             )
                                                         });
-                                                    let split_layout = ((data.mode
-                                                        == ViewMode::Split
-                                                        || matches!(
+                                                        render_row(
+                                                            ix,
                                                             row,
-                                                            Row::CommentBody { .. }
-                                                                | Row::CommentHeader { .. }
-                                                                | Row::CommentEditor { .. }
-                                                        ))
-                                                        && !data
-                                                            .preferences
-                                                            .soft_wrap
-                                                            .unwrap_or(false))
-                                                    .then(|| {
-                                                        data.split_layout(
-                                                            this.char_width
-                                                                .unwrap_or(px(text_size() * 0.6)),
+                                                            row_sel,
+                                                            active,
+                                                            commenting,
+                                                            split_layout,
+                                                            data.search.as_ref(),
+                                                            &rows_entity,
+                                                            if let Row::CommentHeader {
+                                                                comment_id,
+                                                                top,
+                                                                ..
+                                                            } = row
+                                                            {
+                                                                Some(this.diff_comment_controls(
+                                                                    *comment_id,
+                                                                    *top,
+                                                                    &rows_entity,
+                                                                    cx,
+                                                                ))
+                                                            } else {
+                                                                None
+                                                            },
+                                                            cx,
                                                         )
-                                                    });
-                                                    render_row(
-                                                        ix,
-                                                        row,
-                                                        row_sel,
-                                                        active,
-                                                        commenting,
-                                                        split_layout,
-                                                        data.search.as_ref(),
-                                                        &entity,
-                                                        if let Row::CommentHeader {
-                                                            comment_id,
-                                                            top,
-                                                            ..
-                                                        } = row
-                                                        {
-                                                            Some(this.diff_comment_controls(
-                                                                *comment_id,
-                                                                *top,
-                                                                &entity,
-                                                                cx,
-                                                            ))
-                                                        } else {
-                                                            None
-                                                        },
-                                                        cx,
-                                                    )
-                                                })
-                                                .collect()
-                                        }
-                                        None => Vec::new(),
-                                    }
-                                })
-                                .with_decoration(diff_media::InlineText(cx.entity()))
-                                .track_scroll(&data.scroll)
-                                .with_horizontal_sizing_behavior(
-                                    if data.preferences.soft_wrap.unwrap_or(false) {
-                                        ListHorizontalSizingBehavior::FitList
-                                    } else {
-                                        ListHorizontalSizingBehavior::Unconstrained
+                                                    })
+                                                    .collect()
+                                            },
+                                        )
+                                        .with_decoration(diff_media::InlineText(entity.clone()))
+                                        .track_scroll(&data.scroll)
+                                        .with_horizontal_sizing_behavior(
+                                            if data.preferences.soft_wrap.unwrap_or(false) {
+                                                ListHorizontalSizingBehavior::FitList
+                                            } else {
+                                                ListHorizontalSizingBehavior::Unconstrained
+                                            },
+                                        )
+                                        // Unconstrained sizing turns on horizontal overflow,
+                                        // but gpui sizes the scroll range from one measured
+                                        // item — row 0, the file header, which never exceeds
+                                        // the viewport, so `offset.x` was clamped to zero and
+                                        // long lines were unreachable. Measure the widest
+                                        // row instead. Split rows expose their scroll
+                                        // extent without widening the visible panes.
+                                        .with_width_from_item(
+                                            (!data.preferences.soft_wrap.unwrap_or(false))
+                                                .then_some(data.wide_row),
+                                        )
+                                        .size_full()
+                                        .into_any_element();
+                                        list.layout_as_root(
+                                            bounds.size.map(gpui::AvailableSpace::Definite),
+                                            window,
+                                            cx,
+                                        );
+                                        list.prepaint_at(bounds.origin, window, cx);
+                                        list
                                     },
-                                )
-                                // Unconstrained sizing turns on horizontal overflow,
-                                // but gpui sizes the scroll range from one measured
-                                // item — row 0, the file header, which never exceeds
-                                // the viewport, so `offset.x` was clamped to zero and
-                                // long lines were unreachable. Measure the widest
-                                // row instead. Split rows expose their scroll
-                                // extent without widening the visible panes.
-                                .with_width_from_item(
-                                    (!data.preferences.soft_wrap.unwrap_or(false))
-                                        .then_some(data.wide_row),
+                                    |_, mut list, window, cx| list.paint(window, cx),
                                 )
                                 .h_full()
                                 .flex_1()
@@ -10101,6 +10144,81 @@ mod tests {
                         prior
                     );
                 });
+            }
+        }
+    }
+
+    #[test]
+    fn diff_padding_tracks_half_the_viewport_at_any_zoom() {
+        for row_px in [12., 22., 48.] {
+            for pane_px in [0., 1., 300., 441., 900.] {
+                let padding = diff_padding_rows(pane_px, row_px) as f32 * row_px;
+                assert!(padding >= pane_px / 2.);
+                assert!(padding < pane_px / 2. + row_px);
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn diff_padding_and_minimap_share_the_full_scroll_range(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let mut diff = two_file_diff();
+            diff.files[0].hunks = diff_texts("", &"line\n".repeat(200), 3);
+            let mut data = file_mode_data(diff);
+            data.mode = mode;
+            data.set_rows(data.row_build());
+            let source_rows = data.rows.len();
+            let mut item = loop_pr_item(Vec::new());
+            item.state = ItemState::Ready(data);
+            install_item(&app, item, &mut vcx);
+            for height in [600., 900., 450.] {
+                vcx.simulate_resize(size(px(1100.), px(height)));
+                for minimap_visible in [true, false] {
+                    vcx.update(|window, cx| {
+                        app.update(cx, |this, cx| {
+                            this.minimap_visible = minimap_visible;
+                            cx.notify();
+                        });
+                        let _ = window.draw(cx);
+                        let this = app.read(cx);
+                        let data = this.active_data().unwrap();
+                        let state = data.scroll.0.borrow();
+                        let bounds = state.base_handle.bounds();
+                        let pane_h = f32::from(bounds.size.height);
+                        let tail = diff_padding_rows(pane_h, row_height());
+                        let total = source_rows + tail;
+                        assert_eq!(data.rows.len(), source_rows, "padding is not source data");
+                        assert_eq!(data.minimap.len(), source_rows);
+                        assert_eq!(
+                            state.last_item_size.unwrap().contents.height,
+                            px(total as f32 * row_height())
+                        );
+                        assert_eq!(
+                            state.last_item_size.unwrap().item.height,
+                            bounds.size.height,
+                            "the list must still render a full viewport"
+                        );
+                        let layout = data.minimap_layout(pane_h, tail);
+                        assert_eq!((layout.slot_h, layout.group), minimap_scale(total, pane_h));
+                        drop(state);
+
+                        app.update(cx, |this, cx| {
+                            // Scrubbing into the minimap's blank tail must reach
+                            // the same bottom as the actual list/scrollbar.
+                            this.minimap_scrub_to(bounds.bottom_right(), cx);
+                        });
+                        let _ = window.draw(cx);
+                        let data = app.read(cx).active_data().unwrap();
+                        let state = data.scroll.0.borrow();
+                        let bottom = -state.base_handle.offset().y;
+                        assert_eq!(bottom, state.base_handle.max_offset().y);
+                        let code_bottom = source_rows as f32 * row_height() - f32::from(bottom);
+                        assert!(code_bottom <= pane_h / 2. + 0.01);
+                        assert!(code_bottom > pane_h / 2. - row_height() - 0.01);
+                    });
+                }
             }
         }
     }

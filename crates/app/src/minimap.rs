@@ -140,7 +140,8 @@ pub(crate) struct MinimapRun {
 }
 
 pub(crate) struct MinimapLayout {
-    /// Painted height of one slot: clamp(pane_height / total_rows, 1, 3).
+    /// Painted height of one slot: clamp(pane_height / total_rows, 1, 3),
+    /// including any blank tail rows.
     pub(crate) slot_h: f32,
     /// Display rows per slot; 1 unless the diff is taller than the pane at
     /// 1px per row, then ceil(total / pane_px).
@@ -163,9 +164,11 @@ pub(crate) fn minimap_scale(total: usize, pane_px: f32) -> (f32, usize) {
 /// runs. Per group and lane the highest-priority color wins and the width is
 /// the group's max fraction; vertically adjacent slots with the same lane,
 /// color, and width merge into one run. Recomputed only when the rows are
-/// rebuilt or the pane height changes — painting just iterates the runs.
-pub(crate) fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
-    let (slot_h, group) = minimap_scale(rows.len(), pane_px);
+/// rebuilt, the pane height changes, or the blank tail changes — painting
+/// just iterates the runs.
+pub(crate) fn minimap_runs(rows: &[MinimapRow], pane_px: f32, tail_rows: usize) -> MinimapLayout {
+    // Blank scroll-past-end/composer slots affect the scale but paint no bars.
+    let (slot_h, group) = minimap_scale(rows.len() + tail_rows, pane_px);
     let mut runs: Vec<MinimapRun> = Vec::new();
     // Per lane: index into `runs` of the run still open for extension.
     let mut open: [Option<usize>; 3] = [None; 3];
@@ -366,6 +369,33 @@ mod tests {
     }
 
     #[test]
+    fn minimap_blank_tail_scales_without_painting_extra_bars() {
+        let rows = vec![mrow(MinimapKind::Added, 0.5); 80];
+        let tail_rows = 40;
+        let mut padded = rows.clone();
+        padded.extend(vec![mrow(MinimapKind::Blank, 0.); tail_rows]);
+        // Exercise both fractional slots and a tail that forces downsampling.
+        for pane_px in [300., 100.] {
+            let layout = minimap_runs(&rows, pane_px, tail_rows);
+            let explicit = minimap_runs(&padded, pane_px, 0);
+            assert_eq!(
+                (layout.slot_h, layout.group),
+                minimap_scale(rows.len() + tail_rows, pane_px)
+            );
+            assert_eq!(
+                (layout.slot_h, layout.group),
+                (explicit.slot_h, explicit.group)
+            );
+            assert_eq!(layout.runs, explicit.runs);
+            assert_eq!(layout.runs.len(), 1);
+            assert_eq!(
+                layout.runs[0].end as usize,
+                rows.len().div_ceil(layout.group)
+            );
+        }
+    }
+
+    #[test]
     fn minimap_runs_coalesce_same_bars() {
         let rows = vec![
             mrow(MinimapKind::Added, 0.5),
@@ -374,7 +404,7 @@ mod tests {
             mrow(MinimapKind::Context, 0.), // empty line: no bar, breaks the run
             mrow(MinimapKind::Added, 0.5),
         ];
-        let layout = minimap_runs(&rows, 100.);
+        let layout = minimap_runs(&rows, 100., 0);
         assert_eq!((layout.slot_h, layout.group), (3., 1));
         let expect = |start: u32, end: u32, color: MinimapColor, frac: f32| MinimapRun {
             start,
@@ -402,14 +432,14 @@ mod tests {
             mrow(MinimapKind::Context, 0.5),
         ];
         // 3px slots: adjacent headers stay separate 1px ticks.
-        let layout = minimap_runs(&rows, 100.);
+        let layout = minimap_runs(&rows, 100., 0);
         assert_eq!(layout.slot_h, 3.);
         assert_eq!(layout.runs.len(), 3);
         assert!(layout.runs[0].tick && layout.runs[1].tick);
         assert_eq!((layout.runs[0].start, layout.runs[0].end), (0, 1));
         assert_eq!((layout.runs[1].start, layout.runs[1].end), (1, 2));
         // 1px slots: ticks are plain bars and coalesce.
-        let layout = minimap_runs(&rows, 3.);
+        let layout = minimap_runs(&rows, 3., 0);
         assert_eq!(layout.slot_h, 1.);
         assert_eq!(layout.runs.len(), 2);
         assert!(!layout.runs[0].tick);
@@ -426,7 +456,7 @@ mod tests {
         for slot in rows[10..20].iter_mut() {
             *slot = mrow(MinimapKind::Context, 0.2);
         }
-        let layout = minimap_runs(&rows, 10.);
+        let layout = minimap_runs(&rows, 10., 0);
         assert_eq!((layout.slot_h, layout.group), (1., 10));
         // Slot 0: Removed outranks Added/Context; width is the group max.
         // Slot 1: all-context. Slots 2..: blank, nothing painted.
@@ -471,7 +501,7 @@ mod tests {
             pair(0.5, 0.25, true, true),
             pair(0.5, 0., false, false), // context left, absent right
         ];
-        let layout = minimap_runs(&rows, 90.);
+        let layout = minimap_runs(&rows, 90., 0);
         assert_eq!(layout.slot_h, 3.);
         assert_eq!(
             layout.runs,
