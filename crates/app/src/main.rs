@@ -13,6 +13,7 @@ mod minimap;
 mod position;
 mod presentation;
 mod queue;
+mod quick_open;
 mod resolution;
 mod review_dialog;
 mod review_scope;
@@ -219,7 +220,6 @@ actions!(
         ToggleUnchanged,
         ToggleSoftWrap,
         Quit,
-        ToggleSidebar,
         OpenInput,
         CloseItem,
         NextItem,
@@ -433,8 +433,7 @@ fn main() {
                 KeyBinding::new("cmd--", ZoomOut, None),
                 KeyBinding::new("cmd-0", ZoomReset, None),
                 // Global (None context): must work while the open input is focused.
-                KeyBinding::new("cmd-b", ToggleSidebar, None),
-                KeyBinding::new("cmd-t", OpenInput, None),
+                KeyBinding::new("cmd-o", OpenInput, None),
                 KeyBinding::new("cmd-w", CloseItem, None),
                 KeyBinding::new("cmd-q", Quit, None),
             ]);
@@ -1704,12 +1703,12 @@ fn move_selection(selected: usize, len: usize, delta: isize) -> usize {
 pub(crate) struct ReviewApp {
     items: Vec<ReviewItem>,
     active: usize,
-    sidebar_visible: bool,
     sidebar_width: f32,
     /// Pointer x and rendered width at the start of a sidebar resize.
     sidebar_resize: Option<(Pixels, f32)>,
     open_input: gpui::Entity<InputState>,
     open_error: Option<SharedString>,
+    quick_open_visible: bool,
     /// Fuzzy filter over the active item's file tree (`/` focuses it).
     tree_filter_input: gpui::Entity<InputState>,
     focus_handle: FocusHandle,
@@ -1810,10 +1809,15 @@ impl ReviewApp {
             cx.subscribe_in(
                 &open_input,
                 window,
-                |this, _, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { .. } if this.quick_open_visible => {
                         this.submit_open(window, cx);
                     }
+                    InputEvent::Change => {
+                        this.open_error = None;
+                        cx.notify();
+                    }
+                    _ => {}
                 },
             ),
             cx.subscribe_in(
@@ -1840,10 +1844,6 @@ impl ReviewApp {
         let mut this = Self {
             items: Vec::new(),
             active: 0,
-            // The queue is the home screen now: with nothing opened the
-            // sidebar starts hidden (⌘T opens it); several sources or CLI errors still start it
-            // open, the way they always did.
-            sidebar_visible: !errors.is_empty() || sources.len() > 1,
             sidebar_width: store
                 .setting(SIDEBAR_WIDTH_SETTING)
                 .and_then(|value| value.as_f64())
@@ -1852,6 +1852,7 @@ impl ReviewApp {
             sidebar_resize: None,
             open_input,
             open_error: errors.first().cloned().map(SharedString::from),
+            quick_open_visible: false,
             tree_filter_input,
             focus_handle: cx.focus_handle(),
             next_id: 0,
@@ -1893,6 +1894,10 @@ impl ReviewApp {
         this.spawn_queue_refresh(cx);
         this.spawn_background_poll(cx);
         this.spawn_position_memory(cx);
+        if this.open_error.is_some() {
+            // The modal shell needs the window's Root to be installed first.
+            cx.defer_in(window, |app, window, cx| app.open_quick_open(window, cx));
+        }
         this
     }
 
@@ -2117,10 +2122,6 @@ impl ReviewApp {
         };
         self.queue.selected = pos;
         self.open_item(Source::Pr(loc), cx);
-        // The changes view's navigation lives in the sidebar: the file
-        // tree (and the open items above it) must be there when the PR
-        // lands, even though the queue starts with the sidebar hidden.
-        self.sidebar_visible = true;
         cx.notify();
     }
 
@@ -2134,6 +2135,14 @@ impl ReviewApp {
         self.persist_positions();
         self.show_queue = true;
         cx.notify();
+    }
+
+    /// Leave the queue without opening or closing anything. The active item
+    /// keeps its pane and review position, just as it was before visiting home.
+    fn return_to_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_queue && !self.items.is_empty() {
+            self.activate(self.active, window, cx);
+        }
     }
 
     /// A different view must never display the old view's rows, even while
@@ -2419,7 +2428,7 @@ impl ReviewApp {
         // already has brings that item forward — scroll, cursor, view mode
         // and comments exactly where they were left — instead of a second
         // copy that would be a way to lose your place in the first. Every
-        // open path (queue Enter, ⌘T, the CLI) shares this.
+        // open path (queue Enter, ⌘O, the CLI) shares this.
         if let Some(ix) = self
             .items
             .iter()
@@ -2696,34 +2705,6 @@ impl ReviewApp {
             .ok();
         })
         .detach();
-    }
-
-    fn submit_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let value = self.open_input.read(cx).value().trim().to_string();
-        if value.is_empty() {
-            return;
-        }
-        let parsed = if Path::new(&value).is_dir() {
-            git::resolve_local(Path::new(&value))
-                .map(Source::Local)
-                .map_err(|err| format!("{err:#}"))
-        } else {
-            self.github
-                .resolve_pr(&value)
-                .map(Source::Pr)
-                .map_err(|err| err.to_string())
-        };
-        match parsed {
-            Ok(source) => {
-                self.open_error = None;
-                self.open_input
-                    .update(cx, |state, cx| state.set_value("", window, cx));
-                self.open_item(source, cx);
-                window.focus(&self.focus_handle, cx);
-            }
-            Err(message) => self.open_error = Some(message.into()),
-        }
-        cx.notify();
     }
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -4742,6 +4723,38 @@ impl ReviewApp {
         // keeps the item note beside the account chip instead of stranded
         // mid-bar.
         let mut right = div().flex().items_center().flex_shrink_0().h_full().gap_2();
+        // Keep screen navigation in the title bar so it is available even
+        // while the queue is empty, loading, filtered out, or offline.
+        if self.show_queue {
+            if let Some(item) = self.active_item() {
+                right = right.child(
+                    div().debug_selector(|| "back-to-review".into()).child(
+                        Button::new("back-to-review")
+                            .small()
+                            .label("Back to review")
+                            .tooltip(format!("Return to {} (⌘W)", item.primary()))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.return_to_review(window, cx);
+                            })),
+                    ),
+                );
+            }
+        } else {
+            right = right.child(
+                div()
+                    .debug_selector(|| "review-queue-navigation".into())
+                    .child(
+                        Button::new("review-queue-navigation")
+                            .small()
+                            .label("Review queue")
+                            .tooltip("Show review queue (u)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                window.focus(&this.focus_handle, cx);
+                                this.back_to_queue(cx);
+                            })),
+                    ),
+            );
+        }
         if let Some(item) = self.active_item().filter(|item| {
             !self.show_queue
                 && matches!(item.source, Source::Pr(_))
@@ -5030,22 +5043,6 @@ impl ReviewApp {
             .flex_col()
             .bg(theme::mantle(cx))
             .text_size(px(12.))
-            .child(
-                div()
-                    .p_2()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(Input::new(&self.open_input).small())
-                    .when_some(self.open_error.clone(), |area, err| {
-                        area.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(theme::red(cx))
-                                .child(err),
-                        )
-                    }),
-            )
             .child(list)
             .child(div().h(px(1.)).flex_shrink_0().bg(theme::surface0(cx)))
             .child(
@@ -5465,7 +5462,7 @@ impl ReviewApp {
         row.into_any_element()
     }
 
-    /// The pane with nothing open: the ⌘T hint — plus, when GitHub isn't
+    /// The pane with nothing open: the ⌘O hint — plus, when GitHub isn't
     /// usable, the facade's sign-in message above it, so a fresh launch
     /// without `gh auth login` explains itself instead of showing a near-
     /// blank screen. With something open, local diffs included, only the
@@ -5492,10 +5489,10 @@ impl ReviewApp {
                     div()
                         .text_size(px(13.))
                         .text_color(theme::overlay0(cx))
-                        .child(SharedString::from("⌘T to open a PR or path")),
+                        .child(SharedString::from("⌘O to open a PR or path")),
                 )
                 .into_any_element(),
-            _ => centered_message("⌘T to open a PR or path".into(), theme::overlay0(cx)),
+            _ => centered_message("⌘O to open a PR or path".into(), theme::overlay0(cx)),
         }
     }
 
@@ -5535,8 +5532,7 @@ impl ReviewApp {
                 .when(!self.queue.search.filters().is_empty(), |footer| {
                     footer.child(hint(&["escape"], "clear filters"))
                 })
-                .child(hint(&["cmd-t"], "open"))
-                .child(hint(&["cmd-b"], "sidebar"));
+                .child(hint(&["cmd-o"], "open"));
         } else if self
             .active_item()
             .is_some_and(|item| item.pane == ItemPane::Conversation)
@@ -5547,8 +5543,7 @@ impl ReviewApp {
                 .child(hint(&["shift-cmd-right"], "changes"))
                 .child(hint(&["u"], "queue"))
                 .child(hint(&["r"], "refresh"))
-                .child(hint(&["cmd-t"], "open"))
-                .child(hint(&["cmd-b"], "sidebar"));
+                .child(hint(&["cmd-o"], "open"));
         } else {
             footer = footer
                 .child(hint(&["]", "["], "files"))
@@ -5562,8 +5557,7 @@ impl ReviewApp {
                 .child(hint(&["C"], "comment"))
                 .child(hint(&["/"], "filter files"))
                 .child(hint(&["home", "end"], "top/bottom"))
-                .child(hint(&["cmd-t"], "open"))
-                .child(hint(&["cmd-b"], "sidebar"))
+                .child(hint(&["cmd-o"], "open"))
                 .child(hint(&["r"], "refresh"))
                 .child(hint(&["cmd-enter"], "review"));
         }
@@ -6163,29 +6157,25 @@ impl Render for ReviewApp {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                this.finish_sidebar_resize(cx);
-                this.sidebar_visible = !this.sidebar_visible;
-                cx.notify();
-            }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1., false, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1., false, cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(0., true, cx)))
             .on_action(cx.listener(|this, _: &FocusTreeFilter, window, cx| {
-                this.sidebar_visible = true;
                 this.tree_filter_input
                     .update(cx, |state, cx| state.focus(window, cx));
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenInput, window, cx| {
-                this.sidebar_visible = true;
-                this.open_input
-                    .update(cx, |state, cx| state.focus(window, cx));
-                cx.notify();
+                this.open_quick_open(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &CloseItem, _, cx| {
-                let active = this.active;
-                this.close_item(active, cx)
+            .on_action(cx.listener(|this, _: &CloseItem, window, cx| {
+                if this.show_queue {
+                    // The queue is a screen, not a tab: never close an item
+                    // the user cannot see behind it.
+                    this.return_to_review(window, cx);
+                } else {
+                    this.close_item(this.active, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &NextItem, _, cx| this.cycle_items(1, cx)))
             .on_action(cx.listener(|this, _: &PrevItem, _, cx| this.cycle_items(-1, cx)))
@@ -6195,7 +6185,7 @@ impl Render for ReviewApp {
             .on_action(
                 cx.listener(|this, _: &ShowChanges, _, cx| this.flip_pane(ItemPane::Changes, cx)),
             )
-            // The open input propagates Escape when it has nothing of its own
+            // Inputs propagate Escape when they have nothing of their own
             // to dismiss: hand focus back to the diff.
             .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
                 window.focus(&this.focus_handle, cx);
@@ -6207,7 +6197,9 @@ impl Render for ReviewApp {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .when(self.sidebar_visible, |main| {
+                    // The queue is a standalone screen; navigation belongs
+                    // only to the review screen (Changes or Conversation).
+                    .when(!self.show_queue, |main| {
                         main.child(self.render_sidebar(window, cx))
                     })
                     .child(
@@ -6342,12 +6334,6 @@ mod tests {
         data.diff.files[1].new_path = Some("src/b.rs".into());
         data.rebuild_tree();
         install_item(&app, item, cx);
-        cx.update(|cx| {
-            app.update(cx, |app, cx| {
-                app.sidebar_visible = true;
-                cx.notify();
-            })
-        });
         let draw = |vcx: &mut gpui::VisualTestContext| {
             for _ in 0..3 {
                 vcx.update(|window, cx| {
@@ -6883,8 +6869,8 @@ mod tests {
     fn sidebar_drag_resizes_clamps_and_remembers_width(cx: &mut gpui::TestAppContext) {
         let store = local_store::LocalStore::in_memory();
         let (window, app) = queue_window_with_store(cx, Arc::new(FakePr::default()), store.clone());
+        install_item(&app, loop_pr_item(Vec::new()), cx);
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
-        vcx.dispatch_action(ToggleSidebar);
         let draw = |vcx: &mut gpui::VisualTestContext| {
             vcx.update(|window, cx| {
                 let _ = window.draw(cx);
@@ -6916,10 +6902,8 @@ mod tests {
         }
         let width = vcx.debug_bounds("sidebar").unwrap().size.width;
         vcx.simulate_mouse_move(point(px(400.), px(200.)), None, gpui::Modifiers::default());
-        vcx.dispatch_action(ToggleSidebar);
-        draw(&mut vcx);
-        vcx.update(|_, cx| assert!(!app.read(cx).sidebar_visible));
-        vcx.dispatch_action(ToggleSidebar);
+        // The former toggle shortcut must leave the permanent sidebar alone.
+        vcx.simulate_keystrokes("cmd-b");
         draw(&mut vcx);
         assert_eq!(vcx.debug_bounds("sidebar").unwrap().size.width, width);
         assert_eq!(
@@ -7057,7 +7041,6 @@ mod tests {
             let mut vcx = gpui::VisualTestContext::from_window(window, cx);
             vcx.update(|window, cx| {
                 app.update(cx, |this, cx| {
-                    this.sidebar_visible = true;
                     let data = this.active_data_mut().unwrap();
                     data.comments_visible = comments_visible;
                     data.rebuild_rows_anchored();
@@ -7090,7 +7073,6 @@ mod tests {
         let (window, app) = queue_window(cx, fake.clone());
         cx.update(|cx| {
             app.update(cx, |this, cx| {
-                this.sidebar_visible = true;
                 this.open_item(Source::Pr(loop_loc()), cx);
             })
         });
@@ -8492,6 +8474,280 @@ mod tests {
         (window.into(), app)
     }
 
+    fn bind_quick_open(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.bind_keys([KeyBinding::new("cmd-o", OpenInput, None)]));
+    }
+
+    fn draw_window(vcx: &mut gpui::VisualTestContext) {
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn sidebar_belongs_to_review_screen_not_queue(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue
+                    .replace_rows(vec![queued(7, "acme/widgets", "alice")]);
+                cx.notify();
+            });
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("sidebar").is_none());
+        assert!(vcx.debug_bounds("queue-table").is_some());
+
+        vcx.dispatch_action(QueueOpen);
+        draw_window(&mut vcx);
+        let sidebar = vcx.debug_bounds("sidebar").unwrap();
+        assert!(vcx.debug_bounds("queue-table").is_none());
+        vcx.dispatch_action(ShowConversation);
+        draw_window(&mut vcx);
+        assert_eq!(vcx.debug_bounds("sidebar").unwrap(), sidebar);
+        vcx.dispatch_action(ShowChanges);
+        draw_window(&mut vcx);
+        assert_eq!(vcx.debug_bounds("sidebar").unwrap(), sidebar);
+
+        vcx.dispatch_action(BackToQueue);
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("sidebar").is_none());
+        assert!(vcx.debug_bounds("queue-table").is_some());
+        vcx.update(|_, cx| assert_eq!(app.read(cx).items.len(), 1));
+
+        // Re-entering from the queue restores the same review, not a new tab.
+        vcx.dispatch_action(QueueOpen);
+        draw_window(&mut vcx);
+        assert_eq!(vcx.debug_bounds("sidebar").unwrap(), sidebar);
+        vcx.update(|_, cx| assert_eq!(app.read(cx).items.len(), 1));
+        vcx.simulate_keystrokes("cmd-b");
+        draw_window(&mut vcx);
+        assert_eq!(vcx.debug_bounds("sidebar").unwrap(), sidebar);
+
+        vcx.dispatch_action(CloseItem);
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("sidebar").is_none());
+        assert!(vcx.debug_bounds("queue-table").is_some());
+    }
+
+    #[gpui::test]
+    fn titlebar_queue_navigation_preserves_active_review_and_guards_empty_queue(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| cx.bind_keys([KeyBinding::new("cmd-w", CloseItem, None)]));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("back-to-review").is_none());
+        assert!(vcx.debug_bounds("review-queue-navigation").is_none());
+        vcx.simulate_keystrokes("cmd-w");
+        vcx.update(|_, cx| assert!(app.read(cx).show_queue));
+
+        install_item(&app, loop_pr_item(Vec::new()), cx);
+        vcx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                let mut second = loop_pr_item(Vec::new());
+                second.id = 1;
+                second.source = Source::Pr(github::PrLocator {
+                    number: 8,
+                    ..loop_loc()
+                });
+                app.items.push(second);
+                app.active = 1;
+                app.next_id = 2;
+                cx.notify();
+            });
+        });
+        let click = |vcx: &mut gpui::VisualTestContext, selector| {
+            draw_window(vcx);
+            let point = vcx.debug_bounds(selector).unwrap().center();
+            vcx.simulate_mouse_move(point, None, gpui::Modifiers::default());
+            vcx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
+            vcx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
+            draw_window(vcx);
+        };
+        let position = vcx.update(|_, cx| app.read(cx).active_data().unwrap().review_position());
+        for pane in [ItemPane::Changes, ItemPane::Conversation] {
+            vcx.update(|_, cx| app.update(cx, |app, cx| app.flip_pane(pane, cx)));
+            click(&mut vcx, "review-queue-navigation");
+            assert!(vcx.debug_bounds("sidebar").is_none());
+            assert!(vcx.debug_bounds("back-to-review").is_some());
+            click(&mut vcx, "back-to-review");
+            assert!(vcx.debug_bounds("sidebar").is_some());
+            assert!(vcx.debug_bounds("back-to-review").is_none());
+            vcx.update(|window, cx| {
+                let app = app.read(cx);
+                assert!(!app.show_queue);
+                assert_eq!(app.active, 1);
+                assert_eq!(app.items.len(), 2);
+                assert_eq!(app.active_item().unwrap().pane, pane);
+                assert_eq!(app.active_data().unwrap().review_position(), position);
+                assert!(app.focus_handle.is_focused(window));
+            });
+        }
+        // Cmd+W dismisses the queue, rather than closing the hidden PR.
+        click(&mut vcx, "review-queue-navigation");
+        vcx.simulate_keystrokes("cmd-w");
+        draw_window(&mut vcx);
+        vcx.update(|_, cx| {
+            let app = app.read(cx);
+            assert!(!app.show_queue);
+            assert_eq!(app.items.len(), 2);
+            assert_eq!(app.active, 1);
+        });
+        // On the review screen Cmd+W still closes the active item.
+        vcx.simulate_keystrokes("cmd-w cmd-w");
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("back-to-review").is_none());
+        vcx.update(|_, cx| {
+            assert!(app.read(cx).show_queue);
+            assert!(app.read(cx).items.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn quick_open_is_modal_and_dismissal_restores_focus_on_queue(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        bind_quick_open(cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("quick-open-dialog").is_none());
+        assert!(vcx.debug_bounds("sidebar").is_none());
+        vcx.simulate_keystrokes("cmd-o");
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("quick-open-dialog").is_some());
+        assert!(vcx.debug_bounds("sidebar").is_none());
+        vcx.update(|window, cx| {
+            assert!(app.read(cx).open_input.focus_handle(cx).is_focused(window));
+        });
+        // Repeating the shortcut must not stack another modal.
+        vcx.simulate_keystrokes("cmd-o");
+        vcx.simulate_input("draft");
+        vcx.simulate_keystrokes("escape");
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("sidebar").is_none());
+        vcx.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            let app = app.read(cx);
+            assert!(!app.quick_open_visible);
+            assert!(app.focus_handle.is_focused(window));
+            assert_eq!(app.open_input.read(cx).value().as_str(), "draft");
+            assert!(app.items.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn quick_open_surfaces_startup_errors_and_can_reopen_after_backdrop_dismissal(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui::component::init(cx);
+            theme::apply_ui_theme(cx);
+        });
+        let stash = Rc::new(RefCell::new(None));
+        let stash2 = stash.clone();
+        let window = cx.add_window(move |window, cx| {
+            let app = cx.new(|cx| {
+                ReviewApp::new(
+                    Vec::new(),
+                    vec!["could not resolve the supplied PR".into()],
+                    Arc::new(FakePr::default()),
+                    local_store::LocalStore::in_memory(),
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            window.focus(&app.read(cx).focus_handle.clone(), cx);
+            *stash2.borrow_mut() = Some(app.clone());
+            Root::new(app, window, cx)
+        });
+        let app = stash.borrow().clone().unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        bind_quick_open(cx);
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("quick-open-error").is_some());
+        assert!(vcx.debug_bounds("sidebar").is_none());
+        vcx.update(|window, cx| {
+            let app = app.read(cx);
+            assert!(app.quick_open_visible);
+            assert!(app.open_input.focus_handle(cx).is_focused(window));
+            assert_eq!(
+                app.open_error.as_deref(),
+                Some("could not resolve the supplied PR")
+            );
+        });
+        let backdrop = point(px(10.), px(200.));
+        vcx.simulate_mouse_down(backdrop, MouseButton::Left, gpui::Modifiers::default());
+        vcx.simulate_mouse_up(backdrop, MouseButton::Left, gpui::Modifiers::default());
+        draw_window(&mut vcx);
+        vcx.update(|_, cx| assert!(!app.read(cx).quick_open_visible));
+        vcx.simulate_keystrokes("cmd-o");
+        draw_window(&mut vcx);
+        vcx.update(|_, cx| assert!(app.read(cx).quick_open_visible));
+    }
+
+    #[gpui::test]
+    fn quick_open_keeps_errors_in_modal_and_opens_or_reactivates_on_enter(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        bind_quick_open(cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        draw_window(&mut vcx);
+        vcx.simulate_keystrokes("cmd-o");
+        draw_window(&mut vcx);
+        vcx.simulate_keystrokes("enter");
+        vcx.update(|_, cx| {
+            assert!(app.read(cx).quick_open_visible);
+            assert!(app.read(cx).open_error.is_none());
+        });
+        vcx.simulate_input("not-a-pr");
+        vcx.simulate_keystrokes("enter");
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("quick-open-error").is_some());
+        vcx.update(|window, cx| {
+            let app = app.read(cx);
+            assert!(app.quick_open_visible);
+            assert!(app.open_input.focus_handle(cx).is_focused(window));
+            assert_eq!(app.open_input.read(cx).value().as_str(), "not-a-pr");
+            assert!(app.items.is_empty());
+        });
+        for value in ["acme/widgets#7", "https://github.com/acme/widgets/pull/7"] {
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.open_input
+                        .update(cx, |input, cx| input.set_value(value, window, cx));
+                });
+            });
+            vcx.simulate_keystrokes("enter");
+            draw_window(&mut vcx);
+            assert!(vcx.debug_bounds("sidebar").is_some());
+            vcx.update(|window, cx| {
+                assert!(!window.has_active_dialog(cx));
+                let app = app.read(cx);
+                assert!(!app.quick_open_visible);
+                assert!(!app.show_queue);
+                assert_eq!(
+                    app.items.len(),
+                    1,
+                    "the second open reactivates the same PR"
+                );
+                assert!(app.open_input.read(cx).value().is_empty());
+                assert!(app.open_error.is_none());
+                assert!(app.focus_handle.is_focused(window));
+            });
+            vcx.simulate_keystrokes("cmd-o");
+            draw_window(&mut vcx);
+        }
+        // The explicit Cancel button uses the same dismissal path.
+        let point = vcx.debug_bounds("quick-open-cancel").unwrap().center();
+        vcx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
+        vcx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::default());
+        draw_window(&mut vcx);
+        vcx.update(|_, cx| assert!(!app.read(cx).quick_open_visible));
+    }
+
     #[gpui::test]
     fn queue_author_names_are_visible_without_avatars_and_stay_bounded(
         cx: &mut gpui::TestAppContext,
@@ -8730,6 +8986,7 @@ mod tests {
             let table = vcx.debug_bounds("queue-table").unwrap();
             assert!(table.size.width <= px(QUEUE_MAX_WIDTH));
             assert!(table.size.width >= px(QUEUE_MIN_WIDTH));
+            assert!(vcx.debug_bounds("sidebar").is_none());
             assert!((table.center().x - px(width / 2.)).abs() <= px(1.));
             let short = vcx.debug_bounds("queue-row-0").unwrap();
             let long = vcx.debug_bounds("queue-row-1").unwrap();
@@ -9214,7 +9471,7 @@ mod tests {
     }
 
     /// The locator a row opens: the repository's `owner/name` plus the
-    /// number — everything ⌘T's open input parses into, derived from
+    /// number — everything ⌘O's open input parses into, derived from
     /// what the row already carries. A malformed repository degrades
     /// honestly: no locator, so Enter on it does nothing.
     #[test]
@@ -9258,8 +9515,6 @@ mod tests {
                     (loc.owner.as_str(), loc.repo.as_str(), loc.number),
                     ("acme", "gadgets", 2)
                 );
-                // The sidebar carries the file tree: it must be showing.
-                assert!(this.sidebar_visible);
                 // `u`: back to the queue — the item stays open behind the
                 // scenes (ctrl-tab reaches it) and the queue keeps the
                 // selection where it was left.
@@ -9327,7 +9582,6 @@ mod tests {
                 assert_eq!(this.items.len(), 2, "no duplicate may open");
                 assert_eq!(this.active, 0, "the open tab comes forward");
                 assert!(!this.show_queue);
-                assert!(this.sidebar_visible);
 
                 // A row whose repository isn't owner/name opens nothing.
                 this.back_to_queue(cx);
@@ -9770,7 +10024,6 @@ mod tests {
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
         vcx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.sidebar_visible = false;
                 app.open_input
                     .update(cx, |input, cx| input.focus(window, cx));
                 cx.notify();
@@ -9824,7 +10077,6 @@ mod tests {
         item.pane = ItemPane::Conversation;
         install_item(&app, item, cx);
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
-        vcx.dispatch_action(ToggleSidebar);
         vcx.update(|window, cx| {
             let _ = window.draw(cx);
         });
@@ -11417,8 +11669,17 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn resolve_pr(&self, _arg: &str) -> Result<github::PrLocator, github::ClientError> {
-            unimplemented!("loop tests never resolve a PR argument")
+        fn resolve_pr(&self, arg: &str) -> Result<github::PrLocator, github::ClientError> {
+            match arg {
+                "acme/widgets#7" | "https://github.com/acme/widgets/pull/7" => {
+                    Ok(github::PrLocator {
+                        owner: "acme".into(),
+                        repo: "widgets".into(),
+                        number: 7,
+                    })
+                }
+                _ => Err(github::ClientError::Failed("invalid PR identifier".into())),
+            }
         }
 
         fn pr_meta(&self, _loc: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
@@ -11556,9 +11817,14 @@ mod tests {
     /// the state after a finished open.
     fn install_item(
         app: &gpui::Entity<ReviewApp>,
-        item: ReviewItem,
+        mut item: ReviewItem,
         cx: &mut gpui::TestAppContext,
     ) {
+        // Fixtures may replace the diff on an existing item. Keep the now
+        // always-rendered sidebar's tree in sync, as a real fetch does.
+        if let ItemState::Ready(data) = &mut item.state {
+            data.rebuild_tree();
+        }
         cx.update(|cx| {
             app.update(cx, |this, _| {
                 this.show_queue = false;

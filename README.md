@@ -107,11 +107,14 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - tree-sitter highlighting, including CSS and SCSS
 - word-level intra-line diffs
 - whole-file phase-2 upgrade: hunks paint instantly, full-content re-diffs swap in
-- multi-item sidebar with file tree; drag its right edge to resize (width is remembered)
+- standalone review queue without a sidebar; reviews have a permanent multi-item
+  sidebar with file tree beside Changes / Conversation; drag its right edge to
+  resize (width is remembered). Title-bar Review queue / Back to review buttons
+  switch screens without losing the active item's pane or position
 - file-tree comment badges count comments and replies, including outdated comments and drafts
 - per-viewer viewed checkboxes at the right edge of the file tree; click or `V`
   to mark/unmark on GitHub, with optimistic updates and visible sync failures
-- quick-open (`cmd-t`) for known PR identifiers, PR URLs, and local repository paths
+- quick-open modal (`cmd-o`) for known PR identifiers, PR URLs, and local repository paths
 - PR conversation (title-bar Conversation / Changes button, or `⇧⌘←` / `⇧⌘→`):
   GFM description and chronological comments; reviews
   group their inline threads beneath the summary, with captured code context,
@@ -179,7 +182,7 @@ only by your account. Delete that directory to clear downloaded images.
 
 | Key | Action |
 |---|---|
-| `cmd-t` / `cmd-w` / `cmd-b` | quick-open input / close item / toggle sidebar |
+| `cmd-o` / `cmd-w` | quick-open modal / close item (from the queue, return to the open review) |
 | `ctrl-tab` | cycle open items |
 | `j` / `k` + `enter` | queue: move the selection, open the selected PR |
 | `s` | queue: toggle review requested / created ordering (both ascending) |
