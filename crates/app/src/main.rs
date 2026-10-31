@@ -41,17 +41,18 @@ use gpui::component::{
     Disableable as _, IconName, Root, Selectable as _, Sizable as _, TitleBar, WindowExt as _,
 };
 use gpui::{
-    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
-    AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding, Keystroke,
-    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, ScrollHandle, ScrollStrategy, SharedString, Subscription, Task, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    actions, canvas, div, fill, font, list, point, prelude::*, px, relative, size, uniform_list,
+    App, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding, Keystroke,
+    ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollStrategy,
+    SharedString, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions,
 };
 use minimap::{
     minimap_rows, minimap_runs, minimap_scale, MinimapColor, MinimapLane, MinimapLayout,
     MinimapRow, MINIMAP_GAP, MINIMAP_PAD, MINIMAP_WIDTH,
 };
-use queue::{queue_chips, queue_row};
+use queue::{queue_chips, queue_header, queue_row, QUEUE_MAX_WIDTH, QUEUE_MIN_WIDTH};
 #[cfg(test)]
 use review_target::fetch_item;
 use review_target::{dir_name, sources_match, Loaded, LoadedMeta, Source};
@@ -1582,7 +1583,8 @@ struct QueueState {
     /// The row the keyboard selection sits on, kept by position across
     /// refreshes.
     selected: usize,
-    scroll: UniformListScrollHandle,
+    /// Variable-height virtualization: titles and metadata wrap without clipping.
+    scroll: ListState,
 }
 
 /// Where the rows on screen came from.
@@ -1609,8 +1611,21 @@ impl QueueState {
             loading: false,
             error: None,
             selected: 0,
-            scroll: UniformListScrollHandle::new(),
+            scroll: ListState::new(0, ListAlignment::Top, px(200.)),
         }
+    }
+
+    /// Invalidate cached heights even when the refresh has the same row count:
+    /// titles and labels may have changed. Preserve the viewport by row position.
+    fn replace_rows(&mut self, prs: Vec<github::QueueItem>) {
+        let offset = self.scroll.logical_scroll_top();
+        self.selected = move_selection(self.selected, prs.len(), 0);
+        self.scroll.reset(prs.len());
+        self.scroll.scroll_to(ListOffset {
+            item_ix: offset.item_ix.min(prs.len().saturating_sub(1)),
+            offset_in_item: offset.offset_in_item,
+        });
+        self.prs = prs;
     }
 }
 
@@ -1901,7 +1916,7 @@ impl ReviewApp {
         }
         let (sort, order) = self.queue.search.sort();
         let matches = cached.matches(&self.queue.search.query(), sort, order);
-        self.queue.prs = self.store.cached_queue_items();
+        self.queue.replace_rows(self.store.cached_queue_items());
         // The origin stays `None` for a cache that belongs to another
         // search: the status line must not claim "cached" for a queue it
         // doesn't match.
@@ -1910,7 +1925,6 @@ impl ReviewApp {
         } else {
             QueueOrigin::None
         };
-        self.queue.selected = move_selection(self.queue.selected, self.queue.prs.len(), 0);
     }
 
     /// Ask the facade who we're signed in as — a `gh` subprocess in v0.1, so
@@ -1964,8 +1978,7 @@ impl ReviewApp {
                     Ok(prs) => {
                         // Keep the selection where it was, clamped into the
                         // fresh rows.
-                        app.queue.selected = move_selection(app.queue.selected, prs.len(), 0);
-                        app.queue.prs = prs;
+                        app.queue.replace_rows(prs);
                         app.queue.origin = QueueOrigin::Fresh;
                         app.queue.error = None;
                         // The fresh queue becomes the cache: the next
@@ -1996,9 +2009,7 @@ impl ReviewApp {
             return;
         }
         self.queue.selected = move_selection(self.queue.selected, self.queue.prs.len(), delta);
-        self.queue
-            .scroll
-            .scroll_to_item(self.queue.selected, ScrollStrategy::Top);
+        self.queue.scroll.scroll_to_reveal_item(self.queue.selected);
         cx.notify();
     }
 
@@ -2139,7 +2150,7 @@ impl ReviewApp {
     /// stale rows stay visible until it lands.
     fn queue_run_search(&mut self, cx: &mut Context<Self>) {
         self.queue.selected = 0;
-        self.queue.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.queue.scroll.scroll_to(ListOffset::default());
         self.spawn_queue_refresh(cx);
         cx.notify();
     }
@@ -5024,50 +5035,65 @@ impl ReviewApp {
         let entity = cx.entity();
         let now = now_unix();
         let count = queue.prs.len();
-        let selected = queue.selected;
         div()
             .size_full()
             .flex()
             .flex_col()
-            .text_size(px(13.))
+            .items_center()
+            .px_6()
+            .py_4()
             .child(
                 div()
+                    .debug_selector(|| "queue-table".into())
+                    .w_full()
+                    .min_w(px(QUEUE_MIN_WIDTH))
+                    .max_w(px(QUEUE_MAX_WIDTH))
+                    .h_full()
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_4()
-                    .flex_shrink_0()
-                    .h(px(34.))
-                    .border_b_1()
-                    .border_color(theme::surface0(cx))
-                    .child(div().text_color(theme::text(cx)).child("Review queue"))
+                    .flex_col()
+                    .text_size(px(13.))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_right()
-                            .text_size(px(12.))
-                            .text_color(theme::subtext(cx))
-                            .child(SharedString::from(format!(
-                                "{count} {}",
-                                if count == 1 { "PR" } else { "PRs" }
-                            ))),
-                    ),
-            )
-            .child(self.queue_controls(entity.clone(), cx))
-            .child(
-                uniform_list("queue", count, move |range, _window, cx| {
-                    let this = entity.read(cx);
-                    range
-                        .filter_map(|pos| this.queue.prs.get(pos).map(|pr| (pos, pr)))
-                        .map(|(pos, pr)| {
-                            queue_row(pr, pos, pos == selected, now, entity.clone(), cx)
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_4()
+                            .flex_shrink_0()
+                            .h(px(34.))
+                            .border_b_1()
+                            .border_color(theme::surface0(cx))
+                            .child(div().text_color(theme::text(cx)).child("Review queue"))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_right()
+                                    .text_size(px(12.))
+                                    .text_color(theme::subtext(cx))
+                                    .child(SharedString::from(format!(
+                                        "{count} {}",
+                                        if count == 1 { "PR" } else { "PRs" }
+                                    ))),
+                            ),
+                    )
+                    .child(self.queue_controls(entity.clone(), cx))
+                    // Outside the scrolling list, so headings stay aligned and visible.
+                    .child(queue_header(cx))
+                    .child(
+                        list(queue.scroll.clone(), move |pos, _window, cx| {
+                            let this = entity.read(cx);
+                            queue_row(
+                                &this.queue.prs[pos],
+                                pos,
+                                pos == this.queue.selected,
+                                now,
+                                entity.clone(),
+                                cx,
+                            )
                         })
-                        .collect()
-                })
-                .track_scroll(&queue.scroll)
-                .flex_1()
-                .min_h_0(),
+                        .flex_1()
+                        .min_h_0(),
+                    ),
             )
             .into_any_element()
     }
@@ -5097,6 +5123,7 @@ impl ReviewApp {
             .border_color(theme::surface0(cx))
             .child(
                 Button::new("queue-sort-toggle")
+                    .debug_selector(|| "queue-sort-toggle".into())
                     .xsmall()
                     .label(if oldest {
                         "sort: oldest first ↑"
@@ -5124,6 +5151,7 @@ impl ReviewApp {
                 chip_ix += 1;
                 row = row.child(
                     Button::new(("queue-chip", ix))
+                        .debug_selector(move || format!("queue-chip-{ix}"))
                         .xsmall()
                         .ghost()
                         .selected(chip.active)
@@ -8190,10 +8218,10 @@ mod tests {
         let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
         cx.update(|cx| {
             app.update(cx, |app, cx| {
-                app.queue.prs = vec![
+                app.queue.replace_rows(vec![
                     queued(1, "acme/repo", "alice"),
                     queued(2, "acme/repo", "a-very-long-automation-account-name[bot]"),
-                ];
+                ]);
                 cx.notify();
             });
         });
@@ -8213,8 +8241,338 @@ mod tests {
             assert!(author.size.width <= px(160.));
             assert!(author.size.height > px(0.));
             assert!(row.contains(&author.center()));
-            assert_eq!(row.size.height, px(36.));
+            assert!(row.size.height >= author.size.height + px(16.));
         }
+    }
+
+    #[gpui::test]
+    fn queue_labels_share_the_repository_line_when_they_fit(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut labeled = queued(2, "acme/repo", "alice");
+        labeled.is_draft = true;
+        labeled.labels = ["bug", "queue"]
+            .map(|name| github::QueueLabel {
+                name: name.into(),
+                color: "1D76DB".into(),
+            })
+            .to_vec();
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue
+                    .replace_rows(vec![queued(1, "acme/repo", "alice"), labeled]);
+                cx.notify();
+            })
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1440.), px(900.)));
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let repository = vcx.debug_bounds("queue-repository-1").unwrap();
+        for label in ["queue-label-1-0", "queue-label-1-1"] {
+            let label = vcx.debug_bounds(label).unwrap();
+            assert!((label.center().y - repository.center().y).abs() <= px(1.));
+            assert!(label.left() > repository.right());
+        }
+        assert!(
+            (vcx.debug_bounds("queue-row-1").unwrap().size.height
+                - vcx.debug_bounds("queue-row-0").unwrap().size.height)
+                .abs()
+                <= px(1.),
+            "labels that fit inline must not add a row of height"
+        );
+    }
+
+    #[gpui::test]
+    fn queue_polish_keeps_rows_dense_and_status_labels_aligned(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue.replace_rows(
+                    [
+                        (github::CiState::Pass, github::ReviewState::Awaiting),
+                        (github::CiState::Fail, github::ReviewState::ChangesRequested),
+                        (github::CiState::Pending, github::ReviewState::Approved),
+                        (github::CiState::NoChecks, github::ReviewState::Awaiting),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, (ci, review_state))| {
+                        let mut pr = queued(ix as u64, "acme/repo", "alice");
+                        pr.ci = ci;
+                        pr.review_state = review_state;
+                        pr.review_requested_at = Some("2026-01-01T00:00:00Z".into());
+                        pr
+                    })
+                    .collect(),
+                );
+                cx.notify();
+            })
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1440.), px(900.)));
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let first_status = vcx.debug_bounds("queue-ci-label-0").unwrap();
+        for (row, title, ci, review) in [
+            (
+                "queue-row-0",
+                "queue-title-0",
+                "queue-ci-label-0",
+                "queue-review-label-0",
+            ),
+            (
+                "queue-row-1",
+                "queue-title-1",
+                "queue-ci-label-1",
+                "queue-review-label-1",
+            ),
+            (
+                "queue-row-2",
+                "queue-title-2",
+                "queue-ci-label-2",
+                "queue-review-label-2",
+            ),
+            (
+                "queue-row-3",
+                "queue-title-3",
+                "queue-ci-label-3",
+                "queue-review-label-3",
+            ),
+        ] {
+            let row = vcx.debug_bounds(row).unwrap();
+            let title = vcx.debug_bounds(title).unwrap();
+            let ci = vcx.debug_bounds(ci).unwrap();
+            let review = vcx.debug_bounds(review).unwrap();
+            assert!(row.size.height <= px(60.), "ordinary rows stay compact");
+            assert_eq!(title.top() - row.top(), px(8.));
+            assert_eq!(ci.left(), first_status.left());
+            assert_eq!(review.left(), first_status.left());
+            assert_eq!(ci.size.height, px(18.));
+            assert_eq!(review.size.height, px(18.));
+        }
+        let first_row = vcx.debug_bounds("queue-row-0").unwrap();
+        let accent = vcx.debug_bounds("queue-selection-0").unwrap();
+        assert_eq!(accent.left(), first_row.left());
+        assert_eq!(accent.size.width, px(2.));
+        assert!(accent.size.height > px(0.));
+        assert!(accent.top() >= first_row.top() + px(8.));
+        assert!(accent.bottom() <= first_row.bottom() - px(8.));
+        assert!(vcx.debug_bounds("queue-selection-1").is_none());
+        // Hover alone must not move the keyboard-selection accent.
+        let hover = vcx.debug_bounds("queue-row-1").unwrap().center();
+        vcx.simulate_mouse_move(hover, None, gpui::Modifiers::default());
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("queue-selection-0").is_some());
+        assert!(vcx.debug_bounds("queue-selection-1").is_none());
+        cx.update(|cx| app.update(cx, |app, cx| app.queue_move(1, cx)));
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert!(vcx.debug_bounds("queue-selection-0").is_none());
+        assert!(vcx.debug_bounds("queue-selection-1").is_some());
+    }
+
+    /// The queue is a bounded table, but rows are not bounded-height:
+    /// long titles, identities, large counts and every label remain readable.
+    #[gpui::test]
+    fn queue_table_aligns_columns_and_wraps_content_on_resize(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut long = queued(
+            2,
+            &format!("acme/{}", "long-repository-name-".repeat(5)),
+            "a-very-long-automation-account-name[bot]",
+        );
+        long.title = "Keep all of this unusually long pull request title readable without losing important details. ".repeat(5);
+        long.is_draft = true;
+        long.ci = github::CiState::Fail;
+        long.review_state = github::ReviewState::ChangesRequested;
+        long.additions = Some(123_456_789);
+        long.deletions = Some(987_654_321);
+        long.comments = 12345;
+        long.labels = (0..5)
+            .map(|ix| github::QueueLabel {
+                name: if ix == 4 {
+                    "an exceptionally long label with meaningful details ".repeat(5)
+                } else {
+                    format!("label-{ix}")
+                },
+                color: "1D76DB".into(),
+            })
+            .collect();
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue
+                    .replace_rows(vec![queued(1, "acme/repo", "alice"), long]);
+                cx.notify();
+            })
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut wide_title_height = px(0.);
+        for width in [1600., 1100.] {
+            vcx.simulate_resize(size(px(width), px(2400.)));
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            let table = vcx.debug_bounds("queue-table").unwrap();
+            assert!(table.size.width <= px(QUEUE_MAX_WIDTH));
+            assert!(table.size.width >= px(QUEUE_MIN_WIDTH));
+            assert!((table.center().x - px(width / 2.)).abs() <= px(1.));
+            let short = vcx.debug_bounds("queue-row-0").unwrap();
+            let long = vcx.debug_bounds("queue-row-1").unwrap();
+            let title = vcx.debug_bounds("queue-title-1").unwrap();
+            assert!(long.size.height > short.size.height);
+            assert!(title.size.height > px(20.));
+            assert!(vcx.debug_bounds("queue-author-1").unwrap().size.height > px(18.));
+            assert!(vcx.debug_bounds("queue-repository-1").unwrap().size.height > px(18.));
+            assert!(vcx.debug_bounds("queue-label-1-4").unwrap().size.height > px(20.));
+            assert!(title.right() <= vcx.debug_bounds("queue-author-cell-1").unwrap().left());
+            if width == 1600. {
+                wide_title_height = title.size.height;
+            } else {
+                assert!(
+                    title.size.height > wide_title_height,
+                    "resize must remeasure wrapped rows"
+                );
+            }
+            for (header, first, second) in [
+                (
+                    "queue-header-author",
+                    "queue-author-cell-0",
+                    "queue-author-cell-1",
+                ),
+                ("queue-header-status", "queue-status-0", "queue-status-1"),
+                ("queue-header-changes", "queue-changes-0", "queue-changes-1"),
+                ("queue-header-age", "queue-age-0", "queue-age-1"),
+            ] {
+                let header = vcx.debug_bounds(header).unwrap();
+                let first = vcx.debug_bounds(first).unwrap();
+                let second = vcx.debug_bounds(second).unwrap();
+                assert_eq!(header.left(), first.left());
+                assert_eq!(header.left(), second.left());
+                assert_eq!(header.size.width, second.size.width);
+                assert!(second.bottom() <= long.bottom());
+                assert!(second.right() <= long.right());
+            }
+            for label in [
+                "queue-label-1-0",
+                "queue-label-1-1",
+                "queue-label-1-2",
+                "queue-label-1-3",
+                "queue-label-1-4",
+            ] {
+                let label = vcx
+                    .debug_bounds(label)
+                    .expect("all labels are shown, including the fifth");
+                assert!(label.left() >= title.left());
+                assert!(label.right() <= title.right());
+                assert!(label.bottom() <= long.bottom());
+            }
+        }
+        // A same-length refresh must discard old height measurements too.
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue.replace_rows(vec![
+                    queued(1, "acme/repo", "alice"),
+                    queued(2, "acme/repo", "bob"),
+                ]);
+                cx.notify();
+            })
+        });
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            vcx.debug_bounds("queue-row-0").unwrap().size.height,
+            vcx.debug_bounds("queue-row-1").unwrap().size.height
+        );
+        // Unknown diff size reserves its slot, keeping comments on line two.
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                let mut prs = app.queue.prs.clone();
+                prs[1].additions = Some(12);
+                prs[1].deletions = Some(4);
+                app.queue.replace_rows(prs);
+                cx.notify();
+            })
+        });
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let first_comment = vcx.debug_bounds("queue-comments-0").unwrap();
+        let second_comment = vcx.debug_bounds("queue-comments-1").unwrap();
+        assert_eq!(
+            first_comment.top() - vcx.debug_bounds("queue-row-0").unwrap().top(),
+            second_comment.top() - vcx.debug_bounds("queue-row-1").unwrap().top()
+        );
+    }
+
+    #[gpui::test]
+    fn queue_keyboard_reveals_variable_height_rows_and_keeps_headers_fixed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.queue.replace_rows(
+                    (0..50)
+                        .map(|ix| {
+                            let mut pr = queued(ix, "acme/repo", "alice");
+                            if ix % 2 == 0 {
+                                pr.title = "A title that takes more than one line of the queue. "
+                                    .repeat(5);
+                            }
+                            pr
+                        })
+                        .collect(),
+                );
+                cx.notify();
+            })
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1440.), px(700.)));
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let header = vcx.debug_bounds("queue-header-author").unwrap();
+        for _ in 0..35 {
+            cx.update(|cx| app.update(cx, |app, cx| app.queue_move(1, cx)));
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.update(|cx| {
+                let app = app.read(cx);
+                let row = app
+                    .queue
+                    .scroll
+                    .bounds_for_item(app.queue.selected)
+                    .expect("selected row is measured");
+                let viewport = app.queue.scroll.viewport_bounds();
+                assert!(row.top() >= viewport.top());
+                assert!(row.bottom() <= viewport.bottom());
+            });
+            assert_eq!(vcx.debug_bounds("queue-header-author").unwrap(), header);
+        }
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                let offset = app.queue.scroll.logical_scroll_top();
+                app.queue.replace_rows(app.queue.prs.clone());
+                assert_eq!(
+                    app.queue.scroll.logical_scroll_top(),
+                    offset,
+                    "refresh keeps the scroll anchor"
+                );
+                app.queue_run_search(cx);
+                assert_eq!(
+                    app.queue.scroll.logical_scroll_top().item_ix,
+                    0,
+                    "new search starts at the top"
+                );
+            })
+        });
     }
 
     /// The whole chain a chip click runs — handler → search update →
@@ -9400,11 +9758,8 @@ mod tests {
     /// The mouse path itself: a real down-up click on a chip must narrow
     /// the queue — hitbox, element state, pending mouse-down, click
     /// listeners — everything between the platform mouse event and the
-    /// handler the previous test drives directly. Headless tests can't
-    /// read element bounds, so this one probes: first down the window's
-    /// left edge until the sort chip answers (it's the control row's
-    /// first element), then rightward along that row until an author chip
-    /// does.
+    /// handler the previous test drives directly. Use painted bounds so
+    /// the test also works when the queue is centered in a wider window.
     #[gpui::test]
     fn the_mouse_click_path_narrows_the_queue(cx: &mut gpui::TestAppContext) {
         let fake = Arc::new(FakeQueue {
@@ -9412,13 +9767,15 @@ mod tests {
         });
         let (window, app) = queue_window(cx, fake.clone());
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
-        // Paint the element tree the mouse events hit-test against.
-        vcx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-
-        let click = |vcx: &mut gpui::VisualTestContext, x: f32, y: f32| {
-            let at = gpui::point(gpui::px(x), gpui::px(y));
+        vcx.simulate_resize(size(px(1440.), px(900.)));
+        let click = |vcx: &mut gpui::VisualTestContext, selector| {
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            let at = vcx
+                .debug_bounds(selector)
+                .expect("chip is painted")
+                .center();
             vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
             vcx.simulate_mouse_down(at, gpui::MouseButton::Left, gpui::Modifiers::default());
             vcx.simulate_mouse_up(at, gpui::MouseButton::Left, gpui::Modifiers::default());
@@ -9427,50 +9784,14 @@ mod tests {
         let ordering = |vcx: &gpui::VisualTestContext| {
             vcx.cx.update(|cx| app.read(cx).queue.search.ordering())
         };
+        click(&mut vcx, "queue-sort-toggle");
+        assert_eq!(ordering(&vcx), github::QueueSort::OldestUpdated);
+        click(&mut vcx, "queue-sort-toggle");
+        assert_eq!(ordering(&vcx), github::QueueSort::RecentlyUpdated);
 
-        // Find the control row: the sort chip is its first element, and a
-        // click on it flips the order — probe down until one does.
-        let mut band = None;
-        for y in (40..170).step_by(2) {
-            click(&mut vcx, 20., y as f32);
-            if ordering(&vcx) == github::QueueSort::OldestUpdated {
-                band = Some(y as f32);
-                break;
-            }
-        }
-        let band = band.expect("no click ever reached the sort chip");
-        // Restore the default order for the sweep.
-        click(&mut vcx, 20., band);
-        assert_eq!(
-            ordering(&vcx),
-            github::QueueSort::RecentlyUpdated,
-            "the sort chip must flip back on a second click"
-        );
-
-        // Sweep rightward until an author chip answers. The sweep may
-        // cross the sort chip again — restore it when it does, so the
-        // state stays known.
-        let mut clicked: Option<github::QueueFilter> = None;
-        let mut x = 24.;
-        while x < 640. {
-            click(&mut vcx, x, band);
-            if ordering(&vcx) == github::QueueSort::OldestUpdated {
-                click(&mut vcx, 20., band);
-            }
-            let filters = vcx
-                .cx
-                .update(|cx| app.read(cx).queue.search.filters().to_vec());
-            if let Some(filter) = filters
-                .iter()
-                .find(|filter| filter.kind() == github::QueueFilterKind::Author)
-                .cloned()
-            {
-                clicked = Some(filter);
-                break;
-            }
-            x += 3.;
-        }
-        let filter = clicked.expect("no click ever reached an author chip");
+        // Both PRs have the same repository, so only author chips appear.
+        click(&mut vcx, "queue-chip-0");
+        let filter = github::QueueFilter::author("alice");
 
         // The click narrowed the queue — the mouse path works end to end.
         vcx.cx.update(|cx| {
