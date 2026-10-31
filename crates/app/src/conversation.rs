@@ -16,18 +16,22 @@
 //! other constructs (link targets, autolinks, indented code) is treated as
 //! text, so a pathological description can still be rewritten a little too
 //! eagerly. Task 12 reuses this pipe for comment bodies, where the same
-//! tradeoff holds.
+//! tradeoff holds. Jira keys are then linked in parsed Markdown prose only,
+//! leaving code and existing links untouched.
 
+mod jira;
 mod markdown;
 pub(crate) mod posting;
 pub(crate) use markdown::render as render_markdown;
 
-/// Expand the GitHub-isms in a description or comment body into plain GFM:
+/// Expand GitHub-isms and Jira references in a description or comment body
+/// into plain GFM:
 ///
 /// - `:shortcode:` → the emoji character, via the gemoji table,
 /// - `@login` → a link to the GitHub profile,
 /// - `#123` → a link to the issue in `repo_slug` (GitHub redirects pulls
-///   and issues to the same place; `issues/` is the canonical spelling).
+///   and issues to the same place; `issues/` is the canonical spelling),
+/// - `PYAPI-123`, `BOT-123`, `CS-123`, `HELP-123` → Jira ticket links.
 ///
 /// Code is never rewritten: fenced blocks pass through whole, and inline
 /// code spans are skipped within a line.
@@ -62,7 +66,7 @@ pub fn preprocess(body: &str, repo_slug: &str) -> String {
     // split('\n') on a trailing-newline body ends with an empty line, so
     // `foo\n` round-trips; a body without one (`foo`) gains a harmless
     // trailing newline that markdown ignores.
-    out
+    jira::link_references(out)
 }
 
 /// Submitted reviews occupy one slot, with their summary before their inline
@@ -1450,6 +1454,16 @@ pub(crate) mod tests {
             preprocess(body, "acme/widgets"),
             "Thanks [@octocat](https://github.com/octocat) for 🎉 — closes \
              [#123](https://github.com/acme/widgets/issues/123).\n"
+        );
+    }
+
+    #[test]
+    fn jira_refs_share_the_description_and_comment_preprocessing_pipe() {
+        assert_eq!(
+            preprocess("Thanks @bob :tada: — #12 fixes PYAPI-1234.", "acme/widgets"),
+            "Thanks [@bob](https://github.com/bob) 🎉 — \
+             [#12](https://github.com/acme/widgets/issues/12) fixes \
+             [PYAPI-1234](https://ucroo-platform.atlassian.net/browse/PYAPI-1234).\n"
         );
     }
 

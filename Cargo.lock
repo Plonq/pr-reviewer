@@ -1962,6 +1962,7 @@ dependencies = [
  "image",
  "libc",
  "lsp-types",
+ "markdown",
  "serde_json",
  "sha2 0.10.9",
  "store",

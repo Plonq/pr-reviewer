@@ -28,6 +28,8 @@ unicode-segmentation = "1"
 # GitHub's emoji shortcode table (gemoji), for the conversation pane's
 # `:rocket:` → 🚀 pipe.
 emojis = "0.9"
+# Kit's Markdown parser, used to auto-link Jira keys only in prose.
+markdown = "1"
 http_client = { version = "=0.3.10", package = "gpui-pre-http-client" }
 futures = "0.3"
 ureq = "2"
