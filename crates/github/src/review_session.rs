@@ -163,6 +163,11 @@ pub enum Command {
     DeletePublished {
         target: crate::CommentTarget,
     },
+    SetReaction {
+        target: crate::CommentTarget,
+        content: String,
+        reacted: bool,
+    },
     SetThreadResolved {
         thread_id: String,
         resolved: bool,
@@ -233,6 +238,16 @@ impl ReviewSession {
         }
         if let Command::DeletePublished { target } = command {
             return client.delete_comment(&target).map(|_| None);
+        }
+        if let Command::SetReaction {
+            target,
+            content,
+            reacted,
+        } = command
+        {
+            return client
+                .set_comment_reaction(&target, &content, reacted)
+                .map(|_| None);
         }
         if let Command::SetThreadResolved {
             thread_id,
@@ -346,6 +361,7 @@ impl ReviewSession {
             | Command::Conversation { .. }
             | Command::EditPublished { .. }
             | Command::DeletePublished { .. }
+            | Command::SetReaction { .. }
             | Command::SetThreadResolved { .. } => unreachable!(),
         }
         Ok(None)

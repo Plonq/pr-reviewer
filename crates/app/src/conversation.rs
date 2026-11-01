@@ -886,6 +886,8 @@ impl ReviewApp {
                 }
             })
             .unwrap_or_else(|| format!("{kind}-{}", comment.id));
+        let controls = (kind != "optimistic")
+            .then(|| self.comment_controls(target.clone(), placement, &cx.entity()));
         let mut card = div()
             .id(SharedString::from(format!("discussion-{item_id}-{key}")))
             .debug_selector(|| format!("discussion-{item_id}-{key}"))
@@ -912,10 +914,7 @@ impl ReviewApp {
                                 Tooltip::new(timestamp.clone()).build(window, cx)
                             }),
                     )
-                    .children(
-                        (kind != "optimistic")
-                            .then(|| self.comment_controls(target, placement, &cx.entity())),
-                    ),
+                    .children(controls),
             );
         if markdown::has_content(&comment.body) {
             card = card.child(render_markdown(
@@ -925,22 +924,17 @@ impl ReviewApp {
                 cx,
             ));
         }
-        // Plain labels, deliberately not buttons: adding reactions is v0.2.
-        let reactions: Vec<_> = comment
-            .reactions
-            .iter()
-            .filter(|r| r.count > 0)
-            .map(|reaction| {
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(theme::surface0(cx))
-                    .child(format!("{} {}", reaction.emoji(), reaction.count))
-            })
-            .collect();
-        if !reactions.is_empty() {
-            card = card.child(div().mt_3().flex().flex_wrap().gap_2().children(reactions));
+        if kind != "optimistic"
+            && (comment.reactions.iter().any(|r| r.count > 0)
+                || (comment.permissions.can_react && !comment.permissions.node_id.is_empty()))
+        {
+            if let crate::CommentTarget::Published(target) = target {
+                card = card.child(div().mt_3().child(self.comment_reactions(
+                    target,
+                    comment,
+                    &cx.entity(),
+                )));
+            }
         }
         card.into_any_element()
     }
@@ -1178,6 +1172,7 @@ pub(crate) mod tests {
             reactions: vec![github::Reaction {
                 content: "THUMBS_UP".into(),
                 count: 3,
+                viewer_has_reacted: false,
             }],
         };
         github::PrDiscussion {
@@ -1352,6 +1347,7 @@ pub(crate) mod tests {
         discussion.comments[0].reactions = vec![github::Reaction {
             content: "THUMBS_UP".into(),
             count: 1,
+            viewer_has_reacted: false,
         }];
         assert_eq!(timeline(&discussion).len(), 1);
         discussion.comments[0] = review;

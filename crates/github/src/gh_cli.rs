@@ -630,8 +630,8 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         // Paginate each connection independently: a busy PR can have >100
         // comments, reviews, threads, AND replies within one thread.
         for (name, fields) in [
-            ("comments", "id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete author { login } body createdAt reactionGroups { content users { totalCount } }"),
-            ("reviews", "id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete author { login } body createdAt submittedAt state"),
+            ("comments", "id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete viewerCanReact author { login } body createdAt reactionGroups { content viewerHasReacted reactors { totalCount } }"),
+            ("reviews", "id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete viewerCanReact author { login } body createdAt submittedAt state reactionGroups { content viewerHasReacted reactors { totalCount } }"),
         ] {
             let mut after = None;
             loop {
@@ -782,6 +782,37 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         if value["data"][mutation]["clientMutationId"].as_str() != Some(id) {
             return Err(ClientError::Failed(
                 "GitHub returned no deleted comment".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_comment_reaction(
+        &self,
+        target: &crate::CommentTarget,
+        content: &str,
+        reacted: bool,
+    ) -> Result<(), ClientError> {
+        let (crate::CommentTarget::Issue(id)
+        | crate::CommentTarget::Review(id)
+        | crate::CommentTarget::ReviewComment(id)) = target;
+        if id.is_empty() || !crate::Reaction::KINDS.contains(&content) {
+            return Err(ClientError::Invalid(
+                "invalid reaction or comment identity".into(),
+            ));
+        }
+        let mutation = if reacted {
+            "addReaction"
+        } else {
+            "removeReaction"
+        };
+        let value = self.review_graphql(format!(
+            "mutation {{ {mutation}(input:{{subjectId:{},content:{content}}}) {{ subject {{ id }} }} }}",
+            json_string(id),
+        ))?;
+        if value["data"][mutation]["subject"]["id"].as_str() != Some(id) {
+            return Err(ClientError::Failed(
+                "GitHub returned no updated reaction subject".into(),
             ));
         }
         Ok(())
@@ -1574,7 +1605,7 @@ fn after_arg(cursor: Option<&str>) -> String {
 }
 
 fn review_thread_fields(cursor: Option<&str>) -> String {
-    format!("id path isResolved viewerCanResolve viewerCanUnresolve originalLine originalStartLine side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete path body diffHunk createdAt author {{ login }} reactionGroups {{ content users {{ totalCount }} }} replyTo {{ id:fullDatabaseId }} pullRequestReview {{ id state }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
+    format!("id path isResolved viewerCanResolve viewerCanUnresolve originalLine originalStartLine side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete viewerCanReact path body diffHunk createdAt author {{ login }} reactionGroups {{ content viewerHasReacted reactors {{ totalCount }} }} replyTo {{ id:fullDatabaseId }} pullRequestReview {{ id state }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
 }
 
 fn database_id(value: &serde_json::Value) -> Result<u64, ClientError> {
@@ -1592,11 +1623,12 @@ fn discussion_comment(raw: &serde_json::Value) -> Result<crate::DiscussionCommen
     let mut reactions = Vec::new();
     if let Some(groups) = raw["reactionGroups"].as_array() {
         for group in groups {
-            let count: u64 = decode_value(group["users"]["totalCount"].clone())?;
+            let count: u64 = decode_value(group["reactors"]["totalCount"].clone())?;
             if count > 0 {
                 reactions.push(crate::Reaction {
                     content: decode_value(group["content"].clone())?,
                     count,
+                    viewer_has_reacted: group["viewerHasReacted"].as_bool().unwrap_or(false),
                 });
             }
         }
@@ -1607,6 +1639,7 @@ fn discussion_comment(raw: &serde_json::Value) -> Result<crate::DiscussionCommen
             node_id: raw["node_id"].as_str().unwrap_or_default().into(),
             can_edit: raw["viewerCanUpdate"].as_bool().unwrap_or(false),
             can_delete: raw["viewerCanDelete"].as_bool().unwrap_or(false),
+            can_react: raw["viewerCanReact"].as_bool().unwrap_or(false),
         },
         author: raw["author"]["login"].as_str().unwrap_or("ghost").into(),
         body: decode_value(raw["body"].clone())?,
@@ -2352,8 +2385,8 @@ mod tests {
         let comment = |id: u64| {
             json!({"id": id.to_string(), "body": "**hello**", "createdAt": "2026-01-01T00:00:00Z",
                 "author": null, "reactionGroups": [
-                    {"content": "HEART", "users": {"totalCount": 4}},
-                    {"content": "EYES", "users": {"totalCount": 0}}
+                    {"content": "HEART", "viewerHasReacted": true, "reactors": {"totalCount": 4}},
+                    {"content": "EYES", "viewerHasReacted": false, "reactors": {"totalCount": 0}}
                 ], "pullRequestReview": {"id": "R9", "state": "COMMENTED"},
                 "diffHunk": "@@ -40,3 +40,0 @@\n-old one\n-old two\n-old three"
             })
@@ -2413,7 +2446,8 @@ mod tests {
             discussion.comments[0].reactions,
             vec![crate::Reaction {
                 content: "HEART".into(),
-                count: 4
+                count: 4,
+                viewer_has_reacted: true,
             }]
         );
         assert_eq!(discussion.comments[2].created_at, "2026-02-01T00:00:00Z");
@@ -3317,6 +3351,91 @@ mod tests {
     }
 
     #[test]
+    fn reactions_toggle_each_comment_family_without_touching_pending_reviews() {
+        use crate::{
+            review_session::{Command, ReviewSession},
+            CommentTarget, Reaction,
+        };
+        for target in [
+            CommentTarget::Issue("IC1".into()),
+            CommentTarget::Review("R1".into()),
+            CommentTarget::ReviewComment("RC1".into()),
+        ] {
+            let (CommentTarget::Issue(id)
+            | CommentTarget::Review(id)
+            | CommentTarget::ReviewComment(id)) = &target;
+            for content in Reaction::KINDS {
+                let added =
+                    serde_json::json!({"data":{"addReaction":{"subject":{"id":id}}}}).to_string();
+                let removed = serde_json::json!({"data":{"removeReaction":{"subject":{"id":id}}}})
+                    .to_string();
+                let (client, calls) = session_script(&[&added, &removed]);
+                let pending = PendingReview {
+                    id: 91,
+                    node_id: "pending".into(),
+                    body: "untouched".into(),
+                    comments: vec![],
+                };
+                let mut session = ReviewSession {
+                    pending: Some(pending.clone()),
+                    verified: true,
+                };
+                for reacted in [true, false] {
+                    session
+                        .execute(
+                            &client,
+                            &loc(),
+                            Command::SetReaction {
+                                target: target.clone(),
+                                content: content.into(),
+                                reacted,
+                            },
+                        )
+                        .unwrap();
+                }
+                assert_eq!(session.pending, Some(pending));
+                assert!(session.verified);
+                let calls = calls.lock().unwrap();
+                assert_eq!(calls.len(), 2);
+                assert!(calls[0].join(" ").contains("addReaction"));
+                assert!(calls[1].join(" ").contains("removeReaction"));
+                for call in calls.iter() {
+                    let query = call.join(" ");
+                    assert!(query.contains(&format!("subjectId:{}", json_string(id))));
+                    assert!(query.contains(&format!("content:{content}")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reactions_reject_invalid_input_and_failed_or_missing_results() {
+        use crate::CommentTarget;
+        let (client, calls) = session_script(&[]);
+        assert!(client
+            .set_comment_reaction(&CommentTarget::Issue("".into()), "HEART", true)
+            .is_err());
+        for invalid in ["", "heart", "HEART}bad"] {
+            assert!(client
+                .set_comment_reaction(&CommentTarget::Issue("IC1".into()), invalid, true)
+                .is_err());
+        }
+        assert!(calls.lock().unwrap().is_empty());
+        for response in [
+            r#"{"errors":[{"message":"not permitted"}]}"#,
+            r#"{"data":{}}"#,
+            r#"{"data":{"addReaction":{"subject":{"id":"other"}}}}"#,
+        ] {
+            let (client, _) = session_script(&[response, response]);
+            for reacted in [true, false] {
+                assert!(client
+                    .set_comment_reaction(&CommentTarget::Issue("IC1".into()), "HEART", reacted)
+                    .is_err());
+            }
+        }
+    }
+
+    #[test]
     fn published_mutations_route_each_comment_family_without_touching_pending_reviews() {
         use crate::{
             review_session::{Command, ReviewSession},
@@ -3425,14 +3544,15 @@ mod tests {
     fn discussion_permissions_preserve_independent_server_capabilities_not_authorship() {
         let mut raw = serde_json::json!({"id":"5000000001", "node_id":"IC1", "body":"body",
             "createdAt":"2026-10-26T00:00:00Z", "author":{"login":"someone-else"},
-            "viewerCanUpdate":false, "viewerCanDelete":true});
+            "viewerCanUpdate":false, "viewerCanDelete":true, "viewerCanReact":true});
         let c = discussion_comment(&raw).unwrap();
         assert_eq!(
             c.permissions,
             crate::CommentPermissions {
                 node_id: "IC1".into(),
                 can_edit: false,
-                can_delete: true
+                can_delete: true,
+                can_react: true,
             }
         );
         raw["viewerCanUpdate"] = serde_json::json!(true);

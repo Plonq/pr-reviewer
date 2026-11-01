@@ -109,6 +109,11 @@ pub(crate) enum Row {
         text: Arc<crate::diff_media::CommentText>,
         slot: usize,
     },
+    /// Published reaction controls below this comment's Markdown body.
+    CommentReactions {
+        comment_id: u64,
+        half: Option<CommentSide>,
+    },
     /// Space for the root-level editor, replacing this comment's body in place.
     CommentEditor {
         half: Option<CommentSide>,
@@ -129,6 +134,7 @@ pub(crate) fn is_comment_row(row: &Row) -> bool {
         row,
         Row::CommentHeader { .. }
             | Row::CommentBody { .. }
+            | Row::CommentReactions { .. }
             | Row::CommentEditor { .. }
             | Row::CommentActions { .. }
     )
@@ -1363,6 +1369,19 @@ fn render_row_content(
         Row::CommentBody { half, .. } => {
             comment_row(div().into_any_element(), *half, false, CardEdge::Middle, cx)
         }
+        Row::CommentReactions { comment_id, half } => comment_row(
+            div()
+                .debug_selector(|| format!("inline-reactions-{comment_id}"))
+                .flex()
+                .items_center()
+                .h_full()
+                .children(controls)
+                .into_any_element(),
+            *half,
+            false,
+            CardEdge::Middle,
+            cx,
+        ),
         Row::CommentEditor { half } => {
             comment_row(div().into_any_element(), *half, false, CardEdge::Middle, cx)
         }
