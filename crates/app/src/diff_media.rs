@@ -5,6 +5,7 @@
 
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
+use gpui::component::ActiveTheme;
 use gpui::{
     div, px, size, App, AvailableSpace, Bounds, Context, Entity, InteractiveElement, IntoElement,
     MouseButton, ParentElement, Pixels, Point, Styled, UniformListDecoration, Window,
@@ -15,7 +16,7 @@ use crate::{
     rows::{BuiltRows, Row},
     text_size, theme,
     threads::{CommentSide, COMMENT_WRAP_CHARS, REPLY_INDENT},
-    ItemPane, ItemState, ReviewApp, Source, MONO, SPLIT_DIVIDER,
+    ItemPane, ItemState, ReviewApp, Source, SPLIT_DIVIDER,
 };
 
 pub(crate) struct CommentText {
@@ -122,7 +123,7 @@ fn text_content(
             let id = id.to_owned();
             move || format!("{id}-content")
         })
-        .font_family(MONO)
+        .font_family(cx.theme().font_family.clone())
         .text_size(px(text_size()))
         .line_height(px(row_height()))
         .text_color(theme::subtext(cx))

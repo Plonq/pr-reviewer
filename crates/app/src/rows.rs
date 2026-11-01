@@ -9,7 +9,7 @@ use gpui::component::{
     button::{Button, ButtonVariants as _},
     tag::Tag,
     tooltip::Tooltip,
-    Sizable as _,
+    ActiveTheme as _, Sizable as _,
 };
 use gpui::{div, prelude::*, px, HighlightStyle, Hsla, SharedString, StyledText};
 use std::collections::HashMap;
@@ -1134,7 +1134,12 @@ fn comment_row(
                     .child(inner)
             })
     };
-    let row = div().h(px(row_height())).w_full().flex();
+    // Comments use the UI's prose font, not the diff pane's inherited mono.
+    let row = div()
+        .h(px(row_height()))
+        .w_full()
+        .flex()
+        .font_family(cx.theme().font_family.clone());
     match half {
         // Unified: one column, so the card spans it.
         None => row.child(card(inner)).into_any_element(),
