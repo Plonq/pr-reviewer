@@ -148,6 +148,11 @@ impl<P: GhProcess> GhCliClient<P> {
         ) -> Result<(), ClientError>,
     ) -> Result<(), ClientError> {
         let mut after = None;
+        // GitHub can mark LEFT threads outdated merely because the target
+        // branch advanced. Their explicit positions still use the PR merge
+        // base. Resolve mismatched captured bases once per immutable range,
+        // including failures, without making discussion loading depend on it.
+        let mut merge_bases = HashMap::new();
         loop {
             let query = format!("query {{ repository(owner:{},name:{}) {{ pullRequest(number:{}) {{ headRefOid baseRefOid reviewThreads(first:100{}) {{ nodes {{ {} }} pageInfo {{ hasNextPage endCursor }} }} }} }} }}",
                 json_string(&loc.owner), json_string(&loc.repo), loc.number, after_arg(after.as_deref()), review_thread_fields(None));
@@ -155,15 +160,30 @@ impl<P: GhProcess> GhCliClient<P> {
             let pr = &value["data"]["repository"]["pullRequest"];
             let connection = &pr["reviewThreads"];
             for thread in connection_nodes(connection)? {
+                let head = pr["headRefOid"].as_str();
+                let target = pr["baseRefOid"].as_str();
+                let position = &thread["positioning"];
+                let base = if thread["side"].as_str() == Some("LEFT")
+                    && thread["isOutdated"].as_bool() == Some(true)
+                    && head.is_some()
+                    && position["headCommitOid"].as_str() == head
+                    && position["baseCommitOid"].is_string()
+                    && position["baseCommitOid"].as_str() != target
+                {
+                    match (target, head) {
+                        (Some(target), Some(head)) => merge_bases
+                            .entry((target.to_owned(), head.to_owned()))
+                            .or_insert_with(|| self.merge_base(loc, target, head).ok())
+                            .as_deref(),
+                        _ => None,
+                    }
+                } else {
+                    target
+                };
                 let mut page = thread.clone();
                 loop {
                     for comment in connection_nodes(&page["comments"])? {
-                        visit(
-                            &page,
-                            comment,
-                            pr["headRefOid"].as_str(),
-                            pr["baseRefOid"].as_str(),
-                        )?;
+                        visit(&page, comment, head, base)?;
                     }
                     let Some(cursor) = next_cursor(&page["comments"])? else {
                         break;
@@ -1228,6 +1248,25 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         validate_comparison(review, &comparison)
     }
 
+    fn merge_base(&self, loc: &PrLocator, base: &str, head: &str) -> Result<String, ClientError> {
+        use crate::review_changes::valid_oid;
+        if ![base, head].into_iter().all(valid_oid) {
+            return Err(ClientError::Invalid("invalid comparison revision".into()));
+        }
+        let comparison = self.review_api(&[
+            "api".into(),
+            format!(
+                "repos/{}/compare/{base}...{head}?per_page=1",
+                loc.repo_slug()
+            ),
+        ])?;
+        comparison["merge_base_commit"]["sha"]
+            .as_str()
+            .filter(|oid| valid_oid(oid))
+            .map(str::to_owned)
+            .ok_or_else(|| ClientError::Failed("GitHub returned no upstream merge base".into()))
+    }
+
     fn comparison_patch(
         &self,
         loc: &PrLocator,
@@ -1245,22 +1284,8 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         // Both merge bases come from immutable revisions captured for this
         // fetch, not mutable branch names. The PR may not include the target's
         // latest commits, so never merge its tip directly into the baseline.
-        let merge_base = |revision: &str| -> Result<String, ClientError> {
-            let comparison = self.review_api(&[
-                "api".into(),
-                format!(
-                    "repos/{}/compare/{upstream}...{revision}?per_page=1",
-                    loc.repo_slug()
-                ),
-            ])?;
-            comparison["merge_base_commit"]["sha"]
-                .as_str()
-                .filter(|oid| valid_oid(oid))
-                .map(str::to_owned)
-                .ok_or_else(|| ClientError::Failed("GitHub returned no upstream merge base".into()))
-        };
-        let old_upstream = merge_base(base)?;
-        let new_upstream = merge_base(head)?;
+        let old_upstream = self.merge_base(loc, upstream, base)?;
+        let new_upstream = self.merge_base(loc, upstream, head)?;
         if old_upstream != new_upstream {
             return crate::comparison::fetch_comparison(
                 loc,
@@ -1647,6 +1672,7 @@ fn positioning_error(anchor: &CommentAnchor, error: ClientError) -> ClientError 
 
 /// Legacy current positions win. Preview blob positions can look outdated in
 /// the legacy API; use them only when their captured diff is still current.
+/// `base` is the displayed PR baseline, not necessarily the target branch tip.
 fn thread_position(
     thread: &serde_json::Value,
     head: Option<&str>,
@@ -2666,6 +2692,48 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("rate limited"));
+    }
+
+    #[test]
+    fn merge_base_uses_captured_revisions_even_when_target_and_head_diverged() {
+        let target = "a".repeat(40);
+        let head = "b".repeat(40);
+        let ancestor = "c".repeat(40);
+        let response = serde_json::json!({
+            "status": "diverged",
+            "merge_base_commit": {"sha": ancestor},
+        })
+        .to_string();
+        let (client, calls) = session_script(&[&response]);
+        assert_eq!(client.merge_base(&loc(), &target, &head).unwrap(), ancestor);
+        assert_eq!(
+            calls.lock().unwrap()[0],
+            vec![
+                "api".to_string(),
+                format!(
+                    "repos/{}/compare/{target}...{head}?per_page=1",
+                    loc().repo_slug()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_base_errors_never_fall_back_to_target_tip() {
+        let target = "a".repeat(40);
+        let head = "b".repeat(40);
+        for response in [r#"{}"#, r#"{"merge_base_commit":{"sha":"--invalid"}}"#] {
+            let (client, _) = session_script(&[response]);
+            assert!(client.merge_base(&loc(), &target, &head).is_err());
+        }
+        let failed = client(ok(Some(1), "", "network unavailable"));
+        assert!(failed.merge_base(&loc(), &target, &head).is_err());
+        let (client, calls) = session_script(&[]);
+        assert!(matches!(
+            client.merge_base(&loc(), "main", &head),
+            Err(ClientError::Invalid(_))
+        ));
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3696,6 +3764,91 @@ mod tests {
                     );
                     assert_eq!(comments[0].side.as_deref(), Some(side.api_str()));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn target_branch_advance_recovers_merge_base_threads_and_pending_drafts() {
+        use serde_json::json;
+        let target = "a".repeat(40);
+        let head = "b".repeat(40);
+        let baseline = "c".repeat(40);
+        let connection =
+            |nodes| json!({"nodes": nodes, "pageInfo": {"hasNextPage": false, "endCursor": null}});
+        let comment = |id, state| {
+            json!({
+                "id": id, "node_id": format!("C{id}"), "path": "a.rs", "body": "comment",
+                "createdAt": "2026-10-24T00:00:00Z", "author": {"login": "octocat"},
+                "diffHunk": "@@ -74,3 +74,0 @@\n-one\n-two\n-three",
+                "pullRequestReview": {"id": if state == "PENDING" { "PRR_pending" } else { "PRR_published" }, "state": state},
+            })
+        };
+        let thread = |id, line, comments| {
+            json!({
+                "id": format!("T{id}"), "path": "a.rs", "side": "LEFT",
+                // Like the real PR: legacy line numbers moved with the target,
+                // but the explicit blob is still the displayed PR's merge base.
+                "line": line + 84, "isOutdated": true, "isResolved": false,
+                "positioning": {"__typename": "LineComment", "line": line,
+                    "commitOid": baseline, "baseCommitOid": baseline, "headCommitOid": head},
+                "comments": connection(comments),
+            })
+        };
+        let mut reply = comment(2, "COMMENTED");
+        reply["replyTo"] = json!({"id": 1});
+        let threads = json!({"data": {"repository": {"pullRequest": {
+            "headRefOid": head, "baseRefOid": target,
+            "reviewThreads": connection(vec![
+                thread(1, 76, vec![comment(1, "COMMENTED"), reply]),
+                thread(2, 78, vec![comment(3, "COMMENTED")]),
+                thread(3, 82, vec![comment(4, "PENDING")]),
+            ]),
+        }}}})
+        .to_string();
+        let empty = |name: &str| {
+            json!({"data": {"repository": {"pullRequest": {name: connection(vec![])}}}}).to_string()
+        };
+        // Changed baselines and failed lookups must NOT resurrect stale code.
+        for found in [Some(baseline.clone()), Some("d".repeat(40)), None] {
+            let comparison =
+                json!({"status": "diverged", "merge_base_commit": {"sha": found}}).to_string();
+            let (client, calls) = session_script(&[
+                &empty("comments"),
+                &empty("reviews"),
+                &threads,
+                &comparison,
+                SUCCESS,
+                PENDING,
+                &threads,
+                &comparison,
+            ]);
+            let discussion = client.pr_discussion(&loc()).unwrap();
+            let pending = client.pending_review(&loc()).unwrap().unwrap();
+            let current = found.as_deref() == Some(baseline.as_str());
+            assert_eq!(discussion.threads.len(), 2);
+            assert_eq!(discussion.threads[0].line, current.then_some(76));
+            assert_eq!(discussion.threads[1].line, current.then_some(78));
+            assert_eq!(discussion.threads[0].comments.len(), 2);
+            assert_eq!(pending.comments.len(), 1);
+            assert_eq!(pending.comments[0].line, current.then_some(82));
+            let calls = calls.lock().unwrap();
+            assert_eq!(
+                calls.len(),
+                8,
+                "cache the lookup across threads, including failures"
+            );
+            for ix in [3, 7] {
+                assert_eq!(
+                    calls[ix],
+                    vec![
+                        "api".to_owned(),
+                        format!(
+                            "repos/{}/compare/{target}...{head}?per_page=1",
+                            loc().repo_slug()
+                        ),
+                    ]
+                );
             }
         }
     }
