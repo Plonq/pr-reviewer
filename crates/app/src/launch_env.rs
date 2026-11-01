@@ -2,6 +2,7 @@
 //! once, before threads start, for all subprocesses (including git's `gh`
 //! credential helper), not just the GitHub client's direct CLI invocations.
 
+use anyhow::{bail, Context};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::OsStringExt;
@@ -69,7 +70,7 @@ fn merged_path(
 fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
     let mut command = Command::new(shell);
     command.args(["-ilc", PRINT_PATH]);
-    let output = bounded_output(&mut command, timeout)?;
+    let output = bounded_output(&mut command, timeout).ok()?;
     parse_shell_path(&output)
 }
 
@@ -84,32 +85,46 @@ fn parse_shell_path(output: &[u8]) -> Option<OsString> {
     (end > start).then(|| OsString::from_vec(output[start..end].to_vec()))
 }
 
-fn bounded_output(command: &mut Command, timeout: Duration) -> Option<Vec<u8>> {
-    // A file avoids pipe backpressure from noisy startup scripts, and avoids
+fn bounded_output(command: &mut Command, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+    // Files avoid pipe backpressure from noisy startup scripts, and avoid
     // hanging while draining a pipe inherited by a background shell child.
-    let mut output = tempfile::tempfile().ok()?;
-    let mut child = command
+    let mut output = tempfile::tempfile().context("creating shell stdout file")?;
+    let mut stderr = tempfile::tempfile().context("creating shell stderr file")?;
+    command
         .stdin(Stdio::null())
-        .stdout(Stdio::from(output.try_clone().ok()?))
-        .stderr(Stdio::null())
-        // A stalled startup script may be waiting on a child (e.g. `sleep`).
-        // Give it its own process group so timeout kills the whole job.
-        .process_group(0)
+        .stdout(Stdio::from(output.try_clone()?))
+        .stderr(Stdio::from(stderr.try_clone()?));
+    // A new process group alone leaves the shell attached to our controlling
+    // terminal. Interactive zsh can then stop itself with SIGTTIN while waiting
+    // for that background group to become foreground. Detach with a new session;
+    // this also creates a process group so timeout can kill the whole job.
+    // SAFETY: the pre-exec hook only calls the async-signal-safe setsid syscall
+    // and retrieves errno on failure; it does not allocate or acquire locks.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
         .spawn()
-        .ok()?;
+        .with_context(|| format!("starting shell command {command:?}"))?;
     let deadline = Instant::now() + timeout;
-    loop {
+    let completion = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
+                break if status.success() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("shell exited with {status}"))
+                };
             }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            _ => {
+            result => {
                 // SAFETY: this child was started in its own process group;
                 // its positive PID is also that group's ID.
                 unsafe {
@@ -117,25 +132,42 @@ fn bounded_output(command: &mut Command, timeout: Duration) -> Option<Vec<u8>> {
                 }
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                break match result {
+                    Err(error) => Err(anyhow::Error::new(error).context("waiting for shell")),
+                    _ => Err(anyhow::anyhow!("shell timed out after {timeout:?}")),
+                };
             }
         }
+    };
+    if let Err(error) = completion {
+        // Keep failure diagnostics bounded too, even for noisy startup scripts.
+        stderr.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        stderr.take(4096).read_to_end(&mut bytes)?;
+        return Err(error.context(format!("shell stderr: {}", String::from_utf8_lossy(&bytes))));
     }
     // Ignore pathological startup output instead of loading it into memory.
     const MAX_OUTPUT: u64 = 64 * 1024;
-    if output.metadata().ok()?.len() > MAX_OUTPUT {
-        return None;
+    if output.metadata()?.len() > MAX_OUTPUT {
+        bail!("shell stdout exceeded {MAX_OUTPUT} bytes");
     }
-    output.seek(SeekFrom::Start(0)).ok()?;
+    output.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
-    output.take(MAX_OUTPUT + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() <= MAX_OUTPUT as usize).then_some(bytes)
+    output.take(MAX_OUTPUT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_OUTPUT as usize {
+        bail!("shell stdout exceeded {MAX_OUTPUT} bytes");
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
+
+    // Successful subprocess tests should tolerate slow CI and parallel test
+    // load, independently of the app's much shorter startup budget.
+    const TEST_SHELL_TIMEOUT: Duration = Duration::from_secs(10);
 
     #[test]
     fn keeps_inherited_precedence_then_shell_then_package_managers() {
@@ -208,7 +240,7 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", &format!("printf 'a banner\\n'; {PRINT_PATH}")]);
         command.env("PATH", "/a custom/bin:/usr/bin");
-        let output = bounded_output(&mut command, SHELL_TIMEOUT).unwrap();
+        let output = bounded_output(&mut command, TEST_SHELL_TIMEOUT).unwrap();
         assert_eq!(
             parse_shell_path(&output),
             Some(OsString::from("/a custom/bin:/usr/bin"))
@@ -247,8 +279,13 @@ mod tests {
         shell.env("HOME", home.path());
         shell.env("ZDOTDIR", home.path());
         shell.env("PATH", "/usr/bin:/bin");
-        let output = bounded_output(&mut shell, SHELL_TIMEOUT).unwrap();
-        let recovered = parse_shell_path(&output).unwrap();
+        let output = bounded_output(&mut shell, TEST_SHELL_TIMEOUT).unwrap();
+        let recovered = parse_shell_path(&output).unwrap_or_else(|| {
+            panic!(
+                "shell output missing framed PATH: {:?}",
+                String::from_utf8_lossy(&output)
+            )
+        });
         let path = merged_path(Some(OsStr::new("/usr/bin:/bin")), Some(&recovered)).unwrap();
 
         let direct = Command::new("gh")
@@ -270,15 +307,81 @@ mod tests {
     }
 
     #[test]
+    fn finder_path_works_with_a_controlling_terminal() {
+        use std::os::fd::FromRawFd;
+
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: openpty writes two owned descriptors to valid pointers. We
+        // immediately give each descriptor to File for cleanup on every path.
+        let result = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(result, 0, "openpty: {}", std::io::Error::last_os_error());
+        let (_master, slave) = unsafe {
+            (
+                std::fs::File::from_raw_fd(master),
+                std::fs::File::from_raw_fd(slave),
+            )
+        };
+        // Run only the existing end-to-end test in a child with a controlling
+        // terminal. This reproduces running cargo test in a normal terminal,
+        // even when the outer test runner has no terminal (as on CI).
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "launch_env::tests::finder_path_finds_custom_gh_for_direct_calls_and_helpers",
+            "--nocapture",
+        ]);
+        command.stdin(Stdio::from(slave));
+        // SAFETY: these pre-exec syscalls only establish the child's session
+        // and controlling terminal using its already-redirected stdin.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1
+                    || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "test under controlling terminal failed: {}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn ignores_failed_and_stalled_shells() {
         let mut failed = Command::new("/bin/sh");
-        failed.args(["-c", &format!("{PRINT_PATH}; exit 1")]);
-        assert!(bounded_output(&mut failed, SHELL_TIMEOUT).is_none());
+        failed.args([
+            "-c",
+            &format!("{PRINT_PATH}; printf 'startup failed\\n' >&2; exit 1"),
+        ]);
+        let error = bounded_output(&mut failed, TEST_SHELL_TIMEOUT).unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("startup failed"), "{diagnostic}");
+        assert!(diagnostic.contains("exit status: 1"), "{diagnostic}");
 
         let mut stalled = Command::new("/bin/sh");
         stalled.args(["-c", "/bin/sleep 30"]);
         let start = Instant::now();
-        assert!(bounded_output(&mut stalled, Duration::from_millis(50)).is_none());
-        assert!(start.elapsed() < Duration::from_secs(2));
+        let error = bounded_output(&mut stalled, Duration::from_millis(50)).unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        assert!(
+            start.elapsed() < TEST_SHELL_TIMEOUT,
+            "timeout failed to stop the 30-second sleep promptly"
+        );
     }
 }
