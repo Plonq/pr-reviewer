@@ -144,6 +144,8 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - local repo diffs
 - minimap
 - inline GitHub review comments with GFM formatting (reading + posting: hover a line for `+`, or `C` on the selected line; replies post into their thread)
+- replies are indented beneath their thread root in Conversation and Changes,
+  including pending replies and both unified and split diffs
 - edit comments in place and delete them from their own cards, in the diff or
   conversation; published comments follow GitHub's per-comment permissions
 - review threads show resolved/unresolved status in both views, with

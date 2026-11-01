@@ -256,6 +256,9 @@ pub(crate) fn group_comments(comments: Vec<ReviewComment>) -> CommentIndex {
 /// Widest a comment body ever wraps, however roomy the pane: past ~80 columns
 /// prose gets hard to track. Also the fallback before the pane is measured.
 pub(crate) const COMMENT_WRAP_CHARS: usize = 80;
+/// One level beneath the thread root, shared by Conversation and Changes.
+/// GitHub review threads are flat: all replies use the same indentation.
+pub(crate) const REPLY_INDENT: f32 = 24.;
 /// Never wrap narrower than this, however cramped the pane — below it every
 /// word lands on its own line, which is worse than clipping.
 const MIN_COMMENT_WRAP_CHARS: usize = 24;
