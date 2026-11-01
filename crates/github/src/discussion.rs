@@ -15,15 +15,30 @@ pub struct CommentPermissions {
     pub node_id: String,
     pub can_edit: bool,
     pub can_delete: bool,
+    #[serde(default)]
+    pub can_react: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Reaction {
     pub content: String,
     pub count: u64,
+    #[serde(default)]
+    pub viewer_has_reacted: bool,
 }
 
 impl Reaction {
+    pub const KINDS: [&'static str; 8] = [
+        "THUMBS_UP",
+        "THUMBS_DOWN",
+        "LAUGH",
+        "HOORAY",
+        "CONFUSED",
+        "HEART",
+        "ROCKET",
+        "EYES",
+    ];
+
     pub fn emoji(&self) -> &str {
         match self.content.as_str() {
             "THUMBS_UP" => "👍",
@@ -271,6 +286,18 @@ mod tests {
     }
 
     #[test]
+    fn old_cached_reactions_and_permissions_default_to_read_only() {
+        let reaction: Reaction =
+            serde_json::from_value(serde_json::json!({"content":"HEART", "count":3})).unwrap();
+        assert!(!reaction.viewer_has_reacted);
+        let permissions: CommentPermissions = serde_json::from_value(
+            serde_json::json!({"node_id":"IC1", "can_edit":true, "can_delete":true}),
+        )
+        .unwrap();
+        assert!(!permissions.can_react);
+    }
+
+    #[test]
     fn all_github_reaction_kinds_have_display_glyphs() {
         for (content, emoji) in [
             ("THUMBS_UP", "👍"),
@@ -286,7 +313,8 @@ mod tests {
             assert_eq!(
                 Reaction {
                     content: content.into(),
-                    count: 2
+                    count: 2,
+                    viewer_has_reacted: false,
                 }
                 .emoji(),
                 emoji

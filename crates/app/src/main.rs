@@ -15,6 +15,7 @@ mod position;
 mod presentation;
 mod queue;
 mod quick_open;
+mod reactions;
 mod resolution;
 mod review_dialog;
 mod review_scope;
@@ -282,8 +283,8 @@ fn git_env() -> [(&'static str, &'static str); 6] {
 }
 
 /// The app's assets, layered over gpui-component's default icon bundle.
-/// The queue uses an extra Lucide icon plus an Octicon speech bubble
-/// (comment-16, © GitHub, MIT: https://github.com/primer/octicons).
+/// The queue uses an extra Lucide icon; comments use Octicon speech bubble
+/// and smiley icons (© GitHub, MIT: https://github.com/primer/octicons).
 /// GPUI renders these as monochrome masks so they tint with the palette.
 /// App-owned icons live under `icons/gander/` to avoid upstream collisions.
 struct AppAssets;
@@ -294,10 +295,16 @@ gpui_kit_assets::icon_assets!(QueueIcons, [Circle]);
 
 /// (asset path, embedded bytes) — served exactly as an `AssetSource`
 /// expects, so the icon renders like any bundled one.
-const OWNED_ASSETS: &[(&str, &[u8])] = &[(
-    "icons/gander/comment-16.svg",
-    include_bytes!("assets/icons/gander/comment-16.svg"),
-)];
+const OWNED_ASSETS: &[(&str, &[u8])] = &[
+    (
+        "icons/gander/comment-16.svg",
+        include_bytes!("assets/icons/gander/comment-16.svg"),
+    ),
+    (
+        "icons/gander/smiley-16.svg",
+        include_bytes!("assets/icons/gander/smiley-16.svg"),
+    ),
+];
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
@@ -740,6 +747,7 @@ impl ItemData {
                 (f32::from(height.get()) / row_height()).ceil() as usize,
             );
         }
+        reactions::reserve_reaction_rows(&mut built_rows, self.discussion.as_ref());
         let BuiltRows {
             rows,
             file_rows,
@@ -3255,6 +3263,7 @@ impl ReviewApp {
             command,
             SessionCommand::EditPublished { .. }
                 | SessionCommand::DeletePublished { .. }
+                | SessionCommand::SetReaction { .. }
                 | SessionCommand::SetThreadResolved { .. }
         );
         let Some(job) = self.session_job(item_id, command, cx) else {
@@ -3268,6 +3277,7 @@ impl ReviewApp {
                 app.finish_session(item_id, session, &result, cx);
                 if result.is_ok() {
                     app.apply_comment_mutation(item_id, &mutation);
+                    app.apply_reaction(item_id, &mutation);
                     app.apply_thread_resolution(item_id, &mutation);
                 }
                 if let SessionCompletion::Composer(gen) = completion {
@@ -5878,6 +5888,7 @@ impl ReviewApp {
                                                                 Row::CommentBody { .. }
                                                                     | Row::CommentHeader { .. }
                                                                     | Row::CommentEditor { .. }
+                                                                    | Row::CommentReactions { .. }
                                                             ))
                                                             && !data
                                                                 .preferences
@@ -5899,20 +5910,29 @@ impl ReviewApp {
                                                             split_layout,
                                                             data.search.as_ref(),
                                                             &rows_entity,
-                                                            if let Row::CommentHeader {
-                                                                comment_id,
-                                                                top,
-                                                                ..
-                                                            } = row
-                                                            {
-                                                                Some(this.diff_comment_controls(
-                                                                    *comment_id,
-                                                                    *top,
-                                                                    &rows_entity,
-                                                                    cx,
-                                                                ))
-                                                            } else {
-                                                                None
+                                                            match row {
+                                                                Row::CommentHeader {
+                                                                    comment_id,
+                                                                    top,
+                                                                    ..
+                                                                } => Some(
+                                                                    this.diff_comment_controls(
+                                                                        *comment_id,
+                                                                        *top,
+                                                                        &rows_entity,
+                                                                        cx,
+                                                                    ),
+                                                                ),
+                                                                Row::CommentReactions {
+                                                                    comment_id,
+                                                                    ..
+                                                                } => Some(
+                                                                    this.diff_comment_reactions(
+                                                                        *comment_id,
+                                                                        &rows_entity,
+                                                                    ),
+                                                                ),
+                                                                _ => None,
                                                             },
                                                             cx,
                                                         )
@@ -12077,6 +12097,11 @@ mod tests {
     /// (in order — the tests pin that nothing posts twice or out of turn).
     #[derive(Debug, Clone, PartialEq)]
     enum Post {
+        Reaction {
+            target: github::CommentTarget,
+            content: String,
+            reacted: bool,
+        },
         Resolve {
             thread_id: String,
             resolved: bool,
@@ -12115,6 +12140,7 @@ mod tests {
     #[derive(Default)]
     struct FakePr {
         resolutions: std::sync::Mutex<HashMap<String, bool>>,
+        reactions: std::sync::Mutex<HashMap<String, Vec<github::Reaction>>>,
         comment_permissions: std::sync::Mutex<HashMap<u64, github::CommentPermissions>>,
         comments: std::sync::Mutex<Vec<github::ReviewComment>>,
         conversation: std::sync::Mutex<Vec<github::DiscussionComment>>,
@@ -12169,6 +12195,38 @@ mod tests {
     }
 
     impl github::GitHubClient for FakePr {
+        fn set_comment_reaction(
+            &self,
+            target: &github::CommentTarget,
+            content: &str,
+            reacted: bool,
+        ) -> Result<(), github::ClientError> {
+            self.posted.lock().unwrap().push(Post::Reaction {
+                target: target.clone(),
+                content: content.into(),
+                reacted,
+            });
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(github::ClientError::Failed("reaction rejected".into()));
+            }
+            let (github::CommentTarget::Issue(id)
+            | github::CommentTarget::Review(id)
+            | github::CommentTarget::ReviewComment(id)) = target;
+            self.reactions.lock().unwrap().insert(
+                id.clone(),
+                if reacted {
+                    vec![github::Reaction {
+                        content: content.into(),
+                        count: 1,
+                        viewer_has_reacted: true,
+                    }]
+                } else {
+                    vec![]
+                },
+            );
+            Ok(())
+        }
+
         fn set_thread_resolved(
             &self,
             thread_id: &str,
@@ -12341,6 +12399,16 @@ mod tests {
             let permissions = self.comment_permissions.lock().unwrap();
             for comment in discussion.threads.iter_mut().flat_map(|t| &mut t.comments) {
                 comment.permissions = permissions.get(&comment.id).cloned().unwrap_or_default();
+            }
+            let reactions = self.reactions.lock().unwrap();
+            for comment in discussion
+                .comments
+                .iter_mut()
+                .chain(discussion.threads.iter_mut().flat_map(|t| &mut t.comments))
+            {
+                if let Some(reactions) = reactions.get(&comment.permissions.node_id) {
+                    comment.reactions = reactions.clone();
+                }
             }
             if self
                 .stale_discussion
@@ -15328,6 +15396,7 @@ mod tests {
             node_id: node_id.into(),
             can_edit,
             can_delete,
+            can_react: true,
         }
     }
 
@@ -15711,6 +15780,199 @@ mod tests {
         assert!(
             fake.posts().is_empty(),
             "draft changes never publish comments"
+        );
+    }
+
+    #[gpui::test]
+    fn reactions_enforce_capabilities_busy_state_and_active_item(cx: &mut gpui::TestAppContext) {
+        use github::GitHubClient;
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "Read-only",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        let mut permissions = permitted_comment("PRRC11", false, false);
+        permissions.can_react = false;
+        fake.comment_permissions
+            .lock()
+            .unwrap()
+            .insert(11, permissions);
+        fake.reactions.lock().unwrap().insert(
+            "PRRC11".into(),
+            vec![github::Reaction {
+                content: "HEART".into(),
+                count: 2,
+                viewer_has_reacted: false,
+            }],
+        );
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(fake.comments.lock().unwrap().clone());
+        if let ItemState::Ready(data) = &mut item.state {
+            data.discussion = Some(fake.pr_discussion(&loop_loc()).unwrap());
+        }
+        install_item(&app, item, cx);
+        vcx.update(|_, cx| {
+            app.update(cx, |this, _| {
+                this.active_data_mut().unwrap().rebuild_rows_anchored()
+            })
+        });
+        click_commenting(&mut vcx, "reaction-review-comment-PRRC11-HEART");
+        assert!(vcx
+            .debug_bounds("reaction-picker-review-comment-PRRC11")
+            .is_none());
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                let target = github::CommentTarget::ReviewComment("PRRC11".into());
+                this.set_reaction(0, target.clone(), "HEART".into(), true, window, cx);
+                this.active_data_mut()
+                    .unwrap()
+                    .discussion
+                    .as_mut()
+                    .unwrap()
+                    .threads[0]
+                    .comments[0]
+                    .permissions
+                    .can_react = true;
+                this.sessions.entry(0).or_default().busy = true;
+                this.set_reaction(0, target.clone(), "HEART".into(), true, window, cx);
+                this.sessions.get_mut(&0).unwrap().busy = false;
+                this.set_reaction(99, target, "HEART".into(), true, window, cx);
+            })
+        });
+        vcx.run_until_parked();
+        assert!(fake.posts().is_empty());
+    }
+
+    #[gpui::test]
+    fn reaction_picker_and_toggles_share_state_between_diff_and_conversation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use github::GitHubClient;
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "React to this",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        fake.comment_permissions
+            .lock()
+            .unwrap()
+            .insert(11, permitted_comment("PRRC11", false, false));
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut item = loop_pr_item(fake.comments.lock().unwrap().clone());
+        if let ItemState::Ready(data) = &mut item.state {
+            data.discussion = Some(fake.pr_discussion(&loop_loc()).unwrap());
+        }
+        install_item(&app, item, cx);
+        vcx.update(|_, cx| app.update(cx, |this, _| {
+            this.active_data_mut().unwrap().rebuild_rows_anchored();
+            let rows = &this.active_data().unwrap().rows;
+            let footer = rows.iter().position(|r| matches!(r, Row::CommentReactions { comment_id: 11, .. })).unwrap();
+            assert!(matches!(&rows[footer - 1], Row::CommentBody { text, .. } if text.comment_id == 11));
+            assert!(matches!(&rows[footer + 1], Row::CommentActions { root_id: 11, .. }));
+        }));
+        click_commenting(&mut vcx, "reaction-picker-review-comment-PRRC11");
+        assert!(vcx.debug_bounds("reaction-options").is_some());
+        for selector in [
+            "reaction-option-THUMBS_UP",
+            "reaction-option-THUMBS_DOWN",
+            "reaction-option-LAUGH",
+            "reaction-option-HOORAY",
+            "reaction-option-CONFUSED",
+            "reaction-option-HEART",
+            "reaction-option-ROCKET",
+            "reaction-option-EYES",
+        ] {
+            assert!(vcx.debug_bounds(selector).is_some());
+        }
+        click_commenting(&mut vcx, "reaction-option-HEART");
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("reaction-options").is_none());
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Reaction {
+                target: github::CommentTarget::ReviewComment("PRRC11".into()),
+                content: "HEART".into(),
+                reacted: true
+            }]
+        );
+        cx.update(|cx| {
+            let comment = &app
+                .read(cx)
+                .active_data()
+                .unwrap()
+                .discussion
+                .as_ref()
+                .unwrap()
+                .threads[0]
+                .comments[0];
+            assert_eq!(comment.reactions[0].count, 1);
+            assert!(comment.reactions[0].viewer_has_reacted);
+        });
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.items[0].pane = ItemPane::Conversation;
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+        });
+        // A rejected write leaves the last confirmed count and selection intact.
+        fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        click_commenting(&mut vcx, "reaction-review-comment-PRRC11-HEART");
+        vcx.run_until_parked();
+        cx.update(|cx| {
+            let this = app.read(cx);
+            assert!(this.sessions[&0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("reaction rejected"));
+            let comment = &this
+                .active_data()
+                .unwrap()
+                .discussion
+                .as_ref()
+                .unwrap()
+                .threads[0]
+                .comments[0];
+            assert!(comment.reactions[0].viewer_has_reacted);
+            assert_eq!(comment.reactions[0].count, 1);
+        });
+        fake.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        click_commenting(&mut vcx, "reaction-review-comment-PRRC11-HEART");
+        vcx.run_until_parked();
+        cx.update(|cx| {
+            let this = app.read(cx);
+            assert!(this.sessions[&0].error.is_none());
+            assert!(this
+                .active_data()
+                .unwrap()
+                .discussion
+                .as_ref()
+                .unwrap()
+                .threads[0]
+                .comments[0]
+                .reactions
+                .is_empty());
+        });
+        assert_eq!(
+            fake.posts().last(),
+            Some(&Post::Reaction {
+                target: github::CommentTarget::ReviewComment("PRRC11".into()),
+                content: "HEART".into(),
+                reacted: false
+            })
         );
     }
 

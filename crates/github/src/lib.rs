@@ -587,6 +587,17 @@ pub trait GitHubClient: Send + Sync {
             "comment deletion is not supported by this backend".into(),
         ))
     }
+    fn set_comment_reaction(
+        &self,
+        _target: &CommentTarget,
+        _content: &str,
+        _reacted: bool,
+    ) -> Result<(), ClientError> {
+        Err(ClientError::Failed(
+            "comment reactions are not supported by this backend".into(),
+        ))
+    }
+
     /// Detail-only, paginated state for the authenticated viewer, never queue data.
     fn viewed_files(&self, _loc: &PrLocator) -> Result<ViewedFiles, ClientError> {
         Err(ClientError::Failed(

@@ -129,7 +129,9 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - PR conversation (title-bar Conversation / Changes button, or `⇧⌘←` / `⇧⌘→`):
   GFM description and chronological comments; reviews
   group their inline threads beneath the summary, with captured code context,
-  expandable resolved stubs, and read-only reaction counts; cached offline
+  expandable resolved stubs, and emoji reactions; cached offline
+- see, add, or remove GitHub's eight standard emoji reactions on published
+  comments and reviews, in both the conversation and diff views
 - comment from the conversation, or reply inside a review thread (including
   resolved/outdated threads); post immediately or start/add to a review.
   Main-thread drafts append to the pending review summary; replies stay in-thread.

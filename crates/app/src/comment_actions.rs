@@ -83,7 +83,7 @@ pub(crate) fn reserve_editor_rows(built: &mut BuiltRows, id: u64, count: usize) 
 }
 
 impl ReviewApp {
-    fn published_comment(
+    pub(crate) fn published_comment(
         &self,
         target: &github::CommentTarget,
     ) -> Option<&github::DiscussionComment> {
