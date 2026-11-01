@@ -9,11 +9,10 @@ use gpui::{div, prelude::*, Context, SharedString, Window};
 
 impl ItemData {
     pub(crate) fn diff_base(&self) -> &str {
-        self.review_base.as_deref().unwrap_or_else(|| {
-            self.pr_meta
-                .as_ref()
-                .map_or("", |meta| meta.base_ref_oid.as_str())
-        })
+        self.review_base
+            .as_deref()
+            .or(self.pr_base.as_deref())
+            .unwrap_or("")
     }
 
     /// Incremental LEFT coordinates aren't full-PR LEFT coordinates. Force

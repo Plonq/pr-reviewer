@@ -581,6 +581,7 @@ pub(crate) struct ItemData {
     commits: Option<github::PrCommits>,
     commits_expanded: bool,
     review_changes: github::ReviewChanges,
+    pr_base: Option<String>,
     review_base: Option<String>,
     review_base_files: Option<Arc<HashMap<String, github::ComparisonBase>>>,
     viewed: viewed::Viewed,
@@ -673,6 +674,7 @@ impl ItemData {
             commits: None,
             commits_expanded: false,
             review_changes: github::ReviewChanges::default(),
+            pr_base: None,
             review_base: None,
             review_base_files: None,
             viewed: Default::default(),
@@ -1195,6 +1197,7 @@ impl ReviewItem {
             discussion,
             commits,
             review_changes,
+            pr_base,
             review_base,
             review_base_files,
             viewed,
@@ -1224,6 +1227,7 @@ impl ReviewItem {
                     None
                 };
                 data.search = None;
+                data.pr_base = pr_base;
                 data.review_changes = review_changes;
                 data.review_base = review_base;
                 data.review_base_files = review_base_files;
@@ -1314,6 +1318,7 @@ impl ReviewItem {
                 data.upgrades = upgrades;
                 data.discussion = discussion;
                 data.commits = commits;
+                data.pr_base = pr_base;
                 data.review_changes = review_changes;
                 data.review_base = review_base;
                 data.review_base_files = review_base_files;
@@ -6610,6 +6615,198 @@ mod tests {
         })
     }
 
+    /// Opt-in end-to-end check for one file (e.g. main.rs in
+    /// Plonq/pr-reviewer#1). Pick a file without newline-only changes, which
+    /// our full-content diff deliberately normalizes away.
+    #[test]
+    #[ignore = "requires gh authentication, network, GANDER_DIFF_PR, and GANDER_DIFF_PATH"]
+    fn real_full_pr_upgrade_preserves_patch_counts() {
+        use github::GitHubClient as _;
+        let client = Arc::new(github::gh_cli::GhCliClient::new());
+        let loc = client
+            .resolve_pr(&std::env::var("GANDER_DIFF_PR").unwrap())
+            .unwrap();
+        let patch = diff_core::parse_patch(&client.pr_patch(&loc).unwrap());
+        let loaded = fetch_item(client, &Source::Pr(loc), ViewMode::Split, 0).unwrap();
+        assert!(loaded.pr_base.is_some());
+        assert!(!loaded.upgrades.is_empty());
+        let path = std::env::var("GANDER_DIFF_PATH").unwrap();
+        let expected = patch
+            .files
+            .iter()
+            .find(|file| file.display_path() == path)
+            .unwrap();
+        let (ix, actual) = loaded
+            .diff
+            .files
+            .iter()
+            .enumerate()
+            .find(|(_, file)| file.display_path() == path)
+            .unwrap();
+        assert!(
+            loaded.upgrades.contains_key(&ix),
+            "exercise actual blob re-diffing"
+        );
+        assert_eq!(
+            (expected.additions, expected.deletions),
+            (actual.additions, actual.deletions),
+            "{path}",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires gh authentication, network, GANDER_DIFF_PR/PATH/COMMENT_LINES"]
+    fn real_full_pr_left_comments_and_drafts_render() {
+        use github::GitHubClient as _;
+        let client = Arc::new(github::gh_cli::GhCliClient::new());
+        let loc = client
+            .resolve_pr(&std::env::var("GANDER_DIFF_PR").unwrap())
+            .unwrap();
+        let path = std::env::var("GANDER_DIFF_PATH").unwrap();
+        // Comma-separated comment-id:line pairs. Explicit expected positions
+        // make this check independent of GitHub's misleading outdated flag.
+        let expected: Vec<(u64, u64)> = std::env::var("GANDER_DIFF_COMMENT_LINES")
+            .unwrap()
+            .split(',')
+            .map(|pair| {
+                let (id, line) = pair.split_once(':').unwrap();
+                (id.parse().unwrap(), line.parse().unwrap())
+            })
+            .collect();
+        let mut loaded =
+            fetch_item(client.clone(), &Source::Pr(loc.clone()), ViewMode::Split, 0).unwrap();
+        let pending = client.pending_review(&loc).unwrap();
+        let comments = loaded.comments.as_mut().unwrap();
+        comments.replace_pending(pending.as_ref());
+        let file_ix = loaded
+            .diff
+            .files
+            .iter()
+            .position(|file| file.display_path() == path)
+            .unwrap();
+        assert!(loaded.upgrades.contains_key(&file_ix));
+        for (id, line) in &expected {
+            assert!(
+                comments.threads[&path][&(github::DiffSide::Left, *line)]
+                    .iter()
+                    .any(|thread| thread.root.id == *id),
+                "missing {id} at {line}"
+            );
+        }
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let built = build_rows(RowsView {
+                diff: &loaded.diff,
+                upgrades: &loaded.upgrades,
+                comments: Some(comments),
+                options: RowOptions {
+                    mode,
+                    file_ix,
+                    comments_visible: true,
+                    comment_wrap: COMMENT_WRAP_CHARS,
+                },
+            });
+            for (id, _) in &expected {
+                assert!(
+                    built.rows.iter().any(|row| matches!(row,
+                    Row::CommentHeader { comment_id, .. } if comment_id == id)),
+                    "missing row for {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_pr_upgrades_use_merge_base_not_target_tip_and_keep_left_positions() {
+        let patch = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -6 +6 @@\n-old\n+new\n";
+        let fake = Arc::new(FakePr {
+            patch: Some(patch.into()),
+            pr_merge_base: Some("merge-base".into()),
+            file_contents: HashMap::from([
+                (
+                    ("merge-base".into(), "a.rs".into()),
+                    "one\ntwo\nthree\nfour\nfive\nold\n".into(),
+                ),
+                (
+                    ("dead10cc".into(), "a.rs".into()),
+                    "one\ntwo\nthree\nfour\nfive\nnew\n".into(),
+                ),
+                (
+                    ("ba5ec0de".into(), "a.rs".into()),
+                    "unrelated upstream work\n".repeat(100),
+                ),
+            ]),
+            ..Default::default()
+        });
+        // Also cover fallback from an unavailable incremental scope.
+        for since_review in [false, true] {
+            let mut item = loop_pr_item(Vec::new());
+            let loaded = review_target::fetch_item_scoped(
+                fake.clone(),
+                &item.source,
+                ViewMode::Split,
+                0,
+                since_review,
+            )
+            .unwrap();
+            assert_eq!(loaded.upgrades.len(), 1, "exercise full-file re-diffing");
+            let file = &loaded.diff.files[0];
+            assert_eq!((file.additions, file.deletions), (1, 1));
+            assert!(file.hunks.iter().flat_map(|h| &h.rows).any(
+                |row| matches!(row, diff_core::DiffRow::Removed { old_no: 6, text, .. } if text == "old")
+            ));
+            item.install(loaded);
+            let ItemState::Ready(data) = &item.state else {
+                panic!()
+            };
+            assert_eq!(data.diff_base(), "merge-base");
+            // Outside the server patch: explicit LEFT positioning must refer
+            // to the same tree used for full-file context, not the target tip.
+            let anchor = data
+                .selection_anchor(&[(github::DiffSide::Left, 1)])
+                .unwrap();
+            assert_eq!(anchor.position.unwrap().commit_id, "merge-base");
+        }
+    }
+
+    #[test]
+    fn missing_pr_merge_base_keeps_patch_without_guessing_target_tip() {
+        let fake = Arc::new(FakePr {
+            fail_merge_base: true,
+            file_contents: HashMap::from([
+                (
+                    ("ba5ec0de".into(), "a.rs".into()),
+                    "unrelated upstream\n".repeat(100),
+                ),
+                (("dead10cc".into(), "a.rs".into()), "new\n".into()),
+            ]),
+            ..Default::default()
+        });
+        let mut item = loop_pr_item(Vec::new());
+        let loaded = fetch_item(fake, &item.source, ViewMode::Split, 0).unwrap();
+        assert!(loaded.upgrades.is_empty());
+        assert!(loaded.pr_base.is_none());
+        assert_eq!(
+            (
+                loaded.diff.files[0].additions,
+                loaded.diff.files[0].deletions
+            ),
+            (1, 1)
+        );
+        item.install(loaded);
+        let ItemState::Ready(data) = &item.state else {
+            panic!()
+        };
+        assert_eq!(data.diff_base(), "");
+        assert!(data
+            .selection_anchor(&[(github::DiffSide::Left, 2)])
+            .is_err());
+        assert!(data
+            .selection_anchor(&[(github::DiffSide::Left, 1)])
+            .unwrap()
+            .position
+            .is_none());
+    }
+
     #[test]
     fn since_review_is_a_real_range_and_upgrades_and_comments_use_that_range() {
         let fake = since_review_fake();
@@ -11856,15 +12053,19 @@ mod tests {
         ReviewItem {
             id: 0,
             source: Source::Pr(loop_loc()),
-            state: ItemState::Ready(Box::new(ItemData::new(
-                Some(loop_pr_meta()),
-                diff,
-                ViewMode::Unified,
-                0,
-                built_rows,
-                Some(index),
-                None,
-            ))),
+            state: ItemState::Ready(Box::new({
+                let mut data = ItemData::new(
+                    Some(loop_pr_meta()),
+                    diff,
+                    ViewMode::Unified,
+                    0,
+                    built_rows,
+                    Some(index),
+                    None,
+                );
+                data.pr_base = Some("ba5ec0de".into());
+                data
+            })),
             reloading: false,
             refresh_error: None,
             upgrade_gen: 0,
@@ -11930,6 +12131,8 @@ mod tests {
         comparison_patch: std::sync::Mutex<Option<github::ReviewComparison>>,
         comparison_requests: std::sync::Mutex<Vec<(String, String, String)>>,
         fail_review_history: std::sync::atomic::AtomicBool,
+        pr_merge_base: Option<String>,
+        fail_merge_base: bool,
         commit_fetches: std::sync::atomic::AtomicUsize,
         patch: Option<String>,
         /// Hold patch completion independently of the conversation in staged-load tests.
@@ -12437,6 +12640,21 @@ mod tests {
 
         fn pr_meta(&self, _loc: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
             Ok(loop_pr_meta())
+        }
+
+        fn merge_base(
+            &self,
+            loc: &github::PrLocator,
+            base: &str,
+            head: &str,
+        ) -> Result<String, github::ClientError> {
+            assert_eq!(loc.repo_slug(), loop_loc().repo_slug());
+            assert_eq!(base, "ba5ec0de");
+            assert_eq!(head, "dead10cc");
+            if self.fail_merge_base {
+                return Err(github::ClientError::Failed("merge base unavailable".into()));
+            }
+            Ok(self.pr_merge_base.clone().unwrap_or_else(|| base.into()))
         }
 
         fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {

@@ -66,6 +66,8 @@ pub(crate) struct Loaded {
     pub(crate) discussion: Option<github::PrDiscussion>,
     pub(crate) commits: Option<github::PrCommits>,
     pub(crate) review_changes: github::ReviewChanges,
+    /// Full PR's merge base, never the target branch tip. None if unavailable.
+    pub(crate) pr_base: Option<String>,
     /// Active incremental diff's old revision; None means the full PR diff.
     pub(crate) review_base: Option<String>,
     pub(crate) review_base_files: Option<Arc<HashMap<String, github::ComparisonBase>>>,
@@ -115,6 +117,7 @@ pub(crate) fn fetch_item_with_conversation(
     conversation: Option<futures::channel::oneshot::Sender<LoadedConversation>>,
 ) -> anyhow::Result<Loaded> {
     let mut review_changes = github::ReviewChanges::default();
+    let mut pr_base = None;
     let mut review_base = None;
     let mut review_base_files = None;
     let (meta, patch, comments, discussion, commits, viewed, snapshot) = match source {
@@ -183,6 +186,15 @@ pub(crate) fn fetch_item_with_conversation(
                     }
                 }
             }
+            if review_base.is_none() {
+                pr_base = match github.merge_base(loc, &meta.base_ref_oid, &meta.head_ref_oid) {
+                    Ok(oid) => Some(oid),
+                    Err(error) => {
+                        eprintln!("gander: couldn't resolve PR merge base; keeping patch-derived files: {error}");
+                        None
+                    }
+                };
+            }
             let snapshot = discussion_snapshot(loc, &meta, &discussion, commits.as_ref())?;
             (
                 LoadedMeta::Pr(meta),
@@ -223,16 +235,15 @@ pub(crate) fn fetch_item_with_conversation(
         })
         .collect();
     let content_source = match (&meta, source) {
-        (LoadedMeta::Pr(meta), Source::Pr(loc))
-            if !meta.base_ref_oid.is_empty() && !meta.head_ref_oid.is_empty() =>
-        {
-            Some(UpgradeSource::Pr {
+        (LoadedMeta::Pr(meta), Source::Pr(loc)) if !meta.head_ref_oid.is_empty() => review_base
+            .as_ref()
+            .or(pr_base.as_ref())
+            .map(|base| UpgradeSource::Pr {
                 loc: loc.clone(),
-                base_oid: review_base.as_ref().unwrap_or(&meta.base_ref_oid).clone(),
+                base_oid: base.clone(),
                 head_oid: meta.head_ref_oid.clone(),
                 base_files: review_base_files.clone(),
-            })
-        }
+            }),
         (LoadedMeta::Local(src), _) => Some(UpgradeSource::Local(src.clone())),
         _ => None,
     };
@@ -271,6 +282,7 @@ pub(crate) fn fetch_item_with_conversation(
         discussion,
         commits,
         review_changes,
+        pr_base,
         review_base,
         review_base_files,
         viewed,

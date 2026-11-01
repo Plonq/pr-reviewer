@@ -616,6 +616,20 @@ pub trait GitHubClient: Send + Sync {
         ))
     }
 
+    /// Merge base of two captured revisions. A full PR patch compares this
+    /// tree with the head, not the target branch's (possibly newer) tip.
+    /// Failure must leave the patch usable, without guessing a baseline.
+    fn merge_base(
+        &self,
+        _loc: &PrLocator,
+        _base: &str,
+        _head: &str,
+    ) -> Result<String, ClientError> {
+        Err(ClientError::Failed(
+            "merge-base lookup is not supported by this backend".into(),
+        ))
+    }
+
     /// An ancestry-validated review range, excluding upstream changes already
     /// merged into the head. `upstream` is the captured PR target branch tip.
     fn comparison_patch(
