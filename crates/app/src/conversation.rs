@@ -129,7 +129,6 @@ pub(crate) fn timeline(discussion: &github::PrDiscussion) -> Vec<Entry<'_>> {
             !threads.is_empty()
                 || !matches!(comment.review_state.as_deref(), Some("COMMENTED"))
                 || markdown::has_content(&comment.body)
-                || comment.reactions.iter().any(|reaction| reaction.count > 0)
         }
         _ => true,
     });
@@ -264,12 +263,36 @@ use gpui::component::{
     button::{Button, ButtonVariants},
     link::Link,
     tooltip::Tooltip,
-    Disableable, Sizable,
+    Disableable, Icon, Sizable,
 };
 use gpui::{
-    div, prelude::FluentBuilder, px, Context, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window,
+    div, prelude::FluentBuilder, px, Context, FontWeight, HighlightStyle, InteractiveElement,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledText,
+    Window,
 };
+
+const TIMELINE_MARKER_SIZE: f32 = 32.;
+const TIMELINE_INDENT: f32 = TIMELINE_MARKER_SIZE + 12.;
+
+/// Full-width issue comments cross the spine; inline thread cards never do.
+fn timeline_comment_card(cx: &gpui::App) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .border_1()
+        .border_color(theme::surface0(cx))
+        .rounded_md()
+        .bg(theme::base(cx))
+        .p_4()
+}
+
+fn review_icon(state: Option<&str>, cx: &gpui::App) -> (&'static str, gpui::Rgba) {
+    match state {
+        Some("APPROVED") => ("icons/gander/check-16.svg", theme::green(cx)),
+        Some("CHANGES_REQUESTED") => ("icons/gander/diff-16.svg", theme::red(cx)),
+        _ => ("icons/gander/comment-16.svg", theme::subtext(cx)),
+    }
+}
 
 impl ReviewApp {
     pub(crate) fn conversation_composer(
@@ -517,7 +540,6 @@ impl ReviewApp {
         let empty = github::PrDiscussion::default();
         let discussion = data.discussion.as_ref().unwrap_or(&empty);
         let slug = loc.repo_slug();
-        let mut elements = Vec::new();
         let entries = timeline(discussion);
         if entries.is_empty()
             && !data
@@ -526,46 +548,40 @@ impl ReviewApp {
                 .iter()
                 .any(|post| post.reply_to.is_none())
         {
-            elements.push(
-                div()
-                    .mt_6()
-                    .text_color(theme::overlay0(cx))
-                    .child("No comments yet.")
-                    .into_any_element(),
-            );
+            return vec![div()
+                .mt_6()
+                .text_color(theme::overlay0(cx))
+                .child("No comments yet.")
+                .into_any_element()];
         }
+        let mut elements = Vec::new();
         for entry in entries {
             match entry {
                 Entry::Comment(comment) => elements.push(
                     div()
-                        .mt_6()
-                        .w_full()
-                        .min_w_0()
-                        .border_1()
-                        .border_color(theme::surface0(cx))
-                        .rounded_md()
-                        .p_4()
-                        .child(self.discussion_comment(item.id, "main", comment, &slug, window, cx))
+                        .relative()
+                        .child(
+                            timeline_comment_card(cx)
+                                .debug_selector(|| {
+                                    format!("timeline-comment-{}-{}", item.id, comment.id)
+                                })
+                                .child(self.discussion_comment(
+                                    item.id, "main", comment, &slug, window, cx,
+                                )),
+                        )
                         .into_any_element(),
                 ),
                 Entry::Review(comment, threads) => {
-                    let mut review = div()
-                        .mt_6()
-                        .w_full()
-                        .min_w_0()
-                        .border_1()
-                        .border_color(theme::surface0(cx))
-                        .rounded_md()
-                        .child(div().p_4().child(
-                            self.discussion_comment(item.id, "main", comment, &slug, window, cx),
-                        ));
+                    let (icon, color) = review_icon(comment.review_state.as_deref(), cx);
+                    let mut content = div().flex_1().min_w_0().pt_1().child(
+                        self.discussion_comment(item.id, "main", comment, &slug, window, cx),
+                    );
                     if !threads.is_empty() {
-                        review = review.child(
+                        content = content.child(
                             div()
+                                .mt_3()
                                 .w_full()
                                 .min_w_0()
-                                .px_4()
-                                .pb_4()
                                 .flex()
                                 .flex_col()
                                 .gap_3()
@@ -574,11 +590,41 @@ impl ReviewApp {
                                 })),
                         );
                     }
-                    elements.push(review.into_any_element());
+                    elements.push(
+                        div()
+                            .debug_selector(|| {
+                                format!("timeline-review-{}-{}", item.id, comment.id)
+                            })
+                            .relative()
+                            .flex()
+                            .items_start()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .debug_selector(|| {
+                                        format!("timeline-review-icon-{}-{}", item.id, comment.id)
+                                    })
+                                    .size(px(TIMELINE_MARKER_SIZE))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(theme::base(cx))
+                                    .border_1()
+                                    .border_color(theme::surface0(cx))
+                                    .child(
+                                        Icon::default().path(icon).size(px(16.)).text_color(color),
+                                    ),
+                            )
+                            .child(content)
+                            .into_any_element(),
+                    );
                 }
                 Entry::Thread(thread) => elements.push(
                     div()
-                        .mt_6()
+                        .relative()
+                        .pl(px(TIMELINE_INDENT))
                         .child(self.discussion_thread(item, data, thread, &slug, window, cx))
                         .into_any_element(),
                 ),
@@ -592,25 +638,50 @@ impl ReviewApp {
         {
             elements.push(
                 div()
-                    .mt_6()
-                    .w_full()
-                    .min_w_0()
-                    .border_1()
-                    .border_color(theme::surface0(cx))
-                    .rounded_md()
-                    .p_4()
-                    .child(self.discussion_comment(
-                        item.id,
-                        "optimistic",
-                        &post.comment,
-                        &slug,
-                        window,
-                        cx,
-                    ))
+                    .relative()
+                    .child(
+                        timeline_comment_card(cx)
+                            .debug_selector(|| {
+                                format!("timeline-post-{}-{}", item.id, post.comment.id)
+                            })
+                            .child(self.discussion_comment(
+                                item.id,
+                                "optimistic",
+                                &post.comment,
+                                &slug,
+                                window,
+                                cx,
+                            )),
+                    )
                     .into_any_element(),
             );
         }
-        elements
+        // The spine is behind the entire stack, not a border on each card:
+        // top-level comments mask it, while review events sit on it and their
+        // inline threads start to its right. Padding keeps the line continuous
+        // through the spaces between entries.
+        vec![div()
+            .debug_selector(|| format!("timeline-{}", item.id))
+            .mt_6()
+            .relative()
+            .min_w_0()
+            .child(
+                div()
+                    .debug_selector(|| format!("timeline-spine-{}", item.id))
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px((TIMELINE_MARKER_SIZE - 2.) / 2.))
+                    .w(px(2.))
+                    .bg(theme::surface0(cx)),
+            )
+            .children(elements.into_iter().enumerate().map(|(ix, element)| {
+                div()
+                    .relative()
+                    .when(ix > 0, |row| row.pt_6())
+                    .child(element)
+            }))
+            .into_any_element()]
     }
 
     fn discussion_thread(
@@ -649,8 +720,8 @@ impl ReviewApp {
             composing || !thread.is_resolved || data.expanded_threads.contains(&thread.id);
         let item_id = item.id;
         let thread_id = thread.id.clone();
-        let summary = format!(
-            "{}{} · @{} · {} comment{}{}",
+        let prefix = format!(
+            "{}{} · ",
             if thread.is_resolved {
                 if expanded {
                     "▾ Resolved · "
@@ -661,6 +732,10 @@ impl ReviewApp {
                 "Unresolved · "
             },
             anchor(thread),
+        );
+        let author_start = prefix.len();
+        let summary = format!(
+            "{prefix}{} · {} comment{}{}",
             thread.comments[0].author,
             thread.comments.len(),
             if thread.comments.len() == 1 { "" } else { "s" },
@@ -674,6 +749,14 @@ impl ReviewApp {
                 ""
             }
         );
+        let summary_text = StyledText::new(summary.clone()).with_highlights([(
+            author_start..author_start + thread.comments[0].author.len(),
+            HighlightStyle {
+                font_weight: Some(FontWeight::BOLD),
+                color: Some(theme::text(cx).into()),
+                ..Default::default()
+            },
+        )]);
         let mut header = div()
             .id(SharedString::from(format!(
                 "thread-{}-{}",
@@ -699,14 +782,15 @@ impl ReviewApp {
                     .ghost()
                     .small()
                     .w_full()
-                    .label(summary)
+                    .accessibility_label(summary)
+                    .child(summary_text)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_thread_expanded(item_id, &thread_id, cx);
                     })),
                 ),
             );
         } else {
-            header = header.child(div().flex_1().min_w_0().truncate().child(summary));
+            header = header.child(div().flex_1().min_w_0().truncate().child(summary_text));
         }
         header = header.child(self.thread_controls(item.id, thread, false, &cx.entity(), cx));
         let mut card = div()
@@ -716,7 +800,8 @@ impl ReviewApp {
             .border_1()
             .border_color(theme::surface0(cx))
             .rounded_md()
-            .child(header);
+            .bg(theme::base(cx))
+            .child(header.bg(theme::mantle(cx)));
         if expanded {
             let excerpt = code_excerpt(thread);
             if !excerpt.is_empty() {
@@ -925,7 +1010,20 @@ impl ReviewApp {
                         div()
                             .id("heading")
                             .flex_1()
-                            .child(discussion_heading(comment, crate::rows::now_unix()))
+                            .child(
+                                StyledText::new(discussion_heading(
+                                    comment,
+                                    crate::rows::now_unix(),
+                                ))
+                                .with_highlights([(
+                                    0..comment.author.len(),
+                                    HighlightStyle {
+                                        font_weight: Some(FontWeight::BOLD),
+                                        color: Some(theme::text(cx).into()),
+                                        ..Default::default()
+                                    },
+                                )]),
+                            )
                             .tooltip(move |window, cx| {
                                 Tooltip::new(timestamp.clone()).build(window, cx)
                             }),
@@ -941,6 +1039,7 @@ impl ReviewApp {
             ));
         }
         if kind != "optimistic"
+            && comment.review_state.is_none()
             && (comment.reactions.iter().any(|r| r.count > 0)
                 || (comment.permissions.can_react && !comment.permissions.node_id.is_empty()))
         {
@@ -967,7 +1066,7 @@ fn discussion_heading(comment: &github::DiscussionComment, now: i64) -> String {
         None => "",
     };
     format!(
-        "@{} · {}{verdict}",
+        "{} · {}{verdict}",
         comment.author,
         crate::threads::short_age(&comment.created_at, now)
     )
@@ -1176,6 +1275,44 @@ pub(crate) mod tests {
         });
     }
 
+    #[gpui::test]
+    fn review_verdict_icons_have_github_colors_and_bundled_assets(cx: &mut gpui::TestAppContext) {
+        use gpui::AssetSource as _;
+        cx.update(|cx| {
+            gpui::init(cx);
+            for (state, path, color) in [
+                ("APPROVED", "icons/gander/check-16.svg", theme::green(cx)),
+                (
+                    "CHANGES_REQUESTED",
+                    "icons/gander/diff-16.svg",
+                    theme::red(cx),
+                ),
+                (
+                    "COMMENTED",
+                    "icons/gander/comment-16.svg",
+                    theme::subtext(cx),
+                ),
+                (
+                    "DISMISSED",
+                    "icons/gander/comment-16.svg",
+                    theme::subtext(cx),
+                ),
+            ] {
+                assert_eq!(review_icon(Some(state), cx), (path, color));
+                let svg = crate::AppAssets
+                    .load(path)
+                    .unwrap()
+                    .expect("bundled review icon");
+                assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"));
+                assert!(crate::AppAssets
+                    .list("icons/gander/")
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.as_ref() == path));
+            }
+        });
+    }
+
     pub(crate) fn sample_discussion() -> github::PrDiscussion {
         let comment = |id, time: &str| github::DiscussionComment {
             permissions: Default::default(),
@@ -1233,7 +1370,7 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 discussion_heading(&comment, posted + elapsed),
-                format!("@alice · {expected}")
+                format!("alice · {expected}")
             );
         }
         for (state, verdict) in [
@@ -1245,16 +1382,13 @@ pub(crate) mod tests {
             comment.review_state = Some(state.into());
             assert_eq!(
                 discussion_heading(&comment, posted + 120),
-                format!("@alice · 2m ago · {verdict}")
+                format!("alice · 2m ago · {verdict}")
             );
         }
         assert_eq!(comment.created_at, "2026-01-02T00:00:00Z");
         comment.review_state = None;
         comment.created_at = "unknown date".into();
-        assert_eq!(
-            discussion_heading(&comment, posted),
-            "@alice · unknown date"
-        );
+        assert_eq!(discussion_heading(&comment, posted), "alice · unknown date");
     }
 
     #[test]
@@ -1338,7 +1472,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn empty_commented_reviews_are_hidden_but_verdicts_threads_and_reactions_remain() {
+    fn empty_commented_reviews_are_hidden_but_verdicts_threads_and_bodies_remain() {
         let mut discussion = sample_discussion();
         let mut review = discussion.comments[0].clone();
         review.review_state = Some("COMMENTED".into());
@@ -1365,7 +1499,10 @@ pub(crate) mod tests {
             count: 1,
             viewer_has_reacted: false,
         }];
-        assert_eq!(timeline(&discussion).len(), 1);
+        assert!(
+            timeline(&discussion).is_empty(),
+            "cached review reactions are ignored"
+        );
         discussion.comments[0] = review;
         discussion.threads = sample_discussion().threads;
         discussion.threads[0].comments[0].review_id = Some("R1".into());

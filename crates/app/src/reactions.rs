@@ -85,6 +85,12 @@ impl ReviewApp {
         comment: &github::DiscussionComment,
         entity: &Entity<Self>,
     ) -> gpui::AnyElement {
+        // GitHub supports reactions on issue comments and inline review
+        // comments, but not on the submitted review itself. Ignore cached
+        // review reaction counts as well as its advertised capabilities.
+        if matches!(target, github::CommentTarget::Review(_)) {
+            return div().into_any_element();
+        }
         let Some(item) = self.active_item() else {
             return div().into_any_element();
         };
@@ -209,7 +215,8 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_item().map(|item| item.id) != Some(item_id)
+        if matches!(target, github::CommentTarget::Review(_))
+            || self.active_item().map(|item| item.id) != Some(item_id)
             || self.sessions.get(&item_id).is_some_and(|ui| ui.busy)
             || !self
                 .published_comment(&target)

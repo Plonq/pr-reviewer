@@ -304,6 +304,14 @@ const OWNED_ASSETS: &[(&str, &[u8])] = &[
         "icons/gander/smiley-16.svg",
         include_bytes!("assets/icons/gander/smiley-16.svg"),
     ),
+    (
+        "icons/gander/check-16.svg",
+        include_bytes!("assets/icons/gander/check-16.svg"),
+    ),
+    (
+        "icons/gander/diff-16.svg",
+        include_bytes!("assets/icons/gander/diff-16.svg"),
+    ),
 ];
 
 impl AssetSource for AppAssets {
@@ -13884,6 +13892,134 @@ mod tests {
             assert!(avatar.size.width > px(0.));
             assert_eq!(avatar.size.width, avatar.size.height);
         }
+    }
+
+    #[gpui::test]
+    fn conversation_timeline_hierarchy_and_review_reaction_regression(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = Arc::new(FakePr::default());
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut item = commenting_item(&fake);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        let mut discussion = conversation::tests::sample_discussion();
+        let mut comment = discussion.comments[0].clone();
+        comment.id = 21;
+        comment.body = "Top-level comment".into();
+        comment.permissions = permitted_comment("IC21", false, false);
+        discussion.comments = vec![comment.clone()];
+        for (id, state, body) in [
+            (22, "APPROVED", ""),
+            (23, "CHANGES_REQUESTED", "Please adjust this."),
+        ] {
+            comment.id = id;
+            comment.review_state = Some(state.into());
+            comment.review_id = Some(format!("R{id}"));
+            comment.body = body.into();
+            // Old caches may advertise reactions on a submitted review. Neither
+            // the cached counts nor the picker should appear in the timeline.
+            comment.permissions = permitted_comment(&format!("R{id}"), false, false);
+            discussion.comments.push(comment.clone());
+        }
+        let thread = &mut discussion.threads[0];
+        thread.is_resolved = false;
+        thread.comments.truncate(1);
+        thread.comments[0].review_id = Some("R23".into());
+        thread.comments[0].permissions = permitted_comment("PRRC1", false, false);
+        let mut standalone = thread.clone();
+        standalone.id = "T2".into();
+        standalone.comments[0].id = 31;
+        standalone.comments[0].review_id = None;
+        standalone.comments[0].permissions = permitted_comment("PRRC31", false, false);
+        discussion.threads.push(standalone);
+        data.discussion = Some(discussion);
+        data.posts
+            .begin(99, None, "you".into(), "Posting comment".into());
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for width in [1100., 840.] {
+            vcx.simulate_resize(size(px(width), px(1800.)));
+            for _ in 0..3 {
+                vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+                vcx.run_until_parked();
+            }
+            let spine = vcx.debug_bounds("timeline-spine-0").unwrap();
+            for selector in ["timeline-comment-0-21", "timeline-post-0-99"] {
+                let card = vcx.debug_bounds(selector).unwrap();
+                assert!(
+                    card.left() < spine.left() && card.right() > spine.right(),
+                    "top-level comment cards overlap the spine: {selector}"
+                );
+            }
+            for (marker, summary, picker, reaction) in [
+                (
+                    "timeline-review-icon-0-22",
+                    "discussion-0-main-true-22",
+                    "reaction-picker-review-R22",
+                    "reaction-review-R22-THUMBS_UP",
+                ),
+                (
+                    "timeline-review-icon-0-23",
+                    "discussion-0-main-true-23",
+                    "reaction-picker-review-R23",
+                    "reaction-review-R23-THUMBS_UP",
+                ),
+            ] {
+                let marker = vcx.debug_bounds(marker).unwrap();
+                assert_eq!(marker.center().x, spine.center().x);
+                let summary = vcx.debug_bounds(summary).unwrap();
+                assert!(
+                    summary.left() > spine.right(),
+                    "reviews are events to the right of the spine"
+                );
+                assert!(vcx.debug_bounds(picker).is_none());
+                assert!(vcx.debug_bounds(reaction).is_none());
+            }
+            let grouped = vcx.debug_bounds("thread-header-0-T1").unwrap();
+            let standalone = vcx.debug_bounds("thread-header-0-T2").unwrap();
+            assert!(grouped.left() > spine.right());
+            assert_eq!(
+                grouped.left(),
+                standalone.left(),
+                "all inline threads share the same indentation"
+            );
+            let review = vcx.debug_bounds("discussion-0-main-true-23").unwrap();
+            assert!(
+                grouped.top() > review.bottom(),
+                "inline threads follow their review summary"
+            );
+            for selector in [
+                "reaction-picker-issue-IC21",
+                "reaction-picker-review-comment-PRRC1",
+                "reaction-picker-review-comment-PRRC31",
+            ] {
+                assert!(
+                    vcx.debug_bounds(selector).is_some(),
+                    "comments retain reactions: {selector}"
+                );
+            }
+        }
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.set_reaction(
+                    0,
+                    github::CommentTarget::Review("R22".into()),
+                    "HEART".into(),
+                    true,
+                    window,
+                    cx,
+                );
+            });
+        });
+        vcx.run_until_parked();
+        assert!(
+            fake.posts().is_empty(),
+            "submitted reviews cannot send reaction mutations"
+        );
     }
 
     #[gpui::test]
