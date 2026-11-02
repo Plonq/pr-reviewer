@@ -252,11 +252,12 @@ impl FileTree {
     }
 }
 
-/// Count comments, not threads, including replies, outdated comments and drafts.
+/// Count anchored comments, not threads, including replies and drafts.
+/// Outdated threads have no rows in the current diff, so exclude them.
 fn file_comment_count(file: &FileDiff, comments: Option<&CommentIndex>) -> usize {
     comments
         .and_then(|index| index.counts.get(file.display_path()))
-        .map_or(0, |(anchored, outdated)| anchored + outdated)
+        .map_or(0, |(anchored, _)| *anchored)
 }
 
 /// Kit paints mouse selection; `current` is a separate narrow viewport marker.
@@ -446,12 +447,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn file_comment_counts_include_outdated_and_use_display_path() {
+    fn file_comment_counts_exclude_outdated_and_use_display_path() {
         let mut file = crate::test_util::sample_diff().files.remove(0);
         let mut index = CommentIndex::default();
         index.counts.insert("a.rs".into(), (2, 3));
         index.counts.insert("renamed.rs".into(), (4, 0));
-        assert_eq!(file_comment_count(&file, Some(&index)), 5);
+        assert_eq!(file_comment_count(&file, Some(&index)), 2);
         assert_eq!(file_comment_count(&file, None), 0);
 
         file.status = FileStatus::Renamed;
@@ -460,12 +461,48 @@ mod tests {
 
         file.status = FileStatus::Deleted;
         file.new_path = None;
-        assert_eq!(file_comment_count(&file, Some(&index)), 5);
+        assert_eq!(file_comment_count(&file, Some(&index)), 2);
 
         index.counts.insert("a.rs".into(), (0, 3));
-        assert_eq!(file_comment_count(&file, Some(&index)), 3);
+        assert_eq!(file_comment_count(&file, Some(&index)), 0);
         index.counts.clear();
         assert_eq!(file_comment_count(&file, Some(&index)), 0);
+    }
+
+    #[test]
+    fn file_comment_counts_include_only_anchored_threads_and_their_replies() {
+        use crate::threads::{group_comments, CommentSide, CommentTime, ReviewComment};
+
+        let file = crate::test_util::sample_diff().files.remove(0);
+        let comment = |id, line, parent| ReviewComment {
+            id,
+            path: file.display_path().into(),
+            line,
+            side: CommentSide::Right,
+            start_line: None,
+            body: "comment".into(),
+            author: "alice".into(),
+            time: CommentTime::Draft,
+            in_reply_to_id: parent,
+        };
+        // Two outdated roots with four replies, like permissions.py in PR #4805.
+        let mut comments = vec![
+            comment(1, None, None),
+            comment(2, None, Some(1)),
+            comment(3, None, Some(1)),
+            comment(4, None, Some(1)),
+            comment(5, None, None),
+            comment(6, None, Some(5)),
+        ];
+        let index = group_comments(comments.clone());
+        assert_eq!(index.counts[file.display_path()], (0, 6));
+        assert_eq!(file_comment_count(&file, Some(&index)), 0);
+
+        comments.extend([comment(7, Some(2), None), comment(8, None, Some(7))]);
+        let index = group_comments(comments);
+        // Replies follow the root's anchor, even without their own line.
+        assert_eq!(index.counts[file.display_path()], (2, 6));
+        assert_eq!(file_comment_count(&file, Some(&index)), 2);
     }
 
     /// (depth, display name, Some(file_ix) for files / None for dirs).

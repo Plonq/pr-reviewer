@@ -122,7 +122,8 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   sidebar with file tree beside Changes / Conversation; drag its right edge to
   resize (width is remembered). Title-bar Review queue / Back to review buttons
   switch screens without losing the active item's pane or position
-- file-tree comment badges count comments and replies, including outdated comments and drafts
+- file-tree comment badges count comments and replies anchored in the current diff,
+  including drafts but excluding outdated threads (still available in Conversation)
 - per-viewer viewed checkboxes at the right edge of the file tree; click or `V`
   to mark/unmark on GitHub, with optimistic updates and visible sync failures
 - quick-open modal (`cmd-o`) for known PR identifiers, PR URLs, and local repository paths
