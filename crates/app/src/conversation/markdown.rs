@@ -1,5 +1,7 @@
 //! Stock Markdown prose/selection, with image-only Kit extension hooks.
-//! Raw HTML and reference-style images retain stock Kit behaviour.
+//! GitHub's image-only paste/drop HTML uses the same activation path; general
+//! HTML and reference-style images retain stock Kit behaviour.
+mod github_image;
 use crate::{image_viewer::ImageTarget, ReviewApp};
 use gpui::component::text::{
     InlineElement, InlineRenderContext, MarkdownExtensions, MarkdownNode, MarkdownParseContext,
@@ -39,24 +41,59 @@ struct ImagePlugin {
     links: Arc<OnceLock<HashMap<usize, SharedString>>>,
 }
 
-fn image_target(node: &Node, links: &HashMap<usize, SharedString>) -> Option<(usize, ImageTarget)> {
-    let Node::Image(image) = node else {
-        return None;
-    };
-    // Keep data URLs and other non-network images on the stock renderer. In
-    // particular never turn document-provided paths into filesystem access.
-    if !image.url.starts_with("https://") && !image.url.starts_with("http://") {
-        return None;
+#[derive(Clone)]
+struct EmbeddedImage {
+    offset: usize,
+    target: ImageTarget,
+    width: Option<f32>,
+    height: Option<f32>,
+}
+
+#[derive(Clone)]
+struct CaptionedImage {
+    html: SharedString,
+    targets: Vec<ImageTarget>,
+}
+
+fn image_nodes(node: &Node, links: &HashMap<usize, SharedString>) -> Option<Vec<EmbeddedImage>> {
+    let offset = node.position()?.start.offset;
+    match node {
+        Node::Image(image) => {
+            // Never turn document-provided paths into filesystem access.
+            if !image.url.starts_with("https://") && !image.url.starts_with("http://") {
+                return None;
+            }
+            Some(vec![EmbeddedImage {
+                offset,
+                target: ImageTarget {
+                    url: image.url.clone().into(),
+                    alt: image.alt.clone().into(),
+                    link: links.get(&offset).cloned(),
+                },
+                width: None,
+                height: None,
+            }])
+        }
+        Node::Html(html) => Some(
+            github_image::parse(&html.value)?
+                .into_iter()
+                .map(|(local, image)| {
+                    let offset = offset + local;
+                    EmbeddedImage {
+                        offset,
+                        target: ImageTarget {
+                            url: image.url.into(),
+                            alt: image.alt.into(),
+                            link: links.get(&offset).cloned(),
+                        },
+                        width: image.width,
+                        height: image.height,
+                    }
+                })
+                .collect(),
+        ),
+        _ => None,
     }
-    let offset = image.position.as_ref()?.start.offset;
-    Some((
-        offset,
-        ImageTarget {
-            url: image.url.clone().into(),
-            alt: image.alt.clone().into(),
-            link: links.get(&offset).cloned(),
-        },
-    ))
 }
 
 fn image_links(source: &str) -> HashMap<usize, SharedString> {
@@ -86,6 +123,13 @@ fn image_links(source: &str) -> HashMap<usize, SharedString> {
                 links.insert(pos.start.offset, link.to_owned().into());
             }
         }
+        if let (Node::Html(html), Some(link), Some(pos)) = (node, link, node.position()) {
+            if let Some(images) = github_image::parse(&html.value) {
+                for (local, _) in images {
+                    links.insert(pos.start.offset + local, link.to_owned().into());
+                }
+            }
+        }
         if let Some(children) = node.children() {
             for child in children {
                 visit(child, link, defs, links);
@@ -105,17 +149,21 @@ fn image_links(source: &str) -> HashMap<usize, SharedString> {
 }
 
 impl ImagePlugin {
-    fn image(&self, offset: usize, target: &ImageTarget) -> gpui::Stateful<gpui::Img> {
+    fn image(&self, image: &EmbeddedImage) -> gpui::Stateful<gpui::Img> {
+        let offset = image.offset;
         let owner = self.owner.clone();
-        let target = target.clone();
+        let target = image.target.clone();
         let activate = target.clone();
         let selector = format!("{}-image-{offset}", self.host);
         img(target.url)
             .id(offset)
             .object_fit(gpui::ObjectFit::Contain)
             .max_w(relative(1.))
-            .when(self.block, |image| {
-                image
+            .when(self.block, |element| {
+                // Match Kit's block-image path: explicit width, intrinsic
+                // aspect ratio and a maximum of the available prose width.
+                element
+                    .when_some(image.width, |element, width| element.w(px(width)))
                     .with_loading(|| {
                         div()
                             .w(px(180.))
@@ -163,8 +211,34 @@ impl MarkdownPlugin for ImagePlugin {
     }
 
     fn parse(&self, node: &Node, cx: &MarkdownParseContext<'_>) -> Option<MarkdownNode> {
+        if self.block {
+            if let Node::Html(html) = node {
+                if let Some(captioned) = github_image::captioned(&html.value) {
+                    return Some(
+                        MarkdownNode::new(
+                            self.name(),
+                            CaptionedImage {
+                                html: captioned.html.into(),
+                                targets: captioned
+                                    .images
+                                    .into_iter()
+                                    .map(|image| ImageTarget {
+                                        url: image.url.into(),
+                                        alt: image.alt.into(),
+                                        link: None,
+                                    })
+                                    .collect(),
+                            },
+                        )
+                        .text(html.value.clone())
+                        .markdown(cx.node_source(node).unwrap_or_default().to_owned()),
+                    );
+                }
+            }
+        }
         fn contains_image(node: &Node) -> bool {
             matches!(node, Node::Image(_))
+                || matches!(node, Node::Html(html) if github_image::parse(&html.value).is_some())
                 || node
                     .children()
                     .is_some_and(|children| children.iter().any(contains_image))
@@ -172,20 +246,21 @@ impl MarkdownPlugin for ImagePlugin {
         // Ordinary prose should not pay for a second AST walk/parse.
         match node {
             Node::Paragraph(_) if self.block && contains_image(node) => {}
-            Node::Image(_) if !self.block => {}
+            Node::Html(_) if self.block && contains_image(node) => {}
+            Node::Image(_) | Node::Html(_) if !self.block => {}
             _ => return None,
         }
         let links = self.links.get_or_init(|| image_links(cx.source()));
-        let images = if self.block {
+        let images = if self.block && matches!(node, Node::Paragraph(_)) {
             let Node::Paragraph(paragraph) = node else {
-                return None;
+                unreachable!()
             };
             // Image-only paragraphs keep stock full-size/block presentation.
             // Anything with text stays in Kit's normal paragraph/inline flow.
             fn collect(
                 node: &Node,
                 links: &HashMap<usize, SharedString>,
-                out: &mut Vec<(usize, ImageTarget)>,
+                out: &mut Vec<EmbeddedImage>,
             ) -> Option<()> {
                 match node {
                     Node::Link(link) => {
@@ -198,7 +273,7 @@ impl MarkdownPlugin for ImagePlugin {
                             collect(child, links, out)?;
                         }
                     }
-                    _ => out.push(image_target(node, links)?),
+                    _ => out.extend(image_nodes(node, links)?),
                 }
                 Some(())
             }
@@ -211,11 +286,14 @@ impl MarkdownPlugin for ImagePlugin {
             }
             images
         } else {
-            vec![image_target(node, links)?]
+            image_nodes(node, links)?
         };
+        if !self.block && images.len() != 1 {
+            return None;
+        }
         let alt = images
             .iter()
-            .map(|(_, image)| image.alt.as_ref())
+            .map(|image| image.target.alt.as_ref())
             .collect::<Vec<_>>()
             .join(" ");
         Some(
@@ -226,12 +304,49 @@ impl MarkdownPlugin for ImagePlugin {
     }
 
     fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
-        div().w_full().children(
-            node.data::<Vec<(usize, ImageTarget)>>()
-                .unwrap()
-                .iter()
-                .map(|(offset, target)| self.image(*offset, target)),
-        )
+        if let Some(captioned) = node.data::<CaptionedImage>() {
+            let offset = node.source_range().map_or(0, |range| range.start);
+            let owner = self.owner.clone();
+            let targets = captioned.targets.clone();
+            let selector = format!("{}-captioned-image-{offset}", self.host);
+            return div()
+                .w_full()
+                .debug_selector(move || selector.clone())
+                .child(
+                    TextView::html(
+                        SharedString::from(format!("{}-captioned-{offset}", self.host)),
+                        captioned.html.clone(),
+                    )
+                    .w_full()
+                    .h_auto()
+                    .scrollable(false)
+                    .selectable(true)
+                    .on_link_click(move |link, _, window, cx| {
+                        let Some(target) = link
+                            .strip_prefix("gander-image:")
+                            .and_then(|index| index.parse::<usize>().ok())
+                            .and_then(|index| targets.get(index))
+                        else {
+                            return;
+                        };
+                        let _ = owner.update(cx, |app, cx| {
+                            if let Some(item_id) = app.active_item().map(|item| item.id) {
+                                app.open_image(target.clone(), item_id, window, cx);
+                            }
+                        });
+                    }),
+                )
+                .into_any_element();
+        }
+        div()
+            .w_full()
+            .children(
+                node.data::<Vec<EmbeddedImage>>()
+                    .unwrap()
+                    .iter()
+                    .map(|image| self.image(image)),
+            )
+            .into_any_element()
     }
 
     fn render_inline(
@@ -241,21 +356,32 @@ impl MarkdownPlugin for ImagePlugin {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<InlineElement> {
-        let (offset, target) = &node.data::<Vec<(usize, ImageTarget)>>()?[0];
-        // Match Kit's stock mixed-paragraph image geometry: 3/4 line-height,
-        // with asynchronously resolved intrinsic aspect ratio. The same GPUI
-        // asset (and secure HTTP client) supplies both measurement and drawing.
+        let image = &node.data::<Vec<EmbeddedImage>>()?[0];
+        let target = &image.target;
+        // Match Kit's mixed-paragraph image geometry: Markdown images use
+        // 3/4 line-height; HTML images retain their declared pixel dimensions.
+        // The same GPUI asset and secure HTTP client supply both measurement
+        // and drawing, including asynchronously resolved intrinsic sizing.
         let intrinsic = window
             .use_asset::<ImgResourceLoader>(&Resource::Uri(target.url.clone()), cx)
             .and_then(Result::ok)
             .map(|image| image.size(0));
-        let height = context.line_height() * 0.75;
         let ratio = intrinsic.map_or(1., |size| {
             size.width.0 as f32 / (size.height.0 as f32).max(1.)
         });
-        Some(InlineElement::new(
-            self.image(*offset, target).w(height * ratio).h(height),
-        ))
+        let (width, height) = match (image.width, image.height) {
+            (Some(width), Some(height)) => (px(width), px(height)),
+            (Some(width), None) => (
+                px(width),
+                intrinsic.map_or(context.line_height(), |_| px(width / ratio)),
+            ),
+            (None, Some(height)) => (px(height * ratio), px(height)),
+            (None, None) => {
+                let height = context.line_height() * 0.75;
+                (height * ratio, height)
+            }
+        };
+        Some(InlineElement::new(self.image(image).w(width).h(height)))
     }
 }
 

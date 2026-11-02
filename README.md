@@ -140,7 +140,8 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   the refreshed discussion arrives.
 - stock Markdown and images in conversations and diff comment threads,
   including cached private GitHub attachments using the secure HTTP bridge;
-  click Markdown images to inspect them in a full-window image viewer
+  click Markdown images or GitHub's pasted/dropped images to inspect them in a
+  full-window image viewer
 - automatic Jira links for `PYAPI-123`, `BOT-123`, `CS-123`, and `HELP-123`
   in PR descriptions and comments (excluding code and existing links)
 - local repo diffs
@@ -169,11 +170,13 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 
 ### Image viewer
 
-Click a network image written as Markdown (`![alt](https://…)`) in a PR
-description, conversation comment or inline review thread to inspect it without
-leaving Gander. This includes extensionless GitHub attachment URLs, SVGs and
-animated images, in both unified and split Changes views. The dark overlay fills
-the app window without entering macOS fullscreen or changing Spaces.
+Click an image written as Markdown (`![alt](https://…)`) or GitHub's generated
+`<img width="…" height="…" alt="…" src="https://github.com/…">` in a PR description,
+conversation comment or inline review thread to inspect it without leaving
+Gander. GitHub commonly uses the HTML form when you paste or drop a screenshot.
+This includes extensionless GitHub attachment URLs, SVGs and animated images, in
+both unified and split Changes views. The dark overlay fills the app window
+without entering macOS fullscreen or changing Spaces.
 
 - Images start fitted to the window (small images are not enlarged).
 - Zoom with **+ / −**, the mouse wheel/trackpad, or the toolbar buttons; drag the
@@ -185,16 +188,18 @@ the app window without entering macOS fullscreen or changing Spaces.
   **Follow link** opens the original link; **Open image in browser** is an
   explicit fallback. Failed image loads offer **Retry**.
 
-HTML `<img>` tags retain stock rendering/click behaviour and do not open this
-viewer. Reference-style images remain omitted by the stock renderer. There is
-no video playback.
+GitHub image tags (including its user-image hosts) use the viewer and retain
+their specified inline dimensions, including tags followed by a plain caption.
+General HTML containers, non-GitHub HTML images and reference-style images retain
+stock behaviour; reference-style images remain omitted. There is no video playback.
 
 ### Stock Markdown differences
 
 Kit's TextView still owns prose, tables, code and selection; small image-only
-plugins add viewer activation for Markdown images. GitHub mention/issue links and
-emoji preprocessing remain. SVG source toggles are not provided. Mixed-paragraph
-images can be smaller than the former media cards, and narrow tables may clip.
+plugins add viewer activation for Markdown images and GitHub's pasted-image HTML.
+GitHub mention/issue links and emoji preprocessing remain. SVG source toggles are
+not provided. Mixed-paragraph images can be smaller than the former media cards,
+and narrow tables may clip.
 
 ## Where its state lives
 

@@ -157,6 +157,122 @@ fn image_viewer_zoom_drag_resize_fit_and_all_dismissals(cx: &mut gpui::TestAppCo
 }
 
 #[gpui::test]
+fn github_paste_html_images_preserve_dimensions_and_open_the_viewer(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    // This is the markup GitHub generates for ordinary pasted screenshots.
+    let body = "<img width=\"120\" height=\"80\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/pasted\" />";
+    let (window, app) = viewer_conversation(cx, body);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    draw_settled(&mut vcx);
+    assert_eq!(
+        vcx.debug_bounds("conversation-0-image-0").unwrap().size,
+        size(px(120.), px(80.))
+    );
+    click_selector(&mut vcx, "conversation-0-image-0");
+    cx.update(|cx| {
+        let viewer = app.read(cx).image_viewer.as_ref().unwrap();
+        assert_eq!(
+            viewer.target.url.as_ref(),
+            "https://github.com/user-attachments/assets/pasted"
+        );
+        assert_eq!(viewer.target.alt.as_ref(), "Image");
+    });
+    assert_eq!(
+        vcx.debug_bounds("viewer-image").unwrap().size,
+        size(px(240.), px(160.)),
+        "viewer uses the full image, not HTML's reduced display size"
+    );
+    assert!(cx.opened_url().is_none());
+    vcx.simulate_keystrokes("escape");
+    draw_settled(&mut vcx);
+    assert!(vcx.debug_bounds("image-viewer").is_none());
+}
+
+#[gpui::test]
+fn github_paste_html_in_quotes_lists_tables_mixed_links_and_adjacent_images(
+    cx: &mut gpui::TestAppContext,
+) {
+    image_client(cx);
+    let body = "> <img width=\"120\" height=\"80\" alt=\"quote\" src=\"https://github.com/user-attachments/assets/quote\" />\n\n- <img width='120' height='80' alt='list' src='https://github.com/user-attachments/assets/list'>\n\n| Image |\n| --- |\n| <img width='120' height='80' alt='table' src='https://github.com/user-attachments/assets/table'> |\n\n[before <img width='120' height='80' alt='linked' src='https://github.com/user-attachments/assets/linked'> after](https://example.com/original)\n\n<img width='120' height='80' alt='first' src='https://github.com/user-attachments/assets/first'>\n<img width='120' height='80' alt='second' src='https://github.com/user-attachments/assets/second'>";
+    let (window, app) = viewer_conversation(cx, body);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1400.), px(2400.)));
+    draw_settled(&mut vcx);
+    let positions: Vec<_> = body
+        .match_indices("<img")
+        .map(|(position, _)| position)
+        .collect();
+    for (alt, offset) in ["quote", "list", "table", "linked", "first", "second"]
+        .into_iter()
+        .zip(positions)
+    {
+        let selector = Box::leak(format!("conversation-0-image-{offset}").into_boxed_str());
+        assert_eq!(
+            vcx.debug_bounds(selector).unwrap().size,
+            size(px(120.), px(80.)),
+            "{alt}"
+        );
+        click_selector(&mut vcx, selector);
+        cx.update(|cx| {
+            let viewer = app.read(cx).image_viewer.as_ref().unwrap();
+            assert_eq!(viewer.target.alt.as_ref(), alt);
+            if alt == "linked" {
+                assert_eq!(
+                    viewer.target.link.as_deref(),
+                    Some("https://example.com/original")
+                );
+            }
+        });
+        assert!(cx.opened_url().is_none());
+        vcx.simulate_keystrokes("escape");
+        draw_settled(&mut vcx);
+    }
+}
+
+#[gpui::test]
+fn github_paste_image_with_a_following_caption_still_opens(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    // No blank line: CommonMark delivers the image and caption as one HTML node.
+    let body = "<img width=\"120\" height=\"80\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/captioned\" />\nA caption without a blank line.";
+    let (window, app) = viewer_conversation(cx, body);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    draw_settled(&mut vcx);
+    let content = vcx
+        .debug_bounds("conversation-0-captioned-image-0")
+        .unwrap();
+    vcx.simulate_click(content.origin + point(px(60.), px(40.)), Default::default());
+    draw_settled(&mut vcx);
+    cx.update(|cx| {
+        assert_eq!(
+            app.read(cx)
+                .image_viewer
+                .as_ref()
+                .unwrap()
+                .target
+                .url
+                .as_ref(),
+            "https://github.com/user-attachments/assets/captioned"
+        )
+    });
+    assert!(
+        cx.opened_url().is_none(),
+        "internal activation links must never open the browser"
+    );
+    vcx.simulate_keystrokes("escape");
+    draw_settled(&mut vcx);
+    let content = vcx
+        .debug_bounds("conversation-0-captioned-image-0")
+        .unwrap();
+    // Text next to the image is NOT part of its activation target.
+    vcx.simulate_click(
+        content.origin + point(px(200.), px(40.)),
+        Default::default(),
+    );
+    draw_settled(&mut vcx);
+    assert!(vcx.debug_bounds("image-viewer").is_none());
+}
+
+#[gpui::test]
 fn linked_markdown_images_prioritize_viewer_and_browser_actions_are_explicit(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -185,11 +301,11 @@ fn linked_markdown_images_prioritize_viewer_and_browser_actions_are_explicit(
 }
 
 #[gpui::test]
-fn markdown_plugin_covers_lists_tables_and_mixed_link_paragraphs_not_html_or_code(
+fn markdown_plugin_covers_lists_tables_and_mixed_links_not_general_html_or_code(
     cx: &mut gpui::TestAppContext,
 ) {
     image_client(cx);
-    let body = "- ![list](https://github.com/user-attachments/assets/list)\n\n| Image |\n| --- |\n| ![table](https://github.com/user-attachments/assets/table) |\n\n[before ![mixed](https://github.com/user-attachments/assets/mixed) after](https://example.com/mixed)\n\n<img src='https://github.com/user-attachments/assets/html'>\n\n`![code](https://github.com/user-attachments/assets/code)`";
+    let body = "- ![list](https://github.com/user-attachments/assets/list)\n\n| Image |\n| --- |\n| ![table](https://github.com/user-attachments/assets/table) |\n\n[before ![mixed](https://github.com/user-attachments/assets/mixed) after](https://example.com/mixed)\n\n<img src='https://example.com/html'>\n\n`![code](https://github.com/user-attachments/assets/code)`";
     let (window, app) = viewer_conversation(cx, body);
     let mut vcx = gpui::VisualTestContext::from_window(window, cx);
     vcx.simulate_resize(size(px(1400.), px(1800.)));
@@ -221,10 +337,18 @@ fn markdown_plugin_covers_lists_tables_and_mixed_link_paragraphs_not_html_or_cod
         format!("conversation-0-image-{}", body.find("![code]").unwrap()).into_boxed_str(),
     );
     assert!(vcx.debug_bounds(code).is_none());
+    let html =
+        Box::leak(format!("conversation-0-image-{}", body.find("<img").unwrap()).into_boxed_str());
+    assert!(
+        vcx.debug_bounds(html).is_none(),
+        "general HTML stays on the stock renderer"
+    );
 }
 
 #[gpui::test]
-fn markdown_viewer_activates_inline_threads_in_both_changes_views(cx: &mut gpui::TestAppContext) {
+fn image_viewer_activates_markdown_and_github_paste_in_both_changes_views(
+    cx: &mut gpui::TestAppContext,
+) {
     image_client(cx);
     let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
     let mut item = loop_pr_item(vec![
@@ -243,7 +367,7 @@ fn markdown_viewer_activates_inline_threads_in_both_changes_views(cx: &mut gpui:
             "a.rs",
             Some("LEFT"),
             Some(1),
-            "![left](https://github.com/user-attachments/assets/left)",
+            "<img width=\"240\" height=\"160\" alt=\"left\" src=\"https://github.com/user-attachments/assets/left\" />",
             "bob",
             "2026-01-01T00:00:00Z",
             None,
@@ -463,7 +587,9 @@ fn animated_markdown_images_keep_frames_and_share_the_inline_asset(cx: &mut gpui
 }
 
 #[gpui::test]
-fn conversation_comments_and_review_threads_open_markdown_images(cx: &mut gpui::TestAppContext) {
+fn conversation_comments_and_review_threads_open_github_paste_images(
+    cx: &mut gpui::TestAppContext,
+) {
     image_client(cx);
     let (window, app) = viewer_conversation(cx, "Description");
     cx.update(|cx| {
@@ -472,12 +598,12 @@ fn conversation_comments_and_review_threads_open_markdown_images(cx: &mut gpui::
             let mut discussion = conversation::tests::sample_discussion();
             discussion.comments.truncate(1);
             discussion.comments[0].body =
-                "![comment](https://github.com/user-attachments/assets/comment)".into();
+                "<img width=\"240\" height=\"160\" alt=\"comment\" src=\"https://github.com/user-attachments/assets/comment\" />".into();
             discussion.threads[0].is_resolved = false;
             discussion.threads[0].is_outdated = false;
             discussion.threads[0].comments.truncate(1);
             discussion.threads[0].comments[0].body =
-                "![thread](https://github.com/user-attachments/assets/thread)".into();
+                "<img width=\"240\" height=\"160\" alt=\"thread\" src=\"https://github.com/user-attachments/assets/thread\" />".into();
             data.discussion = Some(discussion);
             cx.notify();
         })
