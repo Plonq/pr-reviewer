@@ -6,12 +6,20 @@ fn image_client(cx: &mut gpui::TestAppContext) -> Arc<std::sync::Mutex<Vec<Strin
     let mut png = std::io::Cursor::new(Vec::new());
     image::DynamicImage::new_rgb8(240, 160).write_to(&mut png, image::ImageFormat::Png).unwrap();
     let png = png.into_inner();
+    let mut gif = Vec::new();
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
+        encoder.encode_frames([
+            image::Frame::new(image::RgbaImage::new(120, 80)),
+            image::Frame::new(image::RgbaImage::new(120, 80)),
+        ]).unwrap();
+    }
     cx.update(|cx| cx.set_http_client(http_client::FakeHttpClient::create(move |req| {
         let url = req.uri().to_string();
         seen.lock().unwrap().push(url.clone());
         let bytes = if url.ends_with("diagram") {
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80"><rect width="200" height="80"/></svg>"#.to_vec()
-        } else { png.clone() };
+        } else if url.ends_with("animation") { gif.clone() } else { png.clone() };
         async move { Ok(http_client::http::Response::builder().status(200)
             // Deliberately uninformative MIME and extension: decoding is byte-based.
             .header("content-type", "application/octet-stream")

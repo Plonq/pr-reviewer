@@ -6,6 +6,7 @@ mod conversation;
 mod diff_media;
 mod file_history;
 mod http;
+mod image_viewer;
 #[cfg(target_os = "macos")]
 mod launch_env;
 mod local_store;
@@ -1820,6 +1821,7 @@ pub(crate) struct ReviewApp {
     /// back into the composer generation it was submitted from.
     composer_gen: u64,
     review: Option<ReviewDialog>,
+    image_viewer: Option<image_viewer::ImageViewer>,
     /// Bumped on every review-dialog open/close, same protocol as
     /// `composer_gen`.
     review_gen: u64,
@@ -1953,6 +1955,7 @@ impl ReviewApp {
             composer: None,
             composer_gen: 0,
             review: None,
+            image_viewer: None,
             review_gen: 0,
             sessions: HashMap::new(),
             github,
@@ -3376,6 +3379,9 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.image_viewer.is_some() {
+            return;
+        }
         let Some(item) = self.items.get(self.active) else {
             return;
         };
@@ -3879,8 +3885,8 @@ impl ReviewApp {
 
     /// Open the "submit review" modal for the active item (PR items only).
     fn open_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // One review dialog at a time; this migration adds no nested flow.
-        if self.review.is_some() {
+        // Do not stack modal interfaces.
+        if self.review.is_some() || self.image_viewer.is_some() {
             return;
         }
         let Some(item) = self.active_item() else {
@@ -6147,12 +6153,13 @@ impl Render for ReviewApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.resync_comment_wrap(window);
         self.resync_inline_text(window, cx);
+        let image_viewer = self.render_image_viewer(window, cx);
         let pane: gpui::AnyElement = if self.show_queue {
             self.render_queue(cx)
         } else {
             self.render_item_pane(window, cx)
         };
-        div()
+        let content = div()
             .size_full()
             .relative()
             .flex()
@@ -6418,7 +6425,10 @@ impl Render for ReviewApp {
             // context (plain letters must stay text, like the quick-open input).
             .when(self.composer.is_some(), |root| {
                 root.child(self.render_composer(cx))
-            })
+            });
+        // A sibling, not a descendant of review shortcut handlers. Keep the
+        // review mounted so its selection, scroll and element state survive.
+        div().size_full().relative().child(content).children(image_viewer)
     }
 }
 
@@ -6499,6 +6509,7 @@ mod tests {
 
     mod markdown_hosts {
         include!("markdown_tests.rs");
+        include!("image_viewer_tests.rs");
     }
 
     #[gpui::test]

@@ -139,7 +139,8 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   Posted comments appear immediately as placeholders and update in place when
   the refreshed discussion arrives.
 - stock Markdown and images in conversations and diff comment threads,
-  including cached private GitHub attachments using the secure HTTP bridge
+  including cached private GitHub attachments using the secure HTTP bridge;
+  click Markdown images to inspect them in a full-window image viewer
 - automatic Jira links for `PYAPI-123`, `BOT-123`, `CS-123`, and `HELP-123`
   in PR descriptions and comments (excluding code and existing links)
 - local repo diffs
@@ -166,14 +167,34 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
 - dark-only theme with soft blue-grey surfaces and pastel accents
 
+### Image viewer
+
+Click a network image written as Markdown (`![alt](https://…)`) in a PR
+description, conversation comment or inline review thread to inspect it without
+leaving Gander. This includes extensionless GitHub attachment URLs, SVGs and
+animated images, in both unified and split Changes views. The dark overlay fills
+the app window without entering macOS fullscreen or changing Spaces.
+
+- Images start fitted to the window (small images are not enlarged).
+- Zoom with **+ / −**, the mouse wheel/trackpad, or the toolbar buttons; drag the
+  image to pan. Press **0** or **F**, or click **Fit**, to reset.
+- Close with **Esc**, **Close**, or a click on the backdrop. Review shortcuts and
+  scrolling are isolated while the viewer is open; closing restores focus and
+  leaves the review's scroll position, navigation and diff selection intact.
+- For linked images, the image click opens the viewer, not the browser.
+  **Follow link** opens the original link; **Open image in browser** is an
+  explicit fallback. Failed image loads offer **Retry**.
+
+HTML `<img>` tags retain stock rendering/click behaviour and do not open this
+viewer. Reference-style images remain omitted by the stock renderer. There is
+no video playback.
+
 ### Stock Markdown differences
 
-Kit's TextView owns Markdown layout and media. GitHub mention/issue links and
-emoji preprocessing remain. Reference-style images are omitted; unlinked images
-do not open on click; SVG source toggles and custom image loading/error messages
-are gone. Inline images can be smaller than the former media cards, and narrow
-tables may clip. These are intentional stock-renderer tradeoffs, not custom
-rendering features to restore.
+Kit's TextView still owns prose, tables, code and selection; small image-only
+plugins add viewer activation for Markdown images. GitHub mention/issue links and
+emoji preprocessing remain. SVG source toggles are not provided. Mixed-paragraph
+images can be smaller than the former media cards, and narrow tables may clip.
 
 ## Where its state lives
 
