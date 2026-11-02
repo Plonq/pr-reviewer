@@ -313,6 +313,7 @@ mod tests {
             slot,
             text: std::sync::Arc::new(crate::diff_media::CommentText {
                 comment_id: id,
+                is_reply: false,
                 part: 0,
                 source: "text".into(),
             }),
