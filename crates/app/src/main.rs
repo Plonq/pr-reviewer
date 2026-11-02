@@ -1804,7 +1804,8 @@ pub(crate) struct ReviewApp {
     char_width: Option<Pixels>,
     /// Diff row + split half under the pointer where a hover "+" (new
     /// comment) affordance shows; None when the pointer isn't on a
-    /// commentable line.
+    /// commentable line. Refreshed after list prepaint as well as on mouse
+    /// moves, so scrolling under a stationary pointer updates the target.
     hover_plus: Option<(usize, SelSide)>,
     composer: Option<Composer>,
     /// Bumped on every composer open/close; an in-flight post only reports
@@ -4067,6 +4068,7 @@ impl ReviewApp {
         let entity = cx.entity();
         Some(
             div()
+                .debug_selector(|| "comment-plus".to_string())
                 .absolute()
                 .left(px(x))
                 .top(px(y + (row_height() - 16.) / 2.))
@@ -5674,6 +5676,7 @@ impl ReviewApp {
     /// when the queue screen isn't up.
     fn render_item_pane(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entity = cx.entity();
+        let plus_entity = entity.clone();
         match self.active_item() {
             None => self.render_empty_pane(cx),
             Some(item) => match &item.state {
@@ -5983,9 +5986,39 @@ impl ReviewApp {
                                 pane.child(self.render_minimap(cx))
                             })
                             .child(Scrollbar::new(&data.scroll))
-                            // Hover "+" (add comment) overlay, absolutely positioned
-                            // at the hovered row's y like the minimap viewport.
-                            .children(self.render_plus(cx)),
+                            // Resolve hover only after the list's prepaint has applied
+                            // deferred scrolling and clamped its offset. A cached row
+                            // from the last mouse move (or a render-time offset) can
+                            // lag the code, especially under a stationary pointer.
+                            .child(
+                                canvas(
+                                    move |bounds, window, cx| {
+                                        let mut plus = plus_entity.update(cx, |this, cx| {
+                                            this.hover_plus =
+                                                this.hover_target(window.mouse_position(), window);
+                                            this.render_plus(cx).map(|plus| {
+                                                div().size_full().child(plus).into_any_element()
+                                            })
+                                        });
+                                        if let Some(plus) = &mut plus {
+                                            plus.layout_as_root(
+                                                bounds.size.map(gpui::AvailableSpace::Definite),
+                                                window,
+                                                cx,
+                                            );
+                                            plus.prepaint_at(bounds.origin, window, cx);
+                                        }
+                                        plus
+                                    },
+                                    |_, plus, window, cx| {
+                                        if let Some(mut plus) = plus {
+                                            plus.paint(window, cx);
+                                        }
+                                    },
+                                )
+                                .absolute()
+                                .size_full(),
+                            ),
                     )
                     .into_any_element(),
             },
@@ -7995,6 +8028,108 @@ mod tests {
                 .height
                 < px(row_height() * 3.)
         );
+    }
+
+    #[gpui::test]
+    fn comment_plus_tracks_the_painted_row_while_scrolling(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut item = loop_pr_item(Vec::new());
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        let context: String = (1..=200).map(|line| format!(" line {line}\n")).collect();
+        data.diff = diff_core::parse_patch(&format!(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,200 +1,200 @@\n{context}"
+        ));
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for (mode, side) in [
+            (ViewMode::Unified, SelSide::Unified),
+            (ViewMode::Split, SelSide::Left),
+            (ViewMode::Split, SelSide::Right),
+        ] {
+            vcx.update(|_, cx| {
+                app.update(cx, |this, cx| {
+                    let data = this.active_data_mut().unwrap();
+                    data.mode = mode;
+                    data.set_rows(data.row_build());
+                    data.position_restore = None;
+                    let mut scroll = data.scroll.0.borrow_mut();
+                    scroll.deferred_scroll_to_item = None;
+                    scroll.base_handle.set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                });
+            });
+            draw_window(&mut vcx);
+            let viewport = vcx.update(|_, cx| {
+                app.read(cx)
+                    .active_data()
+                    .unwrap()
+                    .scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .bounds()
+            });
+            let pointer = point(
+                viewport.left()
+                    + viewport.size.width * if side == SelSide::Right { 0.75 } else { 0.25 },
+                viewport.top() + px(6.5 * row_height()),
+            );
+            vcx.simulate_mouse_move(pointer, None, gpui::Modifiers::default());
+            draw_window(&mut vcx);
+            assert!(vcx.debug_bounds("comment-plus").is_some());
+
+            // No mouse moves between scroll packets: the source row under the
+            // pointer changes, but the button must remain on that painted row.
+            // Include fractional rows, overshooting the top, and both directions.
+            for delta in [-137., -83.5, 61., 10000., -47.25] {
+                vcx.simulate_event(gpui::ScrollEvent {
+                    position: pointer,
+                    delta: gpui::ScrollDelta::Pixels(point(px(0.), px(delta))),
+                    ..Default::default()
+                });
+                // Assert the very first frame, not an eventually-correct redraw.
+                vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+                let (row, expected_y) = vcx.update(|_, cx| {
+                    let this = app.read(cx);
+                    let data = this.active_data().unwrap();
+                    let scroll = data.scroll.0.borrow();
+                    let offset = scroll.base_handle.offset().y;
+                    let top = scroll.base_handle.bounds().top();
+                    let row = (f32::from(pointer.y - top - offset) / row_height()).floor() as usize;
+                    (row, top + offset + px((row as f32 + 0.5) * row_height()))
+                });
+                let plus = vcx
+                    .debug_bounds("comment-plus")
+                    .expect("hovered source row has a plus");
+                assert!((f32::from(plus.center().y - expected_y)).abs() <= 0.5,
+                    "button must match the painted row {row} at {expected_y:?} after scrolling {delta}: {plus:?}");
+                if side == SelSide::Right {
+                    assert!(plus.left() > viewport.center().x);
+                } else {
+                    assert!(plus.right() < viewport.center().x);
+                }
+            }
+            let plus = vcx.debug_bounds("comment-plus").unwrap();
+            let expected_row = vcx.update(|window, cx| {
+                app.update(cx, |this, _| {
+                    this.hover_target(plus.center(), window).unwrap().0
+                })
+            });
+            vcx.simulate_click(plus.center(), gpui::Modifiers::default());
+            vcx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    assert_eq!(this.composer.as_ref().unwrap().row_ix, expected_row);
+                    this.close_composer(window, cx);
+                });
+            });
+            vcx.simulate_mouse_move(point(px(0.), px(0.)), None, gpui::Modifiers::default());
+            draw_window(&mut vcx);
+            assert!(vcx.debug_bounds("comment-plus").is_none());
+        }
     }
 
     #[gpui::test]
