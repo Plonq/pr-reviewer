@@ -267,8 +267,8 @@ use gpui::component::{
     Disableable, Sizable,
 };
 use gpui::{
-    div, px, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window,
+    div, prelude::FluentBuilder, px, Context, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Window,
 };
 
 impl ReviewApp {
@@ -769,10 +769,11 @@ impl ReviewApp {
                         .child("Code context unavailable for this thread."),
                 );
             }
-            for comment in &thread.comments {
+            for (ix, comment) in thread.comments.iter().enumerate() {
                 card = card.child(
                     div()
                         .p_4()
+                        .when(ix > 0, |row| row.pl(px(16. + crate::threads::REPLY_INDENT)))
                         .border_t_1()
                         .border_color(theme::surface0(cx))
                         .child(
@@ -789,6 +790,7 @@ impl ReviewApp {
                 card = card.child(
                     div()
                         .p_4()
+                        .pl(px(16. + crate::threads::REPLY_INDENT))
                         .border_t_1()
                         .border_color(theme::surface0(cx))
                         .child(self.discussion_comment(
@@ -817,16 +819,25 @@ impl ReviewApp {
                     if self.composer.as_ref().is_some_and(|composer| {
                         composer.item_id == item.id && composer.placement == placement
                     }) {
-                        card = card.child(div().p_4().child(self.render_composer_card(cx)));
+                        card = card.child(
+                            div()
+                                .p_4()
+                                .pl(px(16. + crate::threads::REPLY_INDENT))
+                                .child(self.render_composer_card(cx)),
+                        );
                         continue;
                     }
                     card = card.child(
                         div()
                             .p_4()
+                            .pl(px(16. + crate::threads::REPLY_INDENT))
                             .border_t_1()
                             .border_color(theme::surface0(cx))
                             .child(
                                 div()
+                                    .debug_selector(|| {
+                                        format!("conversation-draft-{}-{}", item.id, draft.id)
+                                    })
                                     .mb_2()
                                     .flex()
                                     .items_center()
@@ -853,6 +864,7 @@ impl ReviewApp {
                     .p_4()
                     .border_t_1()
                     .border_color(theme::surface0(cx))
+                    .pl(px(16. + crate::threads::REPLY_INDENT))
                     .child(self.conversation_composer(item.id, Some(thread), cx)),
             );
         }

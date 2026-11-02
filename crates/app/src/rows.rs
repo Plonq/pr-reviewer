@@ -9,7 +9,7 @@ use gpui::component::{
     button::{Button, ButtonVariants as _},
     tag::Tag,
     tooltip::Tooltip,
-    Sizable as _,
+    ActiveTheme as _, Sizable as _,
 };
 use gpui::{div, prelude::*, px, HighlightStyle, Hsla, SharedString, StyledText};
 use std::collections::HashMap;
@@ -267,6 +267,7 @@ fn push_thread_rows(
             let push_text = |rows: &mut Vec<Row>, source: &str, part: usize| {
                 let text = Arc::new(crate::diff_media::CommentText {
                     comment_id: comment.id,
+                    is_reply: ix > 0,
                     part,
                     source: source.into(),
                 });
@@ -1133,7 +1134,12 @@ fn comment_row(
                     .child(inner)
             })
     };
-    let row = div().h(px(row_height())).w_full().flex();
+    // Comments use the UI's prose font, not the diff pane's inherited mono.
+    let row = div()
+        .h(px(row_height()))
+        .w_full()
+        .flex()
+        .font_family(cx.theme().font_family.clone());
     match half {
         // Unified: one column, so the card spans it.
         None => row.child(card(inner)).into_any_element(),
@@ -1316,16 +1322,16 @@ fn render_row_content(
             top,
             collapsed,
         } => {
-            let mut inner = div().flex().items_center().gap_2().min_w_0().w_full();
-            if *is_reply {
-                inner = inner.child(
-                    div()
-                        .text_color(theme::overlay0(cx))
-                        .child(SharedString::from("↳")),
-                );
-            }
             comment_row(
-                inner
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .w_full()
+                    .when(*is_reply, |header| {
+                        header.pl(px(crate::threads::REPLY_INDENT))
+                    })
                     .child(
                         crate::threads::author_avatar(author, &entity.read(cx).account)
                             // Header rows share the diff's zoom-dependent height.

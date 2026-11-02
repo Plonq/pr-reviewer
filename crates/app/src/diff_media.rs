@@ -5,6 +5,7 @@
 
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
+use gpui::component::ActiveTheme;
 use gpui::{
     div, px, size, App, AvailableSpace, Bounds, Context, Entity, InteractiveElement, IntoElement,
     MouseButton, ParentElement, Pixels, Point, Styled, UniformListDecoration, Window,
@@ -14,12 +15,13 @@ use crate::{
     conversation, row_height,
     rows::{BuiltRows, Row},
     text_size, theme,
-    threads::{CommentSide, COMMENT_WRAP_CHARS},
-    ItemPane, ItemState, ReviewApp, Source, MONO, SPLIT_DIVIDER,
+    threads::{CommentSide, COMMENT_WRAP_CHARS, REPLY_INDENT},
+    ItemPane, ItemState, ReviewApp, Source, SPLIT_DIVIDER,
 };
 
 pub(crate) struct CommentText {
     pub comment_id: u64,
+    pub is_reply: bool,
     pub part: usize,
     pub source: String,
 }
@@ -44,9 +46,13 @@ pub(crate) struct TextLayout {
 
 pub(crate) type TextLayouts = HashMap<(u64, usize), TextLayout>;
 
-fn text_width(card_width: Pixels, char_width: Pixels) -> Pixels {
+fn reply_indent(is_reply: bool) -> Pixels {
+    px(if is_reply { REPLY_INDENT } else { 0. })
+}
+
+fn text_width(card_width: Pixels, char_width: Pixels, is_reply: bool) -> Pixels {
     // Gutter + borders + px_3 padding, with the existing prose width cap.
-    (card_width - px(99.))
+    (card_width - px(99.) - reply_indent(is_reply))
         .max(px(1.))
         .min(char_width * COMMENT_WRAP_CHARS)
 }
@@ -117,7 +123,7 @@ fn text_content(
             let id = id.to_owned();
             move || format!("{id}-content")
         })
-        .font_family(MONO)
+        .font_family(cx.theme().font_family.clone())
         .text_size(px(text_size()))
         .line_height(px(row_height()))
         .text_color(theme::subtext(cx))
@@ -149,7 +155,6 @@ impl ReviewApp {
         } else {
             list_width
         };
-        let width = text_width(card_width, char_width);
         let slug = match &item.source {
             Source::Pr(loc) => loc.repo_slug(),
             Source::Local(_) => String::new(),
@@ -165,7 +170,7 @@ impl ReviewApp {
                         .get(&text.key())
                         .is_none_or(|layout| {
                             layout.source != text.source
-                                || layout.width != width
+                                || layout.width != text_width(card_width, char_width, text.is_reply)
                                 || layout.font_size != text_size()
                         }) =>
                 {
@@ -179,6 +184,7 @@ impl ReviewApp {
         }
         let mut layouts = Vec::new();
         for text in texts {
+            let width = text_width(card_width, char_width, text.is_reply);
             let rendered = if slug.is_empty() {
                 text.source.clone()
             } else {
@@ -259,7 +265,11 @@ impl UniformListDecoration for InlineText {
                     None => bounds.size.width,
                     Some(_) => (bounds.size.width - px(SPLIT_DIVIDER)) / 2.,
                 };
-                let available = text_width(width, app.char_width.unwrap_or(px(text_size() * 0.6)));
+                let available = text_width(
+                    width,
+                    app.char_width.unwrap_or(px(text_size() * 0.6)),
+                    text.is_reply,
+                );
                 if layout.width != available {
                     // A resize updates list bounds after the app renders.
                     // Remeasure on the next frame and clip to this pane meanwhile.
@@ -280,7 +290,7 @@ impl UniformListDecoration for InlineText {
                 layer = layer.child(
                     div()
                         .absolute()
-                        .left(x - scroll_offset.x + px(86.))
+                        .left(x - scroll_offset.x + px(86.) + reply_indent(text.is_reply))
                         .top(item_height * start + px(4.))
                         .w(layout.width.min(available))
                         .h(item_height * layout.rows - px(8.))
@@ -351,10 +361,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reply_width_accounts_for_indent_before_applying_the_prose_cap() {
+        let root = text_width(px(400.), px(8.), false);
+        let reply = text_width(px(400.), px(8.), true);
+        assert_eq!(root - reply, px(REPLY_INDENT));
+        assert_eq!(text_width(px(2000.), px(8.), true), px(640.));
+        assert_eq!(text_width(px(80.), px(8.), true), px(1.));
+    }
+
+    #[test]
     fn measured_reservations_remap_navigation_and_ignore_stale_sources() {
         for measured_rows in [1, 6] {
             let text = Arc::new(CommentText {
                 comment_id: 7,
+                is_reply: false,
                 part: 0,
                 source: "**unwrapped café**\n\n```rust\nlet x = 1;\n```".into(),
             });

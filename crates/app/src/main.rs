@@ -13886,6 +13886,152 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn conversation_replies_are_indented_including_optimistic_and_pending(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![
+            rc(
+                11,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "Question",
+                "alice",
+                "a",
+                None,
+            ),
+            rc(
+                12,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "Reply",
+                "bob",
+                "b",
+                Some(11),
+            ),
+        ]);
+        *fake.pending.lock().unwrap() = Some(github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: String::new(),
+            comments: vec![github::PendingComment {
+                id: 13,
+                node_id: "draft".into(),
+                path: "a.rs".into(),
+                side: CommentSide::Right,
+                line: Some(1),
+                start_line: None,
+                body: "Pending reply".into(),
+                in_reply_to_id: Some(11),
+            }],
+        });
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut item = commenting_item(&fake);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.posts
+            .begin(99, Some(11), "you".into(), "Posting reply".into());
+        install_item(&app, item, cx);
+        cx.update(|cx| app.update(cx, |this, cx| this.resume_session(0, cx)));
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1100.), px(1800.)));
+        for _ in 0..3 {
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            vcx.run_until_parked();
+        }
+        let root = vcx.debug_bounds("discussion-0-review-false-11").unwrap();
+        for selector in [
+            "discussion-0-review-false-12",
+            "discussion-0-post-99",
+            "conversation-draft-0-13",
+        ] {
+            let reply = vcx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing {selector}"));
+            assert_eq!(
+                reply.left() - root.left(),
+                px(threads::REPLY_INDENT),
+                "{selector}"
+            );
+            assert!(
+                reply.right() <= root.right(),
+                "reply must stay inside the thread"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn inline_reply_headers_and_markdown_are_indented_in_both_views(cx: &mut gpui::TestAppContext) {
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            for side in ["LEFT", "RIGHT"] {
+                let fake = FakePr::with_threads(vec![
+                    rc(11, "a.rs", Some(side), Some(1), "Root", "alice", "a", None),
+                    rc(
+                        12,
+                        "a.rs",
+                        Some(side),
+                        Some(1),
+                        "Reply",
+                        "bob",
+                        "b",
+                        Some(11),
+                    ),
+                    rc(
+                        13,
+                        "a.rs",
+                        Some(side),
+                        Some(1),
+                        "Another reply",
+                        "you",
+                        "c",
+                        Some(12),
+                    ),
+                ]);
+                let (window, app) = queue_window(cx, fake.clone());
+                let mut item = loop_pr_item(fake.comments.lock().unwrap().clone());
+                let ItemState::Ready(data) = &mut item.state else {
+                    unreachable!()
+                };
+                data.mode = mode;
+                data.diff = sample_diff(); // Line 1 exists on both sides.
+                data.set_rows(data.row_build());
+                install_item(&app, item, cx);
+                let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+                vcx.simulate_resize(size(px(1100.), px(1800.)));
+                for _ in 0..3 {
+                    vcx.update(|window, cx| {
+                        let _ = window.draw(cx);
+                    });
+                    vcx.run_until_parked();
+                }
+                let root_header = vcx.debug_bounds("inline-avatar-11").unwrap();
+                let root_body = vcx.debug_bounds("inline-text-0-11-0-card").unwrap();
+                for (header_selector, body_selector) in [
+                    ("inline-avatar-12", "inline-text-0-12-0-card"),
+                    ("inline-avatar-13", "inline-text-0-13-0-card"),
+                ] {
+                    let header = vcx.debug_bounds(header_selector).unwrap();
+                    let body = vcx.debug_bounds(body_selector).unwrap();
+                    assert_eq!(
+                        header.left() - root_header.left(),
+                        px(threads::REPLY_INDENT)
+                    );
+                    assert_eq!(body.left() - root_body.left(), px(threads::REPLY_INDENT));
+                    assert!(body.size.width <= root_body.size.width);
+                    if mode == ViewMode::Split {
+                        assert!(body.right() <= root_body.right());
+                    }
+                }
+            }
+        }
+    }
+
     fn click_commenting(vcx: &mut gpui::VisualTestContext, selector: &'static str) {
         vcx.update(|window, cx| {
             let _ = window.draw(cx);
