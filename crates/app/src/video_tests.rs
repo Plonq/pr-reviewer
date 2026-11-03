@@ -1,0 +1,364 @@
+// Included in markdown_hosts, sharing the real-window fixtures.
+fn pending_video_downloads(app: &gpui::Entity<ReviewApp>, cx: &mut gpui::TestAppContext) {
+    // Real streaming/HEAD/redirects use socket tests; UI tests stay on GPUI's
+    // deterministic scheduler and cannot be woken by foreign OS threads.
+    cx.update(|cx| {
+        let hub = app.read(cx).video_hub.clone();
+        hub.update(cx, |hub, _| {
+            hub.download = Arc::new(|_, _| Box::pin(futures::future::pending()))
+        });
+    });
+}
+fn video_conversation(
+    cx: &mut gpui::TestAppContext,
+    body: &str,
+) -> (gpui::AnyWindowHandle, gpui::Entity<ReviewApp>) {
+    let (window, app) = viewer_conversation(cx, body);
+    pending_video_downloads(&app, cx);
+    (window, app)
+}
+#[gpui::test]
+fn extensionless_attachment_cards_use_metadata_once_and_leave_other_links_stock(
+    cx: &mut gpui::TestAppContext,
+) {
+    image_client(cx);
+    let body = "https://github.com/user-attachments/assets/video\n\nhttps://github.com/user-attachments/assets/image\n\n`https://github.com/user-attachments/assets/code`\n\n[ordinary](https://example.com/page)\n\nBefore [image](https://github.com/user-attachments/assets/image) after.";
+    let (window, app) = video_conversation(cx, body);
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = probes.clone();
+    cx.update(|cx| {
+        app.read(cx).video_hub.clone().update(cx, |hub, _| {
+            hub.probe = Arc::new(move |url| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(async move { Ok(url.ends_with("/video")) })
+            });
+        })
+    });
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1400.), px(1400.)));
+    draw_settled(&mut vcx);
+    assert_eq!(
+        vcx.debug_bounds("conversation-0-video-0")
+            .unwrap()
+            .size
+            .height,
+        px(260.)
+    );
+    let other = Box::leak(
+        format!(
+            "conversation-0-video-{}",
+            body.find("https://github.com/user-attachments/assets/image")
+                .unwrap()
+        )
+        .into_boxed_str(),
+    );
+    assert!(vcx.debug_bounds(other).unwrap().size.height < px(260.));
+    let inline = Box::leak(
+        format!("conversation-0-video-{}", body.find("[image]").unwrap()).into_boxed_str(),
+    );
+    let bounds = vcx.debug_bounds(inline).unwrap();
+    assert!(
+        bounds.size.height < px(60.) && bounds.size.width > px(1.),
+        "non-video inline links do not retain a video-sized gap: {bounds:?}"
+    );
+    draw_settled(&mut vcx);
+    assert_eq!(
+        probes.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "code/ordinary links are not probed; metadata is reused"
+    );
+    cx.update(|cx| assert!(app.read(cx).video_hub.read(cx).session.is_none()));
+    click_selector(&mut vcx, "video-play");
+    cx.update(|cx| {
+        assert!(app
+            .read(cx)
+            .video_hub
+            .read(cx)
+            .session
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .target
+            .url
+            .ends_with("/video"))
+    });
+    assert!(cx.opened_url().is_none());
+}
+
+#[gpui::test]
+fn video_cancel_retry_and_starting_another_card_release_the_old_session(
+    cx: &mut gpui::TestAppContext,
+) {
+    image_client(cx);
+    let (window, app) = video_conversation(
+        cx,
+        "[one](http://127.0.0.1:1/one.mp4)\n\n[two](http://127.0.0.1:1/two.mov)",
+    );
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1400.), px(1400.)));
+    draw_settled(&mut vcx);
+    click_selector(&mut vcx, "video-play");
+    let first = cx.update(|cx| app.read(cx).video_hub.read(cx).session.clone().unwrap());
+    click_selector(&mut vcx, "video-cancel");
+    assert!(vcx.debug_bounds("video-retry").is_some());
+    click_selector(&mut vcx, "video-retry");
+    cx.update(|cx| {
+        assert_eq!(
+            app.read(cx)
+                .video_hub
+                .read(cx)
+                .session
+                .as_ref()
+                .unwrap()
+                .entity_id(),
+            first.entity_id()
+        )
+    });
+    // The remaining Play video button is on the other, inactive card.
+    click_selector(&mut vcx, "video-play");
+    cx.update(|cx| {
+        let hub = app.read(cx).video_hub.read(cx);
+        assert_ne!(hub.session.as_ref().unwrap().entity_id(), first.entity_id());
+        assert!(!first.read(cx).is_playing());
+    });
+    assert!(cx.opened_url().is_none());
+}
+
+#[gpui::test]
+fn video_download_errors_are_retryable_and_never_open_a_browser(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    let (window, app) = video_conversation(cx, "[Recording](http://127.0.0.1:1/recording.mp4)");
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = attempts.clone();
+    cx.update(|cx| {
+        app.read(cx).video_hub.clone().update(cx, |hub, _| {
+            hub.download = Arc::new(move |_, _| {
+                let attempt = counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(async move {
+                    if attempt == 0 {
+                        Err(anyhow::anyhow!("Could not download video"))
+                    } else {
+                        futures::future::pending().await
+                    }
+                })
+            });
+        })
+    });
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    draw_settled(&mut vcx);
+    click_selector(&mut vcx, "video-play");
+    assert!(vcx.debug_bounds("video-error").is_some());
+    assert!(vcx.debug_bounds("video-retry").is_some());
+    assert!(cx.opened_url().is_none());
+    click_selector(&mut vcx, "video-retry");
+    assert!(vcx.debug_bounds("video-error").is_none());
+    assert!(vcx.debug_bounds("video-loading").is_some());
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+    click_selector(&mut vcx, "video-cancel");
+    assert!(vcx.debug_bounds("video-canceled").is_some());
+}
+
+#[gpui::test]
+fn video_is_opt_in_and_overlay_moves_the_same_session(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    let (window, app) = video_conversation(cx, "[Recording](http://127.0.0.1:1/recording.mp4)");
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1400.), px(900.)));
+    draw_settled(&mut vcx);
+    assert!(vcx.debug_bounds("video-card").is_some());
+    cx.update(|cx| {
+        assert!(
+            app.read(cx).video_hub.read(cx).session.is_none(),
+            "rendering never starts a download/player"
+        )
+    });
+    click_selector(&mut vcx, "video-play");
+    let session = cx.update(|cx| app.read(cx).video_hub.read(cx).session.clone().unwrap());
+    vcx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            window.focus(&app.tree_filter_input.focus_handle(cx), cx)
+        })
+    });
+    click_selector(&mut vcx, "video-expand");
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(app.video_hub.read(cx).expanded);
+        assert!(app.image_viewer.as_ref().unwrap().video.is_some());
+        assert_eq!(
+            app.video_hub.read(cx).session.as_ref().unwrap().entity_id(),
+            session.entity_id()
+        );
+    });
+    assert_eq!(
+        vcx.debug_bounds("image-viewer").unwrap().size,
+        size(px(1400.), px(900.))
+    );
+    assert!(
+        vcx.debug_bounds("viewer-image").is_none(),
+        "videos must not invoke the image loader"
+    );
+    assert!(vcx.debug_bounds("video-session").unwrap().size.height > px(260.));
+    vcx.simulate_keystrokes("cmd-w cmd-o j tab");
+    draw_settled(&mut vcx);
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert_eq!(app.items.len(), 1);
+        assert!(!app.quick_open_visible);
+    });
+    vcx.simulate_keystrokes("space");
+    draw_settled(&mut vcx);
+    cx.update(|cx| {
+        assert!(
+            !session.read(cx).is_playing(),
+            "Space can pause a pending playback request"
+        )
+    });
+    vcx.simulate_keystrokes("space");
+    draw_settled(&mut vcx);
+    cx.update(|cx| assert!(session.read(cx).is_playing()));
+    vcx.simulate_keystrokes("escape");
+    draw_settled(&mut vcx);
+    vcx.update(|window, cx| {
+        let app = app.read(cx);
+        assert!(app.image_viewer.is_none());
+        assert!(!app.video_hub.read(cx).expanded);
+        assert_eq!(
+            app.video_hub.read(cx).session.as_ref().unwrap().entity_id(),
+            session.entity_id()
+        );
+        assert!(app.tree_filter_input.focus_handle(cx).is_focused(window));
+    });
+    assert!(cx.opened_url().is_none());
+    cx.update(|cx| app.update(cx, |app, cx| app.close_item(app.active, cx)));
+    draw_settled(&mut vcx);
+    cx.update(|cx| assert!(app.read(cx).video_hub.read(cx).session.is_none()));
+}
+
+#[gpui::test]
+fn video_pauses_on_pane_exit_and_cards_preserve_virtualized_geometry(
+    cx: &mut gpui::TestAppContext,
+) {
+    image_client(cx);
+    let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+    pending_video_downloads(&app, cx);
+    let mut item = loop_pr_item(vec![rc(
+        11,
+        "a.rs",
+        Some("RIGHT"),
+        Some(1),
+        "[clip](http://127.0.0.1:1/recording.mp4)",
+        "alice",
+        "2026-01-01T00:00:00Z",
+        None,
+    )]);
+    let ItemState::Ready(data) = &mut item.state else {
+        unreachable!()
+    };
+    data.diff = diff_core::parse_patch(
+        "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n tail\n",
+    );
+    data.set_rows(data.row_build());
+    install_item(&app, item, cx);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1500.), px(1000.)));
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                let data = app.active_data_mut().unwrap();
+                data.mode = mode;
+                data.rebuild_rows_anchored();
+                data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+                data.scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(point(px(0.), px(0.)));
+                cx.notify();
+            })
+        });
+        draw_settled(&mut vcx);
+        assert_eq!(
+            vcx.debug_bounds("inline-text-0-11-0-video-0")
+                .unwrap()
+                .size
+                .height,
+            px(260.)
+        );
+        let before = cx.update(|cx| app.read(cx).active_data().unwrap().rows.len());
+        click_selector(&mut vcx, "video-play");
+        click_selector(&mut vcx, "video-expand");
+        vcx.simulate_keystrokes("escape");
+        draw_settled(&mut vcx);
+        cx.update(|cx| assert_eq!(app.read(cx).active_data().unwrap().rows.len(), before));
+        // Even if the top reservation is virtualized away the remaining card
+        // remains a real element, not a replacement row or independent window.
+        vcx.simulate_resize(size(px(1500.), px(400.)));
+        cx.update(|cx| app.update(cx, |app, cx| {
+            let data = app.active_data_mut().unwrap();
+            let first = data.rows.iter().position(|row| matches!(row, Row::CommentBody { text, slot: 0, .. } if text.comment_id == 11)).unwrap();
+            data.scroll.0.borrow().base_handle.set_offset(point(px(0.), -px((first + 1) as f32 * row_height()))); cx.notify();
+        }));
+        draw_settled(&mut vcx);
+        assert!(vcx.debug_bounds("video-session").is_some());
+        click_selector(&mut vcx, "video-expand");
+        assert!(vcx.debug_bounds("image-viewer").is_some());
+        vcx.simulate_keystrokes("escape");
+        draw_settled(&mut vcx);
+        cx.update(|cx| app.update(cx, |app, cx| app.flip_pane(ItemPane::Conversation, cx)));
+        draw_settled(&mut vcx);
+        cx.update(|cx| {
+            assert!(!app
+                .read(cx)
+                .video_hub
+                .read(cx)
+                .session
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .is_playing())
+        });
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.video_hub.update(cx, |hub, cx| hub.release(cx));
+                app.flip_pane(ItemPane::Changes, cx);
+            })
+        });
+        vcx.simulate_resize(size(px(1500.), px(1000.)));
+    }
+}
+
+#[gpui::test]
+fn video_html_and_mixed_link_cards_use_shared_markdown_hosts(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    let (window, app) = viewer_conversation(cx,
+        "<video autoplay controls src='http://127.0.0.1:1/a.mov'></video>\n\nBefore [clip](http://127.0.0.1:1/b.webm) after.\n\n`http://127.0.0.1:1/code.mp4`");
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1400.), px(1500.)));
+    draw_settled(&mut vcx);
+    assert!(vcx.debug_bounds("conversation-0-video-0").is_some());
+    cx.update(|cx| assert!(app.read(cx).video_hub.read(cx).session.is_none()));
+    // Conversation comments/review threads use exactly the same host.
+    cx.update(|cx| {
+        app.update(cx, |app, cx| {
+            let data = app.active_data_mut().unwrap();
+            let mut discussion = conversation::tests::sample_discussion();
+            discussion.comments.truncate(1);
+            discussion.comments[0].body = "[video](http://127.0.0.1:1/comment.mp4)".into();
+            discussion.threads[0].is_resolved = false;
+            discussion.threads[0].is_outdated = false;
+            discussion.threads[0].comments.truncate(1);
+            discussion.threads[0].comments[0].body =
+                "<video src='http://127.0.0.1:1/thread.mov'></video>".into();
+            data.discussion = Some(discussion);
+            cx.notify();
+        })
+    });
+    vcx.simulate_resize(size(px(1400.), px(3000.)));
+    draw_settled(&mut vcx);
+    assert!(vcx
+        .debug_bounds("discussion-0-main-false-1-video-0")
+        .is_some());
+    assert!(vcx
+        .debug_bounds("discussion-0-review-false-1-video-0")
+        .is_some());
+}

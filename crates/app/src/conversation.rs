@@ -938,6 +938,7 @@ impl ReviewApp {
                             .child(render_markdown(
                                 &format!("conversation-draft-{}-{}", item.id, draft.id),
                                 preprocess(&draft.body, slug),
+                                self,
                                 window,
                                 cx,
                             )),
@@ -1034,6 +1035,7 @@ impl ReviewApp {
             card = card.child(render_markdown(
                 &format!("discussion-{item_id}-{key}"),
                 preprocess(&comment.body, slug),
+                self,
                 window,
                 cx,
             ));

@@ -1,5 +1,5 @@
-//! Window-filling image inspection, deliberately separate from review input.
-//! Images use GPUI's existing asset loader and the app's authenticated HTTP client.
+//! Window-filling media inspection, deliberately separate from review input.
+//! Images retain the existing GPUI loader; video moves its live session here.
 use crate::ReviewApp;
 use gpui::component::{button::Button, Sizable, WindowExt};
 use gpui::{
@@ -67,6 +67,7 @@ impl Transform {
 pub(crate) struct ImageViewer {
     pub target: ImageTarget,
     pub item_id: u64,
+    pub video: Option<crate::video::Origin>,
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
     pub transform: Transform,
@@ -88,6 +89,17 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_media(target, item_id, None, window, cx);
+    }
+
+    fn open_media(
+        &mut self,
+        target: ImageTarget,
+        item_id: u64,
+        video: Option<crate::video::Origin>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Never stack this over a composer or another modal. A delayed click
         // from a no-longer-active review must not open an orphaned viewer.
         if self.image_viewer.is_some()
@@ -101,9 +113,18 @@ impl ReviewApp {
         let focus = cx.focus_handle();
         let previous_focus = window.focused(cx);
         window.focus(&focus, cx);
+        self.video_hub.update(cx, |hub, cx| {
+            if video.is_some() {
+                hub.expanded = true;
+            } else {
+                hub.pause(cx);
+            }
+            cx.notify();
+        });
         self.image_viewer = Some(ImageViewer {
             target,
             item_id,
+            video,
             focus,
             previous_focus,
             transform: Transform::default(),
@@ -112,12 +133,61 @@ impl ReviewApp {
         cx.notify();
     }
 
+    pub(crate) fn open_video(
+        &mut self,
+        target: crate::video::VideoTarget,
+        origin: crate::video::Origin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Keep the existing modal's focus/input boundary and presentation. The
+        // session entity moves between inline and overlay, never recreated.
+        if self.image_viewer.is_some()
+            || self
+                .active_item()
+                .is_none_or(|item| item.id != origin.item || item.pane != origin.pane)
+        {
+            return;
+        }
+        if !self
+            .video_hub
+            .read(cx)
+            .session
+            .as_ref()
+            .is_some_and(|s| s.read(cx).origin == origin)
+        {
+            return;
+        }
+        let item_id = origin.item;
+        self.open_media(
+            ImageTarget {
+                url: target.url.to_string().into(),
+                alt: target.label,
+                link: None,
+            },
+            item_id,
+            Some(origin),
+            window,
+            cx,
+        );
+    }
+
     pub(crate) fn close_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(viewer) = self.image_viewer.take() {
+            if viewer.video.is_some() {
+                self.video_hub.update(cx, |hub, cx| {
+                    hub.expanded = false;
+                    cx.notify();
+                });
+            }
             if self.show_queue
-                || self
-                    .active_item()
-                    .is_none_or(|item| item.id != viewer.item_id)
+                || self.active_item().is_none_or(|item| {
+                    item.id != viewer.item_id
+                        || viewer
+                            .video
+                            .as_ref()
+                            .is_some_and(|origin| origin.pane != item.pane)
+                })
             {
                 // The originating pane no longer exists; its old input may
                 // have disappeared with it. Focus the current review/queue.
@@ -138,15 +208,25 @@ impl ReviewApp {
     ) -> Option<gpui::AnyElement> {
         let viewer = self.image_viewer.as_ref()?;
         if self.show_queue
-            || self
-                .active_item()
-                .is_none_or(|item| item.id != viewer.item_id)
+            || self.active_item().is_none_or(|item| {
+                item.id != viewer.item_id
+                    || viewer
+                        .video
+                        .as_ref()
+                        .is_some_and(|origin| origin.pane != item.pane)
+            })
         {
             self.close_image(window, cx);
             return None;
         }
+        let is_video = viewer.video.is_some();
         let resource = Resource::Uri(viewer.target.url.clone());
-        let loaded = window.use_asset::<ImgResourceLoader>(&resource, cx);
+        let loaded = if is_video {
+            None
+        } else {
+            window.use_asset::<ImgResourceLoader>(&resource, cx)
+        };
+        let session = self.video_hub.read(cx).session.clone();
         let viewport = window.viewport_size();
         let toolbar_height = if viewport.width < px(760.) { 92. } else { 52. };
         let available = size(
@@ -158,86 +238,95 @@ impl ReviewApp {
         let url = viewer.target.url.clone();
         let link = viewer.target.link.clone();
         let mut label = "Image".to_string();
-        let content = match loaded {
-            Some(Ok(image)) => {
-                // Let GPUI resolve logical dimensions, including its SVG
-                // rasterization scale; RenderImage::size is in device pixels.
-                let natural = img(image.clone()).into_any_element().layout_as_root(
-                    gpui::AvailableSpace::min_size(),
-                    window,
-                    cx,
-                );
-                let (drawn, offset, scale) = viewer.transform.geometry(
-                    size(
-                        f32::from(natural.width).max(1.),
-                        f32::from(natural.height).max(1.),
-                    ),
-                    available,
-                );
-                label = format!("{:.0}%", scale * 100.);
-                div()
-                    .absolute()
-                    .left(px(offset.x + 16.))
-                    .top(px(offset.y + 16.))
-                    .w(px(drawn.width))
-                    .h(px(drawn.height))
-                    .child(
-                        img(image)
-                            .id("viewer-image")
-                            .size_full()
-                            .object_fit(gpui::ObjectFit::Contain),
-                    )
-                    .id("viewer-image-surface")
-                    .debug_selector(|| "viewer-image".into())
-                    .cursor_grab()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|app, event: &gpui::MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            if let Some(viewer) = &mut app.image_viewer {
-                                viewer.drag = Some((event.position, viewer.transform.pan));
-                            }
-                        }),
-                    )
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .into_any_element()
-            }
-            Some(Err(_)) => div()
+        let content = if is_video {
+            div()
+                .id("video-overlay-surface")
                 .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
+                .p_3()
+                .children(session)
+                .into_any_element()
+        } else {
+            match loaded {
+                Some(Ok(image)) => {
+                    // Let GPUI resolve logical dimensions, including its SVG
+                    // rasterization scale; RenderImage::size is in device pixels.
+                    let natural = img(image.clone()).into_any_element().layout_as_root(
+                        gpui::AvailableSpace::min_size(),
+                        window,
+                        cx,
+                    );
+                    let (drawn, offset, scale) = viewer.transform.geometry(
+                        size(
+                            f32::from(natural.width).max(1.),
+                            f32::from(natural.height).max(1.),
+                        ),
+                        available,
+                    );
+                    label = format!("{:.0}%", scale * 100.);
                     div()
-                        .id("viewer-error")
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .debug_selector(|| "viewer-error".into())
+                        .absolute()
+                        .left(px(offset.x + 16.))
+                        .top(px(offset.y + 16.))
+                        .w(px(drawn.width))
+                        .h(px(drawn.height))
+                        .child(
+                            img(image)
+                                .id("viewer-image")
+                                .size_full()
+                                .object_fit(gpui::ObjectFit::Contain),
+                        )
+                        .id("viewer-image-surface")
+                        .debug_selector(|| "viewer-image".into())
+                        .cursor_grab()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|app, event: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(viewer) = &mut app.image_viewer {
+                                    viewer.drag = Some((event.position, viewer.transform.pan));
+                                }
+                            }),
+                        )
                         .on_click(|_, _, cx| cx.stop_propagation())
-                        .child("Could not load this image.")
-                        .child(control(
-                            "viewer-retry",
-                            Button::new("viewer-retry").label("Retry").small().on_click(
-                                cx.listener(|app, _, _, cx| {
-                                    if let Some(viewer) = &app.image_viewer {
-                                        gpui::ImageSource::from(viewer.target.url.clone())
-                                            .remove_asset(cx);
-                                        cx.notify();
-                                    }
-                                }),
-                            ),
-                        )),
-                )
-                .into_any_element(),
-            None => div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .debug_selector(|| "viewer-loading".into())
-                .child("Loading image…")
-                .into_any_element(),
+                        .into_any_element()
+                }
+                Some(Err(_)) => div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("viewer-error")
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .debug_selector(|| "viewer-error".into())
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child("Could not load this image.")
+                            .child(control(
+                                "viewer-retry",
+                                Button::new("viewer-retry").label("Retry").small().on_click(
+                                    cx.listener(|app, _, _, cx| {
+                                        if let Some(viewer) = &app.image_viewer {
+                                            gpui::ImageSource::from(viewer.target.url.clone())
+                                                .remove_asset(cx);
+                                            cx.notify();
+                                        }
+                                    }),
+                                ),
+                            )),
+                    )
+                    .into_any_element(),
+                None => div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .debug_selector(|| "viewer-loading".into())
+                    .child("Loading image…")
+                    .into_any_element(),
+            }
         };
         Some(
             div()
@@ -255,6 +344,14 @@ impl ReviewApp {
                 .capture_key_down(cx.listener(|app, event: &KeyDownEvent, window, cx| {
                     cx.stop_propagation();
                     window.prevent_default();
+                    if app.image_viewer.as_ref().is_some_and(|v| v.video.is_some())
+                        && event.keystroke.key != "escape"
+                    {
+                        if let Some(s) = app.video_hub.read(cx).session.clone() {
+                            s.update(cx, |s, cx| s.key(&event.keystroke.key, cx));
+                        }
+                        return;
+                    }
                     match event.keystroke.key.as_str() {
                         "escape" => app.close_image(window, cx),
                         "+" | "=" => {
@@ -320,6 +417,9 @@ impl ReviewApp {
                 .on_scroll(cx.listener(|app, event: &gpui::ScrollEvent, _, cx| {
                     cx.stop_propagation();
                     if let Some(viewer) = &mut app.image_viewer {
+                        if viewer.video.is_some() {
+                            return;
+                        }
                         let delta = f32::from(event.delta.pixel_delta(px(20.)).y);
                         viewer.transform.zoom_by((delta * 0.005).exp());
                         cx.notify();
@@ -351,42 +451,47 @@ impl ReviewApp {
                         .content_center()
                         .items_center()
                         .gap_2()
-                        .child(control(
-                            "viewer-out",
-                            Button::new("viewer-out")
-                                .label("−")
-                                .small()
-                                .on_click(cx.listener(|app, _, _, cx| {
-                                    if let Some(v) = &mut app.image_viewer {
-                                        v.transform.zoom_by(1. / 1.5);
-                                        cx.notify();
-                                    }
-                                })),
-                        ))
-                        .child(label)
-                        .child(control(
-                            "viewer-in",
-                            Button::new("viewer-in")
-                                .label("+")
-                                .small()
-                                .on_click(cx.listener(|app, _, _, cx| {
-                                    if let Some(v) = &mut app.image_viewer {
-                                        v.transform.zoom_by(1.5);
-                                        cx.notify();
-                                    }
-                                })),
-                        ))
-                        .child(control(
-                            "viewer-fit",
-                            Button::new("viewer-fit").label("Fit (0)").small().on_click(
-                                cx.listener(|app, _, _, cx| {
-                                    if let Some(v) = &mut app.image_viewer {
-                                        v.transform.fit();
-                                        cx.notify();
-                                    }
-                                }),
-                            ),
-                        ))
+                        .when(!is_video, |bar| {
+                            bar.child(control(
+                                "viewer-out",
+                                Button::new("viewer-out")
+                                    .label("−")
+                                    .small()
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        if let Some(v) = &mut app.image_viewer {
+                                            v.transform.zoom_by(1. / 1.5);
+                                            cx.notify();
+                                        }
+                                    })),
+                            ))
+                            .child(label)
+                            .child(control(
+                                "viewer-in",
+                                Button::new("viewer-in")
+                                    .label("+")
+                                    .small()
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        if let Some(v) = &mut app.image_viewer {
+                                            v.transform.zoom_by(1.5);
+                                            cx.notify();
+                                        }
+                                    })),
+                            ))
+                            .child(control(
+                                "viewer-fit",
+                                Button::new("viewer-fit").label("Fit (0)").small().on_click(
+                                    cx.listener(|app, _, _, cx| {
+                                        if let Some(v) = &mut app.image_viewer {
+                                            v.transform.fit();
+                                            cx.notify();
+                                        }
+                                    }),
+                                ),
+                            ))
+                        })
+                        .when(is_video, |bar| {
+                            bar.child("Video — Space: play/pause · ←/→: seek · M: mute")
+                        })
                         .child(div().flex_1())
                         .when_some(link, |bar, link| {
                             bar.child(control(
@@ -400,14 +505,22 @@ impl ReviewApp {
                         .child(control(
                             "viewer-browser",
                             Button::new("viewer-browser")
-                                .label("Open image in browser")
+                                .label(if is_video {
+                                    "Open video in browser"
+                                } else {
+                                    "Open image in browser"
+                                })
                                 .small()
                                 .on_click(move |_, _, cx| cx.open_url(url.as_ref())),
                         ))
                         .child(control(
                             "viewer-close",
                             Button::new("viewer-close")
-                                .label("Close (Esc)")
+                                .label(if is_video {
+                                    "Return inline (Esc)"
+                                } else {
+                                    "Close (Esc)"
+                                })
                                 .small()
                                 .on_click(
                                     cx.listener(|app, _, window, cx| app.close_image(window, cx)),

@@ -28,6 +28,8 @@ mod theme;
 mod threads;
 mod tree;
 mod upgrade;
+mod video;
+mod video_player;
 mod viewed;
 
 #[cfg(test)]
@@ -1822,6 +1824,7 @@ pub(crate) struct ReviewApp {
     composer_gen: u64,
     review: Option<ReviewDialog>,
     image_viewer: Option<image_viewer::ImageViewer>,
+    video_hub: gpui::Entity<video::VideoHub>,
     /// Bumped on every review-dialog open/close, same protocol as
     /// `composer_gen`.
     review_gen: u64,
@@ -1885,12 +1888,18 @@ impl ReviewApp {
             cx.new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
+        let video_hub = cx.new(|_| video::VideoHub::default());
         let _subscriptions = vec![
-            cx.on_app_quit(|this, _| {
+            cx.observe(&video_hub, |_, _, cx| cx.notify()),
+            cx.on_app_quit(|this, cx| {
+                this.video_hub.update(cx, |hub, cx| hub.release(cx));
                 this.persist_positions();
                 async {}
             }),
-            cx.on_release(|this, _| this.persist_positions()),
+            cx.on_release(|this, cx| {
+                this.video_hub.update(cx, |hub, cx| hub.release(cx));
+                this.persist_positions();
+            }),
             // The window's key status: the app refreshes when it comes
             // back to the front, and the background poll only runs while
             // it is frontmost.
@@ -1956,6 +1965,7 @@ impl ReviewApp {
             composer_gen: 0,
             review: None,
             image_viewer: None,
+            video_hub,
             review_gen: 0,
             sessions: HashMap::new(),
             github,
@@ -6071,7 +6081,13 @@ impl ReviewApp {
                 .child(SharedString::from("No description provided."))
                 .into_any_element()
         } else {
-            conversation::render_markdown(&format!("conversation-{}", item.id), body, window, cx)
+            conversation::render_markdown(
+                &format!("conversation-{}", item.id),
+                body,
+                self,
+                window,
+                cx,
+            )
         };
         // The pane itself is the scroll container — like the diff pane, not
         // like the TextView's own scrollable mode — so the wheel scrolls
@@ -6131,6 +6147,7 @@ impl ReviewApp {
                                                     &review.body,
                                                     &loc.repo_slug(),
                                                 ),
+                                                self,
                                                 window,
                                                 cx,
                                             )),
@@ -6153,6 +6170,12 @@ impl Render for ReviewApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.resync_comment_wrap(window);
         self.resync_inline_text(window, cx);
+        let item_ids = self.items.iter().map(|item| item.id).collect::<Vec<_>>();
+        let active = (!self.show_queue)
+            .then(|| self.active_item().map(|item| (item.id, item.pane)))
+            .flatten();
+        self.video_hub
+            .update(cx, |hub, cx| hub.sync(&item_ids, active, cx));
         let image_viewer = self.render_image_viewer(window, cx);
         let pane: gpui::AnyElement = if self.show_queue {
             self.render_queue(cx)
@@ -6428,7 +6451,11 @@ impl Render for ReviewApp {
             });
         // A sibling, not a descendant of review shortcut handlers. Keep the
         // review mounted so its selection, scroll and element state survive.
-        div().size_full().relative().child(content).children(image_viewer)
+        div()
+            .size_full()
+            .relative()
+            .child(content)
+            .children(image_viewer)
     }
 }
 
@@ -6510,6 +6537,7 @@ mod tests {
     mod markdown_hosts {
         include!("markdown_tests.rs");
         include!("image_viewer_tests.rs");
+        include!("video_tests.rs");
     }
 
     #[gpui::test]

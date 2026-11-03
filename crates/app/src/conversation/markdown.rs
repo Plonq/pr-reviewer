@@ -1,7 +1,8 @@
-//! Stock Markdown prose/selection, with image-only Kit extension hooks.
+//! Stock Markdown prose/selection, with narrowly scoped media extension hooks.
 //! GitHub's image-only paste/drop HTML uses the same activation path; general
 //! HTML and reference-style images retain stock Kit behaviour.
 mod github_image;
+mod video;
 use crate::{image_viewer::ImageTarget, ReviewApp};
 use gpui::component::text::{
     InlineElement, InlineRenderContext, MarkdownExtensions, MarkdownNode, MarkdownParseContext,
@@ -388,6 +389,7 @@ impl MarkdownPlugin for ImagePlugin {
 pub(crate) fn render(
     id: &str,
     source: String,
+    app: &ReviewApp,
     _: &mut Window,
     cx: &mut Context<ReviewApp>,
 ) -> gpui::AnyElement {
@@ -397,13 +399,28 @@ pub(crate) fn render(
         host: id.to_owned().into(),
         links: Arc::new(OnceLock::new()),
     };
+    let video = video::VideoPlugin {
+        block: true,
+        hub: app.video_hub.clone(),
+        owner: cx.entity().downgrade(),
+        item: app.active_item().map_or(0, |item| item.id),
+        pane: app
+            .active_item()
+            .map_or(crate::ItemPane::Changes, |item| item.pane),
+        host: id.to_owned().into(),
+    };
     let extensions = MarkdownExtensions::default()
+        .plugin(video.clone())
+        .plugin(video::VideoPlugin {
+            block: false,
+            ..video
+        })
         .plugin(plugin.clone())
         .plugin(ImagePlugin {
             block: false,
             ..plugin
         })
-        .parser_revision(1);
+        .parser_revision(2);
     div()
         .w_full()
         .min_w_0()

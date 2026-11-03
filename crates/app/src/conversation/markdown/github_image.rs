@@ -10,7 +10,7 @@ pub(super) struct GitHubImage {
     pub height: Option<f32>,
 }
 
-fn decode_entities(value: &str) -> String {
+pub(super) fn decode_entities(value: &str) -> String {
     let mut decoded = String::new();
     let mut rest = value;
     while let Some(start) = rest.find('&') {

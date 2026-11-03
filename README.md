@@ -142,6 +142,8 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   including cached private GitHub attachments using the secure HTTP bridge;
   click Markdown images or GitHub's pasted/dropped images to inspect them in a
   full-window image viewer
+- embedded video cards with native macOS playback, audio, seeking and a
+  full-window viewer shared with images; private videos use protected local files
 - automatic Jira links for `PYAPI-123`, `BOT-123`, `CS-123`, and `HELP-123`
   in PR descriptions and comments (excluding code and existing links)
 - local repo diffs
@@ -191,12 +193,55 @@ without entering macOS fullscreen or changing Spaces.
 GitHub image tags (including its user-image hosts) use the viewer and retain
 their specified inline dimensions, including tags followed by a plain caption.
 General HTML containers, non-GitHub HTML images and reference-style images retain
-stock behaviour; reference-style images remain omitted. There is no video playback.
+stock behaviour; reference-style images remain omitted.
+
+### Video playback
+
+Direct MP4, M4V, MOV and WebM links, GitHub attachment links, and standalone HTML
+`<video src="https://…">` embeds (including `<source src="…">`) become inline
+video cards in descriptions, conversation comments and unified/split review
+threads. GitHub attachment links without an extension are checked with a
+metadata-only HEAD request; only a `video/*` response becomes a video card.
+Ordinary links, images and code examples are not downloaded as videos. Rich HTML
+containers, iframes, YouTube and Vimeo players are not supported.
+
+- Click **Play video** to download and play. There is **no autoplay**, even when
+  an HTML embed requests it, and only one video session is kept at a time.
+- Inline controls provide play/pause, a clickable seek bar, **−5s / +5s**,
+  mute/unmute and volume. **Expand** moves the same session into the window-filling
+  media viewer; **Esc**, **Return inline**, or the backdrop returns it inline
+  without resetting playback. In the viewer, **Space** toggles playback,
+  **← / →** seek five seconds and **M** toggles mute.
+- Leaving the originating review pane pauses playback; returning does not resume
+  automatically. Starting another video or closing the originating review stops
+  the old session and releases its local file.
+- Download progress, **Cancel**, **Retry**, unsupported-format and playback-error
+  states stay in the card. **Browser** is an explicit fallback, never automatic.
+
+Playback uses macOS AVFoundation and system codecs, not a webview or bundled
+codec library. Common H.264/AAC MP4 and MOV files are the primary targets. WebM
+links are recognized but decoding depends on macOS support for their container
+and codecs; **WebM playback is not guaranteed**. An unsupported file shows an
+error and offers the browser fallback.
+
+Videos stream directly to a private temporary session cache (0700 directory,
+0600 file), with atomic completion and a **128 MiB per-video limit**. Only one
+completed session file is retained; a canceled in-flight transfer may take up to
+its current network read timeout to release its partial file. Transfers are
+serialized to bound temporary storage to at most one completed file plus one
+partial download. Files are removed when that session is released or on normal
+app exit, and are not a persistent/offline video library. An abnormal process
+termination can leave temporary files for the OS to clean up. GitHub tokens are
+used only for the existing trusted HTTPS attachment endpoints, are never sent
+to CDN redirects or to AVFoundation, and are not stored with the video. The
+image cache and its existing download limits are unchanged. See the
+[native playback testing guide](docs/video-playback-testing.md) for fixture and
+manual verification instructions.
 
 ### Stock Markdown differences
 
-Kit's TextView still owns prose, tables, code and selection; small image-only
-plugins add viewer activation for Markdown images and GitHub's pasted-image HTML.
+Kit's TextView still owns prose, tables, code and selection; small media plugins
+add image activation and video cards without replacing the stock renderer.
 GitHub mention/issue links and emoji preprocessing remain. SVG source toggles are
 not provided. Mixed-paragraph images can be smaller than the former media cards,
 and narrow tables may clip.
