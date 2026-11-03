@@ -458,22 +458,25 @@ impl ReviewApp {
                         .on_click(cx.listener(|app, _, window, cx| app.close_image(window, cx)))
                         .child(content),
                 )
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(toolbar_height))
-                        .when(is_video, |bar| bar.hidden())
-                        .px_3()
-                        .flex()
-                        .flex_wrap()
-                        .content_center()
-                        .items_center()
-                        .gap_2()
-                        .when(!is_video, |bar| {
-                            bar.child(control(
+                // Video has its own in-picture chrome. Do not mount this bar:
+                // `.hidden()` before `.flex()` is overridden by display:flex,
+                // leaving its children overflowing a zero-height video toolbar.
+                .when(!is_video, |overlay| {
+                    overlay.child(
+                        div()
+                            .debug_selector(|| "viewer-toolbar".into())
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(toolbar_height))
+                            .px_3()
+                            .flex()
+                            .flex_wrap()
+                            .content_center()
+                            .items_center()
+                            .gap_2()
+                            .child(control(
                                 "viewer-out",
                                 Button::new("viewer-out")
                                     .label("−")
@@ -509,45 +512,34 @@ impl ReviewApp {
                                     }),
                                 ),
                             ))
-                        })
-                        .when(is_video, |bar| {
-                            bar.child("Video — Space: play/pause · ←/→: seek · M: mute")
-                        })
-                        .child(div().flex_1())
-                        .when_some(link, |bar, link| {
-                            bar.child(control(
-                                "viewer-link",
-                                Button::new("viewer-link")
-                                    .label("Follow link")
+                            .child(div().flex_1())
+                            .when_some(link, |bar, link| {
+                                bar.child(control(
+                                    "viewer-link",
+                                    Button::new("viewer-link")
+                                        .label("Follow link")
+                                        .small()
+                                        .on_click(move |_, _, cx| cx.open_url(&link)),
+                                ))
+                            })
+                            .child(control(
+                                "viewer-browser",
+                                Button::new("viewer-browser")
+                                    .label("Open image in browser")
                                     .small()
-                                    .on_click(move |_, _, cx| cx.open_url(&link)),
+                                    .on_click(move |_, _, cx| cx.open_url(url.as_ref())),
                             ))
-                        })
-                        .child(control(
-                            "viewer-browser",
-                            Button::new("viewer-browser")
-                                .label(if is_video {
-                                    "Open video in browser"
-                                } else {
-                                    "Open image in browser"
-                                })
-                                .small()
-                                .on_click(move |_, _, cx| cx.open_url(url.as_ref())),
-                        ))
-                        .child(control(
-                            "viewer-close",
-                            Button::new("viewer-close")
-                                .label(if is_video {
-                                    "Return inline (Esc)"
-                                } else {
-                                    "Close (Esc)"
-                                })
-                                .small()
-                                .on_click(
-                                    cx.listener(|app, _, window, cx| app.close_image(window, cx)),
-                                ),
-                        )),
-                )
+                            .child(control(
+                                "viewer-close",
+                                Button::new("viewer-close")
+                                    .label("Close (Esc)")
+                                    .small()
+                                    .on_click(cx.listener(|app, _, window, cx| {
+                                        app.close_image(window, cx)
+                                    })),
+                            )),
+                    )
+                })
                 .into_any_element(),
         )
     }

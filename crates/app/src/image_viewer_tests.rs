@@ -61,6 +61,18 @@ fn image_viewer_is_below_header_modal_and_restores_review_state(cx: &mut gpui::T
     let header = APP_HEADER_HEIGHT;
     assert_eq!(overlay.origin, point(px(0.), header));
     assert_eq!(overlay.size, size(px(1200.), px(800.) - header));
+    let toolbar = vcx.debug_bounds("viewer-toolbar").unwrap();
+    assert_eq!(toolbar.top(), overlay.top());
+    for selector in ["viewer-out", "viewer-fit", "viewer-browser", "viewer-close"] {
+        let bounds = vcx.debug_bounds(selector).unwrap();
+        assert!(
+            bounds.left() >= toolbar.left()
+                && bounds.right() <= toolbar.right()
+                && bounds.top() >= toolbar.top()
+                && bounds.bottom() <= toolbar.bottom(),
+            "image toolbar control outside its bar: {selector}: {bounds:?} in {toolbar:?}"
+        );
+    }
     assert!(vcx.debug_bounds("viewer-image").is_some());
     vcx.simulate_keystrokes("cmd-o cmd-w j tab");
     vcx.dispatch_action(ToggleView);

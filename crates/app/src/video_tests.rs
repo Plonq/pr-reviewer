@@ -436,6 +436,33 @@ fn video_expanded_bounds_stay_below_header_and_inside_window(cx: &mut gpui::Test
         let overlay = vcx.debug_bounds("image-viewer").unwrap();
         let picture = vcx.debug_bounds("video-session").unwrap();
         let controls = vcx.debug_bounds("video-controls").unwrap();
+        for selector in [
+            "viewer-toolbar",
+            "viewer-browser",
+            "viewer-close",
+            "viewer-fit",
+        ] {
+            assert!(
+                vcx.debug_bounds(selector).is_none(),
+                "legacy image toolbar must not be rendered for video: {selector}"
+            );
+        }
+        for selector in [
+            "video-play",
+            "video-toggle",
+            "video-seek",
+            "video-volume",
+            "video-expand",
+        ] {
+            let bounds = vcx.debug_bounds(selector).unwrap();
+            assert!(
+                bounds.left() >= picture.left()
+                    && bounds.right() <= picture.right()
+                    && bounds.top() >= picture.top()
+                    && bounds.bottom() <= picture.bottom(),
+                "video control outside picture: {selector}: {bounds:?} in {picture:?}"
+            );
+        }
         assert_eq!(overlay.top(), APP_HEADER_HEIGHT);
         assert_eq!(overlay.bottom(), viewport.height);
         assert!(
@@ -476,6 +503,8 @@ fn video_expanded_controls_hide_on_idle_and_window_exit(cx: &mut gpui::TestAppCo
         .advance_clock(std::time::Duration::from_millis(600));
     draw_settled(&mut vcx);
     assert!(vcx.debug_bounds("video-controls").is_none());
+    assert!(vcx.debug_bounds("viewer-browser").is_none());
+    assert!(vcx.debug_bounds("viewer-close").is_none());
     assert!(
         vcx.debug_bounds("video-play").is_none(),
         "paused center Play also hides"
