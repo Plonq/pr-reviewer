@@ -139,7 +139,11 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   Posted comments appear immediately as placeholders and update in place when
   the refreshed discussion arrives.
 - stock Markdown and images in conversations and diff comment threads,
-  including cached private GitHub attachments using the secure HTTP bridge
+  including cached private GitHub attachments using the secure HTTP bridge;
+  click Markdown images or GitHub's pasted/dropped images to inspect them in a
+  full-window image viewer
+- embedded video cards with native macOS playback, audio, seeking and a
+  full-window viewer shared with images; private videos use protected local files
 - automatic Jira links for `PYAPI-123`, `BOT-123`, `CS-123`, and `HELP-123`
   in PR descriptions and comments (excluding code and existing links)
 - local repo diffs
@@ -166,14 +170,99 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
 - dark-only theme with soft blue-grey surfaces and pastel accents
 
+### Image viewer
+
+Click an image written as Markdown (`![alt](https://…)`) or GitHub's generated
+`<img width="…" height="…" alt="…" src="https://github.com/…">` in a PR description,
+conversation comment or inline review thread to inspect it without leaving
+Gander. GitHub commonly uses the HTML form when you paste or drop a screenshot.
+This includes extensionless GitHub attachment URLs, SVGs and animated images, in
+both unified and split Changes views. The dark overlay fills the area below the
+app header, keeping macOS window controls clear, without entering fullscreen or
+changing Spaces. While either media viewer is open, app header content is replaced
+by a blank, non-interactive strip; it returns when the viewer closes.
+
+- Images start fitted to the window (small images are not enlarged).
+- Zoom with **+ / −**, the mouse wheel/trackpad, or the toolbar buttons; drag the
+  image to pan. Press **0** or **F**, or click **Fit**, to reset.
+- Close with **Esc**, **Close**, or a click on the backdrop. Review shortcuts and
+  scrolling are isolated while the viewer is open; closing restores focus and
+  leaves the review's scroll position, navigation and diff selection intact.
+- For linked images, the image click opens the viewer, not the browser.
+  **Follow link** opens the original link; **Open image in browser** is an
+  explicit fallback. Failed image loads offer **Retry**.
+
+GitHub image tags (including its user-image hosts) use the viewer and retain
+their specified inline dimensions, including tags followed by a plain caption.
+General HTML containers, non-GitHub HTML images and reference-style images retain
+stock behaviour; reference-style images remain omitted.
+
+### Video playback
+
+Direct MP4, M4V, MOV and WebM links, GitHub attachment links, and standalone HTML
+`<video src="https://…">` embeds (including `<source src="…">`) become inline
+video cards in descriptions, conversation comments and unified/split review
+threads. GitHub attachment links without an extension are checked with a
+one-byte ranged GET request, inspecting headers without reading or caching the
+response body; only a `video/*` response becomes a video card. This works with
+GitHub's GET-signed attachment redirects, which can reject HEAD requests.
+Ordinary links, images and code examples are not downloaded as videos. Rich HTML
+containers, iframes, YouTube and Vimeo players are not supported.
+
+- Videos preload a paused first-frame preview and initial media ranges. There
+  is **no autoplay**, even when an HTML embed requests it. Click the picture or
+  play icon to start; playback can begin before the whole file is downloaded.
+- Play immediately starts an eager full download, independent of the decoder's
+  buffering. It continues while paused so playback no longer depends on expiring
+  attachment authorization once cached. Startup still depends on network speed
+  and the container's metadata; servers without range support may need more data.
+- Inline pictures use a larger, full-width 420px-high area. Icon controls overlay
+  the picture, appearing on hover while playing and remaining visible while
+  paused. They provide play/pause, seek/download progress, mute, volume, browser
+  fallback and expand, with tooltips. Both seek and volume support click-and-drag,
+  including outside the slider bounds. Clicking the picture toggles play/pause.
+- Expand moves the same session into the window-filling media viewer; **Esc**,
+  the collapse icon, or the backdrop returns it inline without resetting playback.
+  Expanded controls hide after two seconds without mouse movement or immediately
+  on window exit; moving the pointer reveals them. Active slider drags keep them
+  visible. In the viewer, **Space** toggles playback, **← / →** seek five seconds and **M**
+  toggles mute.
+- Only one video plays at a time. Leaving its review pane pauses it; returning
+  does not resume automatically. Closing a review releases its previews/caches.
+- Download progress, **Cancel**, **Retry**, unsupported-format and playback-error
+  states stay in the card. **Browser** is an explicit fallback, never automatic.
+
+Playback uses macOS AVFoundation and system codecs, not a webview or bundled
+codec library. Common H.264/AAC MP4 and MOV files are the primary targets. WebM
+links are recognized but decoding depends on macOS support for their container
+and codecs; **WebM playback is not guaranteed**. An unsupported file shows an
+error and offers the browser fallback.
+
+Videos use a private temporary range cache (0700 directory, 0600 sparse file),
+with a **128 MiB per-video limit**. At most four previews/caches are retained;
+additional videos prepare on hover or Play, evicting an inactive cache. Automatic
+preloading is bounded to 8 MiB per video; short clips may fit entirely. Offscreen
+row measurement never starts preloading. Only complete cached ranges are exposed
+to AVFoundation through an unguessable loopback-only URL; missing ranges are
+fetched on demand. Play also starts a full download immediately, even if the
+player already has enough buffered data. A canceled transfer can take its
+current network timeout to release its file. Files are removed on eviction,
+review closure or normal app exit, and are not a persistent/offline library.
+Abnormal termination can leave temporary files for the OS to clean up. GitHub
+tokens are used only for trusted HTTPS attachment endpoints, never sent to CDN
+redirects or AVFoundation, and never stored with the video. Signed redirect URLs
+also stay out of AVFoundation and the on-disk cache. The
+image cache and its existing download limits are unchanged. See the
+[native playback testing guide](docs/video-playback-testing.md) for fixture and
+manual verification instructions.
+
 ### Stock Markdown differences
 
-Kit's TextView owns Markdown layout and media. GitHub mention/issue links and
-emoji preprocessing remain. Reference-style images are omitted; unlinked images
-do not open on click; SVG source toggles and custom image loading/error messages
-are gone. Inline images can be smaller than the former media cards, and narrow
-tables may clip. These are intentional stock-renderer tradeoffs, not custom
-rendering features to restore.
+Kit's TextView still owns prose, tables, code and selection; small media plugins
+add image activation and video cards without replacing the stock renderer.
+GitHub mention/issue links and emoji preprocessing remain. SVG source toggles are
+not provided. Mixed-paragraph images can be smaller than the former media cards,
+and narrow tables may clip.
 
 ## Where its state lives
 

@@ -114,6 +114,7 @@ fn text_content(
     id: &str,
     source: String,
     width: Pixels,
+    app: &ReviewApp,
     window: &mut Window,
     cx: &mut Context<ReviewApp>,
 ) -> gpui::AnyElement {
@@ -127,7 +128,7 @@ fn text_content(
         .text_size(px(text_size()))
         .line_height(px(row_height()))
         .text_color(theme::subtext(cx))
-        .child(conversation::render_markdown(id, source, window, cx))
+        .child(conversation::render_markdown(id, source, app, window, cx))
         .into_any_element()
 }
 
@@ -194,6 +195,7 @@ impl ReviewApp {
                 &format!("{}-measure", text.id(item_id)),
                 rendered.clone(),
                 width,
+                self,
                 window,
                 cx,
             );
@@ -346,6 +348,7 @@ impl UniformListDecoration for InlineText {
                             &id,
                             layout.rendered.clone(),
                             layout.width,
+                            app,
                             window,
                             cx,
                         )),

@@ -8,6 +8,9 @@
 //! gpui's async world through a oneshot channel. v0.1's traffic is small
 //! image fetches, where a thread per request beats a resident runtime.
 
+#[path = "http/video.rs"]
+pub(crate) mod video;
+
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::{AsyncReadExt as _, FutureExt as _};

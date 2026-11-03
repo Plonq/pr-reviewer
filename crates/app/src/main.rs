@@ -6,6 +6,7 @@ mod conversation;
 mod diff_media;
 mod file_history;
 mod http;
+mod image_viewer;
 #[cfg(target_os = "macos")]
 mod launch_env;
 mod local_store;
@@ -27,6 +28,8 @@ mod theme;
 mod threads;
 mod tree;
 mod upgrade;
+mod video;
+mod video_player;
 mod viewed;
 
 #[cfg(test)]
@@ -283,15 +286,29 @@ fn git_env() -> [(&'static str, &'static str); 6] {
 }
 
 /// The app's assets, layered over gpui-component's default icon bundle.
-/// The queue uses an extra Lucide icon; comments use Octicon speech bubble
+/// Queue/media controls use extra Lucide icons; comments use Octicon speech bubble
 /// and smiley icons (© GitHub, MIT: https://github.com/primer/octicons).
 /// GPUI renders these as monochrome masks so they tint with the palette.
 /// App-owned icons live under `icons/gander/` to avoid upstream collisions.
 struct AppAssets;
 
-// Catalog entries alone do not bundle SVGs. Explicitly include the review
-// queue's open circle, which is not part of the default component bundle.
-gpui_kit_assets::icon_assets!(QueueIcons, [Circle]);
+// Catalog entries alone do not bundle SVGs. Include the queue/media icons
+// explicitly rather than relying on the default component bundle's subset.
+gpui_kit_assets::icon_assets!(
+    ExtraIcons,
+    [
+        Circle,
+        Play,
+        Pause,
+        Volume2,
+        VolumeX,
+        Maximize2,
+        Minimize2,
+        RotateCcw,
+        ExternalLink,
+        X
+    ]
+);
 
 /// (asset path, embedded bytes) — served exactly as an `AssetSource`
 /// expects, so the icon renders like any bundled one.
@@ -319,7 +336,7 @@ impl AssetSource for AppAssets {
         if let Some((_, bytes)) = OWNED_ASSETS.iter().find(|(known, _)| *known == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        if let Some(bytes) = QueueIcons.load(path)? {
+        if let Some(bytes) = ExtraIcons.load(path)? {
             return Ok(Some(bytes));
         }
         gpui::assets::Assets.load(path)
@@ -327,7 +344,7 @@ impl AssetSource for AppAssets {
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
         let mut all = gpui::assets::Assets.list(path)?;
-        all.extend(QueueIcons.list(path)?);
+        all.extend(ExtraIcons.list(path)?);
         all.extend(
             OWNED_ASSETS
                 .iter()
@@ -1350,6 +1367,9 @@ impl ReviewItem {
     }
 }
 
+// Explicitly shared with media overlays so native window controls stay clear.
+const APP_HEADER_HEIGHT: Pixels = px(34.);
+
 fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
     let (state_color, state_label) = match meta.state.as_str() {
         "OPEN" => (theme::green(cx), "open"),
@@ -1820,6 +1840,8 @@ pub(crate) struct ReviewApp {
     /// back into the composer generation it was submitted from.
     composer_gen: u64,
     review: Option<ReviewDialog>,
+    image_viewer: Option<image_viewer::ImageViewer>,
+    video_hub: gpui::Entity<video::VideoHub>,
     /// Bumped on every review-dialog open/close, same protocol as
     /// `composer_gen`.
     review_gen: u64,
@@ -1883,12 +1905,18 @@ impl ReviewApp {
             cx.new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
+        let video_hub = cx.new(|_| video::VideoHub::default());
         let _subscriptions = vec![
-            cx.on_app_quit(|this, _| {
+            cx.observe(&video_hub, |_, _, cx| cx.notify()),
+            cx.on_app_quit(|this, cx| {
+                this.video_hub.update(cx, |hub, cx| hub.release(cx));
                 this.persist_positions();
                 async {}
             }),
-            cx.on_release(|this, _| this.persist_positions()),
+            cx.on_release(|this, cx| {
+                this.video_hub.update(cx, |hub, cx| hub.release(cx));
+                this.persist_positions();
+            }),
             // The window's key status: the app refreshes when it comes
             // back to the front, and the background poll only runs while
             // it is frontmost.
@@ -1953,6 +1981,8 @@ impl ReviewApp {
             composer: None,
             composer_gen: 0,
             review: None,
+            image_viewer: None,
+            video_hub,
             review_gen: 0,
             sessions: HashMap::new(),
             github,
@@ -3376,6 +3406,9 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.image_viewer.is_some() {
+            return;
+        }
         let Some(item) = self.items.get(self.active) else {
             return;
         };
@@ -3879,8 +3912,8 @@ impl ReviewApp {
 
     /// Open the "submit review" modal for the active item (PR items only).
     fn open_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // One review dialog at a time; this migration adds no nested flow.
-        if self.review.is_some() {
+        // Do not stack modal interfaces.
+        if self.review.is_some() || self.image_viewer.is_some() {
             return;
         }
         let Some(item) = self.active_item() else {
@@ -4721,7 +4754,26 @@ impl ReviewApp {
             .into_any_element()
     }
 
-    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_titlebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.image_viewer.is_some() {
+            // Keep the review's geometry unchanged, but unmount all header
+            // controls (including its drag/double-click handlers) while modal.
+            return div()
+                .debug_selector(|| "media-header-spacer".into())
+                .h(APP_HEADER_HEIGHT)
+                .w_full()
+                .flex_shrink_0()
+                .bg(gpui::rgb(0x101114))
+                .occlude()
+                .on_any_mouse_down(|_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                .on_scroll(|_, _, cx| cx.stop_propagation())
+                .into_any_element();
+        }
         let content: gpui::AnyElement = if self.show_queue {
             app_title(None, cx)
         } else {
@@ -4893,9 +4945,11 @@ impl ReviewApp {
         }
         right = right.child(self.render_account(cx));
         TitleBar::new()
+            .h(APP_HEADER_HEIGHT)
             .text_size(px(13.))
             .child(content)
             .child(right)
+            .into_any_element()
     }
 
     /// The account chip at the title bar's right edge: avatar + login when
@@ -6065,7 +6119,13 @@ impl ReviewApp {
                 .child(SharedString::from("No description provided."))
                 .into_any_element()
         } else {
-            conversation::render_markdown(&format!("conversation-{}", item.id), body, window, cx)
+            conversation::render_markdown(
+                &format!("conversation-{}", item.id),
+                body,
+                self,
+                window,
+                cx,
+            )
         };
         // The pane itself is the scroll container — like the diff pane, not
         // like the TextView's own scrollable mode — so the wheel scrolls
@@ -6125,6 +6185,7 @@ impl ReviewApp {
                                                     &review.body,
                                                     &loc.repo_slug(),
                                                 ),
+                                                self,
                                                 window,
                                                 cx,
                                             )),
@@ -6147,12 +6208,19 @@ impl Render for ReviewApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.resync_comment_wrap(window);
         self.resync_inline_text(window, cx);
+        let item_ids = self.items.iter().map(|item| item.id).collect::<Vec<_>>();
+        let active = (!self.show_queue)
+            .then(|| self.active_item().map(|item| (item.id, item.pane)))
+            .flatten();
+        self.video_hub
+            .update(cx, |hub, cx| hub.sync(&item_ids, active, cx));
+        let image_viewer = self.render_image_viewer(window, cx);
         let pane: gpui::AnyElement = if self.show_queue {
             self.render_queue(cx)
         } else {
             self.render_item_pane(window, cx)
         };
-        div()
+        let content = div()
             .size_full()
             .relative()
             .flex()
@@ -6418,7 +6486,14 @@ impl Render for ReviewApp {
             // context (plain letters must stay text, like the quick-open input).
             .when(self.composer.is_some(), |root| {
                 root.child(self.render_composer(cx))
-            })
+            });
+        // A sibling, not a descendant of review shortcut handlers. Keep the
+        // review mounted so its selection, scroll and element state survive.
+        div()
+            .size_full()
+            .relative()
+            .child(content)
+            .children(image_viewer)
     }
 }
 
@@ -6499,6 +6574,8 @@ mod tests {
 
     mod markdown_hosts {
         include!("markdown_tests.rs");
+        include!("image_viewer_tests.rs");
+        include!("video_tests.rs");
     }
 
     #[gpui::test]

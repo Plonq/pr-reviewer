@@ -16,7 +16,7 @@ impl ReviewApp {
             return;
         }
         // Do not stack quick-open over another modal (for example a review).
-        if window.has_active_dialog(cx) {
+        if self.image_viewer.is_some() || window.has_active_dialog(cx) {
             return;
         }
         self.quick_open_visible = true;
