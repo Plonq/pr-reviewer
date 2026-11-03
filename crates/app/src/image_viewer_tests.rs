@@ -24,7 +24,7 @@ fn click_selector(vcx: &mut gpui::VisualTestContext, selector: &'static str) {
 }
 
 #[gpui::test]
-fn image_viewer_is_full_window_modal_and_restores_review_state(cx: &mut gpui::TestAppContext) {
+fn image_viewer_is_below_header_modal_and_restores_review_state(cx: &mut gpui::TestAppContext) {
     image_client(cx);
     let body = format!(
         "![screen](https://github.com/user-attachments/assets/screen)\n\n{}",
@@ -58,8 +58,9 @@ fn image_viewer_is_full_window_modal_and_restores_review_state(cx: &mut gpui::Te
     let offset = cx.update(|cx| app.read(cx).active_data().unwrap().conv_scroll.offset());
     click_selector(&mut vcx, "conversation-0-image-0");
     let overlay = vcx.debug_bounds("image-viewer").unwrap();
-    assert_eq!(overlay.origin, point(px(0.), px(0.)));
-    assert_eq!(overlay.size, size(px(1200.), px(800.)));
+    let header = APP_HEADER_HEIGHT;
+    assert_eq!(overlay.origin, point(px(0.), header));
+    assert_eq!(overlay.size, size(px(1200.), px(800.) - header));
     assert!(vcx.debug_bounds("viewer-image").is_some());
     vcx.simulate_keystrokes("cmd-o cmd-w j tab");
     vcx.dispatch_action(ToggleView);
@@ -132,13 +133,13 @@ fn image_viewer_zoom_drag_resize_fit_and_all_dismissals(cx: &mut gpui::TestAppCo
     draw_settled(&mut vcx);
     assert_eq!(
         vcx.debug_bounds("image-viewer").unwrap().size,
-        size(px(1100.), px(900.))
+        size(px(1100.), px(900.) - APP_HEADER_HEIGHT)
     );
     vcx.simulate_resize(size(px(500.), px(400.)));
     draw_settled(&mut vcx);
     let close = vcx.debug_bounds("viewer-close").unwrap();
     assert!(
-        close.right() <= px(500.) && close.bottom() <= px(92.),
+        close.right() <= px(500.) && close.bottom() <= APP_HEADER_HEIGHT + px(92.),
         "toolbar must remain usable in narrow windows"
     );
     click_selector(&mut vcx, "viewer-fit");

@@ -9,6 +9,9 @@ cargo build -p gander --all-targets --locked
 
 The application tests use the real Markdown hosts, diff row measurement and
 modal event handlers, with a deterministic pending downloader in GUI tests.
+GUI regressions also exercise below-header overlay bounds across resizing,
+two-second idle/window-exit control hiding, and seek/volume drags outside the
+slider bounds with clamping, release, and click isolation.
 Separate real-socket HTTP tests cover one-byte ranged GET metadata requests,
 GET-signed redirects that reject HEAD, redirect authentication, streaming bounds,
 progress, cancellation and private cache permissions. Progressive-cache tests
@@ -70,10 +73,19 @@ Use a PR containing authorized test attachments; do not post or alter the PR.
   S3 redirects can reject HEAD with 403, so discovery must use GET.
 - Check the larger inline picture, overlay icon controls/tooltips and volume
   slider. Clicking the picture toggles playback exactly once; controls must not
-  also trigger the picture click handler. Check hover chrome while playing and
-  persistent chrome while paused. Expand a paused preview before ever playing.
+  also trigger the picture click handler. Drag both sliders, including beyond
+  their ends and vertically outside their bounds; values should clamp and stop
+  updating on release, without toggling playback or closing the viewer. Check
+  inline hover chrome while playing and persistent chrome while paused.
+  Expand a paused preview before ever playing.
 - Expand while playing and return inline while paused and while playing. Check
   position/audio continuity, previous focus, review scroll and selection.
+  Both image and video overlays must start below the app header/native traffic
+  lights. Resize wide, narrow and short windows; the video picture must remain
+  wholly inside the overlay, without its top being clipped. Expanded video
+  controls (including paused center Play) must hide after two seconds without
+  mouse movement and immediately on window exit, and return on movement. They
+  must remain visible during an active slider gesture.
 - Repeat in conversation comments and inline review threads, unified and split,
   including partially virtualized cards and window resizing. Frames must remain
   clipped to the discussion pane and must not cover adjacent controls.

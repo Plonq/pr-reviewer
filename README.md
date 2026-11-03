@@ -177,8 +177,9 @@ Click an image written as Markdown (`![alt](https://…)`) or GitHub's generated
 conversation comment or inline review thread to inspect it without leaving
 Gander. GitHub commonly uses the HTML form when you paste or drop a screenshot.
 This includes extensionless GitHub attachment URLs, SVGs and animated images, in
-both unified and split Changes views. The dark overlay fills the app window
-without entering macOS fullscreen or changing Spaces.
+both unified and split Changes views. The dark overlay fills the area below the
+app header, keeping macOS window controls clear, without entering fullscreen or
+changing Spaces.
 
 - Images start fitted to the window (small images are not enlarged).
 - Zoom with **+ / −**, the mouse wheel/trackpad, or the toolbar buttons; drag the
@@ -217,10 +218,13 @@ containers, iframes, YouTube and Vimeo players are not supported.
 - Inline pictures use a larger, full-width 420px-high area. Icon controls overlay
   the picture, appearing on hover while playing and remaining visible while
   paused. They provide play/pause, seek/download progress, mute, volume, browser
-  fallback and expand, with tooltips. Clicking the picture toggles play/pause.
+  fallback and expand, with tooltips. Both seek and volume support click-and-drag,
+  including outside the slider bounds. Clicking the picture toggles play/pause.
 - Expand moves the same session into the window-filling media viewer; **Esc**,
   the collapse icon, or the backdrop returns it inline without resetting playback.
-  In the viewer, **Space** toggles playback, **← / →** seek five seconds and **M**
+  Expanded controls hide after two seconds without mouse movement or immediately
+  on window exit; moving the pointer reveals them. Active slider drags keep them
+  visible. In the viewer, **Space** toggles playback, **← / →** seek five seconds and **M**
   toggles mute.
 - Only one video plays at a time. Leaving its review pane pauses it; returning
   does not resume automatically. Closing a review releases its previews/caches.

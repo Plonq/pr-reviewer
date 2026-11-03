@@ -283,7 +283,7 @@ fn video_is_opt_in_and_overlay_moves_the_same_session(cx: &mut gpui::TestAppCont
     });
     assert_eq!(
         vcx.debug_bounds("image-viewer").unwrap().size,
-        size(px(1400.), px(900.))
+        size(px(1400.), px(900.) - APP_HEADER_HEIGHT)
     );
     assert!(
         vcx.debug_bounds("viewer-image").is_none(),
@@ -417,6 +417,191 @@ fn video_pauses_on_pane_exit_and_cards_preserve_virtualized_geometry(
         });
         vcx.simulate_resize(size(px(1500.), px(1000.)));
     }
+}
+
+#[gpui::test]
+fn video_expanded_bounds_stay_below_header_and_inside_window(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    let (window, _) = video_conversation(cx, "[clip](http://127.0.0.1:1/clip.mp4)");
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    draw_settled(&mut vcx);
+    click_selector(&mut vcx, "video-expand");
+    for viewport in [
+        size(px(1400.), px(900.)),
+        size(px(700.), px(500.)),
+        size(px(1000.), px(700.)),
+    ] {
+        vcx.simulate_resize(viewport);
+        draw_settled(&mut vcx);
+        let overlay = vcx.debug_bounds("image-viewer").unwrap();
+        let picture = vcx.debug_bounds("video-session").unwrap();
+        let controls = vcx.debug_bounds("video-controls").unwrap();
+        assert_eq!(overlay.top(), APP_HEADER_HEIGHT);
+        assert_eq!(overlay.bottom(), viewport.height);
+        assert!(
+            picture.top() >= overlay.top() && picture.bottom() <= overlay.bottom(),
+            "picture clipped: {picture:?} in {overlay:?}"
+        );
+        assert!(picture.left() >= overlay.left() && picture.right() <= overlay.right());
+        assert!(picture.size.height >= overlay.size.height - px(40.));
+        assert!(controls.top() >= picture.top() && controls.bottom() <= picture.bottom());
+    }
+}
+
+#[gpui::test]
+fn video_expanded_controls_hide_on_idle_and_window_exit(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    let (window, app) = video_conversation(cx, "[clip](http://127.0.0.1:1/clip.mp4)");
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    draw_settled(&mut vcx);
+    click_selector(&mut vcx, "video-expand");
+    let picture = vcx.debug_bounds("video-session").unwrap();
+    let p = picture.center();
+    vcx.simulate_mouse_move(p, None, Default::default());
+    draw_settled(&mut vcx);
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_millis(1500));
+    draw_settled(&mut vcx);
+    assert!(vcx.debug_bounds("video-controls").is_some());
+    vcx.simulate_mouse_move(p + point(px(5.), px(0.)), None, Default::default());
+    draw_settled(&mut vcx);
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_millis(1500));
+    draw_settled(&mut vcx);
+    assert!(
+        vcx.debug_bounds("video-controls").is_some(),
+        "movement resets the deadline"
+    );
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_millis(600));
+    draw_settled(&mut vcx);
+    assert!(vcx.debug_bounds("video-controls").is_none());
+    assert!(
+        vcx.debug_bounds("video-play").is_none(),
+        "paused center Play also hides"
+    );
+    // A synthetic stationary move must not defeat the idle deadline.
+    vcx.simulate_mouse_move(p + point(px(5.), px(0.)), None, Default::default());
+    draw_settled(&mut vcx);
+    assert!(vcx.debug_bounds("video-controls").is_none());
+    vcx.simulate_mouse_move(p, None, Default::default());
+    draw_settled(&mut vcx);
+    assert!(vcx.debug_bounds("video-controls").is_some());
+    vcx.simulate_event(gpui::MouseExitEvent {
+        position: p,
+        ..Default::default()
+    });
+    draw_settled(&mut vcx);
+    assert!(
+        vcx.debug_bounds("video-controls").is_none(),
+        "leaving the window hides immediately"
+    );
+    vcx.simulate_mouse_move(p, None, Default::default());
+    draw_settled(&mut vcx);
+    assert!(
+        vcx.debug_bounds("video-controls").is_some(),
+        "reentering at the same position reveals controls"
+    );
+    let session = cx.update(|cx| app.read(cx).video_hub.read(cx).session.clone().unwrap());
+    vcx.simulate_keystrokes("space");
+    draw_settled(&mut vcx);
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_millis(2100));
+    draw_settled(&mut vcx);
+    assert!(
+        vcx.debug_bounds("video-controls").is_none(),
+        "playing chrome also idles"
+    );
+    cx.update(|cx| assert!(session.read(cx).is_playing()));
+    vcx.simulate_keystrokes("escape");
+    draw_settled(&mut vcx);
+    assert!(
+        vcx.debug_bounds("video-controls").is_some(),
+        "returning inline resets expanded hiding"
+    );
+}
+
+#[gpui::test]
+fn video_sliders_drag_clamp_release_and_never_toggle_playback(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    let (window, app) = video_conversation(cx, "[clip](http://127.0.0.1:1/clip.mp4)");
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    draw_settled(&mut vcx);
+    click_selector(&mut vcx, "video-expand");
+    let session = cx.update(|cx| app.read(cx).video_hub.read(cx).session.clone().unwrap());
+    for expanded in [true, false] {
+        if !expanded {
+            vcx.simulate_keystrokes("escape");
+            draw_settled(&mut vcx);
+        }
+        for (selector, kind) in [("video-seek", "seek"), ("video-volume", "volume")] {
+            let b = vcx.debug_bounds(selector).unwrap();
+            let p = point(b.left() + b.size.width * 0.25, b.center().y);
+            vcx.simulate_mouse_down(p, MouseButton::Left, Default::default());
+            draw_settled(&mut vcx);
+            cx.update(|cx| {
+                let (actual, value) = session.read(cx).slider_gesture().unwrap();
+                assert_eq!(actual, kind);
+                assert!((value - 0.25).abs() < 0.01);
+            });
+            // Cross the slider vertically: capture must continue the same gesture.
+            let p = point(b.left() + b.size.width * 0.75, b.top() - px(30.));
+            vcx.simulate_mouse_move(p, MouseButton::Left, Default::default());
+            draw_settled(&mut vcx);
+            cx.update(|cx| {
+                assert!((session.read(cx).slider_gesture().unwrap().1 - 0.75).abs() < 0.01)
+            });
+            if expanded {
+                vcx.executor()
+                    .advance_clock(std::time::Duration::from_millis(2100));
+                draw_settled(&mut vcx);
+                assert!(
+                    vcx.debug_bounds("video-controls").is_some(),
+                    "do not hide during a gesture"
+                );
+            }
+            for (x, value) in [(b.right() + px(20.), 1.), (b.left() - px(20.), 0.)] {
+                let p = point(x, b.top() - px(30.));
+                vcx.simulate_mouse_move(p, MouseButton::Left, Default::default());
+                draw_settled(&mut vcx);
+                cx.update(|cx| assert_eq!(session.read(cx).slider_gesture().unwrap().1, value));
+            }
+            let p = if expanded {
+                point(px(1.), APP_HEADER_HEIGHT + px(1.)) // outside the video, on its backdrop
+            } else {
+                point(b.center().x, b.top() - px(30.))
+            };
+            vcx.simulate_mouse_up(p, MouseButton::Left, Default::default());
+            draw_settled(&mut vcx);
+            cx.update(|cx| {
+                assert!(session.read(cx).slider_gesture().is_none());
+                assert!(
+                    !session.read(cx).is_playing(),
+                    "slider release must not click the picture"
+                );
+            });
+            assert_eq!(
+                vcx.debug_bounds("image-viewer").is_some(),
+                expanded,
+                "slider release must not dismiss the viewer"
+            );
+            vcx.simulate_mouse_move(p, None, Default::default());
+            draw_settled(&mut vcx);
+            cx.update(|cx| assert!(session.read(cx).slider_gesture().is_none()));
+        }
+    }
+    let picture = vcx.debug_bounds("video-session").unwrap();
+    vcx.simulate_click(
+        picture.origin + point(px(20.), px(100.)),
+        Default::default(),
+    );
+    draw_settled(&mut vcx);
+    cx.update(|cx| {
+        assert!(
+            session.read(cx).is_playing(),
+            "a subsequent picture click still works"
+        )
+    });
 }
 
 #[gpui::test]

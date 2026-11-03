@@ -395,6 +395,11 @@ pub(crate) struct VideoSession {
     activated: bool,
     download_task: Option<Task<()>>,
     tick_task: Option<Task<()>>,
+    controls_visible: bool,
+    controls_pointer: Option<gpui::Point<gpui::Pixels>>,
+    controls_task: Option<Task<()>>,
+    slider_drag: Option<controls::SliderDrag>,
+    suppress_picture_click: bool,
 }
 
 impl VideoSession {
@@ -422,6 +427,11 @@ impl VideoSession {
             activated: false,
             download_task: None,
             tick_task: None,
+            controls_visible: true,
+            controls_pointer: None,
+            controls_task: None,
+            slider_drag: None,
+            suppress_picture_click: false,
         };
         session.load(cx);
         session
@@ -581,6 +591,7 @@ impl VideoSession {
         self.file = None;
         self.download_task = None;
         self.tick_task = None;
+        self.slider_drag = None;
         self.canceled = true;
     }
     pub fn key(&mut self, key: &str, cx: &mut Context<Self>) {

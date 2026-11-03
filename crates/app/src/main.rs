@@ -1367,6 +1367,9 @@ impl ReviewItem {
     }
 }
 
+// Explicitly shared with media overlays so native window controls stay clear.
+const APP_HEADER_HEIGHT: Pixels = px(34.);
+
 fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
     let (state_color, state_label) = match meta.state.as_str() {
         "OPEN" => (theme::green(cx), "open"),
@@ -4923,6 +4926,7 @@ impl ReviewApp {
         }
         right = right.child(self.render_account(cx));
         TitleBar::new()
+            .h(APP_HEADER_HEIGHT)
             .text_size(px(13.))
             .child(content)
             .child(right)

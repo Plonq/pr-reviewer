@@ -1,6 +1,6 @@
 //! Window-filling media inspection, deliberately separate from review input.
 //! Images retain the existing GPUI loader; video moves its live session here.
-use crate::ReviewApp;
+use crate::{ReviewApp, APP_HEADER_HEIGHT};
 use gpui::component::{button::Button, Sizable, WindowExt};
 use gpui::{
     div, img, point, prelude::*, px, size, Context, FocusHandle, ImgResourceLoader, KeyDownEvent,
@@ -116,6 +116,9 @@ impl ReviewApp {
         self.video_hub.update(cx, |hub, cx| {
             if video.is_some() {
                 hub.expanded = true;
+                if let Some(session) = &hub.session {
+                    session.update(cx, |s, cx| s.expanded_controls(true, cx));
+                }
             } else {
                 hub.pause(cx);
             }
@@ -177,6 +180,9 @@ impl ReviewApp {
             if viewer.video.is_some() {
                 self.video_hub.update(cx, |hub, cx| {
                     hub.expanded = false;
+                    if let Some(session) = &hub.session {
+                        session.update(cx, |s, cx| s.expanded_controls(false, cx));
+                    }
                     cx.notify();
                 });
             }
@@ -235,9 +241,12 @@ impl ReviewApp {
         } else {
             52.
         };
+        // Keep the native traffic lights and app header above either viewer.
+        // Use this same content height for fitting images and laying out video.
+        let content_height = (viewport.height - APP_HEADER_HEIGHT).max(px(0.));
         let available = size(
             (f32::from(viewport.width) - 32.).max(1.),
-            (f32::from(viewport.height) - toolbar_height - 32.).max(1.),
+            (f32::from(content_height) - toolbar_height - 32.).max(1.),
         );
         let viewer = self.image_viewer.as_mut().unwrap();
         let focus = viewer.focus.clone();
@@ -247,7 +256,9 @@ impl ReviewApp {
         let content = if is_video {
             div()
                 .id("video-overlay-surface")
-                .size_full()
+                .absolute()
+                .inset_0()
+                .flex()
                 .p_3()
                 .children(session)
                 .into_any_element()
@@ -338,7 +349,10 @@ impl ReviewApp {
             div()
                 .id("image-viewer")
                 .absolute()
-                .inset_0()
+                .top(APP_HEADER_HEIGHT)
+                .left_0()
+                .right_0()
+                .h(content_height)
                 .occlude()
                 .debug_selector(|| "image-viewer".into())
                 .bg(gpui::rgb(0x101114))
