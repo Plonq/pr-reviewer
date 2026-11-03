@@ -201,7 +201,9 @@ Direct MP4, M4V, MOV and WebM links, GitHub attachment links, and standalone HTM
 `<video src="https://…">` embeds (including `<source src="…">`) become inline
 video cards in descriptions, conversation comments and unified/split review
 threads. GitHub attachment links without an extension are checked with a
-metadata-only HEAD request; only a `video/*` response becomes a video card.
+one-byte ranged GET request, inspecting headers without reading or caching the
+response body; only a `video/*` response becomes a video card. This works with
+GitHub's GET-signed attachment redirects, which can reject HEAD requests.
 Ordinary links, images and code examples are not downloaded as videos. Rich HTML
 containers, iframes, YouTube and Vimeo players are not supported.
 

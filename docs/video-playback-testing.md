@@ -9,9 +9,10 @@ cargo build -p gander --all-targets --locked
 
 The application tests use the real Markdown hosts, diff row measurement and
 modal event handlers, with a deterministic pending downloader in GUI tests.
-Separate real-socket HTTP tests cover HEAD metadata, redirect authentication,
-streaming bounds, progress, cancellation, atomic files and permissions. They do
-not require GitHub credentials or download public media.
+Separate real-socket HTTP tests cover one-byte ranged GET metadata requests,
+GET-signed redirects that reject HEAD, redirect authentication, streaming bounds,
+progress, cancellation, atomic files and permissions. They do not require
+GitHub credentials or download public media.
 
 ## Native decoding probe
 
@@ -55,7 +56,10 @@ Use a PR containing authorized test attachments; do not post or alter the PR.
 - Check MP4 and portrait MOV playback, sound, correct orientation/aspect ratio,
   seeking, end/replay, mute and volume. Repeat with the app already fullscreen.
 - Check private extensionless GitHub attachments while signed in through `gh`.
-  Discovery should use metadata only; the full GET starts only after Play.
+  Discovery should send `Range: bytes=0-0` and inspect headers without reading
+  the body (including when Range is ignored); the full download starts only
+  after Play. GitHub's signed S3 redirects can reject HEAD with 403, so discovery
+  must use GET.
 - Expand while playing and return inline while paused and while playing. Check
   position/audio continuity, previous focus, review scroll and selection.
 - Repeat in conversation comments and inline review threads, unified and split,

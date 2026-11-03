@@ -1,6 +1,6 @@
-//! Video-only requests: HEAD discovery, then opt-in streaming to a protected
-//! session cache. Image request budgets and buffering are intentionally intact.
-use super::{authenticate, http, needs_github_token, UreqHttpClient};
+//! Video-only requests: ranged metadata discovery, then opt-in streaming to a
+//! protected session cache. Image request budgets and buffering stay intact.
+use super::{authenticate, http, needs_github_token, TokenProvider, UreqHttpClient};
 use anyhow::{bail, ensure, Context as _};
 use futures::channel::oneshot;
 use std::{
@@ -110,23 +110,29 @@ pub(crate) fn discover(url: String) -> oneshot::Receiver<anyhow::Result<bool>> {
         let result = (|| {
             ensure!(attachment(&url), "Not a GitHub attachment");
             let client = UreqHttpClient::new();
-            probe(authenticate(
-                agent()
-                    .head(&url)
-                    .set("Accept-Encoding", "identity")
-                    .timeout(Duration::from_secs(30)),
-                &url,
-                &http::HeaderMap::new(),
-                &client.token,
-            ))
+            probe(&url, &client.token)
         })();
         let _ = tx.send(result);
     });
     rx
 }
 
-fn probe(request: ureq::Request) -> anyhow::Result<bool> {
-    let response = request.call()?;
+fn probe(url: &str, token: &TokenProvider) -> anyhow::Result<bool> {
+    // GitHub redirects uploads to GET-signed S3 URLs: following them with HEAD
+    // fails signature validation (403), even when GitHub authentication worked.
+    // Ask for one byte instead, but inspect headers only and drop the response.
+    // Never read/cache a media body here, even if a server ignores Range.
+    let response = authenticate(
+        agent()
+            .get(url)
+            .set("Range", "bytes=0-0")
+            .set("Accept-Encoding", "identity")
+            .timeout(Duration::from_secs(30)),
+        url,
+        &http::HeaderMap::new(),
+        token,
+    )
+    .call()?;
     Ok(is_video_type(
         response.header("Content-Type").unwrap_or_default(),
     ))
@@ -316,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_is_head_only_and_does_not_guess_extensionless_types() {
+    fn metadata_uses_a_one_byte_range_without_reading_bodies_or_guessing_types() {
         for (mime, expected) in [
             ("video/mp4", true),
             ("image/png", false),
@@ -324,9 +330,46 @@ mod tests {
             ("text/html", false),
         ] {
             let (url, worker) = server(format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: 100000000\r\nConnection: close\r\n\r\n"));
-            assert_eq!(probe(agent().head(&url)).unwrap(), expected);
-            assert!(worker.join().unwrap().starts_with("HEAD / "));
+            let token: TokenProvider = Arc::new(|| None);
+            assert_eq!(probe(&url, &token).unwrap(), expected);
+            let request = worker.join().unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("get / "));
+            assert!(request.contains("range: bytes=0-0\r\n"));
+            assert!(request.contains("accept-encoding: identity\r\n"));
         }
+    }
+
+    #[test]
+    fn metadata_follows_get_signed_redirects_that_reject_head() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cdn = format!("http://{}/signed-video", listener.local_addr().unwrap());
+        let cdn_worker = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = [0; 4096];
+                let n = socket.read(&mut bytes).unwrap();
+                let request = String::from_utf8_lossy(&bytes[..n]).to_ascii_lowercase();
+                if request.starts_with("get ") && request.contains("range: bytes=0-0\r\n") {
+                    // No body: discovery must complete from headers alone.
+                    socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Type: video/quicktime\r\nContent-Range: bytes 0-0/16145979\r\nContent-Length: 1\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+                assert!(!request.contains("authorization:"));
+            }
+        });
+        assert!(matches!(
+            agent().head(&cdn).call(),
+            Err(ureq::Error::Status(403, _))
+        ));
+        let (origin, origin_worker) = server(format!("HTTP/1.1 302 Found\r\nLocation: {cdn}?signed=not-persisted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+        let token: TokenProvider = Arc::new(|| None);
+        assert!(probe(&origin, &token).unwrap());
+        let request = origin_worker.join().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get / "));
+        assert!(request.contains("range: bytes=0-0\r\n"));
+        cdn_worker.join().unwrap();
     }
 
     #[test]
