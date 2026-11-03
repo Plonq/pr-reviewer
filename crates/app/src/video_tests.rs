@@ -420,6 +420,82 @@ fn video_pauses_on_pane_exit_and_cards_preserve_virtualized_geometry(
 }
 
 #[gpui::test]
+fn media_overlays_hide_header_and_ignore_its_previous_hit_targets(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    for (body, open) in [
+        (
+            "![screen](https://github.com/user-attachments/assets/screen)",
+            "conversation-0-image-0",
+        ),
+        ("[clip](http://127.0.0.1:1/clip.mp4)", "video-expand"),
+    ] {
+        let (window, app) = video_conversation(cx, body);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1400.), px(900.)));
+        draw_settled(&mut vcx);
+        let header = gpui::Bounds::new(point(px(0.), px(0.)), size(px(1400.), APP_HEADER_HEIGHT));
+        let targets =
+            ["review-queue-navigation", "pane-toggle"].map(|id| vcx.debug_bounds(id).unwrap());
+        click_selector(&mut vcx, open);
+        let focus = vcx.update(|window, cx| window.focused(cx).unwrap());
+        for id in ["review-queue-navigation", "pane-toggle"] {
+            assert!(
+                vcx.debug_bounds(id).is_none(),
+                "header control remains mounted: {id}"
+            );
+        }
+        let spacer = vcx.debug_bounds("media-header-spacer").unwrap();
+        assert_eq!(spacer, header, "keep the review layout stable");
+        for bounds in targets {
+            vcx.simulate_click(bounds.center(), Default::default());
+            draw_settled(&mut vcx);
+            vcx.update(|window, _| {
+                assert!(focus.is_focused(window), "header click stole focus: {body}")
+            });
+        }
+        for direction in [
+            gpui::NavigationDirection::Back,
+            gpui::NavigationDirection::Forward,
+        ] {
+            let button = gpui::MouseButton::Navigate(direction);
+            vcx.simulate_mouse_down(header.center(), button, Default::default());
+            vcx.simulate_mouse_up(header.center(), button, Default::default());
+            vcx.update(|window, _| {
+                assert!(
+                    focus.is_focused(window),
+                    "header navigation button stole focus: {body}"
+                )
+            });
+        }
+        vcx.simulate_keystrokes("tab");
+        draw_settled(&mut vcx);
+        cx.update(|cx| {
+            let app = app.read(cx);
+            assert!(app.image_viewer.is_some());
+            assert!(!app.show_queue);
+            assert_eq!(app.active_item().unwrap().pane, ItemPane::Conversation);
+        });
+        vcx.update(|window, cx| {
+            assert!(
+                focus.contains_focused(window, cx),
+                "focus must remain within the media overlay"
+            )
+        });
+        vcx.simulate_keystrokes("escape");
+        draw_settled(&mut vcx);
+        assert!(vcx.debug_bounds("media-header-spacer").is_none());
+        for (id, bounds) in ["review-queue-navigation", "pane-toggle"]
+            .into_iter()
+            .zip(targets)
+        {
+            assert_eq!(vcx.debug_bounds(id), Some(bounds));
+        }
+        click_selector(&mut vcx, "pane-toggle");
+        cx.update(|cx| assert_eq!(app.read(cx).active_item().unwrap().pane, ItemPane::Changes));
+    }
+}
+
+#[gpui::test]
 fn video_expanded_bounds_stay_below_header_and_inside_window(cx: &mut gpui::TestAppContext) {
     image_client(cx);
     let (window, _) = video_conversation(cx, "[clip](http://127.0.0.1:1/clip.mp4)");

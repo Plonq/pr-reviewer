@@ -179,7 +179,8 @@ Gander. GitHub commonly uses the HTML form when you paste or drop a screenshot.
 This includes extensionless GitHub attachment URLs, SVGs and animated images, in
 both unified and split Changes views. The dark overlay fills the area below the
 app header, keeping macOS window controls clear, without entering fullscreen or
-changing Spaces.
+changing Spaces. While either media viewer is open, app header content is replaced
+by a blank, non-interactive strip; it returns when the viewer closes.
 
 - Images start fitted to the window (small images are not enlarged).
 - Zoom with **+ / −**, the mouse wheel/trackpad, or the toolbar buttons; drag the

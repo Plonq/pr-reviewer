@@ -80,8 +80,11 @@ Use a PR containing authorized test attachments; do not post or alter the PR.
   Expand a paused preview before ever playing.
 - Expand while playing and return inline while paused and while playing. Check
   position/audio continuity, previous focus, review scroll and selection.
-  Both image and video overlays must start below the app header/native traffic
-  lights. Resize wide, narrow and short windows; the video picture must remain
+  Both image and video overlays must start below the native traffic lights.
+  App header content must disappear while either viewer is open; clicking its
+  former controls must not navigate, trigger actions or steal modal focus.
+  Closing the viewer must restore the header and review layout unchanged.
+  Resize wide, narrow and short windows; the video picture must remain
   wholly inside the overlay, without its top being clipped. Expanded video
   controls (including paused center Play) must hide after two seconds without
   mouse movement and immediately on window exit, and return on movement. They

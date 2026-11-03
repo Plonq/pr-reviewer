@@ -4754,7 +4754,26 @@ impl ReviewApp {
             .into_any_element()
     }
 
-    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_titlebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.image_viewer.is_some() {
+            // Keep the review's geometry unchanged, but unmount all header
+            // controls (including its drag/double-click handlers) while modal.
+            return div()
+                .debug_selector(|| "media-header-spacer".into())
+                .h(APP_HEADER_HEIGHT)
+                .w_full()
+                .flex_shrink_0()
+                .bg(gpui::rgb(0x101114))
+                .occlude()
+                .on_any_mouse_down(|_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                .on_scroll(|_, _, cx| cx.stop_propagation())
+                .into_any_element();
+        }
         let content: gpui::AnyElement = if self.show_queue {
             app_title(None, cx)
         } else {
@@ -4930,6 +4949,7 @@ impl ReviewApp {
             .text_size(px(13.))
             .child(content)
             .child(right)
+            .into_any_element()
     }
 
     /// The account chip at the title bar's right edge: avatar + login when
