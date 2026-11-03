@@ -80,6 +80,9 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   or mouse back/forward buttons revisit files at their remembered scroll positions.
   History survives refreshes and switching open reviews, but resets on close or
   comparison-scope changes; selecting another file after going back clears forward history
+- image diffs show before and after side by side, including SVGs; additions
+  and deletions leave the missing side empty. Video and other non-image media
+  are links only, with no inline playback in the diff
 - unified + split views; double-click a word to select it, then drag to extend
   the selection by whole words (`cmd-c` copies the selection)
 - **All changes / Changed since last review** in the Changes pane: compare the

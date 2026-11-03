@@ -57,6 +57,7 @@ pub(crate) struct Loaded {
     /// Original patch coordinates, before re-diffing full file contents.
     pub(crate) anchor_hunks: Vec<Vec<diff_core::Hunk>>,
     pub(crate) upgrades: HashMap<usize, FileUpgrade>,
+    pub(crate) file_media: HashMap<usize, crate::file_media::MediaFile>,
     pub(crate) built_rows: BuiltRows,
     pub(crate) mode: ViewMode,
     /// The file the rows were built for (file mode).
@@ -226,7 +227,7 @@ pub(crate) fn fetch_item_with_conversation(
         .files
         .iter()
         .enumerate()
-        .filter(|(_, file)| file.status != diff_core::FileStatus::Binary && !file.hunks.is_empty())
+        .filter(|(_, file)| crate::file_media::file_kind(file).is_none() && !file.hunks.is_empty())
         .map(|(file_ix, file)| UpgradeJob {
             file_ix,
             old_path: file.old_path.clone(),
@@ -259,6 +260,13 @@ pub(crate) fn fetch_item_with_conversation(
             upgrades.insert(file.file_ix, file.upgrade);
         }
     }
+    let file_media = crate::file_media::prepare(
+        &diff,
+        source,
+        &meta,
+        review_base.as_deref().or(pr_base.as_deref()),
+        review_base_files.as_deref(),
+    );
     let built_rows = build_rows(RowsView {
         diff: &diff,
         upgrades: &upgrades,
@@ -275,6 +283,7 @@ pub(crate) fn fetch_item_with_conversation(
         diff,
         anchor_hunks,
         upgrades,
+        file_media,
         built_rows,
         mode,
         file_ix,

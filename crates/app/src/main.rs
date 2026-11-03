@@ -5,6 +5,7 @@ mod comment_editor;
 mod conversation;
 mod diff_media;
 mod file_history;
+mod file_media;
 mod http;
 mod image_viewer;
 #[cfg(target_os = "macos")]
@@ -628,6 +629,7 @@ pub(crate) struct ItemData {
     /// tables and full new-side lines. The re-diffed hunks themselves
     /// replace `diff.files[ix].hunks`. Reset on refresh.
     upgrades: HashMap<usize, FileUpgrade>,
+    file_media: HashMap<usize, file_media::MediaFile>,
     /// Review threads grouped by anchor; Some for PR items (possibly empty),
     /// and for local items with in-memory draft comments.
     comments: Option<CommentIndex>,
@@ -715,6 +717,7 @@ impl ItemData {
             deletions: 0,
             selection: None,
             upgrades: HashMap::new(),
+            file_media: HashMap::new(),
             comments,
             local_review,
             comments_visible: true,
@@ -1223,6 +1226,7 @@ impl ReviewItem {
             diff,
             anchor_hunks,
             upgrades,
+            file_media,
             mut built_rows,
             mode,
             file_ix,
@@ -1266,6 +1270,7 @@ impl ReviewItem {
                 data.review_base_files = review_base_files;
                 data.discussion_generation += 1;
                 data.upgrades = upgrades;
+                data.file_media = file_media;
                 data.expanded_regions.clear();
                 data.discussion = discussion;
                 if let Some(discussion) = &data.discussion {
@@ -1349,6 +1354,7 @@ impl ReviewItem {
                 ));
                 data.anchor_hunks = anchor_hunks;
                 data.upgrades = upgrades;
+                data.file_media = file_media;
                 data.discussion = discussion;
                 data.commits = commits;
                 data.pr_base = pr_base;
@@ -5767,6 +5773,27 @@ impl ReviewApp {
                     },
                     theme::overlay0(cx),
                 ),
+                ItemState::Ready(data)
+                    if data
+                        .diff
+                        .files
+                        .get(data.file_ix)
+                        .is_some_and(|file| file_media::file_kind(file).is_some()) =>
+                {
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .when(matches!(item.source, Source::Pr(_)), |pane| {
+                            pane.child(self.render_review_scope(item, data, cx))
+                        })
+                        .child(file_media::render(
+                            &data.diff.files[data.file_ix],
+                            data.file_media.get(&data.file_ix),
+                            cx,
+                        ))
+                        .into_any_element()
+                }
                 ItemState::Ready(data) => div()
                     .size_full()
                     .flex()
@@ -6575,6 +6602,7 @@ mod tests {
     mod markdown_hosts {
         include!("markdown_tests.rs");
         include!("image_viewer_tests.rs");
+        include!("file_media_tests.rs");
         include!("video_tests.rs");
     }
 
