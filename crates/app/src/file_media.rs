@@ -1,5 +1,6 @@
 //! File media comparisons, separate from Markdown attachments and video playback.
-//! GPUI's image loader handles raster images and SVG; everything else is a link.
+//! Raster images use GPUI's loader; SVG rasterization tracks display size.
+//! Everything else is a link.
 use std::{collections::HashMap, io::Write, path::Path};
 
 use diff_core::{FileDiff, FileStatus, PrDiff};
@@ -198,8 +199,16 @@ fn render_side(
                 .flex_1()
                 .min_h_0()
                 .w_full()
+                .debug_selector(move || format!("file-media-{label}-viewport"))
                 .overflow_hidden()
                 .children(side.and_then(|side| side.image.clone()).map(|source| {
+                    if path.is_some_and(|path| {
+                        Path::new(path)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+                    }) {
+                        return crate::svg_image::svg_image(source, label);
+                    }
                     img(ImageSource::Resource(source))
                         .id("image")
                         .size_full()
@@ -216,6 +225,7 @@ fn render_side(
                                 .child("Could not load image. Use Open file above.")
                                 .into_any_element()
                         })
+                        .into_any_element()
                 })),
         )
         .into_any_element()

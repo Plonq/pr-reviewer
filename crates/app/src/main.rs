@@ -25,6 +25,7 @@ mod review_target;
 mod rows;
 mod search;
 mod selection;
+mod svg_image;
 mod theme;
 mod threads;
 mod tree;
@@ -6603,6 +6604,7 @@ mod tests {
         include!("markdown_tests.rs");
         include!("image_viewer_tests.rs");
         include!("file_media_tests.rs");
+        include!("svg_image_tests.rs");
         include!("video_tests.rs");
     }
 

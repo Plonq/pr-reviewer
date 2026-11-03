@@ -10,7 +10,7 @@ fn diff_images_are_side_by_side_in_both_modes_and_other_media_only_link(cx: &mut
         let url = req.uri().to_string();
         seen.lock().unwrap().push(url.clone());
         let bytes = if url.ends_with(".svg") {
-            br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80"><rect width="200" height="80" fill="red"/></svg>"#.to_vec()
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="8"><rect width="20" height="8" fill="red"/></svg>"#.to_vec()
         } else { png.clone() };
         async move { Ok(http_client::http::Response::builder().status(200)
             .body(http_client::AsyncBody::from(bytes)).unwrap()) }
@@ -52,12 +52,30 @@ fn diff_images_are_side_by_side_in_both_modes_and_other_media_only_link(cx: &mut
         for selector in ["file-media-Before-error", "file-media-After-error", "file-media-Before-loading", "file-media-After-loading"] {
             assert!(vcx.debug_bounds(selector).is_none());
         }
-        // Verify successful decoding, not merely reserved image rectangles.
+        // A 20px SVG must rasterize at its displayed device resolution, not
+        // stretch GPUI's fixed-size 40px probe bitmap.
+        let viewport = vcx.debug_bounds("file-media-Before-viewport").unwrap();
         vcx.update(|window, cx| {
             let uri = gpui::Resource::Uri("https://raw.githubusercontent.com/acme/widgets/base-commit/before.svg".into());
-            assert!(matches!(window.get_asset::<gpui::ImgResourceLoader>(&uri, cx), Some(Ok(_))));
+            let raster = svg_image::cached_raster(&uri, window, cx).unwrap();
+            let fitted_width = f32::from(viewport.size.width).min(f32::from(viewport.size.height) * 2.5);
+            assert_eq!(raster.size(0).width.0, (fitted_width * window.scale_factor()).ceil() as i32);
+            assert!(raster.size(0).width.0 > 40);
         });
     }
+    // Resizing re-rasterizes the parsed document without downloading it again.
+    for (width, height) in [(1600., 900.), (900., 500.), (1200., 800.)] {
+        vcx.simulate_resize(size(px(width), px(height)));
+        draw_settled(&mut vcx);
+        let viewport = vcx.debug_bounds("file-media-Before-viewport").unwrap();
+        vcx.update(|window, cx| {
+            let uri = gpui::Resource::Uri("https://raw.githubusercontent.com/acme/widgets/base-commit/before.svg".into());
+            let raster = svg_image::cached_raster(&uri, window, cx).unwrap();
+            let fitted_width = f32::from(viewport.size.width).min(f32::from(viewport.size.height) * 2.5);
+            assert_eq!(raster.size(0).width.0, (fitted_width * window.scale_factor()).ceil() as i32);
+        });
+    }
+    assert_eq!(requests.lock().unwrap().iter().filter(|url| url.ends_with("before.svg")).count(), 1);
     click_selector(&mut vcx, "file-media-Before-link");
     assert!(cx.opened_url().unwrap().ends_with("/base-commit/before.svg"));
     let before_video = requests.lock().unwrap().len();
