@@ -1,6 +1,32 @@
 // Included in markdown_hosts, sharing the real-window fixtures.
+#[test]
+fn video_control_icons_are_embedded_in_the_application_assets() {
+    use gpui::AssetSource as _;
+    use gpui_kit_assets::IconName;
+    let listed = crate::AppAssets.list("icons/").unwrap();
+    for icon in [
+        IconName::Play,
+        IconName::Pause,
+        IconName::Volume2,
+        IconName::VolumeX,
+        IconName::Maximize2,
+        IconName::Minimize2,
+        IconName::RotateCcw,
+        IconName::ExternalLink,
+        IconName::X,
+    ] {
+        let path = icon.path();
+        let bytes = crate::AppAssets
+            .load(&path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing video control icon: {path}"));
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("<svg"));
+        assert!(listed.contains(&path));
+    }
+}
+
 fn pending_video_downloads(app: &gpui::Entity<ReviewApp>, cx: &mut gpui::TestAppContext) {
-    // Real streaming/HEAD/redirects use socket tests; UI tests stay on GPUI's
+    // Real streamed ranges/redirects use socket tests; UI tests stay on GPUI's
     // deterministic scheduler and cannot be woken by foreign OS threads.
     cx.update(|cx| {
         let hub = app.read(cx).video_hub.clone();
@@ -42,7 +68,7 @@ fn extensionless_attachment_cards_use_metadata_once_and_leave_other_links_stock(
             .unwrap()
             .size
             .height,
-        px(260.)
+        px(video::INLINE_HEIGHT)
     );
     let other = Box::leak(
         format!(
@@ -146,7 +172,6 @@ fn video_download_errors_are_retryable_and_never_open_a_browser(cx: &mut gpui::T
     });
     let mut vcx = gpui::VisualTestContext::from_window(window, cx);
     draw_settled(&mut vcx);
-    click_selector(&mut vcx, "video-play");
     assert!(vcx.debug_bounds("video-error").is_some());
     assert!(vcx.debug_bounds("video-retry").is_some());
     assert!(cx.opened_url().is_none());
@@ -156,6 +181,73 @@ fn video_download_errors_are_retryable_and_never_open_a_browser(cx: &mut gpui::T
     assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
     click_selector(&mut vcx, "video-cancel");
     assert!(vcx.debug_bounds("video-canceled").is_some());
+}
+
+#[gpui::test]
+fn video_preloads_without_playing_and_picture_and_overlay_controls_toggle_once(
+    cx: &mut gpui::TestAppContext,
+) {
+    image_client(cx);
+    let (window, app) = video_conversation(cx, "[clip](http://127.0.0.1:1/clip.mp4)");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    cx.update(|cx| {
+        app.read(cx).video_hub.clone().update(cx, |hub, _| {
+            hub.download = Arc::new(move |_, _| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(futures::future::pending())
+            });
+        })
+    });
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1400.), px(1000.)));
+    draw_settled(&mut vcx);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    cx.update(|cx| assert!(app.read(cx).video_hub.read(cx).session.is_none()));
+    // A paused preview can expand without starting playback or a full fetch.
+    click_selector(&mut vcx, "video-expand");
+    assert!(vcx.debug_bounds("image-viewer").is_some());
+    cx.update(|cx| {
+        assert!(!app
+            .read(cx)
+            .video_hub
+            .read(cx)
+            .session
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .is_playing())
+    });
+    vcx.simulate_keystrokes("escape");
+    draw_settled(&mut vcx);
+    let picture = vcx.debug_bounds("video-session").unwrap();
+    let chrome = vcx.debug_bounds("video-controls").unwrap();
+    assert_eq!(picture.size.height, px(video::INLINE_HEIGHT));
+    assert!(
+        chrome.top() > picture.top() && chrome.bottom() <= picture.bottom(),
+        "chrome overlays rather than shrinking the picture"
+    );
+    let point = point(picture.left() + px(20.), picture.top() + px(100.));
+    vcx.simulate_click(point, gpui::Modifiers::default());
+    draw_settled(&mut vcx);
+    let session = cx.update(|cx| app.read(cx).video_hub.read(cx).session.clone().unwrap());
+    cx.update(|cx| assert!(session.read(cx).is_playing()));
+    vcx.simulate_click(point, gpui::Modifiers::default());
+    draw_settled(&mut vcx);
+    cx.update(|cx| assert!(!session.read(cx).is_playing()));
+    click_selector(&mut vcx, "video-toggle");
+    cx.update(|cx| {
+        assert!(
+            session.read(cx).is_playing(),
+            "control clicks must not also toggle the picture"
+        )
+    });
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "Play reuses the preloaded source"
+    );
+    assert!(cx.opened_url().is_none());
 }
 
 #[gpui::test]
@@ -169,7 +261,7 @@ fn video_is_opt_in_and_overlay_moves_the_same_session(cx: &mut gpui::TestAppCont
     cx.update(|cx| {
         assert!(
             app.read(cx).video_hub.read(cx).session.is_none(),
-            "rendering never starts a download/player"
+            "preloading never starts playback"
         )
     });
     click_selector(&mut vcx, "video-play");
@@ -282,7 +374,7 @@ fn video_pauses_on_pane_exit_and_cards_preserve_virtualized_geometry(
                 .unwrap()
                 .size
                 .height,
-            px(260.)
+            px(video::INLINE_HEIGHT)
         );
         let before = cx.update(|cx| app.read(cx).active_data().unwrap().rows.len());
         click_selector(&mut vcx, "video-play");
@@ -292,7 +384,7 @@ fn video_pauses_on_pane_exit_and_cards_preserve_virtualized_geometry(
         cx.update(|cx| assert_eq!(app.read(cx).active_data().unwrap().rows.len(), before));
         // Even if the top reservation is virtualized away the remaining card
         // remains a real element, not a replacement row or independent window.
-        vcx.simulate_resize(size(px(1500.), px(400.)));
+        vcx.simulate_resize(size(px(1500.), px(600.)));
         cx.update(|cx| app.update(cx, |app, cx| {
             let data = app.active_data_mut().unwrap();
             let first = data.rows.iter().position(|row| matches!(row, Row::CommentBody { text, slot: 0, .. } if text.comment_id == 11)).unwrap();
@@ -330,7 +422,7 @@ fn video_pauses_on_pane_exit_and_cards_preserve_virtualized_geometry(
 #[gpui::test]
 fn video_html_and_mixed_link_cards_use_shared_markdown_hosts(cx: &mut gpui::TestAppContext) {
     image_client(cx);
-    let (window, app) = viewer_conversation(cx,
+    let (window, app) = video_conversation(cx,
         "<video autoplay controls src='http://127.0.0.1:1/a.mov'></video>\n\nBefore [clip](http://127.0.0.1:1/b.webm) after.\n\n`http://127.0.0.1:1/code.mp4`");
     let mut vcx = gpui::VisualTestContext::from_window(window, cx);
     vcx.simulate_resize(size(px(1400.), px(1500.)));

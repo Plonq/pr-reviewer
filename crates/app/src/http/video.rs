@@ -1,32 +1,40 @@
-//! Video-only requests: ranged metadata discovery, then opt-in streaming to a
-//! protected session cache. Image request budgets and buffering stay intact.
+//! Video-only transport: metadata discovery, bounded preview ranges and eager
+//! full downloads on Play. Image request budgets and buffering stay intact.
 use super::{authenticate, http, needs_github_token, TokenProvider, UreqHttpClient};
-use anyhow::{bail, ensure, Context as _};
+use anyhow::ensure;
+#[path = "video/progressive.rs"]
+mod progressive;
 use futures::channel::oneshot;
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     time::Duration,
 };
 
 pub(crate) const MAX_VIDEO_BYTES: u64 = 128 * 1024 * 1024;
-// A single active session, at most one completed file and one partial file.
-// Serializing workers prevents canceled/stalled requests accumulating on disk.
-static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
-
 #[derive(Default)]
 pub(crate) struct Transfer {
     pub bytes: AtomicU64,
     pub total: AtomicU64,
     pub canceled: AtomicBool,
+    pub started: AtomicBool,
+    pub complete: AtomicBool,
+    pub error: Mutex<Option<String>>,
+    event: Mutex<()>,
+    changed: Condvar,
 }
 impl Transfer {
     pub fn cancel(&self) {
         self.canceled.store(true, Ordering::Relaxed);
+        self.wake();
+    }
+    fn wake(&self) {
+        let _event = self.event.lock().unwrap();
+        self.changed.notify_all();
     }
     fn check(&self) -> anyhow::Result<()> {
         ensure!(!self.canceled.load(Ordering::Relaxed), "Download canceled");
@@ -36,9 +44,9 @@ impl Transfer {
 
 pub(crate) struct VideoFile {
     pub path: PathBuf,
-    // TempDir and NamedTempFile use 0700 / 0600; no response headers, signed
-    // redirect URLs, cookies or tokens are ever written. Drop deletes the file.
-    _directory: tempfile::TempDir,
+    // Cache owns a 0700 directory / 0600 sparse file. Only complete ranges are
+    // exposed to the decoder; no signed URLs or credentials are written.
+    progressive: Arc<progressive::Cache>,
 }
 
 fn agent() -> ureq::Agent {
@@ -138,63 +146,31 @@ fn probe(url: &str, token: &TokenProvider) -> anyhow::Result<bool> {
     ))
 }
 
+/// Prepare a progressive source after its first bounded range. This does not
+/// wait for the full file; `VideoFile::start` begins the eager download on Play.
 pub(crate) fn download(
     url: String,
     transfer: Arc<Transfer>,
 ) -> oneshot::Receiver<anyhow::Result<VideoFile>> {
     let (tx, rx) = oneshot::channel();
     std::thread::spawn(move || {
-        let result = (|| {
-            let _guard = DOWNLOAD_LOCK.lock().unwrap();
-            transfer.check()?;
-            ensure!(safe_url(&url), "Only HTTP(S) video sources are supported");
-            let client = UreqHttpClient::new();
-            let response = authenticate(
-                agent().get(&url).set("Accept-Encoding", "identity"),
-                &url,
-                &http::HeaderMap::new(),
-                &client.token,
-            )
-            .call()
-            .map_err(|_| anyhow::anyhow!("Could not download video"))?;
-            // Keep diagnostics free of redirect URLs, cookies and tokens.
-            let content_type = response.header("Content-Type").unwrap_or_default();
-            ensure!(
-                is_video_type(content_type)
-                    || (direct_video(&url)
-                        && content_type.split(';').next().unwrap_or_default().trim()
-                            == "application/octet-stream"),
-                "Unsupported video response (the server may require sign-in)"
-            );
-            let extension = cache_extension(content_type, &url);
-            let total = response
-                .header("Content-Length")
-                .and_then(|s| s.parse::<u64>().ok());
-            let directory = tempfile::Builder::new().prefix("gander-video-").tempdir()?;
-            let mut partial = tempfile::NamedTempFile::new_in(directory.path())?;
-            stream(
-                response.into_reader(),
-                partial.as_file_mut(),
-                &transfer,
-                total,
-                MAX_VIDEO_BYTES,
-            )?;
-            partial.as_file().sync_all()?;
-            // Completion becomes visible atomically, never a partially written
-            // file. AVFoundation also needs a container suffix for local files;
-            // extensionless GitHub URLs get one from response metadata.
-            let path = directory.path().join(format!("video.{extension}"));
-            partial
-                .persist(&path)
-                .context("Could not complete video cache file")?;
-            Ok(VideoFile {
-                path,
-                _directory: directory,
-            })
-        })();
-        let _ = tx.send(result);
+        let _ = tx.send(progressive::prepare(url, transfer));
     });
     rx
+}
+
+impl VideoFile {
+    pub fn source(&self) -> &str {
+        self.progressive.endpoint()
+    }
+    pub fn start(&self) {
+        self.progressive.start();
+    }
+}
+impl Drop for VideoFile {
+    fn drop(&mut self) {
+        self.progressive.cancel();
+    }
 }
 
 fn cache_extension(content_type: &str, url: &str) -> &'static str {
@@ -220,42 +196,6 @@ fn cache_extension(content_type: &str, url: &str) -> &'static str {
             })
             .unwrap_or("video"),
     }
-}
-
-fn stream(
-    mut reader: impl Read,
-    mut file: impl Write,
-    transfer: &Transfer,
-    total: Option<u64>,
-    limit: u64,
-) -> anyhow::Result<()> {
-    ensure!(
-        total.is_none_or(|n| n <= limit),
-        "Video exceeds 128 MiB download limit"
-    );
-    transfer.total.store(total.unwrap_or(0), Ordering::Relaxed);
-    let mut bytes = 0;
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        transfer.check()?;
-        let n = reader.read(&mut buffer)?;
-        transfer.check()?;
-        if n == 0 {
-            break;
-        }
-        bytes += n as u64;
-        if bytes > limit {
-            bail!("Video exceeds 128 MiB download limit");
-        }
-        file.write_all(&buffer[..n])?;
-        transfer.bytes.store(bytes, Ordering::Relaxed);
-    }
-    ensure!(bytes > 0, "Empty video response");
-    ensure!(
-        total.is_none_or(|n| bytes == n),
-        "Incomplete video response"
-    );
-    Ok(())
 }
 
 #[cfg(test)]
@@ -293,19 +233,6 @@ mod tests {
             cache_extension("application/octet-stream", "https://example.com/a.MOV?x=1"),
             "mov"
         );
-    }
-    #[test]
-    fn streaming_bounds_progress_cancellation_and_short_bodies() {
-        let transfer = Transfer::default();
-        let mut out = Vec::new();
-        stream(&b"video"[..], &mut out, &transfer, Some(5), 8).unwrap();
-        assert_eq!(out, b"video");
-        assert_eq!(transfer.bytes.load(Ordering::Relaxed), 5);
-        assert!(stream(&b"too big"[..], Vec::new(), &transfer, None, 3).is_err());
-        assert!(stream(&b"short"[..], Vec::new(), &transfer, Some(6), 8).is_err());
-        assert!(stream(&b""[..], Vec::new(), &transfer, None, 8).is_err());
-        transfer.cancel();
-        assert!(stream(&b"video"[..], Vec::new(), &transfer, None, 8).is_err());
     }
     fn server(response: String) -> (String, std::thread::JoinHandle<String>) {
         use std::net::TcpListener;
@@ -397,22 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_during_read_does_not_write_the_next_chunk() {
-        struct CancelReader<'a>(&'a Transfer);
-        impl Read for CancelReader<'_> {
-            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-                self.0.cancel();
-                buffer[0] = 1;
-                Ok(1)
-            }
-        }
-        let transfer = Transfer::default();
-        let mut written = Vec::new();
-        assert!(stream(CancelReader(&transfer), &mut written, &transfer, None, 8).is_err());
-        assert!(written.is_empty());
-    }
-
-    #[test]
     fn html_errors_and_oversized_headers_do_not_become_playable_files() {
         for (mime, size) in [("text/html", 5), ("video/mp4", MAX_VIDEO_BYTES + 1)] {
             let (url, worker) = server(format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"));
@@ -427,7 +338,20 @@ mod tests {
     }
 
     #[test]
-    fn download_is_private_atomic_and_session_scoped() {
+    fn preview_rejects_empty_truncated_and_invalid_range_responses() {
+        for response in [
+            "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 20\r\nConnection: close\r\n\r\nshort",
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes 50-54/100\r\nContent-Length: 5\r\nConnection: close\r\n\r\nvideo",
+        ] {
+            let (url, worker) = server(response.into());
+            assert!(futures::executor::block_on(download(url, Arc::default())).unwrap().is_err());
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn cache_is_private_and_session_scoped() {
         use std::{net::TcpListener, os::unix::fs::PermissionsExt};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/a.mp4", listener.local_addr().unwrap());

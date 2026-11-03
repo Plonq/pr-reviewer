@@ -228,7 +228,13 @@ impl ReviewApp {
         };
         let session = self.video_hub.read(cx).session.clone();
         let viewport = window.viewport_size();
-        let toolbar_height = if viewport.width < px(760.) { 92. } else { 52. };
+        let toolbar_height = if is_video {
+            0.
+        } else if viewport.width < px(760.) {
+            92.
+        } else {
+            52.
+        };
         let available = size(
             (f32::from(viewport.width) - 32.).max(1.),
             (f32::from(viewport.height) - toolbar_height - 32.).max(1.),
@@ -445,6 +451,7 @@ impl ReviewApp {
                         .left_0()
                         .right_0()
                         .h(px(toolbar_height))
+                        .when(is_video, |bar| bar.hidden())
                         .px_3()
                         .flex()
                         .flex_wrap()

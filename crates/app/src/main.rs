@@ -286,15 +286,29 @@ fn git_env() -> [(&'static str, &'static str); 6] {
 }
 
 /// The app's assets, layered over gpui-component's default icon bundle.
-/// The queue uses an extra Lucide icon; comments use Octicon speech bubble
+/// Queue/media controls use extra Lucide icons; comments use Octicon speech bubble
 /// and smiley icons (© GitHub, MIT: https://github.com/primer/octicons).
 /// GPUI renders these as monochrome masks so they tint with the palette.
 /// App-owned icons live under `icons/gander/` to avoid upstream collisions.
 struct AppAssets;
 
-// Catalog entries alone do not bundle SVGs. Explicitly include the review
-// queue's open circle, which is not part of the default component bundle.
-gpui_kit_assets::icon_assets!(QueueIcons, [Circle]);
+// Catalog entries alone do not bundle SVGs. Include the queue/media icons
+// explicitly rather than relying on the default component bundle's subset.
+gpui_kit_assets::icon_assets!(
+    ExtraIcons,
+    [
+        Circle,
+        Play,
+        Pause,
+        Volume2,
+        VolumeX,
+        Maximize2,
+        Minimize2,
+        RotateCcw,
+        ExternalLink,
+        X
+    ]
+);
 
 /// (asset path, embedded bytes) — served exactly as an `AssetSource`
 /// expects, so the icon renders like any bundled one.
@@ -322,7 +336,7 @@ impl AssetSource for AppAssets {
         if let Some((_, bytes)) = OWNED_ASSETS.iter().find(|(known, _)| *known == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        if let Some(bytes) = QueueIcons.load(path)? {
+        if let Some(bytes) = ExtraIcons.load(path)? {
             return Ok(Some(bytes));
         }
         gpui::assets::Assets.load(path)
@@ -330,7 +344,7 @@ impl AssetSource for AppAssets {
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
         let mut all = gpui::assets::Assets.list(path)?;
-        all.extend(QueueIcons.list(path)?);
+        all.extend(ExtraIcons.list(path)?);
         all.extend(
             OWNED_ASSETS
                 .iter()

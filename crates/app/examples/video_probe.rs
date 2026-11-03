@@ -1,5 +1,10 @@
 //! macOS smoke check: cargo run -p gander --example video_probe -- /absolute/file.mp4
-//! Space: play/pause; arrows: seek; m: mute; Esc: quit. No network access.
+//! Space: play/pause; arrows: seek; m: mute; Esc: quit.
+//! HTTP(S) inputs exercise the authenticated range cache; --preload checks the
+//! paused first frame before starting the eager download and playback.
+#[allow(dead_code)]
+#[path = "../src/http.rs"]
+mod http;
 #[path = "../src/video_player.rs"]
 mod video_player;
 use gpui::{prelude::*, *};
@@ -16,6 +21,9 @@ struct Probe {
     verify: bool,
     stage: u8,
     paused_at: f64,
+    cache: Option<http::video::VideoFile>,
+    transfer: std::sync::Arc<http::video::Transfer>,
+    preload: bool,
 }
 impl Probe {
     fn poll(&mut self, cx: &mut Context<Self>) {
@@ -34,11 +42,37 @@ impl Probe {
             );
             self.reported = true;
         }
+        if self.preload && self.reported {
+            assert!(!self.player.playing(), "preview must not autoplay");
+            eprintln!(
+                "Paused preview decoded with {} / {} cached bytes",
+                self.transfer
+                    .bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.transfer
+                    .total
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+            if let Some(cache) = &self.cache {
+                cache.start();
+            }
+            self.player.play();
+            self.preload = false;
+            self.start = Instant::now();
+        }
         if self.verify && self.reported {
             let elapsed = self.start.elapsed().as_secs_f32();
             if elapsed > 1. && self.stage == 0 {
                 self.player.pause();
                 self.paused_at = self.player.position();
+                eprintln!(
+                    "Playback position after first second: {:.2}s",
+                    self.paused_at
+                );
+                assert!(
+                    self.paused_at > 0.2,
+                    "initial playback did not start promptly"
+                );
                 self.stage = 1;
             } else if elapsed > 2. && self.stage == 1 {
                 assert!(
@@ -59,16 +93,48 @@ impl Probe {
                 self.stage = 3;
                 eprintln!("Verified pause, seek, mute/unmute and volume; resumed");
             } else if elapsed > 4. && self.stage == 3 {
-                assert!(self.player.position() > 3.5, "resume failed");
-                self.stage = 4;
+                // A network seek may need an uncached range; allow buffering
+                // rather than imposing the local-file probe's one-second limit.
+                if self.player.position() > 3.5 {
+                    self.stage = 4;
+                } else if elapsed > 12. {
+                    eprintln!(
+                        "Cache bytes={}, total={}, error={:?}",
+                        self.transfer
+                            .bytes
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        self.transfer
+                            .total
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        self.transfer.error.lock().unwrap()
+                    );
+                    panic!("resume failed");
+                }
             }
         }
         if self.start.elapsed() > Duration::from_secs(15) {
+            if self.verify {
+                assert_eq!(self.stage, 4, "verification did not finish");
+            }
             eprintln!(
                 "position {:.2}, frame {}",
                 self.player.position(),
                 self.reported
             );
+            if self.cache.is_some() {
+                eprintln!(
+                    "Cache at exit: {} / {} bytes, complete={}",
+                    self.transfer
+                        .bytes
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    self.transfer
+                        .total
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    self.transfer
+                        .complete
+                        .load(std::sync::atomic::Ordering::Acquire)
+                );
+            }
             cx.quit();
         }
         cx.notify();
@@ -118,13 +184,40 @@ impl Render for Probe {
 fn main() {
     let file = PathBuf::from(std::env::args().nth(1).expect("local video path"));
     eprintln!("Starting probe for {}", file.display());
+    let source = file.to_string_lossy();
+    let transfer = std::sync::Arc::<http::video::Transfer>::default();
+    let cache = if source.starts_with("http://") || source.starts_with("https://") {
+        Some(
+            futures::executor::block_on(http::video::download(
+                source.into_owned(),
+                transfer.clone(),
+            ))
+            .unwrap()
+            .unwrap(),
+        )
+    } else {
+        None
+    };
+    let preload = std::env::args().any(|arg| arg == "--preload");
     gpui::application().run(move |cx| {
         eprintln!("Opening probe window");
         cx.open_window(WindowOptions::default(), |window, cx| {
-            let mut player = video_player::VideoPlayer::new(&file).unwrap();
+            let mut player = cache
+                .as_ref()
+                .map(|f| f.source())
+                .map_or_else(
+                    || video_player::VideoPlayer::new(&file),
+                    video_player::VideoPlayer::stream,
+                )
+                .unwrap();
             eprintln!("Player constructed");
             // Explicit playback in this diagnostic only; the application never autoplays.
-            player.play();
+            if !preload {
+                if let Some(cache) = &cache {
+                    cache.start();
+                }
+                player.play();
+            }
             let focus = cx.focus_handle();
             window.focus(&focus, cx);
             cx.new(|cx| {
@@ -148,6 +241,9 @@ fn main() {
                     verify: std::env::args().any(|arg| arg == "--verify"),
                     stage: 0,
                     paused_at: 0.,
+                    cache,
+                    transfer,
+                    preload,
                 }
             })
         })

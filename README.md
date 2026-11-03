@@ -207,16 +207,23 @@ GitHub's GET-signed attachment redirects, which can reject HEAD requests.
 Ordinary links, images and code examples are not downloaded as videos. Rich HTML
 containers, iframes, YouTube and Vimeo players are not supported.
 
-- Click **Play video** to download and play. There is **no autoplay**, even when
-  an HTML embed requests it, and only one video session is kept at a time.
-- Inline controls provide play/pause, a clickable seek bar, **−5s / +5s**,
-  mute/unmute and volume. **Expand** moves the same session into the window-filling
-  media viewer; **Esc**, **Return inline**, or the backdrop returns it inline
-  without resetting playback. In the viewer, **Space** toggles playback,
-  **← / →** seek five seconds and **M** toggles mute.
-- Leaving the originating review pane pauses playback; returning does not resume
-  automatically. Starting another video or closing the originating review stops
-  the old session and releases its local file.
+- Videos preload a paused first-frame preview and initial media ranges. There
+  is **no autoplay**, even when an HTML embed requests it. Click the picture or
+  play icon to start; playback can begin before the whole file is downloaded.
+- Play immediately starts an eager full download, independent of the decoder's
+  buffering. It continues while paused so playback no longer depends on expiring
+  attachment authorization once cached. Startup still depends on network speed
+  and the container's metadata; servers without range support may need more data.
+- Inline pictures use a larger, full-width 420px-high area. Icon controls overlay
+  the picture, appearing on hover while playing and remaining visible while
+  paused. They provide play/pause, seek/download progress, mute, volume, browser
+  fallback and expand, with tooltips. Clicking the picture toggles play/pause.
+- Expand moves the same session into the window-filling media viewer; **Esc**,
+  the collapse icon, or the backdrop returns it inline without resetting playback.
+  In the viewer, **Space** toggles playback, **← / →** seek five seconds and **M**
+  toggles mute.
+- Only one video plays at a time. Leaving its review pane pauses it; returning
+  does not resume automatically. Closing a review releases its previews/caches.
 - Download progress, **Cancel**, **Retry**, unsupported-format and playback-error
   states stay in the card. **Browser** is an explicit fallback, never automatic.
 
@@ -226,16 +233,20 @@ links are recognized but decoding depends on macOS support for their container
 and codecs; **WebM playback is not guaranteed**. An unsupported file shows an
 error and offers the browser fallback.
 
-Videos stream directly to a private temporary session cache (0700 directory,
-0600 file), with atomic completion and a **128 MiB per-video limit**. Only one
-completed session file is retained; a canceled in-flight transfer may take up to
-its current network read timeout to release its partial file. Transfers are
-serialized to bound temporary storage to at most one completed file plus one
-partial download. Files are removed when that session is released or on normal
-app exit, and are not a persistent/offline video library. An abnormal process
-termination can leave temporary files for the OS to clean up. GitHub tokens are
-used only for the existing trusted HTTPS attachment endpoints, are never sent
-to CDN redirects or to AVFoundation, and are not stored with the video. The
+Videos use a private temporary range cache (0700 directory, 0600 sparse file),
+with a **128 MiB per-video limit**. At most four previews/caches are retained;
+additional videos prepare on hover or Play, evicting an inactive cache. Automatic
+preloading is bounded to 8 MiB per video; short clips may fit entirely. Offscreen
+row measurement never starts preloading. Only complete cached ranges are exposed
+to AVFoundation through an unguessable loopback-only URL; missing ranges are
+fetched on demand. Play also starts a full download immediately, even if the
+player already has enough buffered data. A canceled transfer can take its
+current network timeout to release its file. Files are removed on eviction,
+review closure or normal app exit, and are not a persistent/offline library.
+Abnormal termination can leave temporary files for the OS to clean up. GitHub
+tokens are used only for trusted HTTPS attachment endpoints, never sent to CDN
+redirects or AVFoundation, and never stored with the video. Signed redirect URLs
+also stay out of AVFoundation and the on-disk cache. The
 image cache and its existing download limits are unchanged. See the
 [native playback testing guide](docs/video-playback-testing.md) for fixture and
 manual verification instructions.

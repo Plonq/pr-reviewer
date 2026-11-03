@@ -155,6 +155,14 @@ fn html_video(source: &str) -> Option<String> {
 impl VideoPlugin {
     fn card(&self, node: &MarkdownNode, cx: &mut App) -> gpui::AnyElement {
         let (offset, target) = node.data::<(usize, VideoTarget)>().unwrap();
+        // Offscreen row measurement reserves geometry only: it must not open
+        // decoders/downloads or consume the visible preview cache's slots.
+        if self.host.ends_with("-measure") && !self.hub.read(cx).non_video(&target.url) {
+            return div()
+                .w_full()
+                .h(px(video::INLINE_HEIGHT))
+                .into_any_element();
+        }
         let selector = format!("{}-video-{offset}", self.host);
         div()
             .id(SharedString::from(selector.clone()))
@@ -234,7 +242,14 @@ impl MarkdownPlugin for VideoPlugin {
             return Some(InlineElement::new(self.card(node, cx)));
         }
         Some(InlineElement::new(
-            div().w(px(320.)).h(px(260.)).child(self.card(node, cx)),
+            div()
+                // Kit's atomic inline objects cannot reflow their subtree to
+                // the line width. Keep prose-embedded cards bounded; standalone
+                // video paragraphs use the full discussion-pane width.
+                .w(px(320.))
+                .max_w_full()
+                .h(px(video::INLINE_HEIGHT))
+                .child(self.card(node, cx)),
         ))
     }
 }

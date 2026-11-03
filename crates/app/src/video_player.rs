@@ -1,5 +1,5 @@
-//! Local-file AVFoundation playback. The player never sees a network URL or
-//! credentials. GPUI's Metal surface accepts *only* full-range bi-planar NV12.
+//! AVFoundation playback over local files or the private loopback range cache.
+//! The player never sees GitHub credentials or signed CDN URLs.
 use anyhow::{ensure, Context as _};
 use objc2::{rc::Retained, MainThreadMarker};
 use objc2_av_foundation::{
@@ -27,13 +27,31 @@ pub(crate) struct VideoPlayer {
 
 impl VideoPlayer {
     pub fn new(path: &Path) -> anyhow::Result<Self> {
-        let mtm = MainThreadMarker::new().context("Video playback requires the main thread")?;
         let path = path.to_str().context("Invalid video cache path")?;
-        let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+        Self::with_url(&NSURL::fileURLWithPath(&NSString::from_str(path)))
+    }
+
+    pub fn stream(source: &str) -> anyhow::Result<Self> {
+        let parsed = http_client::Url::parse(source)?;
+        ensure!(
+            parsed.scheme() == "http"
+                && parsed.host_str() == Some("127.0.0.1")
+                && parsed.username().is_empty()
+                && parsed.password().is_none(),
+            "Only the local video cache may be streamed"
+        );
+        let url =
+            NSURL::URLWithString(&NSString::from_str(source)).context("Invalid local video URL")?;
+        Self::with_url(&url)
+    }
+
+    fn with_url(url: &NSURL) -> anyhow::Result<Self> {
+        let mtm = MainThreadMarker::new().context("Video playback requires the main thread")?;
         // SAFETY: these objects are used only on the main thread. All inputs
         // are owned Foundation values; the file remains pinned by the session.
         unsafe {
-            let item = AVPlayerItem::playerItemWithURL(&url, mtm);
+            let item = AVPlayerItem::playerItemWithURL(url, mtm);
+            item.setPreferredForwardBufferDuration(1.0);
             let surface_properties = NSDictionary::<NSString, objc2::runtime::AnyObject>::new();
             let attributes = NSDictionary::from_slices(
                 &[
@@ -72,6 +90,7 @@ impl VideoPlayer {
                 &callback,
             );
             let player = AVPlayer::playerWithPlayerItem(Some(&item), mtm);
+            player.setAutomaticallyWaitsToMinimizeStalling(false);
             Ok(Self {
                 player,
                 item,
@@ -101,6 +120,7 @@ impl VideoPlayer {
                     self.item.addOutput(&self.output);
                     self.output_attached = true;
                     self.composition = None;
+                    self.seek(0.);
                 }
             }
             if self.play_requested && self.ready() {
