@@ -301,13 +301,16 @@ pub(crate) fn render_tree_row(
             .flex_shrink_0()
             .flex()
             .items_center()
-            .pl_1()
             // A checkbox click must never also open its file, including
             // when disabled during a mutation or refresh.
             .on_click(|_, _, cx| cx.stop_propagation())
             .child(
                 Checkbox::new(("file-viewed", file_ix))
                     .xsmall()
+                    // Enlarge the control's hitbox, not its visual indicator.
+                    .size(px(TREE_ROW_HEIGHT))
+                    .items_center()
+                    .justify_center()
                     .checked(state == Some(github::FileViewedState::Viewed))
                     .disabled(
                         reloading
