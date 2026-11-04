@@ -11,8 +11,8 @@ pub(crate) const AUTO_COLLAPSE_LINES: usize = 20_000;
 
 pub(crate) fn keybindings() -> [gpui::KeyBinding; 3] {
     [
-        gpui::KeyBinding::new("shift-w", crate::ToggleWhitespace, Some("ReviewApp")),
-        gpui::KeyBinding::new("shift-k", crate::ToggleUnchanged, Some("ReviewApp")),
+        gpui::KeyBinding::new("w", crate::ToggleWhitespace, Some("ReviewApp")),
+        gpui::KeyBinding::new("k", crate::ToggleUnchanged, Some("ReviewApp")),
         gpui::KeyBinding::new("alt-z", crate::ToggleSoftWrap, Some("ReviewApp")),
     ]
 }
