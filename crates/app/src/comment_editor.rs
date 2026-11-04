@@ -88,7 +88,17 @@ fn height(rows: usize, line_height: gpui::Pixels) -> gpui::Pixels {
     line_height * rows.clamp(3, 8) + Size::Medium.input_py() * 2. + px(2.)
 }
 
+#[cfg(test)]
 pub(crate) fn field<T: 'static>(state: &Entity<EditorState>, cx: &mut Context<T>) -> AnyElement {
+    field_with_media(state, None, false, cx)
+}
+
+pub(crate) fn field_with_media<T: 'static>(
+    state: &Entity<EditorState>,
+    uploads: Option<&Entity<crate::comment_media::Uploads>>,
+    disabled: bool,
+    cx: &mut Context<T>,
+) -> AnyElement {
     // Match the original Input's text-sm size (14px with the default theme).
     let font_size = cx.theme().font_size * 0.875;
     let line_height = font_size * 1.5;
@@ -98,22 +108,52 @@ pub(crate) fn field<T: 'static>(state: &Entity<EditorState>, cx: &mut Context<T>
     );
     let owner = cx.entity().entity_id();
     let editor = state.clone();
-    // Wrapping is calculated by the stock editor during layout. If its actual
-    // wrapped row count changed (typing, width or font), settle on the next
-    // frame. Only notify when the clamped height differs, not on every paint.
-    div()
+    let paste_input = state.downgrade();
+    let drop_input = state.downgrade();
+    let mut editor_element = Editor::new(state)
+        .h(h)
+        .disabled(disabled)
+        .font_family(cx.theme().font_family.clone())
+        .text_size(font_size)
+        .line_height(line_height);
+    if let Some(uploads) = uploads.filter(|_| !disabled) {
+        let uploads = uploads.clone();
+        editor_element = editor_element.on_paste(move |item, window, cx| {
+            let sources = crate::comment_media::clipboard_sources(item);
+            if sources.is_empty() {
+                return false;
+            }
+            if let Some(input) = paste_input.upgrade() {
+                crate::comment_media::start(&uploads, &input, sources, window, cx);
+            }
+            true
+        });
+    }
+    let drop_color = crate::theme::surface0(cx);
+    let field = div()
         .debug_selector(|| "comment-editor-field".into())
         .relative()
         .w_full()
         .h(h)
+        .when_some(uploads.filter(|_| !disabled).cloned(), |field, uploads| {
+            field
+                .on_drop(move |paths: &gpui::ExternalPaths, window, cx| {
+                    if let Some(input) = drop_input.upgrade() {
+                        let sources = paths
+                            .0
+                            .iter()
+                            .cloned()
+                            .map(crate::comment_media::Source::File)
+                            .collect();
+                        crate::comment_media::start(&uploads, &input, sources, window, cx);
+                    }
+                })
+                .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.bg(drop_color))
+        })
+        .child(editor_element)
         .child(
-            Editor::new(state)
-                .h(h)
-                .font_family(cx.theme().font_family.clone())
-                .text_size(font_size)
-                .line_height(line_height),
-        )
-        .child(
+            // Wrapping is calculated during layout. Settle on the next frame
+            // only when the clamped height changes, not on every paint.
             canvas(
                 |_, _, _| (),
                 move |_, _, _, cx| {
@@ -128,7 +168,39 @@ pub(crate) fn field<T: 'static>(state: &Entity<EditorState>, cx: &mut Context<T>
             )
             .absolute()
             .size_full(),
-        )
+        );
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(field)
+        .when_some(uploads, |field, uploads| {
+            let blocked = crate::comment_media::blocks_submission(Some(uploads), state, cx);
+            let uploads = uploads.read(cx);
+            field
+                .when(blocked && uploads.pending() == 0, |field| {
+                    field.child(div().text_sm().text_color(crate::theme::red(cx)).child(
+                        "Remove the restored upload placeholder before submitting. Paste/drop the media again if needed.",
+                    ))
+                })
+                .when(uploads.pending() > 0, |field| {
+                    field.child(
+                        div()
+                            .text_sm()
+                            .text_color(crate::theme::subtext(cx))
+                            .child(format!("Uploading {} attachment(s)…", uploads.pending())),
+                    )
+                })
+                .when_some(uploads.error.clone(), |field, error| {
+                    field.child(
+                        div()
+                            .text_sm()
+                            .text_color(crate::theme::red(cx))
+                            .child(error),
+                    )
+                })
+        })
         .into_any_element()
 }
 

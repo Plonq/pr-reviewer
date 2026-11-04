@@ -2,6 +2,7 @@ mod chrome;
 mod comment_actions;
 mod comment_anchor;
 mod comment_editor;
+mod comment_media;
 mod conversation;
 mod diff_media;
 mod file_history;
@@ -1634,6 +1635,7 @@ struct Composer {
     /// harmlessly if rows rebuild while it is open).
     row_ix: usize,
     input: gpui::Entity<gpui::component::input::EditorState>,
+    uploads: Option<gpui::Entity<comment_media::Uploads>>,
     /// Space below the diff's last row, measured from the floating card.
     height: Rc<Cell<gpui::Pixels>>,
     /// Reveal a composer once, after its card is laid out.
@@ -1672,6 +1674,7 @@ struct ReviewDialog {
     item_id: u64,
     verdict: github::ReviewVerdict,
     input: gpui::Entity<gpui::component::input::EditorState>,
+    uploads: Option<gpui::Entity<comment_media::Uploads>>,
     error: Option<SharedString>,
     in_flight: bool,
 }
@@ -3476,6 +3479,9 @@ impl ReviewApp {
         input.update(cx, |state, cx| state.focus(window, cx));
         // Wire up @-mention autocomplete for PR items: seed the pool with known
         // participants now, attach the provider, then fetch the full list once.
+        let uploads = pr_loc
+            .clone()
+            .map(|loc| comment_media::Uploads::new(loc, &input, cx));
         if let Some(loc) = pr_loc {
             if let Some(data) = self.active_data() {
                 let mentions = data.mentions.clone();
@@ -3499,6 +3505,7 @@ impl ReviewApp {
             edit_target: None,
             row_ix,
             input,
+            uploads,
             height: Rc::new(Cell::new(px(250.))),
             reveal: Rc::new(Cell::new(true)),
             error: None,
@@ -3609,7 +3616,9 @@ impl ReviewApp {
         let Some(composer) = &self.composer else {
             return;
         };
-        if composer.in_flight {
+        if composer.in_flight
+            || comment_media::blocks_submission(composer.uploads.as_ref(), &composer.input, cx)
+        {
             return;
         }
         let body = composer.input.read(cx).value().trim().to_string();
@@ -3968,10 +3977,20 @@ impl ReviewApp {
         {
             self.ensure_mentions(item_id, loc, cx);
         }
+        let uploads = self
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .and_then(|item| match &item.source {
+                Source::Pr(loc) => Some(loc.clone()),
+                _ => None,
+            })
+            .map(|loc| comment_media::Uploads::new(loc, &input, cx));
         self.review = Some(ReviewDialog {
             item_id,
             verdict: github::ReviewVerdict::Approve,
             input,
+            uploads,
             error: None,
             in_flight: false,
         });
@@ -4043,7 +4062,9 @@ impl ReviewApp {
         let Some(review) = &self.review else {
             return;
         };
-        if review.in_flight {
+        if review.in_flight
+            || comment_media::blocks_submission(review.uploads.as_ref(), &review.input, cx)
+        {
             return;
         }
         let body = review.input.read(cx).value().trim().to_string();
@@ -4316,6 +4337,9 @@ impl ReviewApp {
             .sessions
             .get(&composer.item_id)
             .is_some_and(|ui| ui.busy);
+        let submit_disabled = composer.in_flight
+            || session_busy
+            || comment_media::blocks_submission(composer.uploads.as_ref(), &composer.input, cx);
         let action = self.composer_submit_label(composer);
         let target = if let Some(CommentTarget::Published(target)) = &composer.edit_target {
             match target {
@@ -4382,7 +4406,12 @@ impl ReviewApp {
                     .truncate()
                     .child(SharedString::from(target)),
             )
-            .child(comment_editor::field(&composer.input, cx))
+            .child(comment_editor::field_with_media(
+                &composer.input,
+                composer.uploads.as_ref(),
+                composer.in_flight,
+                cx,
+            ))
             .when_some(composer.error.clone(), |card, err| {
                 card.child(div().text_color(theme::red(cx)).child(err))
             })
@@ -4412,7 +4441,7 @@ impl ReviewApp {
                             .label(action)
                             .primary()
                             .small()
-                            .disabled(composer.in_flight || session_busy)
+                            .disabled(submit_disabled)
                             .loading(composer.in_flight)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.submit_composer(window, cx);
@@ -4435,7 +4464,7 @@ impl ReviewApp {
                                         Button::new("composer-add-to-review")
                                             .label("Start review")
                                             .small()
-                                            .disabled(composer.in_flight || session_busy)
+                                            .disabled(submit_disabled)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 if let Some(composer) = &mut this.composer {
                                                     composer.pending = true;
@@ -17592,6 +17621,58 @@ mod tests {
                 vcx.run_until_parked();
             }
         }
+    }
+
+    #[gpui::test]
+    fn media_uploads_block_comment_and_review_submission(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, FakePr::with_threads(Vec::new()));
+        install_item(&app, range_pr_item(), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_composer(None, "a.rs".into(), CommentSide::Right, 3, 3, window, cx);
+                let composer = app.composer.as_ref().unwrap();
+                // Unsupported files fail locally; this exercises a pending
+                // upload without creating any GitHub assets in the test suite.
+                comment_media::start(
+                    composer.uploads.as_ref().unwrap(),
+                    &composer.input,
+                    vec![comment_media::Source::File("not-media.txt".into())],
+                    window,
+                    cx,
+                );
+                // Removing a placeholder must not bypass the pending guard.
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_value("comment", window, cx));
+                app.submit_composer(window, cx);
+                assert!(!app.composer.as_ref().unwrap().in_flight);
+                app.close_composer(window, cx);
+                app.open_review(window, cx);
+                let review = app.review.as_ref().unwrap();
+                comment_media::start(
+                    review.uploads.as_ref().unwrap(),
+                    &review.input,
+                    vec![comment_media::Source::File("not-media.txt".into())],
+                    window,
+                    cx,
+                );
+                review
+                    .input
+                    .update(cx, |input, cx| input.set_value("review", window, cx));
+                app.submit_review(window, cx);
+                assert!(!app.review.as_ref().unwrap().in_flight);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let review = app.review.as_ref().unwrap();
+                assert_eq!(review.uploads.as_ref().unwrap().read(cx).pending(), 0);
+                assert_eq!(review.input.read(cx).value(), "review");
+                app.close_review(window, cx);
+            });
+        });
     }
 
     #[gpui::test]
