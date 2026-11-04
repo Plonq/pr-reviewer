@@ -1089,6 +1089,18 @@ enum CardEdge {
     Bottom,
 }
 
+/// Pending threads have no reply-action row to close their outline. Cap the
+/// final body, editor or reaction row instead, without adding layout space.
+fn comment_body_edge(next_row: Option<&Row>) -> CardEdge {
+    if next_row.is_none_or(|row| {
+        !is_comment_row(row) || matches!(row, Row::CommentHeader { top: true, .. })
+    }) {
+        CardEdge::Bottom
+    } else {
+        CardEdge::Middle
+    }
+}
+
 fn comment_row(
     inner: gpui::AnyElement,
     half: Option<CommentSide>,
@@ -1212,6 +1224,7 @@ fn comment_range_overlay(ix: usize, side: SelSide, cx: &gpui::App) -> gpui::Div 
 pub(crate) fn render_row(
     ix: usize,
     row: &Row,
+    next_row: Option<&Row>,
     selection: Option<(SelSide, Range<usize>)>,
     active: Option<SelSide>,
     commenting: Option<SelSide>,
@@ -1224,6 +1237,7 @@ pub(crate) fn render_row(
     let inner = render_row_content(
         ix,
         row,
+        next_row,
         selection,
         active,
         commenting,
@@ -1256,6 +1270,7 @@ pub(crate) fn render_row(
 fn render_row_content(
     ix: usize,
     row: &Row,
+    next_row: Option<&Row>,
     selection: Option<(SelSide, Range<usize>)>,
     active: Option<SelSide>,
     commenting: Option<SelSide>,
@@ -1266,10 +1281,12 @@ fn render_row_content(
     cx: &gpui::App,
 ) -> gpui::AnyElement {
     let row_height = px(row_height());
+    let body_edge = comment_body_edge(next_row);
     match row {
         Row::Continuation(row) => render_row_content(
             ix,
             row,
+            next_row,
             selection,
             active,
             commenting,
@@ -1373,7 +1390,7 @@ fn render_row_content(
             )
         }
         Row::CommentBody { half, .. } => {
-            comment_row(div().into_any_element(), *half, false, CardEdge::Middle, cx)
+            comment_row(div().into_any_element(), *half, false, body_edge, cx)
         }
         Row::CommentReactions { comment_id, half } => comment_row(
             div()
@@ -1385,11 +1402,11 @@ fn render_row_content(
                 .into_any_element(),
             *half,
             false,
-            CardEdge::Middle,
+            body_edge,
             cx,
         ),
         Row::CommentEditor { half } => {
-            comment_row(div().into_any_element(), *half, false, CardEdge::Middle, cx)
+            comment_row(div().into_any_element(), *half, false, body_edge, cx)
         }
         Row::CommentActions {
             root_id,
@@ -1709,6 +1726,69 @@ mod tests {
     use crate::threads::{group_comments, COMMENT_WRAP_CHARS};
     use diff_core::diff_texts;
     use syntax::Token;
+
+    #[test]
+    fn pending_threads_close_on_their_last_body_without_extra_rows() {
+        let mut comments = vec![
+            rc(1, "a.rs", Some("RIGHT"), Some(2), "root", "you", "", None),
+            rc(
+                2,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "reply",
+                "you",
+                "",
+                Some(1),
+            ),
+            rc(3, "a.rs", Some("RIGHT"), Some(2), "single", "you", "", None),
+        ];
+        for comment in &mut comments {
+            comment.time = CommentTime::Pending;
+        }
+        let index = group_comments(comments);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let mut rows = Vec::new();
+            push_thread_rows(
+                &mut rows,
+                index.threads.get("a.rs"),
+                "a.rs",
+                CommentSide::Right,
+                Some(2),
+                0,
+                mode,
+                COMMENT_WRAP_CHARS,
+            );
+            assert_eq!(rows.len(), 6, "no spacer or reply-action rows");
+            assert!(
+                matches!(comment_body_edge(rows.get(2)), CardEdge::Middle),
+                "the root body stays joined to its reply"
+            );
+            assert!(
+                matches!(comment_body_edge(rows.get(4)), CardEdge::Bottom),
+                "the reply body closes before the next thread"
+            );
+            assert!(
+                matches!(comment_body_edge(rows.get(6)), CardEdge::Bottom),
+                "a single pending comment closes at EOF"
+            );
+            assert!(matches!(
+                comment_body_edge(Some(&Row::Binary)),
+                CardEdge::Bottom
+            ));
+            assert!(matches!(
+                comment_body_edge(Some(&Row::CommentEditor { half: None })),
+                CardEdge::Middle
+            ));
+            assert!(matches!(
+                comment_body_edge(Some(&Row::CommentReactions {
+                    comment_id: 3,
+                    half: None
+                })),
+                CardEdge::Middle
+            ));
+        }
+    }
 
     #[gpui::test]
     fn active_gutter_does_not_change_line_geometry(cx: &mut gpui::TestAppContext) {

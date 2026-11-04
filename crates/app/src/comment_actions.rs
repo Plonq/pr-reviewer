@@ -11,6 +11,7 @@ use gpui::component::{
     Disableable as _, Sizable as _,
 };
 use gpui::{div, prelude::*, Context, MouseButton, SharedString, Window};
+use gpui_kit_assets::IconName;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommentTarget {
@@ -181,7 +182,9 @@ impl ReviewApp {
                     .debug_selector(|| format!("comment-edit-{key}"))
                     .child(
                         Button::new(SharedString::from(format!("comment-edit-{key}")))
-                            .label("Edit")
+                            .icon(IconName::Pencil)
+                            .accessibility_label("Edit comment")
+                            .tooltip("Edit comment")
                             .ghost()
                             .xsmall()
                             .disabled(busy || self.composer.is_some() || self.review.is_some())
@@ -207,7 +210,9 @@ impl ReviewApp {
                     .debug_selector(|| format!("comment-delete-{key}"))
                     .child(
                         Button::new(SharedString::from(format!("comment-delete-{key}")))
-                            .label("Delete")
+                            .icon(IconName::Trash)
+                            .accessibility_label("Delete comment")
+                            .tooltip("Delete comment")
                             .ghost()
                             .xsmall()
                             .disabled(busy || self.composer.is_some() || self.review.is_some())
