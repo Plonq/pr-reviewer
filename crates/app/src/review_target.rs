@@ -227,7 +227,12 @@ pub(crate) fn fetch_item_with_conversation(
         .files
         .iter()
         .enumerate()
-        .filter(|(_, file)| crate::file_media::file_kind(file).is_none() && !file.hunks.is_empty())
+        .filter(|(_, file)| {
+            // SVGs keep the same full-file source context as code, even for
+            // an unchanged rename whose patch contains no hunks.
+            crate::file_media::supports_code(file)
+                || (crate::file_media::file_kind(file).is_none() && !file.hunks.is_empty())
+        })
         .map(|(file_ix, file)| UpgradeJob {
             file_ix,
             old_path: file.old_path.clone(),

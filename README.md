@@ -80,8 +80,9 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   or mouse back/forward buttons revisit files at their remembered scroll positions.
   History survives refreshes and switching open reviews, but resets on close or
   comparison-scope changes; selecting another file after going back clears forward history
-- image diffs show before and after side by side, including SVGs; additions
-  and deletions leave the missing side empty. Video and other non-image media
+- image diffs show before and after side by side, including SVGs; SVGs have a
+  Rendered / Code diff toggle, with unified/split source views. Additions and
+  deletions leave the missing side empty. Video and other non-image media
   are links only, with no inline playback in the diff
 - unified + split views; double-click a word to select it, then drag to extend
   the selection by whole words (`cmd-c` copies the selection)
@@ -263,8 +264,8 @@ manual verification instructions.
 
 Kit's TextView still owns prose, tables, code and selection; small media plugins
 add image activation and video cards without replacing the stock renderer.
-GitHub mention/issue links and emoji preprocessing remain. SVG source toggles are
-not provided. Mixed-paragraph images can be smaller than the former media cards,
+GitHub mention/issue links and emoji preprocessing remain. SVG source toggles in
+Markdown are not provided. Mixed-paragraph images can be smaller than the former media cards,
 and narrow tables may clip.
 
 ## Where its state lives

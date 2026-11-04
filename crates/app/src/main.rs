@@ -631,6 +631,8 @@ pub(crate) struct ItemData {
     /// replace `diff.files[ix].hunks`. Reset on refresh.
     upgrades: HashMap<usize, FileUpgrade>,
     file_media: HashMap<usize, file_media::MediaFile>,
+    /// SVG source-view choices, remembered per path for this open review.
+    svg_code: HashSet<String>,
     /// Review threads grouped by anchor; Some for PR items (possibly empty),
     /// and for local items with in-memory draft comments.
     comments: Option<CommentIndex>,
@@ -719,6 +721,7 @@ impl ItemData {
             selection: None,
             upgrades: HashMap::new(),
             file_media: HashMap::new(),
+            svg_code: HashSet::new(),
             comments,
             local_review,
             comments_visible: true,
@@ -3419,7 +3422,9 @@ impl ReviewApp {
         let Some(item) = self.items.get(self.active) else {
             return;
         };
-        if item.reloading && placement == ComposerPlacement::Diff {
+        if placement == ComposerPlacement::Diff
+            && (item.reloading || self.active_data().is_some_and(ItemData::shows_file_media))
+        {
             return;
         }
         let item_id = item.id;
@@ -4163,7 +4168,10 @@ impl ReviewApp {
         let Some(composer) = &self.composer else {
             return empty();
         };
-        if composer.placement != ComposerPlacement::Diff || self.show_queue {
+        if composer.placement != ComposerPlacement::Diff
+            || self.show_queue
+            || self.active_data().is_some_and(ItemData::shows_file_media)
+        {
             return empty();
         }
         // Only render for the item it was opened on, and only while active.
@@ -5774,34 +5782,29 @@ impl ReviewApp {
                     },
                     theme::overlay0(cx),
                 ),
-                ItemState::Ready(data)
-                    if data
-                        .diff
-                        .files
-                        .get(data.file_ix)
-                        .is_some_and(|file| file_media::file_kind(file).is_some()) =>
-                {
-                    div()
-                        .size_full()
-                        .flex()
-                        .flex_col()
-                        .when(matches!(item.source, Source::Pr(_)), |pane| {
-                            pane.child(self.render_review_scope(item, data, cx))
-                        })
-                        .child(file_media::render(
-                            &data.diff.files[data.file_ix],
-                            data.file_media.get(&data.file_ix),
-                            cx,
-                        ))
-                        .into_any_element()
-                }
-                ItemState::Ready(data) => div()
+                ItemState::Ready(data) if data.shows_file_media() => div()
                     .size_full()
                     .flex()
                     .flex_col()
                     .when(matches!(item.source, Source::Pr(_)), |pane| {
                         pane.child(self.render_review_scope(item, data, cx))
                     })
+                    .children(file_media::render_svg_controls(data, cx))
+                    .child(file_media::render(
+                        &data.diff.files[data.file_ix],
+                        data.file_media.get(&data.file_ix),
+                        cx,
+                    ))
+                    .into_any_element(),
+                ItemState::Ready(data) => div()
+                    .debug_selector(|| "code-diff-pane".into())
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .when(matches!(item.source, Source::Pr(_)), |pane| {
+                        pane.child(self.render_review_scope(item, data, cx))
+                    })
+                    .children(file_media::render_svg_controls(data, cx))
                     .child(self.render_presentation_controls(data, cx))
                     .child(
                         div()

@@ -4,9 +4,17 @@
 use std::{collections::HashMap, io::Write, path::Path};
 
 use diff_core::{FileDiff, FileStatus, PrDiff};
-use gpui::{div, img, prelude::*, px, Context, ImageSource, ObjectFit, Resource, StyledImage};
+use gpui::{
+    component::{
+        button::{Button, ButtonVariants as _},
+        Selectable as _, Sizable as _,
+    },
+    div, img,
+    prelude::*,
+    px, Context, ImageSource, ObjectFit, Resource, StyledImage, Window,
+};
 
-use crate::{review_target::LoadedMeta, theme, ReviewApp, Source};
+use crate::{review_target::LoadedMeta, theme, ItemData, ReviewApp, Source};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -32,6 +40,108 @@ pub(crate) fn file_kind(file: &FileDiff) -> Option<Kind> {
     kind(file.display_path())
         .or_else(|| file.old_path.as_deref().and_then(kind))
         .or((file.status == FileStatus::Binary).then_some(Kind::Other))
+}
+
+fn is_svg(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+}
+
+/// Only offer source for text SVG comparisons, never a rename across binary
+/// formats (e.g. SVG to PNG) or a file Git explicitly classified as binary.
+pub(crate) fn supports_code(file: &FileDiff) -> bool {
+    file.status != FileStatus::Binary
+        && file
+            .old_path
+            .iter()
+            .chain(&file.new_path)
+            .any(|path| is_svg(path))
+        && file
+            .old_path
+            .iter()
+            .chain(&file.new_path)
+            .all(|path| is_svg(path))
+}
+
+impl ItemData {
+    pub(crate) fn shows_file_media(&self) -> bool {
+        self.diff.files.get(self.file_ix).is_some_and(|file| {
+            file_kind(file).is_some()
+                && !(supports_code(file) && self.svg_code.contains(file.display_path()))
+        })
+    }
+}
+
+impl ReviewApp {
+    fn set_svg_code(&mut self, code: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        let Some(file) = data
+            .diff
+            .files
+            .get(data.file_ix)
+            .filter(|file| supports_code(file))
+        else {
+            return;
+        };
+        let path = file.display_path().to_owned();
+        if code {
+            data.svg_code.insert(path);
+        } else {
+            data.svg_code.remove(&path);
+        }
+        // Rows and the code viewport remain intact while the preview is shown.
+        data.selection = None;
+        data.cursor_side = None;
+        self.drag_anchor = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+}
+
+pub(crate) fn render_svg_controls(
+    data: &ItemData,
+    cx: &mut Context<ReviewApp>,
+) -> Option<gpui::AnyElement> {
+    let file = data
+        .diff
+        .files
+        .get(data.file_ix)
+        .filter(|file| supports_code(file))?;
+    let code = data.svg_code.contains(file.display_path());
+    Some(
+        div()
+            .h(px(30.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .bg(theme::mantle(cx))
+            .border_b_1()
+            .border_color(theme::surface0(cx))
+            .children(
+                [
+                    (false, "svg-rendered", "Rendered"),
+                    (true, "svg-code", "Code diff"),
+                ]
+                .map(|(value, id, label)| {
+                    div().debug_selector(move || id.to_owned()).child(
+                        Button::new(id)
+                            .ghost()
+                            .small()
+                            .label(label)
+                            .selected(code == value)
+                            .on_click(cx.listener(move |app, _, window, cx| {
+                                app.set_svg_code(value, window, cx)
+                            })),
+                    )
+                }),
+            )
+            .into_any_element(),
+    )
 }
 
 pub(crate) struct Side {
@@ -202,11 +312,7 @@ fn render_side(
                 .debug_selector(move || format!("file-media-{label}-viewport"))
                 .overflow_hidden()
                 .children(side.and_then(|side| side.image.clone()).map(|source| {
-                    if path.is_some_and(|path| {
-                        Path::new(path)
-                            .extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
-                    }) {
+                    if path.is_some_and(is_svg) {
                         return crate::svg_image::svg_image(source, label);
                     }
                     img(ImageSource::Resource(source))
@@ -278,6 +384,23 @@ mod tests {
             assert_eq!(kind(path), Some(Kind::Other));
         }
         assert_eq!(kind("a.rs"), None);
+    }
+
+    #[test]
+    fn source_toggle_is_only_for_text_svg_comparisons() {
+        for (patch, expected) in [
+            ("diff --git a/a.SVG b/b.svg\nsimilarity index 100%\nrename from a.SVG\nrename to b.svg\n", true),
+            ("diff --git a/a.svg b/a.svg\nnew file mode 100644\n--- /dev/null\n+++ b/a.svg\n@@ -0,0 +1 @@\n+<svg/>\n", true),
+            ("diff --git a/a.svg b/a.svg\ndeleted file mode 100644\n--- a/a.svg\n+++ /dev/null\n@@ -1 +0,0 @@\n-<svg/>\n", true),
+            ("diff --git a/a.svg b/a.svg\nBinary files a/a.svg and b/a.svg differ\n", false),
+            ("diff --git a/a.svg b/a.png\nsimilarity index 100%\nrename from a.svg\nrename to a.png\n", false),
+            ("diff --git a/a.png b/a.svg\nsimilarity index 100%\nrename from a.png\nrename to a.svg\n", false),
+            ("diff --git a/a.mp4 b/a.mp4\nBinary files a/a.mp4 and b/a.mp4 differ\n", false),
+            ("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n", false),
+        ] {
+            let diff = diff_core::parse_patch(patch);
+            assert_eq!(supports_code(&diff.files[0]), expected, "{patch}");
+        }
     }
 
     #[test]
