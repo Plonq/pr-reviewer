@@ -294,7 +294,7 @@ fn git_env() -> [(&'static str, &'static str); 6] {
 /// App-owned icons live under `icons/gander/` to avoid upstream collisions.
 struct AppAssets;
 
-// Catalog entries alone do not bundle SVGs. Include the queue/media icons
+// Catalog entries alone do not bundle SVGs. Include the queue/media/comment icons
 // explicitly rather than relying on the default component bundle's subset.
 gpui_kit_assets::icon_assets!(
     ExtraIcons,
@@ -308,7 +308,11 @@ gpui_kit_assets::icon_assets!(
         Minimize2,
         RotateCcw,
         ExternalLink,
-        X
+        X,
+        Pencil,
+        Trash,
+        Square,
+        SquareCheck
     ]
 );
 
@@ -6000,6 +6004,7 @@ impl ReviewApp {
                                                         render_row(
                                                             ix,
                                                             row,
+                                                            data.rows.get(ix + 1),
                                                             row_sel,
                                                             active,
                                                             commenting,
@@ -9937,6 +9942,26 @@ mod tests {
                 <= px(1.),
             "labels that fit inline must not add a row of height"
         );
+    }
+
+    #[test]
+    fn diff_toggle_and_comment_action_icons_are_bundled() {
+        use gpui_kit_assets::IconName;
+        let listed = AppAssets.list("icons/").unwrap();
+        for icon in [
+            IconName::Square,
+            IconName::SquareCheck,
+            IconName::Pencil,
+            IconName::Trash,
+        ] {
+            let path = icon.path();
+            let svg = AppAssets
+                .load(&path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing styling icon: {path}"));
+            assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"));
+            assert!(listed.contains(&path));
+        }
     }
 
     #[test]

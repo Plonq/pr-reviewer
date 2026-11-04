@@ -329,14 +329,24 @@ impl ReviewApp {
         data: &ItemData,
         cx: &mut Context<Self>,
     ) -> impl gpui::IntoElement {
-        use gpui::component::{
-            button::{Button, ButtonVariants as _},
-            Sizable as _,
-        };
+        use gpui::component::{button::Button, Selectable as _, Sizable as _};
         use gpui::{div, prelude::*, px};
-        let label = |name: &str, on: bool| format!("{name}: {}", if on { "on" } else { "off" });
+        use gpui_kit_assets::IconName;
+        let toggle = |id, name, shortcut, enabled| {
+            Button::new(id)
+                .small()
+                .label(name)
+                .icon(if enabled {
+                    IconName::SquareCheck
+                } else {
+                    IconName::Square
+                })
+                .selected(enabled)
+                .toggled(enabled)
+                .tooltip(format!("{name} ({shortcut})"))
+        };
         div()
-            .h(px(30.))
+            .h(px(36.))
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -346,42 +356,39 @@ impl ReviewApp {
             .border_b_1()
             .border_color(crate::theme::surface0(cx))
             .child(
-                Button::new("hide-whitespace")
-                    .ghost()
-                    .small()
-                    .label(label(
-                        "Hide whitespace (W)",
-                        data.preferences.hide_whitespace.unwrap_or(false),
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_presentation(Preference::Whitespace, cx)
-                    })),
+                toggle(
+                    "hide-whitespace",
+                    "Hide whitespace",
+                    "W",
+                    data.preferences.hide_whitespace.unwrap_or(false),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_presentation(Preference::Whitespace, cx)
+                })),
             )
             .child(
-                Button::new("collapse-unchanged")
-                    .ghost()
-                    .small()
-                    .label(label(
-                        "Collapse (K)",
-                        data.preferences.collapse_unchanged.unwrap_or(false),
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                toggle(
+                    "collapse-unchanged",
+                    "Collapse",
+                    "K",
+                    data.preferences.collapse_unchanged.unwrap_or(false),
+                )
+                .on_click(
+                    cx.listener(|this, _, _, cx| {
                         this.toggle_presentation(Preference::Collapse, cx)
-                    })),
+                    }),
+                ),
             )
             .child(
-                Button::new("soft-wrap")
-                    .ghost()
-                    .small()
-                    .label(label(
-                        "Wrap (⌥Z)",
-                        data.preferences.soft_wrap.unwrap_or(false),
-                    ))
-                    .on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.toggle_presentation(Preference::Wrap, cx)
-                        }),
-                    ),
+                toggle(
+                    "soft-wrap",
+                    "Wrap",
+                    "⌥Z",
+                    data.preferences.soft_wrap.unwrap_or(false),
+                )
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.toggle_presentation(Preference::Wrap, cx)),
+                ),
             )
     }
 }
