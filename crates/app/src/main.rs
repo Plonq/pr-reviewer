@@ -13659,7 +13659,27 @@ mod tests {
             assert_eq!(data.preferences, store::DiffPreferences::OFF);
             assert_eq!(data.preference_overrides.hide_whitespace, None);
         });
-        vcx.simulate_keystrokes("shift-w shift-k alt-z");
+        // Presentation toggles use plain letters, not Shift+W / Shift+K.
+        vcx.simulate_keystrokes("w");
+        cx.update(|cx| {
+            let prefs = app.read(cx).active_data().unwrap().preferences;
+            assert_eq!(prefs.hide_whitespace, Some(true));
+            assert_eq!(prefs.collapse_unchanged, Some(false));
+        });
+        vcx.simulate_keystrokes("k");
+        cx.update(|cx| {
+            let prefs = app.read(cx).active_data().unwrap().preferences;
+            assert_eq!(prefs.hide_whitespace, Some(true));
+            assert_eq!(prefs.collapse_unchanged, Some(true));
+        });
+        vcx.simulate_keystrokes("w k");
+        cx.update(|cx| {
+            assert_eq!(
+                app.read(cx).active_data().unwrap().preferences,
+                store::DiffPreferences::OFF
+            );
+        });
+        vcx.simulate_keystrokes("w k alt-z");
         let wanted = store::DiffPreferences {
             hide_whitespace: Some(true),
             collapse_unchanged: Some(true),

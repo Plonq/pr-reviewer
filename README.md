@@ -114,7 +114,7 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   whitespace-hidden context is temporarily revealed. Large-file safety banners
   still require explicit expansion; search reports excluded large files and
   files where only patch content is available.
-- diff presentation controls: `W` hides whitespace changes, `K` folds unchanged
+- diff presentation controls: `w` hides whitespace changes, `k` folds unchanged
   regions, and `alt-z` toggles soft wrapping. All three start off for new PRs;
   each PR remembers its own choices. Horizontal scrolling works in both views.
   Fold boundaries expand on click. Files of 20,000+ lines open behind an
@@ -306,7 +306,7 @@ only by your account. Delete that directory to clear downloaded images.
 | `n` / `p` | next / previous hunk |
 | `v` | unified ↔ split view |
 | `V` | toggle current file viewed on GitHub |
-| `W` / `K` | hide whitespace / collapse unchanged (sticky per PR) |
+| `w` / `k` | hide whitespace / collapse unchanged (sticky per PR) |
 | `alt-z` | toggle soft wrap |
 | `cmd-f` | search current diff; Enter / Shift-Enter cycle, Esc restores position |
 | `/` | fuzzy file filter |
