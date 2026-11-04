@@ -7652,6 +7652,92 @@ mod tests {
     }
 
     #[gpui::test]
+    fn viewed_checkbox_padding_toggles_only_when_enabled(cx: &mut gpui::TestAppContext) {
+        for query in ["", "b.rs"] {
+            for disabled in ["", "pending", "uncertain", "unknown", "reloading"] {
+                let fake = Arc::new(FakePr {
+                    patch: Some("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-old\n+new\n".into()),
+                    ..Default::default()
+                });
+                let (window, app) = queue_window(cx, fake.clone());
+                cx.update(|cx| {
+                    app.update(cx, |this, cx| this.open_item(Source::Pr(loop_loc()), cx))
+                });
+                cx.run_until_parked();
+                let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+                vcx.update(|window, cx| {
+                    app.update(cx, |this, cx| {
+                        let data = this.active_data_mut().unwrap();
+                        match disabled {
+                            "pending" => {
+                                data.viewed.pending.insert("b.rs".into());
+                            }
+                            "uncertain" => {
+                                data.viewed.uncertain.insert("b.rs".into());
+                            }
+                            "unknown" => {
+                                data.viewed.fetched.as_mut().unwrap().files.remove("b.rs");
+                            }
+                            _ => {}
+                        }
+                        this.items[this.active].reloading = disabled == "reloading";
+                        this.tree_filter_input
+                            .update(cx, |input, cx| input.set_value(query, window, cx));
+                        cx.notify();
+                    });
+                });
+                vcx.run_until_parked();
+                vcx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+                let bounds = vcx.debug_bounds("viewed-1").unwrap();
+                assert_eq!(bounds.size.width, px(24.));
+                assert_eq!(bounds.size.height, px(24.));
+                // Each corner is outside the small, centered visual indicator.
+                for (ix, (x, y)) in [(1., 1.), (23., 1.), (1., 23.), (23., 23.)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let position = bounds.origin + gpui::point(px(x), px(y));
+                    vcx.simulate_mouse_down(
+                        position,
+                        MouseButton::Left,
+                        gpui::Modifiers::default(),
+                    );
+                    vcx.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
+                    vcx.run_until_parked();
+                    vcx.update(|window, cx| {
+                        let data = app.read(cx).active_data().unwrap();
+                        assert_eq!(data.file_ix, 0, "padding must not open b.rs");
+                        if disabled.is_empty() {
+                            assert_eq!(
+                                data.viewed.state("b.rs"),
+                                Some(if ix % 2 == 0 {
+                                    github::FileViewedState::Viewed
+                                } else {
+                                    github::FileViewedState::Unviewed
+                                })
+                            );
+                        }
+                        let _ = window.draw(cx);
+                    });
+                }
+                let expected = if disabled.is_empty() {
+                    vec![
+                        ("b.rs".into(), true),
+                        ("b.rs".into(), false),
+                        ("b.rs".into(), true),
+                        ("b.rs".into(), false),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(*fake.viewed_writes.lock().unwrap(), expected);
+            }
+        }
+    }
+
+    #[gpui::test]
     fn viewed_toggles_are_optimistic_serialized_and_reconcile_failures(
         cx: &mut gpui::TestAppContext,
     ) {
