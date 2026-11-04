@@ -79,6 +79,7 @@ pub(crate) fn new(window: &mut Window, cx: &mut Context<EditorState>) -> EditorS
         .soft_wrap(true)
         .wrapping_indent(WrappingIndent::None)
         .scroll_beyond_last_line(Some(0))
+        .scroll_bounce(false)
 }
 
 fn height(rows: usize, line_height: gpui::Pixels) -> gpui::Pixels {
@@ -211,6 +212,50 @@ mod tests {
             window.refresh();
         });
         assert_eq!(settle(&mut vcx), height(3, px(31.5)));
+    }
+
+    #[gpui::test]
+    fn long_comments_stop_at_the_edges_without_bouncing(cx: &mut TestAppContext) {
+        let (mut vcx, _, input) = fixture(cx);
+        vcx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("line\n".repeat(40), window, cx);
+            });
+        });
+        settle(&mut vcx);
+        let position = vcx.debug_bounds("comment-editor-field").unwrap().center();
+        for delta in [120., -120.] {
+            // A line-wheel packet reaches the edge without triggering rubber-band
+            // displacement, even if the platform default is accidentally restored.
+            vcx.simulate_event(gpui::ScrollEvent {
+                position,
+                delta: gpui::ScrollDelta::Lines(gpui::point(0., delta * 100.)),
+                ..Default::default()
+            });
+            settle(&mut vcx);
+            let before = vcx.update(|_, cx| {
+                let state = input.read(cx);
+                (state.text_bounds(), state.scroll_offset())
+            });
+            for phase in [gpui::TouchPhase::Started, gpui::TouchPhase::Moved] {
+                vcx.simulate_event(gpui::ScrollEvent {
+                    position,
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(delta))),
+                    touch_phase: phase,
+                    ..Default::default()
+                });
+                settle(&mut vcx);
+                vcx.update(|_, cx| {
+                    let state = input.read(cx);
+                    assert_eq!((state.text_bounds(), state.scroll_offset()), before);
+                });
+            }
+            vcx.simulate_event(gpui::ScrollEvent {
+                position,
+                touch_phase: gpui::TouchPhase::Ended,
+                ..Default::default()
+            });
+        }
     }
 
     #[gpui::test]

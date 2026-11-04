@@ -5188,6 +5188,8 @@ impl ReviewApp {
                         cx,
                     )
                 })
+                // Match our plain scroll containers: stop at the ends, never bounce.
+                .scroll_bounce(false)
                 .into_any_element()
             }
             Some(_) if filtered => div()
@@ -6609,6 +6611,93 @@ mod tests {
         include!("file_media_tests.rs");
         include!("svg_image_tests.rs");
         include!("video_tests.rs");
+    }
+
+    #[gpui::test]
+    fn file_tree_scrolls_without_bouncing_at_either_end(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut item = loop_pr_item(Vec::new());
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff.files = (0..80)
+            .map(|ix| {
+                let mut file = two_file_diff().files.remove(0);
+                file.old_path = Some(format!("file-{ix:02}.rs"));
+                file.new_path = file.old_path.clone();
+                file
+            })
+            .collect();
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        // Filtering swaps the tree's entries, but must keep the same scroll policy.
+        for query in ["", "file"] {
+            vcx.update(|window, cx| {
+                app.read(cx)
+                    .tree_filter_input
+                    .clone()
+                    .update(cx, |state, cx| state.set_value(query, window, cx));
+            });
+            draw_window(&mut vcx);
+            let handle = cx.update(|cx| {
+                app.read(cx)
+                    .active_data()
+                    .unwrap()
+                    .tree_view
+                    .as_ref()
+                    .unwrap()
+                    .state
+                    .read(cx)
+                    .scroll_handle()
+                    .clone()
+            });
+            for (offset, selector, delta) in
+                [(0., "tree-row-0", 120.), (-100_000., "tree-row-79", -120.)]
+            {
+                handle
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(point(px(0.), px(offset)));
+                draw_window(&mut vcx);
+                let before = vcx.debug_bounds(selector).unwrap();
+                let logical_offset = handle.0.borrow().base_handle.offset();
+                for phase in [gpui::TouchPhase::Started, gpui::TouchPhase::Moved] {
+                    vcx.simulate_event(gpui::ScrollEvent {
+                        position: before.center(),
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(delta))),
+                        touch_phase: phase,
+                        ..Default::default()
+                    });
+                    draw_window(&mut vcx);
+                    // Bounce is a paint displacement, not a logical offset change.
+                    assert_eq!(vcx.debug_bounds(selector).unwrap(), before);
+                    assert_eq!(handle.0.borrow().base_handle.offset(), logical_offset);
+                }
+                vcx.simulate_event(gpui::ScrollEvent {
+                    position: before.center(),
+                    touch_phase: gpui::TouchPhase::Ended,
+                    ..Default::default()
+                });
+            }
+            // Disabling bounce must not disable ordinary scrolling or reversal.
+            handle
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(point(px(0.), px(0.)));
+            draw_window(&mut vcx);
+            let position = vcx.debug_bounds("tree-row-0").unwrap().center();
+            for (delta, expected) in [(-48., -48.), (24., -24.)] {
+                vcx.simulate_event(gpui::ScrollEvent {
+                    position,
+                    delta: gpui::ScrollDelta::Pixels(point(px(0.), px(delta))),
+                    ..Default::default()
+                });
+                draw_window(&mut vcx);
+                assert_eq!(handle.0.borrow().base_handle.offset().y, px(expected));
+            }
+        }
     }
 
     #[gpui::test]
