@@ -14,6 +14,8 @@ impl ReviewApp {
         };
         let selected = review.verdict;
         let busy = review.in_flight;
+        let uploading =
+            crate::comment_media::blocks_submission(review.uploads.as_ref(), &review.input, cx);
         let verdict = |id, label, value| {
             Button::new(id)
                 .label(label)
@@ -76,7 +78,12 @@ impl ReviewApp {
                         github::ReviewVerdict::Comment,
                     )),
             )
-            .child(comment_editor::field(&review.input, cx))
+            .child(comment_editor::field_with_media(
+                &review.input,
+                review.uploads.as_ref(),
+                busy,
+                cx,
+            ))
             .when_some(review.error.clone(), |body, error| {
                 body.child(div().text_color(theme::red(cx)).child(error))
             })
@@ -107,7 +114,7 @@ impl ReviewApp {
                             .label(submit_label)
                             .primary()
                             .small()
-                            .disabled(busy)
+                            .disabled(busy || uploading)
                             .loading(busy)
                             .on_click(
                                 cx.listener(|app, _, window, cx| app.submit_review(window, cx)),

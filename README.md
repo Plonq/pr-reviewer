@@ -142,6 +142,13 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   Main-thread drafts append to the pending review summary; replies stay in-thread.
   Posted comments appear immediately as placeholders and update in place when
   the refreshed discussion arrives.
+- paste an image or copied media file, or drop images/videos onto any PR comment
+  editor (including replies, edits, and review summaries) to upload to GitHub and
+  insert its attachment Markdown at the cursor. Uploads show progress and errors;
+  submission waits for completion. Uses your `gh` login and requires repository
+  write access. Supports PNG/JPEG/GIF/WebP/SVG up to 10 MB and MP4/MOV/WebM up to
+  100 MB (GitHub may enforce a lower video limit for your plan). Local-repository
+  comments do not upload files. See [attachment testing](docs/comment-media-testing.md).
 - stock Markdown and images in conversations and diff comment threads,
   including cached private GitHub attachments using the secure HTTP bridge;
   click Markdown images or GitHub's pasted/dropped images to inspect them in a
