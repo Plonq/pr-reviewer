@@ -350,7 +350,7 @@ impl ReviewApp {
                     .ghost()
                     .small()
                     .label(label(
-                        "Hide whitespace (w)",
+                        "Hide whitespace (W)",
                         data.preferences.hide_whitespace.unwrap_or(false),
                     ))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -362,7 +362,7 @@ impl ReviewApp {
                     .ghost()
                     .small()
                     .label(label(
-                        "Collapse (k)",
+                        "Collapse (K)",
                         data.preferences.collapse_unchanged.unwrap_or(false),
                     ))
                     .on_click(cx.listener(|this, _, _, cx| {
