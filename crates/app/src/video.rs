@@ -94,11 +94,10 @@ impl VideoHub {
         active: Option<(u64, crate::ItemPane)>,
         cx: &mut Context<Self>,
     ) {
-        let playing = self.session.as_ref().map(|s| s.entity_id());
+        // A preview owns its downloaded ranges. Keep it for the lifetime of
+        // the review tab, even while another pane, tab or the queue is shown.
         self.previews.retain(|(origin, session)| {
-            let in_pane = active == Some((origin.item, origin.pane));
-            let last_played = playing == Some(session.entity_id());
-            if item_ids.contains(&origin.item) && (in_pane || last_played) {
+            if item_ids.contains(&origin.item) {
                 true
             } else {
                 session.update(cx, |s, _| s.cancel());
@@ -187,13 +186,12 @@ impl VideoHub {
         if let Some(old) = &self.session {
             old.update(cx, |s, _| s.pause());
         }
-        if let Some(session) = self.preload(target, origin, owner, true, cx) {
-            session.update(cx, |s, cx| {
-                s.activated = true;
-                s.resume(cx);
-            });
-            self.session = Some(session);
-        }
+        let session = self.preload(target, origin, owner, cx);
+        session.update(cx, |s, cx| {
+            s.activated = true;
+            s.resume(cx);
+        });
+        self.session = Some(session);
         cx.notify();
     }
 
@@ -202,26 +200,13 @@ impl VideoHub {
         target: VideoTarget,
         origin: Origin,
         owner: WeakEntity<ReviewApp>,
-        force: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Entity<VideoSession>> {
+    ) -> Entity<VideoSession> {
         if let Some((_, session)) = self.previews.iter().find(|(key, _)| key == &origin) {
-            return Some(session.clone());
+            return session.clone();
         }
-        // Keep at most four bounded media caches/decoders. Additional cards can
-        // preload on hover or Play, without render-time eviction/reload loops.
-        if self.previews.len() >= 4 {
-            if !force {
-                return None;
-            }
-            let index = self.previews.iter().position(|(_, s)| {
-                self.session
-                    .as_ref()
-                    .is_none_or(|active| active.entity_id() != s.entity_id())
-            })?;
-            let (_, old) = self.previews.remove(index);
-            old.update(cx, |s, _| s.cancel());
-        }
+        // Each source has a bounded preload budget. Preparing another card must
+        // not discard ranges already downloaded for this review.
         let hub = cx.entity().downgrade();
         let session = cx.new(|cx| {
             VideoSession::new(
@@ -234,7 +219,7 @@ impl VideoHub {
             )
         });
         self.previews.push((origin, session.clone()));
-        Some(session)
+        session
     }
 }
 
@@ -255,16 +240,15 @@ pub(crate) fn card(
         .cloned();
     let expanded = hub.read(cx).expanded;
     if matches!(state, Discovery::Video) && !(expanded && active.is_some()) {
-        if let Some(session) = hub.update(cx, |hub, cx| {
-            hub.preload(target.clone(), origin.clone(), owner.clone(), false, cx)
-        }) {
-            return div()
-                .w_full()
-                .h(px(INLINE_HEIGHT))
-                .debug_selector(|| "video-card".into())
-                .child(session)
-                .into_any_element();
-        }
+        let session = hub.update(cx, |hub, cx| {
+            hub.preload(target.clone(), origin.clone(), owner.clone(), cx)
+        });
+        return div()
+            .w_full()
+            .h(px(INLINE_HEIGHT))
+            .debug_selector(|| "video-card".into())
+            .child(session)
+            .into_any_element();
     }
     let url = target.url.clone();
     let label = if target.label.is_empty() {
@@ -284,28 +268,9 @@ pub(crate) fn card(
         .selectable(true)
         .into_any_element();
     }
-    let hover_hub = hub.clone();
-    let hover_target = target.clone();
-    let hover_origin = origin.clone();
-    let hover_owner = owner.clone();
-    let can_preload = matches!(state, Discovery::Video) && !expanded;
     div()
         .id("video-card")
         .relative()
-        .on_hover(move |hovered, _, cx| {
-            if *hovered && can_preload {
-                hover_hub.update(cx, |hub, cx| {
-                    hub.preload(
-                        hover_target.clone(),
-                        hover_origin.clone(),
-                        hover_owner.clone(),
-                        true,
-                        cx,
-                    );
-                    cx.notify();
-                });
-            }
-        })
         .w_full()
         .h(px(INLINE_HEIGHT))
         .overflow_hidden()

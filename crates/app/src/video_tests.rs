@@ -111,6 +111,127 @@ fn extensionless_attachment_cards_use_metadata_once_and_leave_other_links_stock(
     assert!(cx.opened_url().is_none());
 }
 
+// Retain the exact transfer objects so cancellation/recreation cannot masquerade
+// as a reused preview, even while the deterministic downloader is still pending.
+fn record_video_downloads(
+    app: &gpui::Entity<ReviewApp>,
+    cx: &mut gpui::TestAppContext,
+) -> Arc<std::sync::Mutex<Vec<Arc<crate::http::video::Transfer>>>> {
+    let transfers = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = transfers.clone();
+    cx.update(|cx| {
+        app.read(cx).video_hub.clone().update(cx, |hub, _| {
+            hub.download = Arc::new(move |_, transfer| {
+                recorded.lock().unwrap().push(transfer);
+                Box::pin(futures::future::pending())
+            });
+        });
+    });
+    transfers
+}
+
+#[gpui::test]
+fn video_preparing_and_hovering_six_cards_never_evicts_another_preview(
+    cx: &mut gpui::TestAppContext,
+) {
+    image_client(cx);
+    let links: Vec<_> = (0..6)
+        .map(|i| format!("[clip {i}](http://127.0.0.1:1/{i}.mp4)"))
+        .collect();
+    let body = links.join("\n\n");
+    let (window, app) = video_conversation(cx, &body);
+    let transfers = record_video_downloads(&app, cx);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1400.), px(3400.)));
+    draw_settled(&mut vcx);
+    assert_eq!(transfers.lock().unwrap().len(), 6, "all cards preload");
+    for _ in 0..2 {
+        for link in &links {
+            let selector = Box::leak(
+                format!("conversation-0-video-{}", body.find(link).unwrap()).into_boxed_str(),
+            );
+            let bounds = vcx.debug_bounds(selector).unwrap();
+            vcx.simulate_mouse_move(bounds.center(), None, Default::default());
+            draw_settled(&mut vcx);
+            let transfers = transfers.lock().unwrap();
+            assert_eq!(transfers.len(), 6, "hover/redraw must not reload videos");
+            assert!(transfers.iter().all(|t| !t.canceled.load(std::sync::atomic::Ordering::Relaxed)));
+        }
+    }
+    cx.update(|cx| app.update(cx, |app, cx| app.close_item(app.active, cx)));
+    draw_settled(&mut vcx);
+    assert!(transfers.lock().unwrap().iter().all(|t| t.canceled.load(std::sync::atomic::Ordering::Relaxed)));
+}
+
+#[gpui::test]
+fn video_previews_survive_pane_tab_and_queue_navigation_until_their_review_closes(
+    cx: &mut gpui::TestAppContext,
+) {
+    image_client(cx);
+    let (window, app) = video_conversation(
+        cx,
+        "[one](http://127.0.0.1:1/one.mp4)\n\n[two](http://127.0.0.1:1/two.mp4)",
+    );
+    let transfers = record_video_downloads(&app, cx);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1400.), px(1400.)));
+    draw_settled(&mut vcx);
+    assert_eq!(transfers.lock().unwrap().len(), 2);
+    click_selector(&mut vcx, "video-play");
+    let session = cx.update(|cx| app.read(cx).video_hub.read(cx).session.clone().unwrap());
+    cx.update(|cx| assert!(session.read(cx).is_playing()));
+    for pane in [ItemPane::Changes, ItemPane::Conversation] {
+        cx.update(|cx| app.update(cx, |app, cx| app.flip_pane(pane, cx)));
+        draw_settled(&mut vcx);
+        cx.update(|cx| assert!(!session.read(cx).is_playing(), "returning must not auto-resume"));
+        let transfers = transfers.lock().unwrap();
+        assert_eq!(transfers.len(), 2, "reuse both played and unplayed previews");
+        assert!(transfers.iter().all(|t| !t.canceled.load(std::sync::atomic::Ordering::Relaxed)));
+    }
+    cx.update(|cx| app.update(cx, |app, cx| {
+        app.show_queue = true;
+        cx.notify();
+    }));
+    draw_settled(&mut vcx);
+    cx.update(|cx| app.update(cx, |app, cx| {
+        let mut other = loop_pr_item(Vec::new());
+        other.id = 1;
+        other.pane = ItemPane::Conversation;
+        let ItemState::Ready(data) = &mut other.state else { unreachable!() };
+        data.pr_meta.as_mut().unwrap().body = "[other](http://127.0.0.1:1/other.mp4)".into();
+        data.discussion = Some(github::PrDiscussion::default());
+        app.items.push(other);
+        app.cycle_items(1, cx);
+    }));
+    draw_settled(&mut vcx);
+    assert_eq!(transfers.lock().unwrap().len(), 3);
+    cx.update(|cx| app.update(cx, |app, cx| app.cycle_items(-1, cx)));
+    draw_settled(&mut vcx);
+    cx.update(|cx| {
+        let hub = app.read(cx).video_hub.read(cx);
+        assert_eq!(hub.session.as_ref().unwrap().entity_id(), session.entity_id());
+        assert!(!session.read(cx).is_playing());
+    });
+    {
+        let transfers = transfers.lock().unwrap();
+        assert_eq!(transfers.len(), 3, "returning to a tab reuses its previews");
+        assert!(transfers.iter().all(|t| !t.canceled.load(std::sync::atomic::Ordering::Relaxed)));
+    }
+    // Closing an inactive review releases only its own previews.
+    cx.update(|cx| app.update(cx, |app, cx| app.close_item(1, cx)));
+    draw_settled(&mut vcx);
+    {
+        let transfers = transfers.lock().unwrap();
+        assert!(!transfers[0].canceled.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!transfers[1].canceled.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(transfers[2].canceled.load(std::sync::atomic::Ordering::Relaxed));
+    }
+    cx.update(|cx| app.update(cx, |app, cx| app.close_item(0, cx)));
+    draw_settled(&mut vcx);
+    assert!(transfers.lock().unwrap().iter().all(|t| t.canceled.load(std::sync::atomic::Ordering::Relaxed)));
+    cx.update(|cx| assert!(app.read(cx).video_hub.read(cx).session.is_none()));
+}
+
 #[gpui::test]
 fn video_cancel_retry_and_starting_another_card_release_the_old_session(
     cx: &mut gpui::TestAppContext,

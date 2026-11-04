@@ -9,7 +9,10 @@ cargo build -p gander --all-targets --locked
 
 The application tests use the real Markdown hosts, diff row measurement and
 modal event handlers, with a deterministic pending downloader in GUI tests.
-GUI regressions also exercise below-header overlay bounds across resizing,
+GUI regressions cover retaining played and unplayed previews across pane, tab
+and queue navigation, preparing/hovering six attachments without eviction or
+reload, and releasing only the closed review's transfers. They also exercise
+below-header overlay bounds across resizing,
 two-second idle/window-exit control hiding, and seek/volume drags outside the
 slider bounds with clamping, release, and click isolation.
 Separate real-socket HTTP tests cover one-byte ranged GET metadata requests,
@@ -92,11 +95,17 @@ Use a PR containing authorized test attachments; do not post or alter the PR.
 - Repeat in conversation comments and inline review threads, unified and split,
   including partially virtualized cards and window resizing. Frames must remain
   clipped to the discussion pane and must not cover adjacent controls.
+- Use a PR with at least six video attachments. Each rendered card should
+  prepare its paused preview; hovering or playing another card must not reset
+  any previously loaded attachment. Switch between Conversation and Changes,
+  between review tabs, and to/from the queue. All downloaded ranges should be
+  retained for as long as their review tab is open, without re-downloading on
+  return. Returning must not auto-resume playback.
 - Start another card, leave the originating pane, close its review, and quit.
   Check that only one video plays, while eager downloads continue when paused.
-  Check that cache files disappear on eviction/review closure/quit. Up to four
-  previews are retained; extra cards prepare on hover or Play without constantly
-  evicting/reloading during rendering. Returning to a pane must not auto-resume.
+  Cache files should disappear on Cancel/Retry, review closure or quit, not on
+  navigation or preparing another attachment. Closing one review must not clear
+  another open review's videos.
 - Check slow downloads, Cancel/Retry, an HTTP error/login response, oversized
   media and unsupported WebM. Errors must remain in the card; browser opening
   must always require an explicit click.
