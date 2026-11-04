@@ -144,6 +144,32 @@ pub fn file_at_base(src: &LocalSource, path: &str) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+/// Export a base-side file without interpreting binary bytes as UTF-8.
+/// Redirecting stdout to a file also keeps large link-only media out of memory.
+pub fn copy_file_at_base(
+    src: &LocalSource,
+    path: &str,
+    destination: &mut std::fs::File,
+) -> Result<()> {
+    let oid = src
+        .base_oid
+        .as_deref()
+        .ok_or_else(|| anyhow!("No base commit"))?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&src.repo_root)
+        .args(["show", &format!("{oid}:{path}")])
+        .stdout(destination.try_clone()?)
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "Could not load base file: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 /// Unified patch of everything that would go into a PR opened from here:
 /// merge-base(HEAD, base)..working-tree (two-dot, so committed + staged +
 /// unstaged), plus untracked files appended as added-file diffs.

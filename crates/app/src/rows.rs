@@ -629,7 +629,7 @@ pub(crate) fn build_presented_rows(
             comments: n_comments,
             outdated: n_outdated,
         });
-        if file.status == FileStatus::Binary {
+        if crate::file_media::file_kind(file).is_some() && !crate::file_media::supports_code(file) {
             rows.push(Row::Binary);
             continue;
         }

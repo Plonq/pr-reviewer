@@ -5,6 +5,7 @@ mod comment_editor;
 mod conversation;
 mod diff_media;
 mod file_history;
+mod file_media;
 mod http;
 mod image_viewer;
 #[cfg(target_os = "macos")]
@@ -24,6 +25,7 @@ mod review_target;
 mod rows;
 mod search;
 mod selection;
+mod svg_image;
 mod theme;
 mod threads;
 mod tree;
@@ -628,6 +630,9 @@ pub(crate) struct ItemData {
     /// tables and full new-side lines. The re-diffed hunks themselves
     /// replace `diff.files[ix].hunks`. Reset on refresh.
     upgrades: HashMap<usize, FileUpgrade>,
+    file_media: HashMap<usize, file_media::MediaFile>,
+    /// SVG source-view choices, remembered per path for this open review.
+    svg_code: HashSet<String>,
     /// Review threads grouped by anchor; Some for PR items (possibly empty),
     /// and for local items with in-memory draft comments.
     comments: Option<CommentIndex>,
@@ -715,6 +720,8 @@ impl ItemData {
             deletions: 0,
             selection: None,
             upgrades: HashMap::new(),
+            file_media: HashMap::new(),
+            svg_code: HashSet::new(),
             comments,
             local_review,
             comments_visible: true,
@@ -1223,6 +1230,7 @@ impl ReviewItem {
             diff,
             anchor_hunks,
             upgrades,
+            file_media,
             mut built_rows,
             mode,
             file_ix,
@@ -1266,6 +1274,7 @@ impl ReviewItem {
                 data.review_base_files = review_base_files;
                 data.discussion_generation += 1;
                 data.upgrades = upgrades;
+                data.file_media = file_media;
                 data.expanded_regions.clear();
                 data.discussion = discussion;
                 if let Some(discussion) = &data.discussion {
@@ -1349,6 +1358,7 @@ impl ReviewItem {
                 ));
                 data.anchor_hunks = anchor_hunks;
                 data.upgrades = upgrades;
+                data.file_media = file_media;
                 data.discussion = discussion;
                 data.commits = commits;
                 data.pr_base = pr_base;
@@ -3412,7 +3422,9 @@ impl ReviewApp {
         let Some(item) = self.items.get(self.active) else {
             return;
         };
-        if item.reloading && placement == ComposerPlacement::Diff {
+        if placement == ComposerPlacement::Diff
+            && (item.reloading || self.active_data().is_some_and(ItemData::shows_file_media))
+        {
             return;
         }
         let item_id = item.id;
@@ -4156,7 +4168,10 @@ impl ReviewApp {
         let Some(composer) = &self.composer else {
             return empty();
         };
-        if composer.placement != ComposerPlacement::Diff || self.show_queue {
+        if composer.placement != ComposerPlacement::Diff
+            || self.show_queue
+            || self.active_data().is_some_and(ItemData::shows_file_media)
+        {
             return empty();
         }
         // Only render for the item it was opened on, and only while active.
@@ -5767,13 +5782,29 @@ impl ReviewApp {
                     },
                     theme::overlay0(cx),
                 ),
-                ItemState::Ready(data) => div()
+                ItemState::Ready(data) if data.shows_file_media() => div()
                     .size_full()
                     .flex()
                     .flex_col()
                     .when(matches!(item.source, Source::Pr(_)), |pane| {
                         pane.child(self.render_review_scope(item, data, cx))
                     })
+                    .children(file_media::render_svg_controls(data, cx))
+                    .child(file_media::render(
+                        &data.diff.files[data.file_ix],
+                        data.file_media.get(&data.file_ix),
+                        cx,
+                    ))
+                    .into_any_element(),
+                ItemState::Ready(data) => div()
+                    .debug_selector(|| "code-diff-pane".into())
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .when(matches!(item.source, Source::Pr(_)), |pane| {
+                        pane.child(self.render_review_scope(item, data, cx))
+                    })
+                    .children(file_media::render_svg_controls(data, cx))
                     .child(self.render_presentation_controls(data, cx))
                     .child(
                         div()
@@ -6575,6 +6606,8 @@ mod tests {
     mod markdown_hosts {
         include!("markdown_tests.rs");
         include!("image_viewer_tests.rs");
+        include!("file_media_tests.rs");
+        include!("svg_image_tests.rs");
         include!("video_tests.rs");
     }
 

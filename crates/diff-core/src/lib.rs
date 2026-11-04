@@ -89,6 +89,8 @@ pub fn parse_patch(patch: &str) -> PrDiff {
             deletions: 0,
         };
         let mut is_rename = false;
+        let mut is_added = false;
+        let mut is_deleted = false;
 
         // Extended header lines, up to the first hunk or the next file.
         while let Some(next) = lines.peek() {
@@ -98,8 +100,10 @@ pub fn parse_patch(patch: &str) -> PrDiff {
             let next = lines.next().unwrap();
             if next.starts_with("new file mode") {
                 file.status = FileStatus::Added;
+                is_added = true;
             } else if next.starts_with("deleted file mode") {
                 file.status = FileStatus::Deleted;
+                is_deleted = true;
             } else if let Some(p) = next.strip_prefix("rename from ") {
                 file.old_path = Some(p.to_string());
                 is_rename = true;
@@ -122,10 +126,10 @@ pub fn parse_patch(patch: &str) -> PrDiff {
         if is_rename && file.status == FileStatus::Modified {
             file.status = FileStatus::Renamed;
         }
-        if file.status == FileStatus::Added {
+        if is_added {
             file.old_path = None;
         }
-        if file.status == FileStatus::Deleted {
+        if is_deleted {
             file.new_path = None;
         }
 
@@ -584,6 +588,20 @@ fn word_diff(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_additions_and_deletions_keep_the_absent_side_absent() {
+        let diff = parse_patch(concat!(
+            "diff --git a/new.png b/new.png\nnew file mode 100644\nBinary files /dev/null and b/new.png differ\n",
+            "diff --git a/old.png b/old.png\ndeleted file mode 100644\nBinary files a/old.png and /dev/null differ\n",
+        ));
+        assert_eq!(diff.files[0].status, FileStatus::Binary);
+        assert_eq!(diff.files[0].old_path, None);
+        assert_eq!(diff.files[0].new_path.as_deref(), Some("new.png"));
+        assert_eq!(diff.files[1].status, FileStatus::Binary);
+        assert_eq!(diff.files[1].old_path.as_deref(), Some("old.png"));
+        assert_eq!(diff.files[1].new_path, None);
+    }
 
     const SAMPLE: &str = "\
 diff --git a/src/main.rs b/src/main.rs
