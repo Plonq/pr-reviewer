@@ -121,12 +121,11 @@ pub(crate) fn status_style(status: FileStatus, cx: &gpui::App) -> (&'static str,
     }
 }
 
-/// One row of the sidebar's tree list: an index into `ItemData::tree`, or —
-/// while the fuzzy filter is active — a matching file shown as its full path.
+/// A sidebar row's topology and current stock-tree expansion state.
 #[derive(Clone, Copy)]
-pub(crate) enum TreeListRow {
-    Entry(usize),
-    FilteredFile(usize),
+pub(crate) struct TreeListRow {
+    pub entry_ix: usize,
+    pub expanded: bool,
 }
 
 pub(crate) fn file_id(path: &str) -> SharedString {
@@ -136,24 +135,23 @@ fn directory_id(path: &str) -> SharedString {
     format!("directory:{path}").into()
 }
 
-/// Adapts our compressed hierarchy (or score-ordered filtered leaves) to stable
-/// stock identities. Visible positions are never identities.
+/// Adapts our compressed hierarchy to stable stock identities, pruning files
+/// that do not match and directories with no matching descendants. Filtering
+/// preserves the original topology and order, and reveals matching subtrees.
+/// Visible positions are never identities.
 fn kit_items(
     entries: &[TreeEntry],
     paths: &[&str],
     collapsed: &HashSet<String>,
     query: &str,
 ) -> Vec<TreeItem> {
-    if !query.is_empty() {
-        return fuzzy_file_matches(paths, query)
-            .into_iter()
-            .map(|ix| TreeItem::new(file_id(paths[ix]), paths[ix].to_owned()))
-            .collect();
-    }
+    let matches: Option<HashSet<usize>> =
+        (!query.trim().is_empty()).then(|| fuzzy_file_matches(paths, query).into_iter().collect());
     fn level(
         entries: &[TreeEntry],
         paths: &[&str],
         collapsed: &HashSet<String>,
+        matches: Option<&HashSet<usize>>,
         at: &mut usize,
         depth: usize,
     ) -> Vec<TreeItem> {
@@ -162,19 +160,26 @@ fn kit_items(
             *at += 1;
             let item = match &entry.kind {
                 TreeEntryKind::File { file_ix } => {
+                    if matches.is_some_and(|matches| !matches.contains(file_ix)) {
+                        continue;
+                    }
                     TreeItem::new(file_id(paths[*file_ix]), entry.name.clone())
                 }
                 TreeEntryKind::Dir { path } => {
+                    let children = level(entries, paths, collapsed, matches, at, depth + 1);
+                    if children.is_empty() {
+                        continue;
+                    }
                     TreeItem::new(directory_id(path), entry.name.clone())
-                        .expanded(!collapsed.contains(path))
-                        .children(level(entries, paths, collapsed, at, depth + 1))
+                        .expanded(matches.is_some() || !collapsed.contains(path))
+                        .children(children)
                 }
             };
             items.push(item);
         }
         items
     }
-    level(entries, paths, collapsed, &mut 0, 0)
+    level(entries, paths, collapsed, matches.as_ref(), &mut 0, 0)
 }
 
 pub(crate) struct FileTree {
@@ -197,6 +202,16 @@ impl FileTree {
             else {
                 return;
             };
+            // Filtered trees start expanded. Let the stock tree handle toggles,
+            // but do not overwrite the unfiltered tree's collapse preferences.
+            if data
+                .tree_view
+                .as_ref()
+                .is_some_and(|view| !view.query.is_empty())
+            {
+                cx.notify();
+                return;
+            }
             match event {
                 TreeEvent::Expanded(id) => {
                     if let Some(path) = id.strip_prefix("directory:") {
@@ -365,76 +380,50 @@ pub(crate) fn render_tree_row(
                 .when(current, |marker| marker.bg(theme::blue(cx)))
                 .debug_selector(move || format!("current-file-{pos}")),
         );
-    let content = match row {
-        TreeListRow::Entry(entry_ix) => {
-            let entry = &data.tree[entry_ix];
-            let indent = px(8. + entry.depth as f32 * 12.);
-            let base = base.pl(indent);
-            match &entry.kind {
-                TreeEntryKind::Dir { path } => {
-                    let chevron = if data.collapsed.contains(path) {
-                        "▸"
-                    } else {
-                        "▾"
-                    };
-                    base.child(
-                        div()
-                            .w(px(12.))
-                            .flex_shrink_0()
-                            .text_color(theme::overlay0(cx))
-                            .child(SharedString::from(chevron)),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(theme::overlay0(cx))
-                            .child(entry.name.clone()),
-                    )
-                    .into_any_element()
-                }
-                TreeEntryKind::File { file_ix } => {
-                    let file = &data.diff.files[*file_ix];
-                    let (_, status_color) = status_style(file.status, cx);
-                    let file_ix = *file_ix;
-                    base.on_click(move |_, window, cx| {
-                        entity.update(cx, |this, cx| this.jump_to_file(file_ix, window, cx));
-                    })
-                    .child(div().w(px(12.)).flex_shrink_0()) // aligns with dir chevrons
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(status_color)
-                            .child(entry.name.clone()),
-                    )
-                    .children(comments(file_ix))
-                    .child(stats(file))
-                    .when(data.pr_meta.is_some(), |row| row.child(checkbox(file_ix)))
-                    .into_any_element()
-                }
+    let content = {
+        let entry = &data.tree[row.entry_ix];
+        let indent = px(8. + entry.depth as f32 * 12.);
+        let base = base.pl(indent);
+        match &entry.kind {
+            TreeEntryKind::Dir { .. } => {
+                let chevron = if row.expanded { "▾" } else { "▸" };
+                base.child(
+                    div()
+                        .w(px(12.))
+                        .flex_shrink_0()
+                        .text_color(theme::overlay0(cx))
+                        .child(SharedString::from(chevron)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme::overlay0(cx))
+                        .child(entry.name.clone()),
+                )
+                .into_any_element()
             }
-        }
-        TreeListRow::FilteredFile(file_ix) => {
-            let file = &data.diff.files[file_ix];
-            let (_, status_color) = status_style(file.status, cx);
-            base.pl_2()
-                .on_click(move |_, window, cx| {
+            TreeEntryKind::File { file_ix } => {
+                let file = &data.diff.files[*file_ix];
+                let (_, status_color) = status_style(file.status, cx);
+                let file_ix = *file_ix;
+                base.on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| this.jump_to_file(file_ix, window, cx));
                 })
+                .child(div().w(px(12.)).flex_shrink_0()) // aligns with dir chevrons
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .truncate()
                         .text_color(status_color)
-                        .child(SharedString::from(file.display_path().to_string())),
+                        .child(entry.name.clone()),
                 )
                 .children(comments(file_ix))
                 .child(stats(file))
                 .when(data.pr_meta.is_some(), |row| row.child(checkbox(file_ix)))
                 .into_any_element()
+            }
         }
     };
     ListItem::new(("file-tree-row", pos))
@@ -611,15 +600,78 @@ mod tests {
                 assert!(state.entry(count - 1).is_some());
                 assert!(state.entry(count).is_none());
             }
-            let filtered = kit_items(&tree, &paths, &HashSet::new(), "defs");
-            assert_eq!(filtered[0].id, file_id(paths[0]));
-            assert!(!filtered[0].is_folder());
-            assert!(filtered[0].id != directory_id(paths[0]));
+            let collapsed = HashSet::from(["src".into(), "src/core/flags".into()]);
+            let filtered = TreeState::new(cx).items(kit_items(&tree, &paths, &collapsed, "defs"));
+            assert_eq!(filtered.entry(0).unwrap().item().id, directory_id("src"));
+            assert_eq!(
+                filtered.entry(1).unwrap().item().id,
+                directory_id("src/core/flags")
+            );
+            assert_eq!(filtered.entry(2).unwrap().item().id, file_id(paths[0]));
+            assert!(filtered.entry(3).is_none());
+            // Clearing the filter restores the original collapse state.
+            let restored = TreeState::new(cx).items(kit_items(&tree, &paths, &collapsed, ""));
+            assert_eq!(restored.entry(0).unwrap().item().id, directory_id("src"));
+            assert_eq!(restored.entry(1).unwrap().item().id, file_id("README.md"));
+            assert!(restored.entry(2).is_none());
         });
     }
 
+    #[gpui::test]
+    fn fuzzy_filter_preserves_topology_labels_and_tree_order(cx: &mut gpui::TestAppContext) {
+        // Keep src and core/flags separate even when filtering leaves a single
+        // child directory; do not rebuild/compress a different tree of matches.
+        let paths = [
+            "src/core/flags/main_test.rs",
+            "src/core/flags/main.rs",
+            "src/main.rs",
+            "docs/guide.md",
+            "src/other/nope.txt",
+            "main.rs",
+        ];
+        let tree = build_tree(&paths);
+        cx.update(|cx| {
+            let state =
+                TreeState::new(cx).items(kit_items(&tree, &paths, &HashSet::new(), "main.rs"));
+            let rows: Vec<_> = (0..)
+                .map_while(|ix| state.entry(ix))
+                .map(|entry| {
+                    (
+                        entry.depth(),
+                        entry.item().label.as_ref(),
+                        entry.item().id.as_ref(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    (0, "src", "directory:src"),
+                    (1, "core/flags", "directory:src/core/flags"),
+                    (2, "main.rs", "file:src/core/flags/main.rs"),
+                    (2, "main_test.rs", "file:src/core/flags/main_test.rs"),
+                    (1, "main.rs", "file:src/main.rs"),
+                    (0, "main.rs", "file:main.rs"),
+                ]
+            );
+            // Matching a directory name keeps its files, with their ancestors.
+            let state =
+                TreeState::new(cx).items(kit_items(&tree, &paths, &HashSet::new(), "flags"));
+            assert_eq!(state.entry(0).unwrap().item().id, directory_id("src"));
+            assert_eq!(
+                state.entry(1).unwrap().item().id,
+                directory_id("src/core/flags")
+            );
+            assert_eq!(state.entry(2).unwrap().item().id, file_id(paths[1]));
+            assert_eq!(state.entry(3).unwrap().item().id, file_id(paths[0]));
+            assert!(state.entry(4).is_none());
+        });
+        assert!(kit_items(&tree, &paths, &HashSet::new(), "zzzqqq").is_empty());
+        assert!(kit_items(&[], &[], &HashSet::new(), "main").is_empty());
+    }
+
     #[test]
-    fn fuzzy_filter_flattens_and_ranks() {
+    fn fuzzy_file_matches_rank_by_score() {
         let paths = ["src/core/flags/defs.rs", "src/main.rs", "docs/guide.md"];
         assert_eq!(fuzzy_file_matches(&paths, "defs"), vec![0]);
         assert_eq!(fuzzy_file_matches(&paths, "guide"), vec![2]);

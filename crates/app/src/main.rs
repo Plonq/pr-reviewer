@@ -5162,19 +5162,19 @@ impl ReviewApp {
                             .iter()
                             .position(|file| file.display_path() == path)
                     });
-                    let row = if filtered {
-                        file.map(TreeListRow::FilteredFile)
-                    } else {
-                        data.tree
-                            .iter()
-                            .position(|entry| match &entry.kind {
-                                TreeEntryKind::Dir { path } => {
-                                    id.strip_prefix("directory:") == Some(path.as_str())
-                                }
-                                TreeEntryKind::File { file_ix } => Some(*file_ix) == file,
-                            })
-                            .map(TreeListRow::Entry)
-                    };
+                    let row = data
+                        .tree
+                        .iter()
+                        .position(|entry| match &entry.kind {
+                            TreeEntryKind::Dir { path } => {
+                                id.strip_prefix("directory:") == Some(path.as_str())
+                            }
+                            TreeEntryKind::File { file_ix } => Some(*file_ix) == file,
+                        })
+                        .map(|entry_ix| TreeListRow {
+                            entry_ix,
+                            expanded: entry.is_expanded(),
+                        });
                     let Some(row) = row else {
                         return gpui::component::list::ListItem::new(pos).disabled(true);
                     };
@@ -6740,6 +6740,64 @@ mod tests {
                 app.read(cx).focus_handle.is_focused(window),
                 "Tree mouse selection must not create a new keyboard focus route"
             )
+        });
+
+        // Filtering reveals matching descendants of collapsed directories,
+        // using real directory rows that can still be toggled and clicked.
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.tree_filter_input
+                    .update(cx, |state, cx| state.set_value("b.rs", window, cx));
+                cx.notify();
+            });
+        });
+        draw(&mut vcx);
+        cx.update(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.entry(0).unwrap().item().id.as_ref(), "directory:src");
+            assert!(state.entry(0).unwrap().is_expanded());
+            assert_eq!(state.entry(1).unwrap().item().id, tree::file_id("src/b.rs"));
+            assert!(state.entry(2).is_none());
+        });
+        let directory = vcx.debug_bounds("tree-row-0").unwrap().center();
+        for expanded in [false, true] {
+            vcx.simulate_mouse_down(directory, MouseButton::Left, gpui::Modifiers::default());
+            vcx.simulate_mouse_up(directory, MouseButton::Left, gpui::Modifiers::default());
+            draw(&mut vcx);
+            cx.update(|cx| {
+                assert_eq!(state.read(cx).entry(0).unwrap().is_expanded(), expanded);
+                assert!(app
+                    .read(cx)
+                    .active_data()
+                    .unwrap()
+                    .collapsed
+                    .contains("src"));
+            });
+        }
+        let file = vcx.debug_bounds("tree-row-1").unwrap().center();
+        vcx.simulate_mouse_down(file, MouseButton::Left, gpui::Modifiers::default());
+        vcx.simulate_mouse_up(file, MouseButton::Left, gpui::Modifiers::default());
+        draw(&mut vcx);
+        cx.update(|cx| {
+            assert_eq!(app.read(cx).active_data().unwrap().file_ix, 0);
+        });
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.tree_filter_input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                cx.notify();
+            });
+        });
+        draw(&mut vcx);
+        cx.update(|cx| {
+            assert!(!state.read(cx).entry(0).unwrap().is_expanded());
+            assert!(state.read(cx).entry(1).is_none());
+            assert!(app
+                .read(cx)
+                .active_data()
+                .unwrap()
+                .collapsed
+                .contains("src"));
         });
     }
     use crate::test_util::{
@@ -11419,10 +11477,11 @@ mod tests {
                     });
                     let _ = window.draw(cx);
                 });
-                let selector = match (query.is_empty(), file_ix) {
-                    (true, 0) | (false, 1) => "tree-row-1",
-                    (true, _) => "tree-row-2",
-                    (false, _) => "tree-row-0",
+                // Filtering retains the src directory and alphabetical order.
+                let selector = if file_ix == 0 {
+                    "tree-row-1"
+                } else {
+                    "tree-row-2"
                 };
                 let point = vcx.debug_bounds(selector).unwrap().center();
                 vcx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::default());
