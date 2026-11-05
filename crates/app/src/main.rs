@@ -259,6 +259,15 @@ actions!(
     ]
 );
 
+fn file_navigation_keybindings() -> [KeyBinding; 4] {
+    [
+        KeyBinding::new("]", NextFile, Some("ReviewApp")),
+        KeyBinding::new("[", PrevFile, Some("ReviewApp")),
+        KeyBinding::new("shift-n", NextFile, Some("ReviewApp")),
+        KeyBinding::new("shift-p", PrevFile, Some("ReviewApp")),
+    ]
+}
+
 /// Environment that makes every `git` we (or anything below us) run use the
 /// token from `gh auth login` and never block on a prompt.
 ///
@@ -416,9 +425,8 @@ fn main() {
             cx.bind_keys(search::keybindings());
             cx.bind_keys(file_history::keybindings());
             cx.bind_keys(tree::keybindings());
+            cx.bind_keys(file_navigation_keybindings());
             cx.bind_keys([
-                KeyBinding::new("]", NextFile, Some("ReviewApp")),
-                KeyBinding::new("[", PrevFile, Some("ReviewApp")),
                 KeyBinding::new("n", NextHunk, Some("ReviewApp")),
                 KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
@@ -612,6 +620,9 @@ pub(crate) struct ItemData {
     /// the TextView's own), so the wheel scrolls from anywhere over the pane
     /// and the scrollbar paints at the pane's edge — like the diff pane's.
     conv_scroll: ScrollHandle,
+    /// Parsed conversation bodies survive pane/tab unmounts, so their full
+    /// height is available before the scroller clamps its retained offset.
+    conv_markdown: RefCell<HashMap<String, gpui::Entity<gpui::component::text::TextViewState>>>,
     discussion: Option<github::PrDiscussion>,
     /// Invalidate older comment fetches when a resolution write starts.
     discussion_generation: u64,
@@ -709,6 +720,7 @@ impl ItemData {
             file_history: Default::default(),
             search: None,
             conv_scroll: ScrollHandle::new(),
+            conv_markdown: RefCell::new(HashMap::new()),
             discussion: None,
             discussion_generation: 0,
             posts: Default::default(),
@@ -1441,7 +1453,34 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                             .small()
                             .child(SharedString::from(label.to_string())),
                     )
-                }),
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .child(
+                            Button::new("copy-pr-link")
+                                .debug_selector(|| "copy-pr-link".into())
+                                .icon(gpui_kit_assets::IconName::Copy)
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Copy PR link")
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
+                                }),
+                        )
+                        .child(
+                            Button::new("open-in-browser")
+                                .debug_selector(|| "open-in-browser".into())
+                                .icon(IconName::ExternalLink)
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Open PR in GitHub")
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        ),
+                ),
         )
         .child(
             div()
@@ -1450,44 +1489,6 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                 .gap_2()
                 .flex_shrink_0()
                 .pr_3()
-                .child(
-                    div()
-                        .text_color(theme::overlay0(cx))
-                        .child(SharedString::from(format!(
-                            "{} ← {}",
-                            meta.base_ref_name, meta.head_ref_name
-                        ))),
-                )
-                .child(
-                    div()
-                        .text_color(theme::green(cx))
-                        .child(SharedString::from(format!("+{}", meta.additions))),
-                )
-                .child(
-                    div()
-                        .text_color(theme::red(cx))
-                        .child(SharedString::from(format!("−{}", meta.deletions))),
-                )
-                .child(
-                    Button::new("copy-pr-link")
-                        .debug_selector(|| "copy-pr-link".into())
-                        .icon(gpui_kit_assets::IconName::Copy)
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Copy PR link")
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
-                        }),
-                )
-                .child(
-                    Button::new("open-in-browser")
-                        .debug_selector(|| "open-in-browser".into())
-                        .icon(IconName::ExternalLink)
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Open PR in GitHub")
-                        .on_click(move |_, _, cx| cx.open_url(&url)),
-                )
                 .when(meta.state == "OPEN", |row| {
                     row.child(
                         Button::new("submit-review")
@@ -1504,9 +1505,7 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
 }
 
 fn local_titlebar_content(
-    _item_id: u64,
     src: &git::LocalSource,
-    data: &ItemData,
     cx: &mut Context<ReviewApp>,
 ) -> gpui::AnyElement {
     let blue: Hsla = theme::blue(cx).into();
@@ -1541,25 +1540,6 @@ fn local_titlebar_content(
                 .gap_2()
                 .flex_shrink_0()
                 .pr_3()
-                .child(
-                    div()
-                        .px_1()
-                        .text_color(theme::overlay0(cx))
-                        .child(SharedString::from(format!(
-                            "{} ← {}",
-                            src.base_label, src.branch
-                        ))),
-                )
-                .child(
-                    div()
-                        .text_color(theme::green(cx))
-                        .child(SharedString::from(format!("+{}", data.additions))),
-                )
-                .child(
-                    div()
-                        .text_color(theme::red(cx))
-                        .child(SharedString::from(format!("−{}", data.deletions))),
-                )
                 .child(
                     Button::new("copy-local-review-prompt")
                         .label("Copy prompt")
@@ -4882,7 +4862,7 @@ impl ReviewApp {
                             Some(meta) => pr_titlebar_content(meta, cx),
                             None => app_title(None, cx),
                         },
-                        Source::Local(src) => local_titlebar_content(item.id, src, data, cx),
+                        Source::Local(src) => local_titlebar_content(src, cx),
                     },
                     ItemState::Loading => {
                         app_title(Some(format!("loading {}…", item.primary())), cx)
@@ -5800,7 +5780,7 @@ impl ReviewApp {
                 .child(hint(&["cmd-o"], "open"));
         } else {
             footer = footer
-                .child(hint(&["]", "["], "files"))
+                .child(hint(&["shift-n", "shift-p"], "files"))
                 .child(hint(&["n", "p"], "hunks"))
                 // The conversation pane is one keystroke off the changes.
                 .child(hint(&["shift-cmd-left"], "conversation"))
@@ -5908,6 +5888,9 @@ impl ReviewApp {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    if window.default_prevented() {
+                                        return;
+                                    }
                                     window.focus(&this.focus_handle, cx);
                                     let char_width = this.char_width(window);
                                     if event.modifiers.shift {
@@ -6227,9 +6210,8 @@ impl ReviewApp {
             );
         };
         // The pipe runs on every paint; bodies are small, the output is
-        // what the TextView's keyed state diffs against (same text → no
-        // re-parse), and keeping it out of ItemData means a refresh swaps
-        // the description without any cache to invalidate.
+        // what the retained TextView state diffs against (same text → no
+        // re-parse). A refreshed description updates that state on render.
         let body = conversation::preprocess(&meta.body, &loc.repo_slug());
         let content = if body.trim().is_empty() {
             // GitHub's own empty state, verbatim.
@@ -6249,8 +6231,8 @@ impl ReviewApp {
         // The pane itself is the scroll container — like the diff pane, not
         // like the TextView's own scrollable mode — so the wheel scrolls
         // from anywhere over the pane (the centered column's gutters
-        // included). The timeline shares this scroller. TextViews keep keyed
-        // parse state; resolved bodies are not rendered until expanded.
+        // included). The timeline shares this scroller. TextViews retain their
+        // parsed documents in ItemData; resolved bodies render only if expanded.
         //
         // Two layers, like the diff pane's: the scroller below, and the
         // Scrollbar overlay outside it, in a non-scrolling relative parent —
@@ -8101,7 +8083,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn titlebar_copies_the_pr_url_next_to_the_github_button(cx: &mut gpui::TestAppContext) {
+    fn titlebar_pr_links_stay_together_on_the_left_and_use_the_metadata_url(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
         for state in ["OPEN", "CLOSED", "MERGED"] {
@@ -8128,6 +8112,9 @@ mod tests {
                 let copy = vcx.debug_bounds("copy-pr-link").unwrap();
                 assert_eq!(copy.top(), open.top());
                 assert!(copy.right() <= open.left());
+                let navigation = vcx.debug_bounds("review-queue-navigation").unwrap();
+                assert!(open.right() + px(100.) < navigation.left(),
+                    "PR links should sit beside the title, not in the right-hand controls");
             }
         }
         assert!(cx.opened_url().is_none(), "copying must not open a browser");
@@ -9087,6 +9074,37 @@ mod tests {
         vcx.update(|_, cx| app.update(cx, |app, cx| app.back_to_queue(cx)));
         vcx.simulate_keystrokes("cmd-f");
         vcx.update(|_, cx| assert!(app.read(cx).active_data().unwrap().search.is_none()));
+    }
+
+    #[gpui::test]
+    fn shifted_hunk_keys_navigate_files_without_stealing_input(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| cx.bind_keys(file_navigation_keybindings()));
+        let mut item = loop_pr_item(Vec::new());
+        item.state = ItemState::Ready(file_mode_data(two_file_diff()));
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let focus = app.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        for keys in ["shift-n", "shift-n", "shift-p", "shift-p", "]", "]", "[", "["] {
+            let before = cx.update(|cx| app.read(cx).active_data().unwrap().file_ix);
+            vcx.simulate_keystrokes(keys);
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+                assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1 - before);
+            });
+        }
+        vcx.update(|window, cx| {
+            app.read(cx).tree_filter_input.clone().update(cx, |state, cx| state.focus(window, cx));
+        });
+        vcx.simulate_keystrokes("shift-n shift-p");
+        vcx.update(|_, cx| {
+            assert_eq!(app.read(cx).active_data().unwrap().file_ix, 0);
+            assert_eq!(app.read(cx).tree_filter_input.read(cx).value(), "NP");
+        });
     }
 
     #[gpui::test]
