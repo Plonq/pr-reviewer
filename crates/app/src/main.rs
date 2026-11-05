@@ -55,8 +55,8 @@ use gpui::component::{
 };
 use gpui::{
     actions, canvas, div, fill, font, list, point, prelude::*, px, relative, size, uniform_list,
-    App, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Hsla, KeyBinding, Keystroke,
-    ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton,
+    App, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Focusable, Hsla, KeyBinding,
+    Keystroke, ListAlignment, ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point, ScrollHandle,
     ScrollStrategy, SharedString, Subscription, Task, TitlebarOptions, UniformListScrollHandle,
     Window, WindowBounds, WindowOptions,
@@ -87,9 +87,7 @@ use threads::{
     assemble_threads, comment_wrap_cols, group_comments, CommentIndex, CommentSide, CommentThread,
     CommentTime, ReviewComment, COMMENT_WRAP_CHARS,
 };
-use tree::{
-    build_tree, fuzzy_file_matches, render_tree_row, TreeEntry, TreeEntryKind, TreeListRow,
-};
+use tree::{build_tree, render_tree_row, TreeEntry, TreeEntryKind, TreeListRow};
 #[cfg(test)]
 use upgrade::{run_upgrade, UpgradeJob, UpgradeSource};
 
@@ -417,6 +415,7 @@ fn main() {
             cx.bind_keys(presentation::keybindings());
             cx.bind_keys(search::keybindings());
             cx.bind_keys(file_history::keybindings());
+            cx.bind_keys(tree::keybindings());
             cx.bind_keys([
                 KeyBinding::new("]", NextFile, Some("ReviewApp")),
                 KeyBinding::new("[", PrevFile, Some("ReviewApp")),
@@ -1960,18 +1959,12 @@ impl ReviewApp {
                 |this, _, event: &InputEvent, window, cx| match event {
                     InputEvent::PressEnter { .. } => this.tree_filter_confirm(window, cx),
                     InputEvent::Change => {
-                        // The match list changes shape; start it at the top.
-                        if let Some(data) = this.active_data() {
-                            if let Some(tree) = &data.tree_view {
-                                tree.state
-                                    .read(cx)
-                                    .scroll_handle()
-                                    .scroll_to_item(0, ScrollStrategy::Top);
-                            }
-                        }
+                        // Reconcile before another keystroke can confirm or move
+                        // a stale highlight, even if no frame has painted yet.
+                        this.reconcile_file_tree(cx);
                         cx.notify();
                     }
-                    _ => {}
+                    InputEvent::Focus | InputEvent::Blur => cx.notify(),
                 },
             ),
         ];
@@ -2999,18 +2992,74 @@ impl ReviewApp {
         cx.notify();
     }
 
-    /// Enter in the tree filter: jump to the best match and return focus to
-    /// the diff (the filter stays, like GitHub's tree).
-    fn tree_filter_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Share reconciliation between painting and filter keystrokes, so input
+    /// events always act on the current query and stable file identities.
+    fn reconcile_file_tree(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Entity<gpui::component::tree::TreeState>> {
         let query = self.tree_filter_input.read(cx).value().trim().to_string();
-        let Some(data) = self.active_data() else {
-            return;
-        };
-        if query.is_empty() {
+        if self
+            .active_data()
+            .is_some_and(|data| data.tree_view.is_none())
+        {
+            let view = tree::FileTree::new(self.active_item().unwrap().id, cx);
+            self.active_data_mut().unwrap().tree_view = Some(view);
+        }
+        let data = self.active_data_mut()?;
+        let paths: Vec<_> = data
+            .diff
+            .files
+            .iter()
+            .map(|file| file.display_path())
+            .collect();
+        let view = data.tree_view.as_mut()?;
+        view.reconcile(&data.tree, &paths, &data.collapsed, &query, cx);
+        if data.tree_last_file != Some(data.file_ix) {
+            data.tree_last_file = Some(data.file_ix);
+            // While filtering, scrolling follows the highlight, not the diff.
+            if query.is_empty() {
+                if let Some(path) = paths.get(data.file_ix) {
+                    let state = view.state.read(cx);
+                    if let Some(ix) = state.index_of(&tree::file_id(path)) {
+                        state
+                            .scroll_handle()
+                            .scroll_to_item(ix, ScrollStrategy::Center);
+                    }
+                }
+            }
+        }
+        Some(view.state.clone())
+    }
+
+    fn tree_filter_highlight(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.tree_filter_input.read(cx).value().trim().is_empty() {
             return;
         }
-        let paths: Vec<&str> = data.diff.files.iter().map(|f| f.display_path()).collect();
-        if let Some(file_ix) = fuzzy_file_matches(&paths, &query).into_iter().next() {
+        self.reconcile_file_tree(cx);
+        if let Some(tree) = self.active_data().and_then(|data| data.tree_view.as_ref()) {
+            tree.highlight_file(delta, cx);
+        }
+        cx.notify();
+    }
+
+    /// Enter opens the highlighted file and focuses the diff. The query stays.
+    fn tree_filter_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_filter_input.read(cx).value().trim().is_empty() {
+            return;
+        }
+        let Some(state) = self.reconcile_file_tree(cx) else {
+            return;
+        };
+        let file_ix = state.read(cx).selected_item().and_then(|item| {
+            let path = item.id.strip_prefix("file:")?;
+            self.active_data()?
+                .diff
+                .files
+                .iter()
+                .position(|file| file.display_path() == path)
+        });
+        if let Some(file_ix) = file_ix {
             self.jump_to_file(file_ix, window, cx);
         }
     }
@@ -5150,35 +5199,7 @@ impl ReviewApp {
 
         // --- stock file tree, with application-owned topology and identities ---
         let query = self.tree_filter_input.read(cx).value().trim().to_string();
-        if self
-            .active_data()
-            .is_some_and(|data| data.tree_view.is_none())
-        {
-            let view = tree::FileTree::new(self.active_item().unwrap().id, cx);
-            self.active_data_mut().unwrap().tree_view = Some(view);
-        }
-        let tree_state = self.active_data_mut().and_then(|data| {
-            let paths: Vec<_> = data
-                .diff
-                .files
-                .iter()
-                .map(|file| file.display_path())
-                .collect();
-            let view = data.tree_view.as_mut()?;
-            view.reconcile(&data.tree, &paths, &data.collapsed, &query, cx);
-            if data.tree_last_file != Some(data.file_ix) {
-                data.tree_last_file = Some(data.file_ix);
-                if let Some(path) = paths.get(data.file_ix) {
-                    let state = view.state.read(cx);
-                    if let Some(ix) = state.index_of(&tree::file_id(path)) {
-                        state
-                            .scroll_handle()
-                            .scroll_to_item(ix, ScrollStrategy::Center);
-                    }
-                }
-            }
-            Some(view.state.clone())
-        });
+        let tree_state = self.reconcile_file_tree(cx);
         let entity = cx.entity();
         let filtered = !query.is_empty();
         let tree_list: gpui::AnyElement = match tree_state {
@@ -5253,6 +5274,18 @@ impl ReviewApp {
                     .min_h_0()
                     .flex()
                     .flex_col()
+                    // Only a non-empty filter overrides the input's up/down.
+                    .key_context(if filtered {
+                        "FileFilter"
+                    } else {
+                        "EmptyFileFilter"
+                    })
+                    .on_action(cx.listener(|this, _: &tree::HighlightNextFile, _, cx| {
+                        this.tree_filter_highlight(1, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &tree::HighlightPreviousFile, _, cx| {
+                        this.tree_filter_highlight(-1, cx);
+                    }))
                     // The filter input propagates Escape when it has nothing
                     // of its own to dismiss; catch it here (before the root's
                     // handler) to clear the query and return to the diff.
@@ -5265,7 +5298,26 @@ impl ReviewApp {
                     .child(
                         div()
                             .p_2()
-                            .child(Input::new(&self.tree_filter_input).small()),
+                            .child(Input::new(&self.tree_filter_input).small())
+                            .when(filtered, |area| {
+                                area.child(
+                                    div()
+                                        .debug_selector(|| "file-filter-hint".into())
+                                        .pt_1()
+                                        .text_size(px(10.))
+                                        .text_color(theme::overlay0(cx))
+                                        // Reserve its space on blur: clicking a
+                                        // result must not move it mid-press.
+                                        .when(
+                                            !self
+                                                .tree_filter_input
+                                                .focus_handle(cx)
+                                                .is_focused(window),
+                                            |hint| hint.invisible(),
+                                        )
+                                        .child("↑ ↓ select · ↵ open · esc clear"),
+                                )
+                            }),
                     )
                     .when_some(
                         self.active_data()
@@ -6637,6 +6689,10 @@ mod tests {
         // Case-insensitive, and no match returns None.
         assert_eq!(mention_rank(&octocat, "OCT"), Some(0));
         assert_eq!(mention_rank(&octocat, "zzz"), None);
+    }
+
+    mod file_filter {
+        include!("tree_filter_tests.rs");
     }
 
     mod markdown_hosts {

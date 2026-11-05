@@ -126,6 +126,11 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   sidebar with file tree beside Changes / Conversation; drag its right edge to
   resize (width is remembered). Title-bar Review queue / Back to review buttons
   switch screens without losing the active item's pane or position
+- `/` focuses the fuzzy file filter; while filtering, `↑` / `↓` move the existing
+  tree highlight between visible files, skipping directories. `Enter` opens the
+  highlighted file and focuses the diff (keeping the filter); `Esc` clears the
+  filter and returns to the diff without opening a file. Each query starts at
+  the first matching file in tree order; arrows stop at either end.
 - file-tree comment badges count comments and replies anchored in the current diff,
   including drafts but excluding outdated threads (still available in Conversation)
 - per-viewer viewed checkboxes at the right edge of the file tree; click or `V`
