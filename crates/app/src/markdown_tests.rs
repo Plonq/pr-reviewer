@@ -91,6 +91,60 @@ fn stock_inline_markdown_measures_images_in_both_sides_and_partial_virtualizatio
 }
 
 #[gpui::test]
+fn inline_comment_drags_select_prose_without_moving_the_diff(cx: &mut gpui::TestAppContext) {
+    let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+    let mut item = loop_pr_item(vec![rc(
+        11, "a.rs", Some("RIGHT"), Some(1),
+        "Alpha bravo charlie delta echo foxtrot golf hotel.",
+        "alice", "2026-01-01T00:00:00Z", None,
+    )]);
+    let ItemState::Ready(data) = &mut item.state else { unreachable!() };
+    let context = " context\n".repeat(200);
+    data.diff = diff_core::parse_patch(&format!(
+        "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,201 +1,201 @@\n-old\n+new\n{context}"
+    ));
+    data.set_rows(data.row_build());
+    install_item(&app, item, cx);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        cx.update(|cx| app.update(cx, |app, cx| {
+            let data = app.active_data_mut().unwrap();
+            data.mode = mode;
+            data.rebuild_rows_anchored();
+            data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+            data.scroll.0.borrow().base_handle.set_offset(point(px(0.), -px(row_height())));
+            cx.notify();
+        }));
+        draw_settled(&mut vcx);
+        for click_count in [1, 2] {
+            let body = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
+            let start = body.origin + point(px(8.), px(10.));
+            let end = start + point(px(150.), px(0.));
+            let before = cx.update(|cx| app.read(cx).active_data().unwrap()
+                .scroll.0.borrow().base_handle.offset());
+            vcx.simulate_event(MouseDownEvent {
+                position: start, button: MouseButton::Left, click_count,
+                ..Default::default()
+            });
+            vcx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+            // Give selection auto-scroll time to run: the pointer is near the
+            // comment's top, but nowhere near the diff viewport's top.
+            vcx.executor().advance_clock(std::time::Duration::from_millis(150));
+            draw_settled(&mut vcx);
+            vcx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+            vcx.update(|window, cx| {
+                let selected = gpui::base::TextSelection::selected_text(window, cx);
+                assert!(selected.contains("bravo"), "click count {click_count}: {selected:?}");
+                let app = app.read(cx);
+                assert!(app.drag_anchor.is_none());
+                assert!(app.active_data().unwrap().selection.is_none());
+                assert_eq!(app.active_data().unwrap().scroll.0.borrow().base_handle.offset(), before);
+            });
+        }
+    }
+}
+
+#[gpui::test]
 fn stock_conversation_markdown_loads_html_linked_and_extensionless_images(cx: &mut gpui::TestAppContext) {
     let requests = image_client(cx);
     let (window, app) = queue_window(cx, Arc::new(FakePr::default()));

@@ -5856,6 +5856,9 @@ impl ReviewApp {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    if window.default_prevented() {
+                                        return;
+                                    }
                                     window.focus(&this.focus_handle, cx);
                                     let char_width = this.char_width(window);
                                     if event.modifiers.shift {
