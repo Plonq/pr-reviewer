@@ -6,7 +6,7 @@ mod video;
 use crate::{image_viewer::ImageTarget, ReviewApp};
 use gpui::component::text::{
     InlineElement, InlineRenderContext, MarkdownExtensions, MarkdownNode, MarkdownParseContext,
-    MarkdownPlugin, TextView,
+    MarkdownPlugin, TextView, TextViewState,
 };
 use gpui::{
     div, img, prelude::*, px, relative, App, Context, ImgResourceLoader, MouseButton, Resource,
@@ -393,6 +393,44 @@ pub(crate) fn render(
     _: &mut Window,
     cx: &mut Context<ReviewApp>,
 ) -> gpui::AnyElement {
+    render_view(
+        id,
+        TextView::markdown(SharedString::from(id.to_owned()), source),
+        app,
+        cx,
+    )
+}
+
+/// Conversation documents outlive their mounted elements. Otherwise returning
+/// from Changes reparses long bodies asynchronously, temporarily shortens the
+/// timeline, and irreversibly clamps the pane's retained scroll offset.
+pub(crate) fn render_persistent(
+    id: &str,
+    source: String,
+    app: &ReviewApp,
+    _: &mut Window,
+    cx: &mut Context<ReviewApp>,
+) -> gpui::AnyElement {
+    let state = app
+        .active_data()
+        .expect("a ready conversation")
+        .conv_markdown
+        .borrow_mut()
+        .entry(id.to_owned())
+        .or_insert_with(|| cx.new(|cx| TextViewState::markdown(&source, cx)))
+        .clone();
+    // Edits and refreshes still replace the source; unchanged bodies keep both
+    // their parsed document and layout when their element is mounted again.
+    state.update(cx, |state, cx| state.set_text(&source, cx));
+    render_view(id, TextView::new(&state), app, cx)
+}
+
+fn render_view(
+    id: &str,
+    view: TextView,
+    app: &ReviewApp,
+    cx: &mut Context<ReviewApp>,
+) -> gpui::AnyElement {
     let plugin = ImagePlugin {
         block: true,
         owner: cx.entity().downgrade(),
@@ -430,8 +468,7 @@ pub(crate) fn render(
             move || format!("{id}-text")
         })
         .child(
-            TextView::markdown(SharedString::from(id.to_owned()), source)
-                .markdown_extensions(extensions)
+            view.markdown_extensions(extensions)
                 .w_full()
                 .h_auto()
                 .scrollable(false)

@@ -128,7 +128,9 @@ fn text_content(
         .text_size(px(text_size()))
         .line_height(px(row_height()))
         .text_color(theme::subtext(cx))
-        .child(conversation::render_markdown(id, source, app, window, cx))
+        .child(conversation::render_transient_markdown(
+            id, source, app, window, cx,
+        ))
         .into_any_element()
 }
 
@@ -296,12 +298,18 @@ impl UniformListDecoration for InlineText {
                         .top(item_height * start + px(4.))
                         .w(layout.width.min(available))
                         .h(item_height * layout.rows - px(8.))
-                        .overflow_hidden()
+                        // Let the list viewport clip prose. A card-local mask
+                        // makes Kit auto-scroll at the comment's edges instead
+                        // of the diff viewport's edges during selection.
                         .debug_selector({
                             let id = id.clone();
                             move || format!("{id}-card")
                         })
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down(MouseButton::Left, |_, window, _| {
+                            // Skip the diff's custom selection, but let this
+                            // reach Kit's window-level prose selection handler.
+                            window.prevent_default();
+                        })
                         // Images resolve asynchronously inside stock TextView.
                         // Observe its outer content geometry, not its block or
                         // media internals, and resize only the matching source.

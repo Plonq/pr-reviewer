@@ -372,6 +372,44 @@ fn video_preloads_without_playing_and_picture_and_overlay_controls_toggle_once(
 }
 
 #[gpui::test]
+fn conversation_media_expands_over_a_composer_and_preserves_its_draft(
+    cx: &mut gpui::TestAppContext,
+) {
+    image_client(cx);
+    for (body, selector) in [
+        ("![screen](https://github.com/user-attachments/assets/screen)", "conversation-0-image-0"),
+        ("[Recording](http://127.0.0.1:1/recording.mp4)", "video-expand"),
+    ] {
+        let (window, app) = video_conversation(cx, body);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1400.), px(1200.)));
+        draw_settled(&mut vcx);
+        click_selector(&mut vcx, "conversation-compose-0-0");
+        let input = vcx.update(|window, cx| {
+            let input = app.read(cx).composer.as_ref().unwrap().input.clone();
+            input.update(cx, |state, cx| {
+                state.set_value("Keep this unfinished comment", window, cx);
+                state.set_selected_range(5..9, cx);
+            });
+            input
+        });
+        draw_settled(&mut vcx);
+        click_selector(&mut vcx, selector);
+        assert!(vcx.debug_bounds("image-viewer").is_some());
+        vcx.simulate_keystrokes("escape");
+        draw_settled(&mut vcx);
+        vcx.update(|window, cx| {
+            let app = app.read(cx);
+            assert!(app.image_viewer.is_none());
+            assert_eq!(app.composer.as_ref().unwrap().input, input);
+            assert_eq!(input.read(cx).value(), "Keep this unfinished comment");
+            assert_eq!(input.read(cx).selected_range(), 5..9);
+            assert!(input.focus_handle(cx).is_focused(window));
+        });
+    }
+}
+
+#[gpui::test]
 fn video_is_opt_in_and_overlay_moves_the_same_session(cx: &mut gpui::TestAppContext) {
     image_client(cx);
     let (window, app) = video_conversation(cx, "[Recording](http://127.0.0.1:1/recording.mp4)");
