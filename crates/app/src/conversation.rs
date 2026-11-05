@@ -232,20 +232,24 @@ fn code_excerpt(thread: &github::ReviewThread) -> Vec<CodeLine<'_>> {
     lines
 }
 
-pub(crate) fn anchor(thread: &github::ReviewThread) -> String {
+fn anchor_range(thread: &github::ReviewThread) -> String {
     let (start, line) = if thread.line.is_some() {
         (thread.start_line, thread.line)
     } else {
         (thread.original_start_line, thread.original_line)
     };
-    let range = match (start, line) {
+    match (start, line) {
         (Some(start), Some(end)) if start < end => format!(":{start}–{end}"),
         (_, Some(line)) => format!(":{line}"),
         _ => String::new(),
-    };
+    }
+}
+
+pub(crate) fn anchor(thread: &github::ReviewThread) -> String {
     format!(
-        "{}{range} · {}{}",
+        "{}{} · {}{}",
         thread.path,
+        anchor_range(thread),
         if thread.side == "LEFT" { "old" } else { "new" },
         if thread.is_outdated {
             " · outdated"
@@ -720,79 +724,129 @@ impl ReviewApp {
             composing || !thread.is_resolved || data.expanded_threads.contains(&thread.id);
         let item_id = item.id;
         let thread_id = thread.id.clone();
-        let prefix = format!(
-            "{}{} · ",
-            if thread.is_resolved {
-                if expanded {
-                    "▾ Resolved · "
-                } else {
-                    "▸ Resolved · "
-                }
-            } else {
-                "Unresolved · "
-            },
-            anchor(thread),
-        );
-        let author_start = prefix.len();
-        let summary = format!(
-            "{prefix}{} · {} comment{}{}",
-            thread.comments[0].author,
-            thread.comments.len(),
-            if thread.comments.len() == 1 { "" } else { "s" },
-            if thread.is_resolved && !composing {
-                if expanded {
-                    " · collapse"
-                } else {
-                    " · expand"
-                }
-            } else {
-                ""
-            }
-        );
-        let summary_text = StyledText::new(summary.clone()).with_highlights([(
-            author_start..author_start + thread.comments[0].author.len(),
-            HighlightStyle {
-                font_weight: Some(FontWeight::BOLD),
-                color: Some(theme::text(cx).into()),
-                ..Default::default()
-            },
-        )]);
-        let mut header = div()
+        let collapsible = thread.is_resolved && !composing;
+        let range = anchor_range(thread);
+        let full_location = format!("{}{range}", thread.path);
+        // The button's content is centred by default. Give it a full-width,
+        // left-aligned row, and truncate only the path, never the line range.
+        let location = div()
+            .id("location")
+            .debug_selector(|| format!("thread-location-{}-{}", item.id, thread.id))
+            .w_full()
+            .min_w_0()
+            .h_6()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(px(text_size() - 1.))
+            .text_color(theme::text(cx))
+            .child(
+                div()
+                    .debug_selector(|| format!("thread-chevron-{}-{}", item.id, thread.id))
+                    .w(px(12.))
+                    .flex_shrink_0()
+                    .child(if collapsible {
+                        if expanded {
+                            "▾"
+                        } else {
+                            "▸"
+                        }
+                    } else {
+                        ""
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .debug_selector(|| format!("thread-path-{}-{}", item.id, thread.id))
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis_middle()
+                            .child(thread.path.clone()),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| format!("thread-range-{}-{}", item.id, thread.id))
+                            .flex_shrink_0()
+                            .child(range),
+                    )
+                    .when(thread.is_outdated, |location| {
+                        location.child(
+                            div()
+                                .debug_selector(|| {
+                                    format!("thread-outdated-{}-{}", item.id, thread.id)
+                                })
+                                .ml_2()
+                                .flex_shrink_0()
+                                .whitespace_nowrap()
+                                .text_color(theme::subtext(cx))
+                                .child("· Outdated"),
+                        )
+                    })
+                    .when(thread.side == "LEFT", |location| {
+                        location.child(
+                            div()
+                                .debug_selector(|| format!("thread-old-{}-{}", item.id, thread.id))
+                                .ml_2()
+                                .flex_shrink_0()
+                                .whitespace_nowrap()
+                                .text_color(theme::subtext(cx))
+                                .child("· Old"),
+                        )
+                    }),
+            )
+            .tooltip(move |window, cx| Tooltip::new(full_location.clone()).build(window, cx));
+        let location = if collapsible {
+            Button::new(SharedString::from(format!(
+                "thread-toggle-{}-{}",
+                item.id, thread.id
+            )))
+            .ghost()
+            .small()
+            .w_full()
+            .px_0()
+            .accessibility_label(format!(
+                "{} thread at {}{}",
+                if expanded { "Collapse" } else { "Expand" },
+                thread.path,
+                anchor_range(thread),
+            ))
+            .child(location)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_thread_expanded(item_id, &thread_id, cx);
+            }))
+            .into_any_element()
+        } else {
+            location.into_any_element()
+        };
+        let header = div()
             .id(SharedString::from(format!(
                 "thread-{}-{}",
                 item.id, thread.id
             )))
             .debug_selector(|| format!("thread-header-{}-{}", item.id, thread.id))
             .w_full()
+            .min_w_0()
+            .px_4()
+            .py_2()
             .flex()
             .items_center()
             .gap_2()
-            .px_4()
-            .py_2()
-            .text_size(px(text_size() - 1.))
-            .text_color(theme::subtext(cx))
-            .overflow_hidden();
-        if thread.is_resolved && !composing {
-            header = header.child(
-                div().flex_1().min_w_0().child(
-                    Button::new(SharedString::from(format!(
-                        "thread-toggle-{}-{}",
-                        item.id, thread.id
-                    )))
-                    .ghost()
-                    .small()
-                    .w_full()
-                    .accessibility_label(summary)
-                    .child(summary_text)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_thread_expanded(item_id, &thread_id, cx);
-                    })),
-                ),
-            );
-        } else {
-            header = header.child(div().flex_1().min_w_0().truncate().child(summary_text));
-        }
-        header = header.child(self.thread_controls(item.id, thread, false, &cx.entity(), cx));
+            .child(div().flex_1().min_w_0().child(location))
+            .child(div().flex_shrink_0().child(self.thread_controls(
+                item.id,
+                thread,
+                false,
+                &cx.entity(),
+                cx,
+            )));
         let mut card = div()
             .w_full()
             .flex_shrink_0()
@@ -1411,6 +1465,25 @@ pub(crate) mod tests {
             anchor(&discussion.threads[0]),
             "src/main.rs:10–12 · old · outdated"
         );
+    }
+
+    #[test]
+    fn thread_location_ranges_follow_current_then_historical_coordinates() {
+        let mut thread = sample_discussion().threads.remove(0);
+        assert_eq!(anchor_range(&thread), ":10–12");
+        thread.line = Some(473);
+        thread.start_line = Some(472);
+        assert_eq!(anchor_range(&thread), ":472–473");
+        thread.start_line = None;
+        assert_eq!(anchor_range(&thread), ":473");
+        thread.start_line = Some(473);
+        assert_eq!(anchor_range(&thread), ":473");
+        thread.line = None;
+        assert_eq!(anchor_range(&thread), ":10–12");
+        thread.original_start_line = None;
+        assert_eq!(anchor_range(&thread), ":12");
+        thread.original_line = None;
+        assert_eq!(anchor_range(&thread), "");
     }
 
     #[test]

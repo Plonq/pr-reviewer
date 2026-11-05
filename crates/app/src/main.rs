@@ -11734,29 +11734,12 @@ mod tests {
             })
         };
         assert!(!expanded(cx));
-        vcx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-        let click = |vcx: &mut gpui::VisualTestContext, y| {
-            let point = gpui::point(px(1100.), px(y));
-            vcx.simulate_mouse_move(point, None, gpui::Modifiers::default());
-            vcx.simulate_mouse_down(point, gpui::MouseButton::Left, gpui::Modifiers::default());
-            vcx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::default());
-            vcx.run_until_parked();
-        };
-        let mut header_y = None;
-        for y in (80..600).step_by(4) {
-            click(&mut vcx, y as f32);
-            if expanded(cx) {
-                header_y = Some(y as f32);
-                break;
-            }
-        }
-        let header_y = header_y.expect("the resolved one-line stub must be clickable");
-        vcx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-        click(&mut vcx, header_y);
+        click_commenting(&mut vcx, "thread-location-0-T1");
+        assert!(
+            expanded(cx),
+            "the file location expands the resolved thread"
+        );
+        click_commenting(&mut vcx, "thread-location-0-T1");
         assert!(!expanded(cx), "a second click collapses the thread");
         vcx.update(|window, cx| {
             let _ = window.draw(cx);
@@ -14309,6 +14292,109 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing comment author avatar: {selector}"));
             assert!(avatar.size.width > px(0.));
             assert_eq!(avatar.size.width, avatar.size.height);
+        }
+    }
+
+    #[gpui::test]
+    fn conversation_thread_headers_keep_one_line_locations_actions_and_padded_chevrons(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = Arc::new(FakePr::default());
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut item = commenting_item(&fake);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        let mut discussion = conversation::tests::sample_discussion();
+        discussion.comments.clear();
+        discussion.threads[0].path = format!(
+            "api/{}/notices/models.py",
+            "a_very_long_directory/".repeat(12)
+        );
+        data.discussion = Some(discussion);
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let mut range_width = None;
+        for (resolved, expanded, outdated, side) in [
+            (true, false, true, "LEFT"),
+            (true, true, true, "RIGHT"),
+            (false, false, false, "RIGHT"),
+            (true, false, false, "LEFT"),
+        ] {
+            vcx.update(|_, cx| {
+                app.update(cx, |this, cx| {
+                    let ItemState::Ready(data) = &mut this.items[0].state else {
+                        unreachable!()
+                    };
+                    let thread = &mut data.discussion.as_mut().unwrap().threads[0];
+                    thread.is_resolved = resolved;
+                    thread.is_outdated = outdated;
+                    thread.side = side.into();
+                    if expanded {
+                        data.expanded_threads.insert("T1".into());
+                    } else {
+                        data.expanded_threads.clear();
+                    }
+                    cx.notify();
+                });
+            });
+            let mut action_width = None;
+            let mut wide_path_width = None;
+            for width in [1100., 840., 740.] {
+                vcx.simulate_resize(size(px(width), px(1800.)));
+                for _ in 0..3 {
+                    vcx.update(|window, cx| {
+                        let _ = window.draw(cx);
+                    });
+                    vcx.run_until_parked();
+                }
+                let header = vcx.debug_bounds("thread-header-0-T1").unwrap();
+                let location = vcx.debug_bounds("thread-location-0-T1").unwrap();
+                let path = vcx.debug_bounds("thread-path-0-T1").unwrap();
+                let range = vcx.debug_bounds("thread-range-0-T1").unwrap();
+                let chevron = vcx.debug_bounds("thread-chevron-0-T1").unwrap();
+                let action = vcx.debug_bounds("thread-resolve-0-T1").unwrap();
+                assert!(
+                    path.size.width > px(0.),
+                    "path must remain visible at width {width}, side {side}, outdated {outdated}: header {header:?}, location {location:?}, range {range:?}, action {action:?}"
+                );
+                assert_eq!(path.right(), range.left());
+                assert!(location.left() >= header.left());
+                assert!(range.right() <= location.right());
+                assert!(location.right() < action.left());
+                assert!(action.right() <= header.right());
+                assert_eq!(chevron.left() - location.left(), px(8.));
+                assert_eq!(header.size.height, location.size.height + px(16.));
+                assert_eq!(location.center().y, action.center().y);
+                assert!(vcx.debug_bounds("thread-metadata-0-T1").is_none());
+                assert_eq!(
+                    *action_width.get_or_insert(action.size.width),
+                    action.size.width
+                );
+                assert_eq!(
+                    *range_width.get_or_insert(range.size.width),
+                    range.size.width
+                );
+                let mut trailing_edge = range.right();
+                for (selector, visible) in [
+                    ("thread-outdated-0-T1", outdated),
+                    ("thread-old-0-T1", side == "LEFT"),
+                ] {
+                    let label = vcx.debug_bounds(selector);
+                    assert_eq!(label.is_some(), visible);
+                    if let Some(label) = label {
+                        assert!(label.left() > trailing_edge);
+                        assert_eq!(label.center().y, range.center().y);
+                        trailing_edge = label.right();
+                    }
+                }
+                assert!(trailing_edge <= location.right() - px(8.));
+                if width == 1100. {
+                    wide_path_width = Some(path.size.width);
+                } else {
+                    assert!(path.size.width < wide_path_width.unwrap());
+                }
+            }
         }
     }
 
