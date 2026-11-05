@@ -10,7 +10,16 @@ use gpui::component::{
     list::ListItem,
     tree::{TreeEvent, TreeItem, TreeState},
 };
-use gpui::{div, prelude::*, px, Hsla, SharedString};
+use gpui::{div, prelude::*, px, Hsla, KeyBinding, ScrollStrategy, SharedString};
+
+gpui::actions!(file_filter, [HighlightNextFile, HighlightPreviousFile]);
+
+pub(crate) fn keybindings() -> [KeyBinding; 2] {
+    [
+        KeyBinding::new("down", HighlightNextFile, Some("FileFilter > Input")),
+        KeyBinding::new("up", HighlightPreviousFile, Some("FileFilter > Input")),
+    ]
+}
 
 /// Row height of sidebar file-tree entries.
 const TREE_ROW_HEIGHT: f32 = 24.0;
@@ -255,14 +264,57 @@ impl FileTree {
         if let Some(selected) = self.state.read(cx).selected_item() {
             self.selection = Some(selected.id.clone());
         }
+        let reset_highlight = self.query != query && !query.is_empty();
         self.paths = paths.iter().map(|p| p.to_string()).collect();
         self.query = query.into();
         let items = kit_items(entries, paths, collapsed, query);
         self.state.update(cx, |state, cx| {
             state.set_items(items, cx);
+            // Filtering starts on the first visible file, not the highest fuzzy
+            // score. This is the stock tree highlight, separate from the diff.
+            let ix = if reset_highlight {
+                (0..)
+                    .map_while(|ix| state.entry(ix).map(|entry| (ix, entry)))
+                    .find(|(_, entry)| entry.item().id.starts_with("file:"))
+                    .map(|(ix, _)| ix)
+            } else {
+                self.selection.as_ref().and_then(|id| state.index_of(id))
+            };
             // Do not use set_selected_item/reveal_item: they expand ancestors.
-            let ix = self.selection.as_ref().and_then(|id| state.index_of(id));
             state.set_selected_index(ix, cx);
+            if reset_highlight {
+                state.scroll_to_item(0, ScrollStrategy::Top);
+            }
+        });
+    }
+
+    /// Move only the stock highlight; opening files and focus are unchanged.
+    /// Directory headings (and descendants hidden by a collapse) are skipped.
+    pub fn highlight_file(&self, delta: i32, cx: &mut gpui::App) {
+        self.state.update(cx, |state, cx| {
+            let files: Vec<_> = (0..)
+                .map_while(|ix| state.entry(ix).map(|entry| (ix, entry)))
+                .filter(|(_, entry)| entry.item().id.starts_with("file:"))
+                .map(|(ix, _)| ix)
+                .collect();
+            let ix = match state.selected_index() {
+                Some(current) if delta > 0 => files
+                    .iter()
+                    .copied()
+                    .find(|&ix| ix > current)
+                    .or_else(|| files.last().copied()),
+                Some(current) => files
+                    .iter()
+                    .copied()
+                    .rev()
+                    .find(|&ix| ix < current)
+                    .or_else(|| files.first().copied()),
+                None => files.first().copied(),
+            };
+            state.set_selected_index(ix, cx);
+            if let Some(ix) = ix {
+                state.scroll_to_item(ix, ScrollStrategy::Nearest);
+            }
         });
     }
 }
