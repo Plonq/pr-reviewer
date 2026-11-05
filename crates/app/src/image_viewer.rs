@@ -100,10 +100,10 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Never stack this over a composer or another modal. A delayed click
-        // from a no-longer-active review must not open an orphaned viewer.
+        // A composer stays mounted underneath, retaining its draft and focus
+        // for when inspection ends. Don't stack over another modal, or let a
+        // delayed click from an inactive review open an orphaned viewer.
         if self.image_viewer.is_some()
-            || self.composer.is_some()
             || window.has_active_dialog(cx)
             || self.show_queue
             || self.active_item().is_none_or(|item| item.id != item_id)
