@@ -73,7 +73,8 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - one file at a time: the whole file fills the pane — no `@@` markers, hunk
   boundaries read from the highlighting — revealed at its first change on
   first visit, with each file's scroll position remembered while the review is open;
-  `]`/`[` move between files and `n`/`p` between hunks (both wrap), following
+  `Shift+N`/`Shift+P` (or `]`/`[`) move between files and `n`/`p` between hunks
+(both wrap), following
   the sidebar's directory-first, name-sorted order. New reviews start at the top
   file; returning to a PR resumes its last file and scroll position, even after restarting
 - file-selection history per open review: `cmd-[` / `cmd-]`, title-bar arrows,

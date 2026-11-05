@@ -261,6 +261,15 @@ actions!(
     ]
 );
 
+fn file_navigation_keybindings() -> [KeyBinding; 4] {
+    [
+        KeyBinding::new("]", NextFile, Some("ReviewApp")),
+        KeyBinding::new("[", PrevFile, Some("ReviewApp")),
+        KeyBinding::new("shift-n", NextFile, Some("ReviewApp")),
+        KeyBinding::new("shift-p", PrevFile, Some("ReviewApp")),
+    ]
+}
+
 /// Environment that makes every `git` we (or anything below us) run use the
 /// token from `gh auth login` and never block on a prompt.
 ///
@@ -417,9 +426,8 @@ fn main() {
             cx.bind_keys(presentation::keybindings());
             cx.bind_keys(search::keybindings());
             cx.bind_keys(file_history::keybindings());
+            cx.bind_keys(file_navigation_keybindings());
             cx.bind_keys([
-                KeyBinding::new("]", NextFile, Some("ReviewApp")),
-                KeyBinding::new("[", PrevFile, Some("ReviewApp")),
                 KeyBinding::new("n", NextHunk, Some("ReviewApp")),
                 KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
@@ -5748,7 +5756,7 @@ impl ReviewApp {
                 .child(hint(&["cmd-o"], "open"));
         } else {
             footer = footer
-                .child(hint(&["]", "["], "files"))
+                .child(hint(&["shift-n", "shift-p"], "files"))
                 .child(hint(&["n", "p"], "hunks"))
                 // The conversation pane is one keystroke off the changes.
                 .child(hint(&["shift-cmd-left"], "conversation"))
@@ -9034,6 +9042,37 @@ mod tests {
         vcx.update(|_, cx| app.update(cx, |app, cx| app.back_to_queue(cx)));
         vcx.simulate_keystrokes("cmd-f");
         vcx.update(|_, cx| assert!(app.read(cx).active_data().unwrap().search.is_none()));
+    }
+
+    #[gpui::test]
+    fn shifted_hunk_keys_navigate_files_without_stealing_input(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        cx.update(|cx| cx.bind_keys(file_navigation_keybindings()));
+        let mut item = loop_pr_item(Vec::new());
+        item.state = ItemState::Ready(file_mode_data(two_file_diff()));
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let focus = app.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        for keys in ["shift-n", "shift-n", "shift-p", "shift-p", "]", "]", "[", "["] {
+            let before = cx.update(|cx| app.read(cx).active_data().unwrap().file_ix);
+            vcx.simulate_keystrokes(keys);
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+                assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1 - before);
+            });
+        }
+        vcx.update(|window, cx| {
+            app.read(cx).tree_filter_input.clone().update(cx, |state, cx| state.focus(window, cx));
+        });
+        vcx.simulate_keystrokes("shift-n shift-p");
+        vcx.update(|_, cx| {
+            assert_eq!(app.read(cx).active_data().unwrap().file_ix, 0);
+            assert_eq!(app.read(cx).tree_filter_input.read(cx).value(), "NP");
+        });
     }
 
     #[gpui::test]
