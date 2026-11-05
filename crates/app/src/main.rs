@@ -621,6 +621,9 @@ pub(crate) struct ItemData {
     /// the TextView's own), so the wheel scrolls from anywhere over the pane
     /// and the scrollbar paints at the pane's edge — like the diff pane's.
     conv_scroll: ScrollHandle,
+    /// Parsed conversation bodies survive pane/tab unmounts, so their full
+    /// height is available before the scroller clamps its retained offset.
+    conv_markdown: RefCell<HashMap<String, gpui::Entity<gpui::component::text::TextViewState>>>,
     discussion: Option<github::PrDiscussion>,
     /// Invalidate older comment fetches when a resolution write starts.
     discussion_generation: u64,
@@ -718,6 +721,7 @@ impl ItemData {
             file_history: Default::default(),
             search: None,
             conv_scroll: ScrollHandle::new(),
+            conv_markdown: RefCell::new(HashMap::new()),
             discussion: None,
             discussion_generation: 0,
             posts: Default::default(),
@@ -6186,9 +6190,8 @@ impl ReviewApp {
             );
         };
         // The pipe runs on every paint; bodies are small, the output is
-        // what the TextView's keyed state diffs against (same text → no
-        // re-parse), and keeping it out of ItemData means a refresh swaps
-        // the description without any cache to invalidate.
+        // what the retained TextView state diffs against (same text → no
+        // re-parse). A refreshed description updates that state on render.
         let body = conversation::preprocess(&meta.body, &loc.repo_slug());
         let content = if body.trim().is_empty() {
             // GitHub's own empty state, verbatim.
@@ -6208,8 +6211,8 @@ impl ReviewApp {
         // The pane itself is the scroll container — like the diff pane, not
         // like the TextView's own scrollable mode — so the wheel scrolls
         // from anywhere over the pane (the centered column's gutters
-        // included). The timeline shares this scroller. TextViews keep keyed
-        // parse state; resolved bodies are not rendered until expanded.
+        // included). The timeline shares this scroller. TextViews retain their
+        // parsed documents in ItemData; resolved bodies render only if expanded.
         //
         // Two layers, like the diff pane's: the scroller below, and the
         // Scrollbar overlay outside it, in a non-scrolling relative parent —

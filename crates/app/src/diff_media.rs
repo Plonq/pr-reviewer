@@ -128,7 +128,9 @@ fn text_content(
         .text_size(px(text_size()))
         .line_height(px(row_height()))
         .text_color(theme::subtext(cx))
-        .child(conversation::render_markdown(id, source, app, window, cx))
+        .child(conversation::render_transient_markdown(
+            id, source, app, window, cx,
+        ))
         .into_any_element()
 }
 

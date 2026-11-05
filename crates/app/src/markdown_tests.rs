@@ -145,6 +145,51 @@ fn inline_comment_drags_select_prose_without_moving_the_diff(cx: &mut gpui::Test
 }
 
 #[gpui::test]
+fn conversation_keeps_deep_scroll_across_pane_switches(cx: &mut gpui::TestAppContext) {
+    let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+    let mut item = loop_pr_item(Vec::new());
+    item.pane = ItemPane::Conversation;
+    let ItemState::Ready(data) = &mut item.state else { unreachable!() };
+    data.pr_meta.as_mut().unwrap().body = "Description paragraph.\n\n".repeat(300);
+    let mut discussion = conversation::tests::sample_discussion();
+    discussion.threads.clear();
+    let template = discussion.comments[0].clone();
+    discussion.comments = (1..=30).map(|id| {
+        let mut comment = template.clone();
+        comment.id = id;
+        comment.body = format!("Comment {id}.\n\n{}", "A long comment paragraph with enough source to parse asynchronously.\n\n".repeat(80));
+        comment
+    }).collect();
+    data.discussion = Some(discussion);
+    install_item(&app, item, cx);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    draw_settled(&mut vcx);
+    for y in [-120., -6000., -16000.] {
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.active_data().unwrap().conv_scroll.set_offset(point(px(0.), px(y)));
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+        });
+        let expected = cx.update(|cx| app.read(cx).active_data().unwrap().conv_scroll.offset());
+        assert_eq!(expected.y, px(y), "the fixture must have enough scroll range");
+        for _ in 0..2 {
+            vcx.dispatch_action(ShowChanges);
+            draw_settled(&mut vcx);
+            vcx.dispatch_action(ShowConversation);
+            // Check the very first frame too, before async Markdown can parse.
+            vcx.update(|window, cx| {
+                let _ = window.draw(cx);
+                assert_eq!(app.read(cx).active_data().unwrap().conv_scroll.offset(), expected);
+            });
+            draw_settled(&mut vcx);
+            cx.update(|cx| assert_eq!(app.read(cx).active_data().unwrap().conv_scroll.offset(), expected));
+        }
+    }
+}
+
+#[gpui::test]
 fn stock_conversation_markdown_loads_html_linked_and_extensionless_images(cx: &mut gpui::TestAppContext) {
     let requests = image_client(cx);
     let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
