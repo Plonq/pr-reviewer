@@ -1454,7 +1454,34 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                             .small()
                             .child(SharedString::from(label.to_string())),
                     )
-                }),
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .child(
+                            Button::new("copy-pr-link")
+                                .debug_selector(|| "copy-pr-link".into())
+                                .icon(gpui_kit_assets::IconName::Copy)
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Copy PR link")
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
+                                }),
+                        )
+                        .child(
+                            Button::new("open-in-browser")
+                                .debug_selector(|| "open-in-browser".into())
+                                .icon(IconName::ExternalLink)
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Open PR in GitHub")
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        ),
+                ),
         )
         .child(
             div()
@@ -1463,44 +1490,6 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                 .gap_2()
                 .flex_shrink_0()
                 .pr_3()
-                .child(
-                    div()
-                        .text_color(theme::overlay0(cx))
-                        .child(SharedString::from(format!(
-                            "{} ← {}",
-                            meta.base_ref_name, meta.head_ref_name
-                        ))),
-                )
-                .child(
-                    div()
-                        .text_color(theme::green(cx))
-                        .child(SharedString::from(format!("+{}", meta.additions))),
-                )
-                .child(
-                    div()
-                        .text_color(theme::red(cx))
-                        .child(SharedString::from(format!("−{}", meta.deletions))),
-                )
-                .child(
-                    Button::new("copy-pr-link")
-                        .debug_selector(|| "copy-pr-link".into())
-                        .icon(gpui_kit_assets::IconName::Copy)
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Copy PR link")
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
-                        }),
-                )
-                .child(
-                    Button::new("open-in-browser")
-                        .debug_selector(|| "open-in-browser".into())
-                        .icon(IconName::ExternalLink)
-                        .ghost()
-                        .xsmall()
-                        .tooltip("Open PR in GitHub")
-                        .on_click(move |_, _, cx| cx.open_url(&url)),
-                )
                 .when(meta.state == "OPEN", |row| {
                     row.child(
                         Button::new("submit-review")
@@ -1517,9 +1506,7 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
 }
 
 fn local_titlebar_content(
-    _item_id: u64,
     src: &git::LocalSource,
-    data: &ItemData,
     cx: &mut Context<ReviewApp>,
 ) -> gpui::AnyElement {
     let blue: Hsla = theme::blue(cx).into();
@@ -1554,25 +1541,6 @@ fn local_titlebar_content(
                 .gap_2()
                 .flex_shrink_0()
                 .pr_3()
-                .child(
-                    div()
-                        .px_1()
-                        .text_color(theme::overlay0(cx))
-                        .child(SharedString::from(format!(
-                            "{} ← {}",
-                            src.base_label, src.branch
-                        ))),
-                )
-                .child(
-                    div()
-                        .text_color(theme::green(cx))
-                        .child(SharedString::from(format!("+{}", data.additions))),
-                )
-                .child(
-                    div()
-                        .text_color(theme::red(cx))
-                        .child(SharedString::from(format!("−{}", data.deletions))),
-                )
                 .child(
                     Button::new("copy-local-review-prompt")
                         .label("Copy prompt")
@@ -4845,7 +4813,7 @@ impl ReviewApp {
                             Some(meta) => pr_titlebar_content(meta, cx),
                             None => app_title(None, cx),
                         },
-                        Source::Local(src) => local_titlebar_content(item.id, src, data, cx),
+                        Source::Local(src) => local_titlebar_content(src, cx),
                     },
                     ItemState::Loading => {
                         app_title(Some(format!("loading {}…", item.primary())), cx)
@@ -8059,7 +8027,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn titlebar_copies_the_pr_url_next_to_the_github_button(cx: &mut gpui::TestAppContext) {
+    fn titlebar_pr_links_stay_together_on_the_left_and_use_the_metadata_url(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
         for state in ["OPEN", "CLOSED", "MERGED"] {
@@ -8086,6 +8056,9 @@ mod tests {
                 let copy = vcx.debug_bounds("copy-pr-link").unwrap();
                 assert_eq!(copy.top(), open.top());
                 assert!(copy.right() <= open.left());
+                let navigation = vcx.debug_bounds("review-queue-navigation").unwrap();
+                assert!(open.right() + px(100.) < navigation.left(),
+                    "PR links should sit beside the title, not in the right-hand controls");
             }
         }
         assert!(cx.opened_url().is_none(), "copying must not open a browser");
