@@ -1,6 +1,6 @@
 //! Two scopes only: the complete PR, or the viewer's last submitted review.
 
-use crate::{theme, ItemData, ItemState, ReviewApp, ReviewItem};
+use crate::{theme, ItemData, ItemState, ReviewApp, ReviewItem, Source};
 use gpui::component::{
     button::{Button, ButtonVariants as _},
     Disableable as _, Sizable as _,
@@ -98,12 +98,13 @@ impl ReviewApp {
         cx.notify();
     }
 
-    pub(crate) fn render_review_scope(
+    pub(crate) fn render_changes_header(
         &self,
         item: &ReviewItem,
         data: &ItemData,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let is_pr = matches!(item.source, Source::Pr(_));
         let active = data.review_base.is_some();
         let busy = item.reloading
             || !data.viewed.pending.is_empty()
@@ -123,6 +124,7 @@ impl ReviewApp {
             ),
         };
         let mut bar = div()
+            .debug_selector(|| "changes-header".into())
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -138,41 +140,59 @@ impl ReviewApp {
                     .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .child(
-                        Button::new("scope-all")
-                            .ghost()
-                            .small()
-                            .label(if active {
-                                "All changes"
-                            } else {
-                                "✓ All changes"
-                            })
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.switch_review_scope(false, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("scope-since-review")
-                            .ghost()
-                            .small()
-                            .label(if active {
-                                "✓ Changed since last review"
-                            } else {
-                                "Changed since last review"
-                            })
-                            .disabled(busy || data.review_changes.baseline().is_none())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.switch_review_scope(true, window, cx)
-                            })),
-                    )
-                    .child(
+                    .children(is_pr.then(|| {
                         div()
-                            .text_color(theme::subtext(cx))
-                            .child(SharedString::from(detail)),
-                    ),
+                            .debug_selector(|| "review-scope-controls".into())
+                            .flex()
+                            .flex_1()
+                            .flex_basis(gpui::px(380.))
+                            .min_w_0()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("scope-all")
+                                    .ghost()
+                                    .small()
+                                    .label(if active {
+                                        "All changes"
+                                    } else {
+                                        "✓ All changes"
+                                    })
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.switch_review_scope(false, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("scope-since-review")
+                                    .ghost()
+                                    .small()
+                                    .label(if active {
+                                        "✓ Changed since last review"
+                                    } else {
+                                        "Changed since last review"
+                                    })
+                                    .tooltip(detail.clone())
+                                    .disabled(busy || data.review_changes.baseline().is_none())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.switch_review_scope(true, window, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme::subtext(cx))
+                                    .child(SharedString::from(detail)),
+                            )
+                    }))
+                    .when(!data.shows_file_media(), |row| {
+                        row.child(self.render_presentation_controls(data, cx))
+                    }),
             );
-        if active {
+        if is_pr && active {
             bar = bar.child(div().text_color(theme::subtext(cx)).child(
                 "Comments on the full PR's old revision remain in Conversation; new comments use explicit revision positioning."
             ));
