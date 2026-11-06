@@ -138,6 +138,18 @@ impl ReviewApp {
             .gap_2()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         if diff {
+            if thread.is_outdated {
+                controls = controls.child(
+                    div()
+                        .debug_selector(|| {
+                            format!("inline-thread-outdated-{item_id}-{}", thread.id)
+                        })
+                        .flex_shrink_0()
+                        .whitespace_nowrap()
+                        .text_color(crate::theme::subtext(cx))
+                        .child("Outdated"),
+                );
+            }
             if thread.is_resolved {
                 let expanded = item.is_some_and(|item| matches!(&item.state, ItemState::Ready(data) if data.expanded_threads.contains(&thread.id)));
                 let thread_id = thread.id.clone();
