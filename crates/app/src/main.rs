@@ -74,7 +74,8 @@ use rows::{
     render_row, widest_row_ix, BuiltRows, FileUpgrade, Row, RowOptions, RowsView, ViewMode,
 };
 use selection::{
-    row_selection_range, selection_text, word_selection, RowCol, SelSide, Selection, SelectionDrag,
+    line_selection, next_source_line, row_selection_range, selection_text, source_line_start,
+    word_selection, RowCol, SelSide, Selection, SelectionDrag,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -227,6 +228,10 @@ actions!(
         GoToBottom,
         ScrollLeft,
         ScrollRight,
+        SelectPreviousLine,
+        SelectNextLine,
+        ExtendPreviousLine,
+        ExtendNextLine,
         ToggleView,
         ToggleViewed,
         ToggleWhitespace,
@@ -426,6 +431,7 @@ fn main() {
             cx.bind_keys(file_history::keybindings());
             cx.bind_keys(tree::keybindings());
             cx.bind_keys(file_navigation_keybindings());
+            cx.bind_keys(selection::keybindings());
             cx.bind_keys([
                 KeyBinding::new("n", NextHunk, Some("ReviewApp")),
                 KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
@@ -637,9 +643,9 @@ pub(crate) struct ItemData {
     expanded_threads: HashSet<String>,
     additions: u32,
     deletions: u32,
-    /// Mouse text selection, in display-row space. Per item (survives item
-    /// switching); cleared on view-mode toggle and refresh, where row indices
-    /// change meaning.
+    /// Mouse text or whole-line keyboard selection, in display-row space.
+    /// Per item (survives item switching); cleared on view-mode toggle and
+    /// refresh, where row indices change meaning.
     selection: Option<Selection>,
     /// Full-file contents by file index into `diff.files`: whole-file span
     /// tables and full new-side lines. The re-diffed hunks themselves
@@ -2862,9 +2868,78 @@ impl ReviewApp {
             data.position_restore = None;
             data.cursor = ix;
             data.cursor_side = None;
+            data.selection = None;
             data.scroll.scroll_to_item_strict(ix, ScrollStrategy::Top);
             data.remember_jump();
         }
+        cx.notify();
+    }
+
+    /// Arrow keys move the active source line; Shift retains the anchor and
+    /// selects complete lines. Split selections stay on their original side.
+    fn select_line(&mut self, direction: i32, extend: bool, cx: &mut Context<Self>) {
+        if self.show_queue
+            || !self
+                .active_item()
+                .is_some_and(|item| item.pane == ItemPane::Changes)
+        {
+            return;
+        }
+        let Some(data) = self
+            .active_data_mut()
+            .filter(|data| !data.shows_file_media())
+        else {
+            return;
+        };
+        let origin = data.selection.map(|sel| sel.side).or(data.cursor_side);
+        let mut side = origin.unwrap_or_else(|| match data.mode {
+            ViewMode::Unified => SelSide::Unified,
+            ViewMode::Split => match cursor_anchor(&data.rows, data.cursor) {
+                Some((CommentSide::Left, _)) => SelSide::Left,
+                _ => SelSide::Right,
+            },
+        });
+        let current = data
+            .selection
+            .map(|sel| sel.head.row)
+            .unwrap_or(data.cursor);
+        let target_on_side = |side| {
+            next_source_line(&data.rows, side, current, direction).or_else(|| {
+                selection::row_side_text(data.rows.get(current)?, side).map(|_| current)
+            })
+        };
+        let mut target = target_on_side(side);
+        // From a header in a deletion-only split file, there may be no right
+        // cell anywhere. Pick the available side until an origin is established.
+        if target.is_none() && origin.is_none() && data.mode == ViewMode::Split {
+            side = if side == SelSide::Right {
+                SelSide::Left
+            } else {
+                SelSide::Right
+            };
+            target = target_on_side(side);
+        }
+        let Some(target) = target else {
+            return;
+        };
+        if extend {
+            let anchor = data
+                .selection
+                .map(|sel| sel.anchor.row)
+                .unwrap_or(data.cursor);
+            // A header or other non-source cursor starts a new range at the
+            // first source line reached, rather than selecting a header.
+            data.selection = line_selection(&data.rows, side, anchor, target)
+                .or_else(|| line_selection(&data.rows, side, target, target));
+        } else {
+            data.selection = None;
+        }
+        data.cursor = source_line_start(&data.rows, target);
+        data.cursor_side = Some(side);
+        data.position_restore = None;
+        data.scroll
+            .scroll_to_item(data.cursor, ScrollStrategy::Nearest);
+        self.drag_anchor = None;
         cx.notify();
     }
 
@@ -3211,34 +3286,28 @@ impl ReviewApp {
         }
     }
 
-    fn extend_comment_selection(
-        &mut self,
-        side: SelSide,
-        head: RowCol,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn extend_line_selection(&mut self, side: SelSide, head: RowCol, cx: &mut Context<Self>) {
         let Some(data) = self.active_data_mut() else {
             return;
         };
-        if data.cursor_side.is_some_and(|origin| origin != side) {
+        let origin = data.selection.map(|sel| sel.side).or(data.cursor_side);
+        if origin.is_some_and(|origin| origin != side) {
             self.items[self.active].refresh_error =
                 Some("a comment range must stay on the same side".into());
             cx.notify();
             return;
         }
-        let anchor = data.selection.map(|sel| sel.anchor).unwrap_or(RowCol {
-            row: data.cursor,
-            col: 0,
-        });
-        data.selection = Some(Selection { side, anchor, head });
+        let anchor = data
+            .selection
+            .map(|sel| sel.anchor.row)
+            .unwrap_or(data.cursor);
+        let Some(selection) = line_selection(&data.rows, side, anchor, head.row) else {
+            return;
+        };
+        data.selection = Some(selection);
+        data.cursor = source_line_start(&data.rows, head.row);
+        data.cursor_side = Some(side);
         self.drag_anchor = None;
-        self.open_composer_on_selection(window, cx);
-        // The selection only supplies the comment range; Shift+click should
-        // not leave ordinary diff text selected behind the composer.
-        if let Some(data) = self.active_data_mut() {
-            data.selection = None;
-        }
         cx.notify();
     }
 
@@ -4195,13 +4264,13 @@ impl ReviewApp {
                     let path = path.clone();
                     entity.update(cx, |this, cx| {
                         if event.modifiers.shift {
-                            this.extend_comment_selection(
+                            window.focus(&this.focus_handle, cx);
+                            this.extend_line_selection(
                                 side,
                                 RowCol {
                                     row: row_ix,
                                     col: 0,
                                 },
-                                window,
                                 cx,
                             );
                         } else {
@@ -5899,11 +5968,7 @@ impl ReviewApp {
                                         else {
                                             return;
                                         };
-                                        // The composer takes focus below; don't let
-                                        // the parent diff container's default
-                                        // mouse-down behavior take it back.
-                                        window.prevent_default();
-                                        this.extend_comment_selection(side, head, window, cx);
+                                        this.extend_line_selection(side, head, cx);
                                         return;
                                     }
                                     let hit = this.pane_hit(event.position, char_width, None);
@@ -6034,9 +6099,17 @@ impl ReviewApp {
                                                                 .filter(|range| !range.is_empty())
                                                                 .map(|range| (sel.side, range))
                                                         });
-                                                        let active = (ix == data.cursor)
-                                                            .then_some(data.cursor_side)
-                                                            .flatten();
+                                                        let active = sel
+                                                            .filter(|sel| {
+                                                                row_selection_range(sel, ix, row)
+                                                                    .is_some()
+                                                            })
+                                                            .map(|sel| sel.side)
+                                                            .or_else(|| {
+                                                                (ix == data.cursor)
+                                                                    .then_some(data.cursor_side)
+                                                                    .flatten()
+                                                            });
                                                         let commenting = this
                                                             .composer
                                                             .as_ref()
@@ -6364,6 +6437,16 @@ impl Render for ReviewApp {
             .on_action(cx.listener(|this, _: &PrevFile, _, cx| this.step_file(-1, cx)))
             .on_action(cx.listener(|this, _: &NextHunk, _, cx| this.step_hunk(1, cx)))
             .on_action(cx.listener(|this, _: &PrevHunk, _, cx| this.step_hunk(-1, cx)))
+            .on_action(
+                cx.listener(|this, _: &SelectPreviousLine, _, cx| this.select_line(-1, false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectNextLine, _, cx| this.select_line(1, false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ExtendPreviousLine, _, cx| this.select_line(-1, true, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ExtendNextLine, _, cx| this.select_line(1, true, cx)))
             .on_action(cx.listener(|this, _: &GoToTop, _, cx| this.jump(0, cx)))
             .on_action(cx.listener(|this, _: &GoToBottom, _, cx| {
                 if let Some(last) = this.active_data().map(|d| d.rows.len().saturating_sub(1)) {
@@ -6676,6 +6759,8 @@ mod tests {
     mod file_filter {
         include!("tree_filter_tests.rs");
     }
+
+    include!("keyboard_selection_tests.rs");
 
     mod markdown_hosts {
         include!("markdown_tests.rs");
@@ -17888,9 +17973,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn shift_click_opens_a_range_composer_through_the_mouse_handlers(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn shift_click_selects_a_range_then_c_opens_the_composer(cx: &mut gpui::TestAppContext) {
         let fake = FakePr::with_threads(Vec::new());
         let (window, app) = queue_window(cx, fake);
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
@@ -17924,6 +18007,16 @@ mod tests {
         vcx.simulate_mouse_down(last, MouseButton::Left, shift);
         vcx.simulate_mouse_up(last, MouseButton::Left, shift);
         vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let app = app.read(cx);
+            assert!(app.composer.is_none(), "selecting does not start a comment");
+            assert!(app.focus_handle.is_focused(window));
+            let data = app.active_data().unwrap();
+            assert_eq!(data.selection.unwrap().ordered().0.row, 1);
+            assert_eq!(data.selection.unwrap().ordered().1.row, 3);
+        });
+        vcx.dispatch_action(NewComment);
+        vcx.run_until_parked();
         let range_selectors = [
             (
                 "comment-range-Unified-1",
@@ -17954,12 +18047,15 @@ mod tests {
         vcx.simulate_input("range feedback");
         vcx.update(|window, cx| {
             let app = app.read(cx);
-            let composer = app.composer.as_ref().expect("shift-click composes a range");
+            let composer = app
+                .composer
+                .as_ref()
+                .expect("C composes the selected range");
             assert!(composer.input.focus_handle(cx).is_focused(window));
             assert_eq!(composer.input.read(cx).value(), "range feedback");
             assert!(
-                app.active_data().unwrap().selection.is_none(),
-                "shift-click selects a comment range, not diff text"
+                app.active_data().unwrap().selection.is_some(),
+                "the range persists while composing"
             );
             assert!(app.drag_anchor.is_none());
             assert_eq!(composer.start_line, Some(1));
