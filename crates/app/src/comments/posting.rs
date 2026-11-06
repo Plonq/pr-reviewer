@@ -1,4 +1,5 @@
-//! Transient conversation placeholders. Never written to the GitHub cache.
+//! Transient Conversation posts and exact-receipt identity aliases.
+//! Never written to the GitHub cache; no remote identities are fabricated.
 
 use github::{DiscussionComment, PrDiscussion};
 use std::collections::HashMap;
@@ -6,15 +7,32 @@ use std::collections::HashMap;
 pub(crate) struct Post {
     pub token: u64,
     pub reply_to: Option<u64>,
-    pub comment: DiscussionComment,
+    pub author: String,
+    pub body: String,
+    pub status: Status,
     receipt: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Status {
+    Posting,
+    Syncing,
+}
+
+impl Status {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Posting => "Posting…",
+            Self::Syncing => "Posted · syncing…",
+        }
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct Posts {
     pub pending: Vec<Post>,
     // Retain the view identity after loading, so markdown/media update in place.
-    loaded: HashMap<(bool, u64), u64>,
+    loaded: HashMap<super::CommentKey, super::CommentKey>,
 }
 
 impl Posts {
@@ -23,16 +41,9 @@ impl Posts {
             token,
             reply_to,
             receipt: None,
-            comment: DiscussionComment {
-                permissions: Default::default(),
-                id: token,
-                author,
-                body,
-                created_at: "Posting…".into(),
-                reactions: Vec::new(),
-                review_state: None,
-                review_id: None,
-            },
+            author,
+            body,
+            status: Status::Posting,
         });
     }
 
@@ -44,7 +55,7 @@ impl Posts {
                 return true;
             }
             post.receipt = receipt;
-            post.comment.created_at = "Posted · syncing…".into();
+            post.status = Status::Syncing;
             receipt.is_some()
         });
     }
@@ -65,25 +76,32 @@ impl Posts {
                 }),
             };
             if found {
+                let remote = if post.reply_to.is_some() {
+                    super::CommentKey::Inline(id)
+                } else {
+                    super::CommentKey::Issue(id)
+                };
                 self.loaded
-                    .insert((post.reply_to.is_some(), id), post.token);
+                    .insert(remote, super::CommentKey::Post(post.token));
             }
             !found
         });
     }
 
-    pub fn key(&self, kind: &str, comment: &DiscussionComment) -> String {
-        let token = if kind == "optimistic" {
-            Some(comment.id)
-        } else if comment.review_state.is_none() {
-            self.loaded.get(&(kind == "review", comment.id)).copied()
+    pub fn identity(&self, comment: &DiscussionComment, inline: bool) -> super::CommentKey {
+        let remote = if inline {
+            super::CommentKey::Inline(comment.id)
+        } else if comment.review_state.is_some() {
+            super::CommentKey::Review(comment.id)
         } else {
-            None
+            super::CommentKey::Issue(comment.id)
         };
-        token.map_or_else(
-            || format!("{kind}-{}-{}", comment.review_state.is_some(), comment.id),
-            |token| format!("post-{token}"),
-        )
+        self.loaded.get(&remote).cloned().unwrap_or(remote)
+    }
+
+    #[cfg(test)]
+    pub fn key(&self, kind: &str, comment: &DiscussionComment) -> String {
+        self.identity(comment, kind == "review").markdown_key()
     }
 }
 
@@ -108,7 +126,7 @@ mod tests {
     fn exact_receipts_replace_placeholders_without_matching_older_identical_text() {
         let mut posts = Posts::default();
         posts.begin(1, None, "tester".into(), "same text".into());
-        let key = posts.key("optimistic", &posts.pending[0].comment);
+        let key = super::super::CommentKey::Post(posts.pending[0].token).markdown_key();
         let mut discussion = PrDiscussion {
             comments: vec![comment(50)],
             threads: vec![],
@@ -126,7 +144,7 @@ mod tests {
             1,
             "a stale fetch or identical older body does not remove it"
         );
-        assert_eq!(posts.pending[0].comment.created_at, "Posted · syncing…");
+        assert_eq!(posts.pending[0].status.label(), "Posted · syncing…");
         discussion.comments.push(comment(100));
         posts.reconcile(&discussion);
         assert!(posts.pending.is_empty());

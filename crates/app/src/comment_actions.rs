@@ -1,10 +1,8 @@
 //! Comment-level controls shared by diff cards, the conversation, and the tray.
 
 use crate::{
-    group_comments,
     rows::{BuiltRows, Row},
-    CommentSide, ComposerPlacement, ItemState, ReviewApp, ReviewComment, SessionCommand,
-    SessionCompletion,
+    CommentSide, ComposerPlacement, ItemState, ReviewApp, SessionCommand, SessionCompletion,
 };
 use gpui::component::{
     button::{Button, ButtonVariants as _},
@@ -84,22 +82,22 @@ pub(crate) fn reserve_editor_rows(built: &mut BuiltRows, id: u64, count: usize) 
 }
 
 impl ReviewApp {
+    pub(crate) fn active_comment_projection(&self) -> Option<crate::comments::Projection<'_>> {
+        let item = self.active_item()?;
+        Some(
+            self.active_data()?.comment_projection(
+                self.sessions
+                    .get(&item.id)
+                    .and_then(|ui| ui.state.pending.as_ref()),
+            ),
+        )
+    }
+
     pub(crate) fn published_comment(
         &self,
         target: &github::CommentTarget,
     ) -> Option<&github::DiscussionComment> {
-        let discussion = self.active_data()?.discussion.as_ref()?;
-        match target {
-            github::CommentTarget::ReviewComment(_) => discussion
-                .threads
-                .iter()
-                .flat_map(|t| &t.comments)
-                .find(|c| c.permissions.node_id == node_id(target)),
-            _ => discussion
-                .comments
-                .iter()
-                .find(|c| c.permissions.node_id == node_id(target)),
-        }
+        self.active_comment_projection()?.published(target)
     }
 
     pub(crate) fn diff_comment_target(&self, id: u64) -> Option<CommentTarget> {
@@ -111,21 +109,11 @@ impl ReviewApp {
                 .any(|c| c.id == id)
                 .then_some(CommentTarget::Local(id));
         }
-        if self
-            .sessions
-            .get(&self.active_item()?.id)
-            .and_then(|ui| ui.state.pending.as_ref())
-            .is_some_and(|review| review.comments.iter().any(|c| c.id == id))
-        {
-            return Some(CommentTarget::Pending(id));
+        match self.active_comment_projection()?.inline(id)? {
+            crate::comments::Comment::Pending(_) => Some(CommentTarget::Pending(id)),
+            crate::comments::Comment::Published(c) => Some(published_target("review", c)),
+            crate::comments::Comment::Posting(_) => None,
         }
-        data.discussion
-            .as_ref()?
-            .threads
-            .iter()
-            .flat_map(|t| &t.comments)
-            .find(|c| c.id == id)
-            .map(|c| published_target("review", c))
     }
 
     fn comment_permissions(&self, target: &CommentTarget) -> (bool, bool) {
@@ -140,10 +128,8 @@ impl ReviewApp {
             }
             CommentTarget::Pending(id) => {
                 let exists = self
-                    .active_item()
-                    .and_then(|item| self.sessions.get(&item.id))
-                    .and_then(|ui| ui.state.pending.as_ref())
-                    .is_some_and(|review| review.comments.iter().any(|c| c.id == *id));
+                    .active_comment_projection()
+                    .is_some_and(|projection| projection.pending_comment(*id).is_some());
                 (exists, exists)
             }
             CommentTarget::Local(id) => {
@@ -250,14 +236,10 @@ impl ReviewApp {
         }
         let (id, path, side, line, start_line, body) = match &target {
             CommentTarget::Pending(id) => {
-                let c = self.sessions[&item.id]
-                    .state
-                    .pending
-                    .as_ref()
+                let c = self
+                    .active_comment_projection()
                     .unwrap()
-                    .comments
-                    .iter()
-                    .find(|c| c.id == *id)
+                    .pending_comment(*id)
                     .unwrap();
                 (
                     c.id,
@@ -290,19 +272,13 @@ impl ReviewApp {
             }
             CommentTarget::Published(published) => {
                 let c = self.published_comment(published).unwrap();
-                let thread = self
-                    .active_data()
-                    .unwrap()
-                    .discussion
-                    .as_ref()
-                    .unwrap()
-                    .threads
-                    .iter()
-                    .find(|t| {
-                        t.comments
-                            .iter()
-                            .any(|member| member.permissions.node_id == c.permissions.node_id)
-                    });
+                let thread = if matches!(published, github::CommentTarget::ReviewComment(_)) {
+                    self.active_comment_projection()
+                        .unwrap()
+                        .thread_for_inline(c.id)
+                } else {
+                    None
+                };
                 (
                     c.id,
                     thread.map_or(String::new(), |t| t.path.clone()),
@@ -321,11 +297,7 @@ impl ReviewApp {
         let mut row_ix = 0;
         if placement == ComposerPlacement::Diff {
             if let Some(data) = self.active_data_mut() {
-                if let Some(thread) = data.discussion.as_ref().and_then(|d| {
-                    d.threads
-                        .iter()
-                        .find(|t| t.comments.iter().any(|c| c.id == id))
-                }) {
+                if let Some(thread) = data.comment_projection(None).thread_for_inline(id) {
                     data.expanded_threads.insert(thread.id.clone());
                 }
                 if let Some(file_ix) = data
@@ -522,19 +494,11 @@ impl ReviewApp {
             }
             _ => update(&mut discussion.comments),
         }
-        data.comments = Some(group_comments(
-            discussion
-                .review_comments()
-                .into_iter()
-                .map(ReviewComment::from)
-                .collect(),
-        ));
-        if let Some(ui) = self.sessions.get(&item_id) {
-            data.comments
-                .as_mut()
-                .unwrap()
-                .replace_pending(ui.state.pending.as_ref());
-        }
+        data.project_comments(
+            self.sessions
+                .get(&item_id)
+                .and_then(|ui| ui.state.pending.as_ref()),
+        );
         data.rebuild_rows_anchored();
     }
 }

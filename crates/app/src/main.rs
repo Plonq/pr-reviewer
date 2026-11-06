@@ -3,6 +3,7 @@ mod comment_actions;
 mod comment_anchor;
 mod comment_editor;
 mod comment_media;
+mod comments;
 mod conversation;
 mod diff_media;
 mod file_history;
@@ -645,7 +646,7 @@ pub(crate) struct ItemData {
     discussion: Option<github::PrDiscussion>,
     /// Invalidate older comment fetches when a resolution write starts.
     discussion_generation: u64,
-    posts: conversation::posting::Posts,
+    posts: comments::posting::Posts,
     commits: Option<github::PrCommits>,
     commits_expanded: bool,
     review_changes: github::ReviewChanges,
@@ -708,6 +709,23 @@ pub(crate) struct ItemData {
 }
 
 impl ItemData {
+    fn comment_projection<'a>(
+        &'a self,
+        pending: Option<&'a github::PendingReview>,
+    ) -> comments::Projection<'a> {
+        comments::Projection::new(self.discussion.as_ref(), pending, &self.posts)
+    }
+
+    /// Rebuild only the display index. Confirmed storage and transient identity
+    /// aliases remain separate, and scope filtering runs after projection.
+    fn project_comments(&mut self, pending: Option<&github::PendingReview>) {
+        if self.local_review.is_some() {
+            return;
+        }
+        self.comments = Some(self.comment_projection(pending).diff_index());
+        self.filter_scope_comments();
+    }
+
     /// A fresh item's data, showing the sidebar's first file at its first change.
     /// `file_ix` identifies the supplied background-built rows, not tree order.
     fn new(
@@ -1244,14 +1262,12 @@ impl ReviewItem {
             return;
         }
         let diff = PrDiff::default();
-        let comments = group_comments(
-            loaded
-                .discussion
-                .review_comments()
-                .into_iter()
-                .map(ReviewComment::from)
-                .collect(),
-        );
+        let comments = comments::Projection::new(
+            Some(&loaded.discussion),
+            None,
+            &comments::posting::Posts::default(),
+        )
+        .diff_index();
         let built = build_rows(RowsView {
             diff: &diff,
             upgrades: &HashMap::new(),
@@ -3603,10 +3619,7 @@ impl ReviewApp {
         let ItemState::Ready(data) = &mut item.state else {
             return;
         };
-        data.comments
-            .get_or_insert_with(CommentIndex::default)
-            .replace_pending(ui.state.pending.as_ref());
-        data.filter_scope_comments();
+        data.project_comments(ui.state.pending.as_ref());
         data.rebuild_rows_anchored();
     }
 
@@ -4296,21 +4309,12 @@ impl ReviewApp {
                                 app.store.save_snapshot(&snapshot);
                             }
                         }
-                        data.comments = Some(group_comments(
-                            discussion
-                                .review_comments()
-                                .into_iter()
-                                .map(ReviewComment::from)
-                                .collect(),
-                        ));
                         data.discussion = Some(discussion);
-                        if let Some(ui) = app.sessions.get(&item_id) {
-                            data.comments
-                                .as_mut()
-                                .unwrap()
-                                .replace_pending(ui.state.pending.as_ref());
-                        }
-                        data.filter_scope_comments();
+                        data.project_comments(
+                            app.sessions
+                                .get(&item_id)
+                                .and_then(|ui| ui.state.pending.as_ref()),
+                        );
                         data.rebuild_rows_anchored();
                     }
                     Err(err) => {
@@ -4917,6 +4921,11 @@ impl ReviewApp {
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        let no_posts = comments::posting::Posts::default();
+        let projection = match &item.state {
+            ItemState::Ready(data) => data.comment_projection(ui.state.pending.as_ref()),
+            _ => comments::Projection::new(None, ui.state.pending.as_ref(), &no_posts),
+        };
         let pending = ui.state.pending.is_some();
         // A fallback editor for an outdated/unanchorable draft lives here.
         // Keep it visible until it is submitted or cancelled, even if the
@@ -4929,8 +4938,12 @@ impl ReviewApp {
         let label = if pending {
             format!(
                 "Pending review · {} comment{}{}",
-                ui.state.count(),
-                if ui.state.count() == 1 { "" } else { "s" },
+                projection.pending.len(),
+                if projection.pending.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 if ui.busy {
                     " · syncing…"
                 } else if !ui.state.verified {
@@ -4965,7 +4978,7 @@ impl ReviewApp {
                             .flex_1()
                             .child(SharedString::from(label)),
                     )
-                    .when(ui.state.count() > 0, |row| {
+                    .when(!projection.pending.is_empty(), |row| {
                         row.child(
                             Button::new("pending-comments-toggle")
                                 .debug_selector(|| "pending-comments-toggle".into())
@@ -5026,7 +5039,7 @@ impl ReviewApp {
         if let Some(error) = &ui.error {
             tray = tray.child(div().text_color(theme::red(cx)).child(error.clone()));
         }
-        if let Some(review) = ui.state.pending.as_ref().filter(|_| expanded) {
+        if pending && expanded {
             let mut comments = div()
                 .id("pending-comments")
                 .debug_selector(|| "pending-comments".into())
@@ -5035,7 +5048,7 @@ impl ReviewApp {
                 .flex()
                 .flex_col()
                 .gap_1();
-            for comment in &review.comments {
+            for comment in &projection.pending {
                 let comment_id = comment.id;
                 if self.composer().is_some_and(|composer| {
                     composer.item_id == id
@@ -16304,7 +16317,7 @@ mod tests {
             let app = app.read(cx);
             assert!(app.composer().is_none());
             let discussion = app.active_data().unwrap().discussion.as_ref().unwrap();
-            assert!(matches!(&conversation::timeline(discussion)[..], [conversation::Entry::Comment(c)] if c.body == "conversation feedbackcr"));
+            assert!(matches!(&conversation::timeline(discussion)[..], [comments::Entry::Comment(comments::Comment::Published(c))] if c.body == "conversation feedbackcr"));
             assert!(discussion.threads.is_empty());
             assert_eq!(app.store.snapshot("acme/widgets", 7).unwrap().discussion.unwrap()["comments"][0]["body"], "conversation feedbackcr");
         });
@@ -16603,8 +16616,8 @@ mod tests {
                 let post = &data.posts.pending[0];
                 assert_eq!(post.token, 1);
                 assert_eq!(post.reply_to, reply.then_some(11));
-                assert_eq!(post.comment.body, "visible immediately");
-                assert_eq!(post.comment.created_at, "Posting…");
+                assert_eq!(post.body, "visible immediately");
+                assert_eq!(post.status.label(), "Posting…");
             })
         });
         cx.run_until_parked();
@@ -16617,10 +16630,7 @@ mod tests {
                 1,
                 "a successful POST plus a stale GET must not make the comment disappear"
             );
-            assert_eq!(
-                data.posts.pending[0].comment.created_at,
-                "Posted · syncing…"
-            );
+            assert_eq!(data.posts.pending[0].status.label(), "Posted · syncing…");
             assert!(data.discussion.as_ref().unwrap().comments.is_empty());
             assert_eq!(
                 app.store
