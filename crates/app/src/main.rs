@@ -14927,6 +14927,71 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn inline_threads_show_outdated_status_in_both_views(cx: &mut gpui::TestAppContext) {
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            for side in ["LEFT", "RIGHT"] {
+                let comments = vec![
+                    rc(11, "a.rs", Some(side), Some(1), "Root", "alice", "a", None),
+                    rc(
+                        12,
+                        "a.rs",
+                        Some(side),
+                        Some(1),
+                        "Reply",
+                        "bob",
+                        "b",
+                        Some(11),
+                    ),
+                ];
+                let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+                let mut item = loop_pr_item(comments.clone());
+                let ItemState::Ready(data) = &mut item.state else {
+                    unreachable!()
+                };
+                data.mode = mode;
+                data.diff = sample_diff(); // Line 1 exists on both sides.
+                data.discussion = Some(github::PrDiscussion::from_review_comments(comments));
+                install_item(&app, item, cx);
+                let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+                vcx.simulate_resize(size(px(1400.), px(1800.)));
+                for (resolved, expanded) in [(false, false), (true, false), (true, true)] {
+                    for outdated in [false, true] {
+                        vcx.update(|_, cx| {
+                            app.update(cx, |this, cx| {
+                                let data = this.active_data_mut().unwrap();
+                                let thread = &mut data.discussion.as_mut().unwrap().threads[0];
+                                // GitHub can flag a thread outdated while still supplying
+                                // current coordinates. Keep it anchored and label its status.
+                                thread.is_outdated = outdated;
+                                thread.is_resolved = resolved;
+                                data.expanded_threads.clear();
+                                if expanded {
+                                    data.expanded_threads.insert("11".into());
+                                }
+                                data.set_rows(data.row_build());
+                                cx.notify();
+                            });
+                        });
+                        draw_window(&mut vcx);
+                        assert!(vcx.debug_bounds("inline-avatar-11").is_some());
+                        assert_eq!(
+                            vcx.debug_bounds("inline-thread-outdated-0-11").is_some(),
+                            outdated,
+                            "split {}, side {side}, resolved {resolved}, expanded {expanded}",
+                            mode == ViewMode::Split
+                        );
+                        assert!(vcx.debug_bounds("inline-thread-outdated-0-12").is_none());
+                        assert_eq!(
+                            vcx.debug_bounds("inline-avatar-12").is_some(),
+                            !resolved || expanded
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn resolved_diff_threads_are_one_row_in_both_modes_and_keep_navigation_counts() {
         let comments = vec![
