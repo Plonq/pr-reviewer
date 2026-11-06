@@ -1810,6 +1810,31 @@ fn move_selection(selected: usize, len: usize, delta: isize) -> usize {
     (selected as isize + delta).clamp(0, len as isize - 1) as usize
 }
 
+/// A whole-line comment selection, separate from copyable text selection.
+#[derive(Clone, Copy)]
+struct CommentDrag {
+    item_id: u64,
+    file_ix: usize,
+    side: SelSide,
+    anchor_side: CommentSide,
+    anchor: usize,
+    head: usize,
+}
+
+impl CommentDrag {
+    fn highlighted_side(self, item_id: u64, data: &ItemData, row: &Row) -> Option<SelSide> {
+        if self.item_id != item_id || self.file_ix != data.file_ix {
+            return None;
+        }
+        let anchor = rows::comment_line(data.rows.get(self.anchor)?, self.anchor_side)?;
+        let head = rows::comment_line(data.rows.get(self.head)?, self.anchor_side)?;
+        let line = rows::comment_line(row, self.anchor_side)?;
+        (anchor.min(head)..=anchor.max(head))
+            .contains(&line)
+            .then_some(self.side)
+    }
+}
+
 pub(crate) struct ReviewApp {
     items: Vec<ReviewItem>,
     active: usize,
@@ -1826,6 +1851,7 @@ pub(crate) struct ReviewApp {
     /// Where the current selection drag started (side locked at mouse-down);
     /// None when no drag is in progress.
     drag_anchor: Option<SelectionDrag>,
+    comment_drag: Option<CommentDrag>,
     /// `m` toggles the minimap column for every item.
     minimap_visible: bool,
     /// A minimap scrub drag is in progress (mouse went down on the minimap).
@@ -1970,6 +1996,7 @@ impl ReviewApp {
             focus_handle: cx.focus_handle(),
             next_id: 0,
             drag_anchor: None,
+            comment_drag: None,
             minimap_visible: true,
             minimap_scrub: false,
             char_width: None,
@@ -3286,6 +3313,137 @@ impl ReviewApp {
         }
     }
 
+    fn start_comment_drag(
+        &mut self,
+        row: usize,
+        side: SelSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.show_queue || self.composer.is_some() || self.review.is_some() {
+            return;
+        }
+        let Some(item) = self.active_item() else {
+            return;
+        };
+        let Some(data) = self.active_data() else {
+            return;
+        };
+        let Some((anchor_side, _)) = comment_anchor(&data.rows, row, side) else {
+            return;
+        };
+        self.comment_drag = Some(CommentDrag {
+            item_id: item.id,
+            file_ix: data.file_ix,
+            side,
+            anchor_side,
+            anchor: row,
+            head: row,
+        });
+        self.drag_anchor = None;
+        self.minimap_scrub = false;
+        if let Some(data) = self.active_data_mut() {
+            data.selection = None;
+            data.cursor = row;
+            data.cursor_side = Some(side);
+        }
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn update_comment_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = self.comment_drag else {
+            return;
+        };
+        let Some(item) = self.active_item() else {
+            return;
+        };
+        let Some(data) = self.active_data() else {
+            return;
+        };
+        if item.id != drag.item_id
+            || data.file_ix != drag.file_ix
+            || item.pane != ItemPane::Changes
+            || self.show_queue
+            || (data.mode == ViewMode::Unified) != (drag.side == SelSide::Unified)
+            || data.rows.get(drag.anchor).is_none()
+            || data.rows.get(drag.head).is_none()
+        {
+            self.comment_drag = None;
+            cx.notify();
+            return;
+        }
+        // Keep the last valid endpoint over headers, comments, empty split
+        // cells, and outside the pane. Never switch sides during a drag.
+        let scroll = data.scroll.0.borrow();
+        let bounds = scroll.base_handle.bounds();
+        let y = f32::from(position.y - bounds.top() - scroll.base_handle.offset().y);
+        if !bounds.contains(&position) || y < 0. || y >= data.rows.len() as f32 * row_height() {
+            return;
+        }
+        drop(scroll);
+        let Some((_, row, _)) = self.pane_text_hit(position, Some(drag.side)) else {
+            return;
+        };
+        if rows::comment_line(&data.rows[row], drag.anchor_side).is_some() && row != drag.head {
+            self.comment_drag.as_mut().unwrap().head = row;
+            cx.notify();
+        }
+    }
+
+    fn finish_comment_drag(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.comment_drag.is_none() {
+            return;
+        }
+        self.update_comment_drag(position, cx);
+        let Some(drag) = self.comment_drag.take() else {
+            return;
+        };
+        cx.notify();
+        if self.composer.is_some() || self.review.is_some() {
+            return;
+        }
+        let Some(data) = self.active_data() else {
+            return;
+        };
+        let mut last = drag.anchor.max(drag.head);
+        // The card belongs below the entire final source line, even when the
+        // pointer ended on its first wrapped fragment.
+        while matches!(data.rows.get(last + 1), Some(Row::Continuation(_))) {
+            last += 1;
+        }
+        let points: Vec<_> = (drag.anchor.min(drag.head)..=last)
+            .filter_map(|row| rows::comment_line(&data.rows[row], drag.anchor_side))
+            .map(|line| (drag.anchor_side, line))
+            .collect();
+        let Some(start) = points.iter().map(|(_, line)| *line).min() else {
+            return;
+        };
+        let end = points.iter().map(|(_, line)| *line).max().unwrap();
+        let path = data.diff.files[data.file_ix].display_path().to_string();
+        let range = if matches!(self.active_item().unwrap().source, Source::Pr(_)) {
+            match data.selection_anchor(&points) {
+                Ok(anchor) => Some(anchor),
+                Err(error) => {
+                    self.items[self.active].refresh_error = Some(error.into());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.open_composer(None, path, drag.anchor_side, end, last, window, cx);
+        if let Some(composer) = &mut self.composer {
+            composer.start_line = (start != end).then_some(start);
+            composer.position = range.and_then(|anchor| anchor.position);
+        }
+    }
+
     fn extend_line_selection(&mut self, side: SelSide, head: RowCol, cx: &mut Context<Self>) {
         let Some(data) = self.active_data_mut() else {
             return;
@@ -4207,10 +4365,13 @@ impl ReviewApp {
 
     /// The hover "+" affordance: a small blue box at the far left of the
     /// hovered line (its half, in split mode), absolutely positioned over the
-    /// list like the minimap viewport. Clicking opens the composer for that
-    /// row's anchor.
+    /// list like the minimap viewport. Pressing starts a whole-line selection;
+    /// releasing opens the composer for that range (or just the clicked line).
     fn render_plus(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let (row_ix, side) = self.hover_plus?;
+        let (row_ix, side) = self
+            .comment_drag
+            .map(|drag| (drag.head, drag.side))
+            .or(self.hover_plus)?;
         let item = self.active_item()?;
         let ItemState::Ready(data) = &item.state else {
             return None;
@@ -4224,8 +4385,7 @@ impl ReviewApp {
                 return None;
             }
         }
-        let (anchor_side, line) = comment_anchor(&data.rows, row_ix, side)?;
-        let path = data.diff.files[data.file_ix].display_path().to_string();
+        comment_anchor(&data.rows, row_ix, side)?;
         let (bounds, offset) = {
             let state = data.scroll.0.borrow();
             (state.base_handle.bounds(), state.base_handle.offset())
@@ -4261,7 +4421,7 @@ impl ReviewApp {
                 .child(SharedString::from("+"))
                 .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                     cx.stop_propagation();
-                    let path = path.clone();
+                    window.prevent_default();
                     entity.update(cx, |this, cx| {
                         if event.modifiers.shift {
                             window.focus(&this.focus_handle, cx);
@@ -4274,7 +4434,7 @@ impl ReviewApp {
                                 cx,
                             );
                         } else {
-                            this.open_composer(None, path, anchor_side, line, row_ix, window, cx);
+                            this.start_comment_drag(row_ix, side, window, cx);
                         }
                     });
                 })
@@ -6110,16 +6270,25 @@ impl ReviewApp {
                                                                     .then_some(data.cursor_side)
                                                                     .flatten()
                                                             });
-                                                        let commenting = this
-                                                            .composer
-                                                            .as_ref()
-                                                            .and_then(|composer| {
-                                                                composer.highlighted_side(
+                                                        let dragging =
+                                                            this.comment_drag.and_then(|drag| {
+                                                                drag.highlighted_side(
                                                                     this.items[this.active].id,
                                                                     data,
                                                                     row,
                                                                 )
                                                             });
+                                                        let commenting = dragging.or_else(|| {
+                                                            this.composer.as_ref().and_then(
+                                                                |composer| {
+                                                                    composer.highlighted_side(
+                                                                        this.items[this.active].id,
+                                                                        data,
+                                                                        row,
+                                                                    )
+                                                                },
+                                                            )
+                                                        });
                                                         let split_layout = ((data.mode
                                                             == ViewMode::Split
                                                             || matches!(
@@ -6504,6 +6673,24 @@ impl Render for ReviewApp {
                     cx.notify();
                 }
             }))
+            .when(self.comment_drag.is_some(), |root| {
+                let entity = cx.entity();
+                root.child(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, _, window, _| {
+                            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                                if phase == gpui::DispatchPhase::Capture && event.dragging() {
+                                    entity.update(cx, |this, cx| {
+                                        this.update_comment_drag(event.position, cx);
+                                    });
+                                }
+                            });
+                        },
+                    )
+                    .size(px(0.)),
+                )
+            })
             .when(self.sidebar_resize.is_some(), |root| {
                 let entity = cx.entity();
                 root.cursor_col_resize().child(
@@ -6541,14 +6728,18 @@ impl Render for ReviewApp {
                     .size(px(0.)),
                 )
             })
-            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, _, cx| {
+            .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
                 if event.button == MouseButton::Left {
                     this.finish_sidebar_resize(cx);
+                    this.finish_comment_drag(event.position, window, cx);
                 }
             }))
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_sidebar_resize(cx)),
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    this.finish_sidebar_resize(cx);
+                    this.finish_comment_drag(event.position, window, cx);
+                }),
             )
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .on_action(cx.listener(|this, _: &QueueUp, _, cx| this.queue_move(-1, cx)))
@@ -6564,6 +6755,10 @@ impl Render for ReviewApp {
             // Bound in the "ReviewApp" context: these only fire while the
             // diff pane has focus.
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
+                if this.comment_drag.take().is_some() {
+                    cx.notify();
+                    return;
+                }
                 if this.close_search(window, cx) {
                     return;
                 }
@@ -8642,6 +8837,261 @@ mod tests {
             vcx.simulate_mouse_move(point(px(0.), px(0.)), None, gpui::Modifiers::default());
             draw_window(&mut vcx);
             assert!(vcx.debug_bounds("comment-plus").is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn comment_plus_drag_previews_then_composes_whole_line_ranges(cx: &mut gpui::TestAppContext) {
+        let (window, app) = queue_window(cx, FakePr::with_threads(Vec::new()));
+        let mut item = range_pr_item();
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,5 +1,5 @@\n one\n two\n three\n four\n five\n");
+        data.anchor_hunks = data
+            .diff
+            .files
+            .iter()
+            .map(|file| file.hunks.clone())
+            .collect();
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for (mode, side) in [
+            (ViewMode::Unified, SelSide::Unified),
+            (ViewMode::Split, SelSide::Left),
+            (ViewMode::Split, SelSide::Right),
+        ] {
+            for (anchor, heads) in [(1, vec![3]), (3, vec![1]), (3, vec![5, 1]), (2, vec![])] {
+                vcx.update(|_, cx| {
+                    app.update(cx, |this, cx| {
+                        let data = this.active_data_mut().unwrap();
+                        data.mode = mode;
+                        data.set_rows(data.row_build());
+                        data.position_restore = None;
+                        let mut scroll = data.scroll.0.borrow_mut();
+                        scroll.deferred_scroll_to_item = None;
+                        scroll.base_handle.set_offset(point(px(0.), px(0.)));
+                        cx.notify();
+                    })
+                });
+                draw_window(&mut vcx);
+                let at = |row: usize, opposite: bool, vcx: &mut gpui::VisualTestContext| {
+                    vcx.update(|_, cx| {
+                        let data = app.read(cx).active_data().unwrap();
+                        let scroll = data.scroll.0.borrow();
+                        let bounds = scroll.base_handle.bounds();
+                        let right = (side == SelSide::Right) != opposite;
+                        point(
+                            bounds.left() + bounds.size.width * if right { 0.75 } else { 0.25 },
+                            bounds.top()
+                                + scroll.base_handle.offset().y
+                                + px((row as f32 + 0.5) * row_height()),
+                        )
+                    })
+                };
+                let start = at(anchor, false, &mut vcx);
+                vcx.simulate_mouse_move(start, None, gpui::Modifiers::default());
+                draw_window(&mut vcx);
+                let plus = vcx.debug_bounds("comment-plus").unwrap().center();
+                vcx.simulate_mouse_down(plus, MouseButton::Left, gpui::Modifiers::default());
+                draw_window(&mut vcx);
+                vcx.update(|_, cx| {
+                    assert!(
+                        app.read(cx).composer.is_none(),
+                        "wait until release to compose"
+                    );
+                    assert!(app.read(cx).comment_drag.is_some());
+                });
+                let mut end = plus;
+                for head in &heads {
+                    // Deliberately cross the split divider: only the original half selects.
+                    end = at(*head, mode == ViewMode::Split, &mut vcx);
+                    vcx.simulate_mouse_move(
+                        end,
+                        Some(MouseButton::Left),
+                        gpui::Modifiers::default(),
+                    );
+                    draw_window(&mut vcx);
+                    for row in 1..=5 {
+                        let selectors = match side {
+                            SelSide::Unified => [
+                                "comment-range-Unified-1",
+                                "comment-range-Unified-2",
+                                "comment-range-Unified-3",
+                                "comment-range-Unified-4",
+                                "comment-range-Unified-5",
+                            ],
+                            SelSide::Left => [
+                                "comment-range-Left-1",
+                                "comment-range-Left-2",
+                                "comment-range-Left-3",
+                                "comment-range-Left-4",
+                                "comment-range-Left-5",
+                            ],
+                            SelSide::Right => [
+                                "comment-range-Right-1",
+                                "comment-range-Right-2",
+                                "comment-range-Right-3",
+                                "comment-range-Right-4",
+                                "comment-range-Right-5",
+                            ],
+                        };
+                        let selector = selectors[row - 1];
+                        assert_eq!(
+                            vcx.debug_bounds(selector).is_some(),
+                            (anchor.min(*head)..=anchor.max(*head)).contains(&row),
+                            "{selector}"
+                        );
+                    }
+                    vcx.update(|_, cx| {
+                        let this = app.read(cx);
+                        assert!(this.composer.is_none());
+                        assert!(this.active_data().unwrap().selection.is_none());
+                        assert!(this.drag_anchor.is_none());
+                    });
+                }
+                let head = heads.last().copied().unwrap_or(anchor);
+                vcx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+                draw_window(&mut vcx);
+                vcx.simulate_input("range feedback");
+                vcx.update(|window, cx| {
+                    app.update(cx, |this, cx| {
+                        assert!(this.comment_drag.is_none());
+                        let composer = this.composer.as_ref().unwrap();
+                        assert_eq!(
+                            composer.start_line,
+                            (anchor != head).then_some(anchor.min(head) as u64)
+                        );
+                        assert_eq!(composer.line, anchor.max(head) as u64);
+                        assert_eq!(composer.row_ix, anchor.max(head));
+                        assert_eq!(
+                            composer.side,
+                            if side == SelSide::Left {
+                                CommentSide::Left
+                            } else {
+                                CommentSide::Right
+                            }
+                        );
+                        assert!(
+                            composer.position.is_none(),
+                            "in-hunk ranges use normal API anchors"
+                        );
+                        assert_eq!(composer.input.read(cx).value(), "range feedback");
+                        assert!(composer.input.focus_handle(cx).is_focused(window));
+                        this.close_composer(window, cx);
+                    })
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn comment_plus_drag_skips_other_sides_and_invalid_endpoints_and_can_cancel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, FakePr::with_threads(Vec::new()));
+        let mut item = range_pr_item();
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,3 +1,3 @@\n one\n-old\n+new\n three\n");
+        data.set_rows(data.row_build());
+        data.anchor_hunks = data
+            .diff
+            .files
+            .iter()
+            .map(|file| file.hunks.clone())
+            .collect();
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        draw_window(&mut vcx);
+        let bounds = vcx.update(|_, cx| {
+            app.read(cx)
+                .active_data()
+                .unwrap()
+                .scroll
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+        });
+        let at = |row: usize| {
+            point(
+                bounds.left() + px(140.),
+                bounds.top() + px((row as f32 + 0.5) * row_height()),
+            )
+        };
+        let begin = |row, vcx: &mut gpui::VisualTestContext| {
+            vcx.simulate_mouse_move(at(row), None, gpui::Modifiers::default());
+            draw_window(vcx);
+            let plus = vcx.debug_bounds("comment-plus").unwrap().center();
+            vcx.simulate_mouse_down(plus, MouseButton::Left, gpui::Modifiers::default());
+            draw_window(vcx);
+        };
+        begin(1, &mut vcx);
+        vcx.simulate_mouse_move(at(4), Some(MouseButton::Left), gpui::Modifiers::default());
+        draw_window(&mut vcx);
+        assert!(
+            vcx.debug_bounds("comment-range-Unified-2").is_none(),
+            "do not include removed lines in a right-side range"
+        );
+        assert!(vcx.debug_bounds("comment-range-Unified-3").is_some());
+        // Headers, blank tail, and outside-window releases retain the last source endpoint.
+        for position in [at(0), at(8), point(px(-10.), px(-10.))] {
+            vcx.simulate_mouse_move(
+                position,
+                Some(MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            draw_window(&mut vcx);
+            vcx.update(|_, cx| assert_eq!(app.read(cx).comment_drag.unwrap().head, 4));
+        }
+        vcx.simulate_mouse_up(
+            point(px(-10.), px(-10.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                let composer = this.composer.as_ref().unwrap();
+                assert_eq!(composer.start_line, Some(1));
+                assert_eq!(composer.line, 3);
+                assert_eq!(composer.side, CommentSide::Right);
+                this.close_composer(window, cx);
+            })
+        });
+        draw_window(&mut vcx);
+        begin(2, &mut vcx);
+        vcx.dispatch_action(ClearSelection);
+        draw_window(&mut vcx);
+        vcx.simulate_mouse_up(at(4), MouseButton::Left, gpui::Modifiers::default());
+        vcx.update(|_, cx| {
+            assert!(app.read(cx).composer.is_none());
+            assert!(app.read(cx).comment_drag.is_none());
+        });
+        // A removed-line drag stays on LEFT when extended into context, even
+        // though a fresh click on that context line would default to RIGHT.
+        for head in [1, 4] {
+            begin(2, &mut vcx);
+            vcx.simulate_mouse_move(
+                at(head),
+                Some(MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            draw_window(&mut vcx);
+            assert!(vcx.debug_bounds("comment-range-Unified-2").is_some());
+            assert!(vcx.debug_bounds("comment-range-Unified-3").is_none());
+            vcx.simulate_mouse_up(at(head), MouseButton::Left, gpui::Modifiers::default());
+            vcx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    let composer = this.composer.as_ref().unwrap();
+                    assert_eq!(composer.start_line, Some(if head == 1 { 1 } else { 2 }));
+                    assert_eq!(composer.line, if head == 1 { 2 } else { 3 });
+                    assert_eq!(composer.side, CommentSide::Left);
+                    this.close_composer(window, cx);
+                })
+            });
+            draw_window(&mut vcx);
         }
     }
 
@@ -17948,6 +18398,22 @@ mod tests {
                     composer.highlighted_side(item_id, data, &fragment),
                     Some(SelSide::Unified)
                 );
+                let drag = CommentDrag {
+                    item_id,
+                    file_ix: data.file_ix,
+                    side: SelSide::Unified,
+                    anchor_side: CommentSide::Right,
+                    anchor: 1,
+                    head: 3,
+                };
+                assert_eq!(
+                    drag.highlighted_side(item_id, data, &fragment),
+                    Some(SelSide::Unified)
+                );
+                assert!(drag
+                    .highlighted_side(item_id + 1, data, &fragment)
+                    .is_none());
+                assert!(drag.highlighted_side(item_id, data, &Row::Binary).is_none());
                 assert!(composer
                     .highlighted_side(item_id, data, &Row::Binary)
                     .is_none());
