@@ -5537,10 +5537,18 @@ impl ReviewApp {
                     let Some(row) = row else {
                         return gpui::component::list::ListItem::new(pos).disabled(true);
                     };
+                    let composing = file.is_some_and(|file_ix| {
+                        app.composers.iter().any(|composer| {
+                            Some(composer.item_id) == app.active_item().map(|item| item.id)
+                                && composer.placement == ComposerPlacement::Diff
+                                && composer.path == data.diff.files[file_ix].display_path()
+                        })
+                    });
                     render_tree_row(
                         row,
                         pos,
                         file == Some(data.file_ix),
+                        composing,
                         data,
                         &entity,
                         app.active_item().is_some_and(|item| item.reloading),
@@ -8134,6 +8142,108 @@ mod tests {
                 has_comments && query != "b.rs"
             );
             assert!(vcx.debug_bounds("file-comments-1").is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn file_tree_pencils_mark_open_inline_composers_before_comment_counts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Fresh windows keep absence assertions independent of old debug bounds.
+        for (files, close_first, query) in [
+            (vec![0], false, ""),
+            (vec![0, 1], false, ""),
+            (vec![0, 1], true, ""),
+            (vec![0, 1], false, "a.rs"),
+            (vec![], false, ""),
+        ] {
+            let (window, app) = queue_window(cx, FakePr::with_threads(Vec::new()));
+            install_item(
+                &app,
+                loop_pr_item(vec![rc(
+                    11,
+                    "a.rs",
+                    Some("RIGHT"),
+                    Some(1),
+                    "comment",
+                    "alice",
+                    "",
+                    None,
+                )]),
+                cx,
+            );
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    for &file_ix in &files {
+                        app.active_data_mut().unwrap().open_file(file_ix, None);
+                        app.open_composer_on_selection(window, cx);
+                    }
+                    if close_first {
+                        app.active_data_mut().unwrap().open_file(0, None);
+                        app.close_composer(window, cx);
+                    }
+                    app.tree_filter_input
+                        .update(cx, |input, cx| input.set_value(query, window, cx));
+                    cx.notify();
+                });
+            });
+            vcx.run_until_parked();
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+            let first = vcx.debug_bounds("file-composer-0");
+            assert_eq!(first.is_some(), files.contains(&0) && !close_first);
+            assert_eq!(
+                vcx.debug_bounds("file-composer-1").is_some(),
+                files.contains(&1) && query.is_empty()
+            );
+            if let Some(pencil) = first {
+                let count = vcx.debug_bounds("file-comments-0").unwrap();
+                assert!(
+                    pencil.right() <= count.left(),
+                    "the pencil precedes the comment count"
+                );
+            }
+            assert!(
+                vcx.debug_bounds("file-comments-1").is_none(),
+                "a pencil does not require any comments"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn file_tree_pencils_exclude_other_items_and_conversation_composers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for other_item in [false, true] {
+            let (window, app) = queue_window(cx, FakePr::with_threads(Vec::new()));
+            install_item(&app, loop_pr_item(Vec::new()), cx);
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    if other_item {
+                        app.open_composer_on_selection(window, cx);
+                        let mut item = loop_pr_item(Vec::new());
+                        item.id = 1;
+                        app.items.push(item);
+                        app.activate(1, window, cx);
+                    } else {
+                        app.open_comment_composer(
+                            ComposerPlacement::ConversationMain,
+                            None,
+                            "a.rs".into(),
+                            CommentSide::Right,
+                            1,
+                            1,
+                            window,
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                });
+            });
+            vcx.run_until_parked();
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(vcx.debug_bounds("file-composer-0").is_none());
         }
     }
 
