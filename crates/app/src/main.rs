@@ -672,7 +672,7 @@ pub(crate) struct ItemData {
     local_review: Option<LocalReview>,
     /// `c` toggles the comment rows; the file-header counts always show.
     comments_visible: bool,
-    editing_comment: Option<(u64, Rc<Cell<Pixels>>)>,
+    editing_comments: HashMap<u64, Rc<Cell<Pixels>>>,
     /// Columns used for initial comment-height estimates, derived from the
     /// measured pane width (see `comment_wrap_cols`). Changing it re-wraps the
     /// estimates, which changes the row count, so render rebuilds the rows when
@@ -759,7 +759,7 @@ impl ItemData {
             comments,
             local_review,
             comments_visible: true,
-            editing_comment: None,
+            editing_comments: HashMap::new(),
             comment_wrap: COMMENT_WRAP_CHARS,
             comment_text_layouts: HashMap::new(),
             preferences: Default::default(),
@@ -797,16 +797,16 @@ impl ItemData {
             .filter(|thread| {
                 thread.is_resolved
                     && !self.expanded_threads.contains(&thread.id)
-                    && !self
-                        .editing_comment
-                        .as_ref()
-                        .is_some_and(|(id, _)| thread.comments.iter().any(|c| c.id == *id))
+                    && !thread
+                        .comments
+                        .iter()
+                        .any(|c| self.editing_comments.contains_key(&c.id))
             })
             .filter_map(|thread| thread.comments.first().map(|c| c.id))
             .collect();
         resolution::collapse_threads(&mut built_rows, &collapsed);
         diff_media::resize_text_rows(&mut built_rows, &self.comment_text_layouts);
-        if let Some((id, height)) = &self.editing_comment {
+        for (id, height) in &self.editing_comments {
             comment_actions::reserve_editor_rows(
                 &mut built_rows,
                 *id,
@@ -1489,7 +1489,9 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                                 .xsmall()
                                 .tooltip("Copy PR link")
                                 .on_click(move |_, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copy_url.clone(),
+                                    ));
                                 }),
                         )
                         .child(
@@ -1525,10 +1527,7 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
         .into_any_element()
 }
 
-fn local_titlebar_content(
-    src: &git::LocalSource,
-    cx: &mut Context<ReviewApp>,
-) -> gpui::AnyElement {
+fn local_titlebar_content(src: &git::LocalSource, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
     let blue: Hsla = theme::blue(cx).into();
     div()
         .flex()
@@ -1613,10 +1612,10 @@ enum ComposerPlacement {
     PendingTray(u64),
 }
 
-/// The comment/reply composer. One at a time, targeting a specific
-/// anchor of a specific item (it survives item switches but only renders —
-/// and can only post — for the item it was opened on).
+/// A comment/reply draft. Diff composers belong to a specific item and file;
+/// switching files keeps their editor, uploads, and submission state intact.
 struct Composer {
+    id: u64,
     item_id: u64,
     placement: ComposerPlacement,
     /// Some(root comment id) = reply to that thread; None = a new anchored
@@ -1883,9 +1882,8 @@ pub(crate) struct ReviewApp {
     /// commentable line. Refreshed after list prepaint as well as on mouse
     /// moves, so scrolling under a stationary pointer updates the target.
     hover_plus: Option<(usize, SelSide)>,
-    composer: Option<Composer>,
-    /// Bumped on every composer open/close; an in-flight post only reports
-    /// back into the composer generation it was submitted from.
+    composers: Vec<Composer>,
+    /// Monotonic draft ID, so asynchronous posts target their original composer.
     composer_gen: u64,
     review: Option<ReviewDialog>,
     image_viewer: Option<image_viewer::ImageViewer>,
@@ -2021,7 +2019,7 @@ impl ReviewApp {
             minimap_scrub: false,
             char_width: None,
             hover_plus: None,
-            composer: None,
+            composers: Vec::new(),
             composer_gen: 0,
             review: None,
             image_viewer: None,
@@ -2818,7 +2816,9 @@ impl ReviewApp {
             return;
         }
         self.persist_positions();
-        self.items.remove(ix);
+        let item = self.items.remove(ix);
+        self.composers
+            .retain(|composer| composer.item_id != item.id);
         if self.active > ix || self.active >= self.items.len() {
             self.active = self.active.saturating_sub(1);
         }
@@ -3264,7 +3264,7 @@ impl ReviewApp {
     /// anchor goes through `comment_anchor`/`cursor_anchor`, so headers,
     /// comment rows, and binary rows are no-ops.
     fn open_composer_on_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.show_queue || self.composer.is_some() || self.review.is_some() {
+        if self.show_queue || self.composer().is_some() || self.review.is_some() {
             return;
         }
         let Some(item) = self.active_item() else {
@@ -3327,7 +3327,7 @@ impl ReviewApp {
             None
         };
         self.open_composer(None, path, anchor_side, line, row_ix, window, cx);
-        if let (Some(composer), Some(anchor)) = (&mut self.composer, range) {
+        if let (Some(composer), Some(anchor)) = (self.composer_mut(), range) {
             composer.line = anchor.line;
             composer.start_line = anchor.start_line;
             composer.position = anchor.position;
@@ -3341,7 +3341,7 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.show_queue || self.composer.is_some() || self.review.is_some() {
+        if self.show_queue || self.composer().is_some() || self.review.is_some() {
             return;
         }
         let Some(item) = self.active_item() else {
@@ -3426,7 +3426,7 @@ impl ReviewApp {
             return;
         };
         cx.notify();
-        if self.composer.is_some() || self.review.is_some() {
+        if self.composer().is_some() || self.review.is_some() {
             return;
         }
         let Some(data) = self.active_data() else {
@@ -3459,7 +3459,7 @@ impl ReviewApp {
             None
         };
         self.open_composer(None, path, drag.anchor_side, end, last, window, cx);
-        if let Some(composer) = &mut self.composer {
+        if let Some(composer) = self.composer_mut() {
             composer.start_line = (start != end).then_some(start);
             composer.position = range.and_then(|anchor| anchor.position);
         }
@@ -3624,10 +3624,10 @@ impl ReviewApp {
                     }
                 }
                 match completion {
-                    SessionCompletion::Composer(gen) if app.composer_gen == gen => match &result {
-                        Ok(()) => app.close_composer(window, cx),
+                    SessionCompletion::Composer(gen) => match &result {
+                        Ok(()) => app.close_composer_id(gen, window, cx),
                         Err(error) => {
-                            if let Some(composer) = &mut app.composer {
+                            if let Some(composer) = app.composers.iter_mut().find(|c| c.id == gen) {
                                 composer.in_flight = false;
                                 composer.error = Some(error.to_string().into());
                             }
@@ -3754,7 +3754,7 @@ impl ReviewApp {
                 }
             }
         }
-        if self.composer.is_some() {
+        if self.composer().is_some() {
             self.close_composer(window, cx);
         }
         self.composer_gen += 1;
@@ -3773,7 +3773,8 @@ impl ReviewApp {
             }
             self.ensure_mentions(item_id, loc, cx);
         }
-        self.composer = Some(Composer {
+        self.composers.push(Composer {
+            id: self.composer_gen,
             item_id,
             placement,
             reply_to,
@@ -3843,20 +3844,60 @@ impl ReviewApp {
         .detach();
     }
 
+    /// Resolve drafts from the current item/file, regardless of how navigation
+    /// happened (tree, search, keyboard, history, or a refresh).
+    fn composer_index(&self) -> Option<usize> {
+        let item = self.active_item()?;
+        // A conversation/tray composer opened after a diff draft takes
+        // precedence, even when navigating back to that draft's file.
+        self.composers.iter().rposition(|composer| {
+            composer.item_id == item.id
+                && (composer.placement != ComposerPlacement::Diff
+                    || self.active_data().is_some_and(|data| {
+                        data.diff
+                            .files
+                            .get(data.file_ix)
+                            .is_some_and(|file| file.display_path() == composer.path)
+                    }))
+        })
+    }
+
+    fn composer(&self) -> Option<&Composer> {
+        self.composer_index().map(|ix| &self.composers[ix])
+    }
+
+    fn composer_mut(&mut self) -> Option<&mut Composer> {
+        let ix = self.composer_index()?;
+        Some(&mut self.composers[ix])
+    }
+
     fn close_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(composer) = self.composer.take() {
+        if let Some(id) = self.composer().map(|composer| composer.id) {
+            self.close_composer_id(id, window, cx);
+        }
+    }
+
+    fn close_composer_id(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.composers.iter().position(|composer| composer.id == id) {
+            let was_active = self.composer().is_some_and(|composer| composer.id == id);
+            let composer = self.composers.remove(ix);
             if let Some(ItemState::Ready(data)) = self
                 .items
                 .iter_mut()
                 .find(|item| item.id == composer.item_id)
                 .map(|item| &mut item.state)
             {
-                if data.editing_comment.take().is_some() {
+                if composer
+                    .edit_id
+                    .and_then(|id| data.editing_comments.remove(&id))
+                    .is_some()
+                {
                     data.rebuild_rows_anchored();
                 }
             }
-            self.composer_gen += 1;
-            window.focus(&self.focus_handle, cx);
+            if was_active {
+                window.focus(&self.focus_handle, cx);
+            }
             cx.notify();
         }
     }
@@ -3904,11 +3945,11 @@ impl ReviewApp {
     }
 
     fn submit_composer_to_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(composer) = &self.composer else {
+        let Some(composer) = self.composer() else {
             return;
         };
         if self.composer_can_start_review(composer) {
-            self.composer.as_mut().unwrap().pending = true;
+            self.composer_mut().unwrap().pending = true;
         } else if !self.composer_uses_pending_review(composer) {
             return;
         }
@@ -3918,7 +3959,7 @@ impl ReviewApp {
     /// Submit the composer's comment (or reply): local items update in-memory
     /// drafts immediately; PR items post via gh on the background executor.
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(composer) = &self.composer else {
+        let Some(composer) = self.composer() else {
             return;
         };
         if composer.in_flight
@@ -3938,7 +3979,7 @@ impl ReviewApp {
         if self.active_item().map(|item| item.id) != Some(item_id) {
             return;
         }
-        let gen = self.composer_gen;
+        let gen = composer.id;
         // Keyboard submission must obey the same per-PR serialization as the
         // disabled button, including while pending-review reconciliation runs.
         if matches!(source, Source::Pr(_)) && self.sessions.get(&item_id).is_some_and(|ui| ui.busy)
@@ -3961,7 +4002,7 @@ impl ReviewApp {
                     return;
                 }
                 CommentTarget::Pending(id) => {
-                    let composer = self.composer.as_mut().unwrap();
+                    let composer = self.composer_mut().unwrap();
                     composer.in_flight = true;
                     composer.error = None;
                     self.run_session(
@@ -3974,7 +4015,7 @@ impl ReviewApp {
                     return;
                 }
                 CommentTarget::Published(target) => {
-                    let composer = self.composer.as_mut().unwrap();
+                    let composer = self.composer_mut().unwrap();
                     composer.in_flight = true;
                     composer.error = None;
                     self.run_session(
@@ -4008,7 +4049,7 @@ impl ReviewApp {
             } else {
                 SessionCommand::Conversation { body }
             };
-            let composer = self.composer.as_mut().unwrap();
+            let composer = self.composer_mut().unwrap();
             composer.in_flight = true;
             composer.error = None;
             if !pending {
@@ -4055,7 +4096,7 @@ impl ReviewApp {
                 (_, Some(comment_id)) => SessionCommand::Reply { comment_id, body },
                 _ => SessionCommand::Add { anchor, body },
             };
-            let composer = self.composer.as_mut().unwrap();
+            let composer = self.composer_mut().unwrap();
             composer.in_flight = true;
             composer.error = None;
             self.run_session(
@@ -4068,7 +4109,7 @@ impl ReviewApp {
             return;
         }
         let (reply_to, path, side, line) = {
-            let composer = self.composer.as_mut().unwrap();
+            let composer = self.composer_mut().unwrap();
             composer.in_flight = true;
             composer.error = None;
             (
@@ -4080,9 +4121,7 @@ impl ReviewApp {
         };
         if let Source::Local(_) = source {
             self.add_local_comment(item_id, reply_to, path, side, line, body, cx);
-            if self.composer_gen == gen {
-                self.close_composer(window, cx);
-            }
+            self.close_composer_id(gen, window, cx);
             return;
         }
         let Source::Pr(loc) = source else {
@@ -4102,16 +4141,13 @@ impl ReviewApp {
                 })
                 .await;
             this.update_in(cx, |app, window, cx| {
-                if app.composer_gen != gen {
-                    return; // The composer was closed or retargeted meanwhile.
-                }
                 match result {
                     Ok(()) => {
-                        app.close_composer(window, cx);
+                        app.close_composer_id(gen, window, cx);
                         app.refetch_comments(item_id, loc, cx);
                     }
                     Err(err) => {
-                        if let Some(composer) = &mut app.composer {
+                        if let Some(composer) = app.composers.iter_mut().find(|c| c.id == gen) {
                             composer.in_flight = false;
                             composer.error = Some(err.to_string().into());
                         }
@@ -4515,7 +4551,7 @@ impl ReviewApp {
     /// diff, never by moving the card upward over the selected source lines.
     fn render_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let empty = || div().into_any_element();
-        let Some(composer) = &self.composer else {
+        let Some(composer) = self.composer() else {
             return empty();
         };
         if composer.placement != ComposerPlacement::Diff
@@ -4656,7 +4692,7 @@ impl ReviewApp {
     }
 
     fn render_composer_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let composer = self.composer.as_ref().expect("an open composer");
+        let composer = self.composer().expect("an open composer");
         let pending = self.composer_uses_pending_review(composer);
         let session_busy = self
             .sessions
@@ -4837,7 +4873,7 @@ impl ReviewApp {
         // A fallback editor for an outdated/unanchorable draft lives here.
         // Keep it visible until it is submitted or cancelled, even if the
         // user had not expanded the tray before opening that editor.
-        let editing_in_tray = self.composer.as_ref().is_some_and(|composer| {
+        let editing_in_tray = self.composer().is_some_and(|composer| {
             composer.item_id == id
                 && matches!(composer.placement, ComposerPlacement::PendingTray(_))
         });
@@ -4953,7 +4989,7 @@ impl ReviewApp {
                 .gap_1();
             for comment in &review.comments {
                 let comment_id = comment.id;
-                if self.composer.as_ref().is_some_and(|composer| {
+                if self.composer().is_some_and(|composer| {
                     composer.item_id == id
                         && composer.placement == ComposerPlacement::PendingTray(comment_id)
                 }) {
@@ -4994,7 +5030,7 @@ impl ReviewApp {
                                 .ghost()
                                 .small()
                                 .disabled(
-                                    ui.busy || self.composer.is_some() || self.review.is_some(),
+                                    ui.busy || self.composer().is_some() || self.review.is_some(),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.edit_pending(comment_id, window, cx)
@@ -5006,7 +5042,7 @@ impl ReviewApp {
                                 .ghost()
                                 .small()
                                 .disabled(
-                                    ui.busy || self.composer.is_some() || self.review.is_some(),
+                                    ui.busy || self.composer().is_some() || self.review.is_some(),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.confirm_delete_comment(
@@ -5501,10 +5537,18 @@ impl ReviewApp {
                     let Some(row) = row else {
                         return gpui::component::list::ListItem::new(pos).disabled(true);
                     };
+                    let composing = file.is_some_and(|file_ix| {
+                        app.composers.iter().any(|composer| {
+                            Some(composer.item_id) == app.active_item().map(|item| item.id)
+                                && composer.placement == ComposerPlacement::Diff
+                                && composer.path == data.diff.files[file_ix].display_path()
+                        })
+                    });
                     render_tree_row(
                         row,
                         pos,
                         file == Some(data.file_ix),
+                        composing,
                         data,
                         &entity,
                         app.active_item().is_some_and(|item| item.reloading),
@@ -6090,8 +6134,7 @@ impl ReviewApp {
     /// composer space in addition to the half-viewport scroll-past-end area.
     fn diff_tail_rows(&self, pane_height: f32) -> usize {
         let composer_rows = self
-            .composer
-            .as_ref()
+            .composer()
             .filter(|composer| {
                 self.active_item()
                     .is_some_and(|item| item.id == composer.item_id)
@@ -6336,15 +6379,13 @@ impl ReviewApp {
                                                                 )
                                                             });
                                                         let commenting = dragging.or_else(|| {
-                                                            this.composer.as_ref().and_then(
-                                                                |composer| {
-                                                                    composer.highlighted_side(
-                                                                        this.items[this.active].id,
-                                                                        data,
-                                                                        row,
-                                                                    )
-                                                                },
-                                                            )
+                                                            this.composer().and_then(|composer| {
+                                                                composer.highlighted_side(
+                                                                    this.items[this.active].id,
+                                                                    data,
+                                                                    row,
+                                                                )
+                                                            })
                                                         });
                                                         let split_layout = ((data.mode
                                                             == ViewMode::Split
@@ -6821,7 +6862,7 @@ impl Render for ReviewApp {
                 }
                 // With the composer open but focus back on the diff pane,
                 // escape closes the composer before touching the selection.
-                if this.composer.is_some() {
+                if this.composer().is_some() {
                     this.close_composer(window, cx);
                     return;
                 }
@@ -6898,7 +6939,7 @@ impl Render for ReviewApp {
                             // quiet and the queue's (j/k, r) fire instead.
                             .key_context(if self.show_queue {
                                 "Queue"
-                            } else if self.composer.as_ref().is_some_and(|composer| {
+                            } else if self.composer().is_some_and(|composer| {
                                 composer.placement != ComposerPlacement::Diff
                                     && self.active_item().is_some_and(|item| {
                                         item.id == composer.item_id
@@ -6920,7 +6961,7 @@ impl Render for ReviewApp {
             .child(self.render_search(cx))
             // Root-level so the composer's input escapes the "ReviewApp" key
             // context (plain letters must stay text, like the quick-open input).
-            .when(self.composer.is_some(), |root| {
+            .when(self.composer().is_some(), |root| {
                 root.child(self.render_composer(cx))
             });
         // A sibling, not a descendant of review shortcut handlers. Keep the
@@ -8102,6 +8143,108 @@ mod tests {
     }
 
     #[gpui::test]
+    fn file_tree_pencils_mark_open_inline_composers_before_comment_counts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Fresh windows keep absence assertions independent of old debug bounds.
+        for (files, close_first, query) in [
+            (vec![0], false, ""),
+            (vec![0, 1], false, ""),
+            (vec![0, 1], true, ""),
+            (vec![0, 1], false, "a.rs"),
+            (vec![], false, ""),
+        ] {
+            let (window, app) = queue_window(cx, FakePr::with_threads(Vec::new()));
+            install_item(
+                &app,
+                loop_pr_item(vec![rc(
+                    11,
+                    "a.rs",
+                    Some("RIGHT"),
+                    Some(1),
+                    "comment",
+                    "alice",
+                    "",
+                    None,
+                )]),
+                cx,
+            );
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    for &file_ix in &files {
+                        app.active_data_mut().unwrap().open_file(file_ix, None);
+                        app.open_composer_on_selection(window, cx);
+                    }
+                    if close_first {
+                        app.active_data_mut().unwrap().open_file(0, None);
+                        app.close_composer(window, cx);
+                    }
+                    app.tree_filter_input
+                        .update(cx, |input, cx| input.set_value(query, window, cx));
+                    cx.notify();
+                });
+            });
+            vcx.run_until_parked();
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+            let first = vcx.debug_bounds("file-composer-0");
+            assert_eq!(first.is_some(), files.contains(&0) && !close_first);
+            assert_eq!(
+                vcx.debug_bounds("file-composer-1").is_some(),
+                files.contains(&1) && query.is_empty()
+            );
+            if let Some(pencil) = first {
+                let count = vcx.debug_bounds("file-comments-0").unwrap();
+                assert!(
+                    pencil.right() <= count.left(),
+                    "the pencil precedes the comment count"
+                );
+            }
+            assert!(
+                vcx.debug_bounds("file-comments-1").is_none(),
+                "a pencil does not require any comments"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn file_tree_pencils_exclude_other_items_and_conversation_composers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for other_item in [false, true] {
+            let (window, app) = queue_window(cx, FakePr::with_threads(Vec::new()));
+            install_item(&app, loop_pr_item(Vec::new()), cx);
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    if other_item {
+                        app.open_composer_on_selection(window, cx);
+                        let mut item = loop_pr_item(Vec::new());
+                        item.id = 1;
+                        app.items.push(item);
+                        app.activate(1, window, cx);
+                    } else {
+                        app.open_comment_composer(
+                            ComposerPlacement::ConversationMain,
+                            None,
+                            "a.rs".into(),
+                            CommentSide::Right,
+                            1,
+                            1,
+                            window,
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                });
+            });
+            vcx.run_until_parked();
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(vcx.debug_bounds("file-composer-0").is_none());
+        }
+    }
+
+    #[gpui::test]
     fn viewed_keyboard_and_far_right_checkboxes_sync_without_opening_files(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -8526,8 +8669,10 @@ mod tests {
                 assert_eq!(copy.top(), open.top());
                 assert!(copy.right() <= open.left());
                 let navigation = vcx.debug_bounds("review-queue-navigation").unwrap();
-                assert!(open.right() + px(100.) < navigation.left(),
-                    "PR links should sit beside the title, not in the right-hand controls");
+                assert!(
+                    open.right() + px(100.) < navigation.left(),
+                    "PR links should sit beside the title, not in the right-hand controls"
+                );
             }
         }
         assert!(cx.opened_url().is_none(), "copying must not open a browser");
@@ -8963,7 +9108,7 @@ mod tests {
             vcx.simulate_click(plus.center(), gpui::Modifiers::default());
             vcx.update(|window, cx| {
                 app.update(cx, |this, cx| {
-                    assert_eq!(this.composer.as_ref().unwrap().row_ix, expected_row);
+                    assert_eq!(this.composer().unwrap().row_ix, expected_row);
                     this.close_composer(window, cx);
                 });
             });
@@ -9030,7 +9175,7 @@ mod tests {
                 draw_window(&mut vcx);
                 vcx.update(|_, cx| {
                     assert!(
-                        app.read(cx).composer.is_none(),
+                        app.read(cx).composer().is_none(),
                         "wait until release to compose"
                     );
                     assert!(app.read(cx).comment_drag.is_some());
@@ -9078,7 +9223,7 @@ mod tests {
                     }
                     vcx.update(|_, cx| {
                         let this = app.read(cx);
-                        assert!(this.composer.is_none());
+                        assert!(this.composer().is_none());
                         assert!(this.active_data().unwrap().selection.is_none());
                         assert!(this.drag_anchor.is_none());
                     });
@@ -9090,7 +9235,7 @@ mod tests {
                 vcx.update(|window, cx| {
                     app.update(cx, |this, cx| {
                         assert!(this.comment_drag.is_none());
-                        let composer = this.composer.as_ref().unwrap();
+                        let composer = this.composer().unwrap();
                         assert_eq!(
                             composer.start_line,
                             (anchor != head).then_some(anchor.min(head) as u64)
@@ -9186,7 +9331,7 @@ mod tests {
         );
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                let composer = this.composer.as_ref().unwrap();
+                let composer = this.composer().unwrap();
                 assert_eq!(composer.start_line, Some(1));
                 assert_eq!(composer.line, 3);
                 assert_eq!(composer.side, CommentSide::Right);
@@ -9199,7 +9344,7 @@ mod tests {
         draw_window(&mut vcx);
         vcx.simulate_mouse_up(at(4), MouseButton::Left, gpui::Modifiers::default());
         vcx.update(|_, cx| {
-            assert!(app.read(cx).composer.is_none());
+            assert!(app.read(cx).composer().is_none());
             assert!(app.read(cx).comment_drag.is_none());
         });
         // A removed-line drag stays on LEFT when extended into context, even
@@ -9217,7 +9362,7 @@ mod tests {
             vcx.simulate_mouse_up(at(head), MouseButton::Left, gpui::Modifiers::default());
             vcx.update(|window, cx| {
                 app.update(cx, |this, cx| {
-                    let composer = this.composer.as_ref().unwrap();
+                    let composer = this.composer().unwrap();
                     assert_eq!(composer.start_line, Some(if head == 1 { 1 } else { 2 }));
                     assert_eq!(composer.line, if head == 1 { 2 } else { 3 });
                     assert_eq!(composer.side, CommentSide::Left);
@@ -9758,7 +9903,9 @@ mod tests {
             let focus = app.read(cx).focus_handle.clone();
             window.focus(&focus, cx);
         });
-        for keys in ["shift-n", "shift-n", "shift-p", "shift-p", "]", "]", "[", "["] {
+        for keys in [
+            "shift-n", "shift-n", "shift-p", "shift-p", "]", "]", "[", "[",
+        ] {
             let before = cx.update(|cx| app.read(cx).active_data().unwrap().file_ix);
             vcx.simulate_keystrokes(keys);
             vcx.update(|window, cx| {
@@ -9767,7 +9914,10 @@ mod tests {
             });
         }
         vcx.update(|window, cx| {
-            app.read(cx).tree_filter_input.clone().update(cx, |state, cx| state.focus(window, cx));
+            app.read(cx)
+                .tree_filter_input
+                .clone()
+                .update(cx, |state, cx| state.focus(window, cx));
         });
         vcx.simulate_keystrokes("shift-n shift-p");
         vcx.update(|_, cx| {
@@ -14100,6 +14250,9 @@ mod tests {
                 comment_id,
                 body: body.to_string(),
             });
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(github::ClientError::Failed("reply rejected".into()));
+            }
             let id = self
                 .next_id
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -15875,7 +16028,7 @@ mod tests {
         vcx.simulate_input("conversation feedback");
         vcx.simulate_keystrokes("c r");
         cx.update(|cx| {
-            let composer = app.read(cx).composer.as_ref().unwrap();
+            let composer = app.read(cx).composer().unwrap();
             assert_eq!(composer.placement, ComposerPlacement::ConversationMain);
             assert_eq!(
                 composer.input.read(cx).value().as_str(),
@@ -15892,7 +16045,7 @@ mod tests {
         );
         cx.update(|cx| {
             let app = app.read(cx);
-            assert!(app.composer.is_none());
+            assert!(app.composer().is_none());
             let discussion = app.active_data().unwrap().discussion.as_ref().unwrap();
             assert!(matches!(&conversation::timeline(discussion)[..], [conversation::Entry::Comment(c)] if c.body == "conversation feedbackcr"));
             assert!(discussion.threads.is_empty());
@@ -15924,7 +16077,7 @@ mod tests {
         click_commenting(&mut vcx, "conversation-compose-0-11");
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                let composer = this.composer.as_ref().unwrap();
+                let composer = this.composer().unwrap();
                 assert_eq!(
                     composer.placement,
                     ComposerPlacement::ConversationThread("11".into())
@@ -15954,7 +16107,7 @@ mod tests {
             );
             assert_eq!(discussion.threads[0].comments.len(), 2);
             assert_eq!(discussion.threads[0].comments[1].body, "answered here");
-            assert!(app.composer.is_none());
+            assert!(app.composer().is_none());
         });
     }
 
@@ -15993,7 +16146,7 @@ mod tests {
                     window,
                     cx,
                 );
-                let composer = this.composer.as_ref().unwrap();
+                let composer = this.composer().unwrap();
                 assert_eq!(this.composer_submit_label(composer), "Add to review");
                 composer
                     .input
@@ -16004,7 +16157,7 @@ mod tests {
         cx.run_until_parked();
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                assert!(this.composer.is_none());
+                assert!(this.composer().is_none());
                 assert_eq!(
                     this.sessions[&0].state.pending.as_ref().unwrap().body,
                     "web summary\n\nextra summary"
@@ -16019,7 +16172,7 @@ mod tests {
                     window,
                     cx,
                 );
-                let composer = this.composer.as_ref().unwrap();
+                let composer = this.composer().unwrap();
                 assert_eq!(this.composer_submit_label(composer), "Add to review");
                 composer
                     .input
@@ -16116,7 +16269,7 @@ mod tests {
         cx.update(|cx| {
             let app = app.read(cx);
             assert_eq!(
-                app.composer_submit_label(app.composer.as_ref().unwrap()),
+                app.composer_submit_label(app.composer().unwrap()),
                 if reply { "Reply" } else { "Comment" }
             );
         });
@@ -16125,7 +16278,7 @@ mod tests {
         assert!(fake.posts().is_empty(), "Start review never publishes");
         cx.update(|cx| {
             let app = app.read(cx);
-            assert!(app.composer.is_none(), "the draft was saved");
+            assert!(app.composer().is_none(), "the draft was saved");
             let review = app.store.review_session(&loop_loc()).pending.unwrap();
             if reply {
                 assert_eq!(review.comments.len(), 1);
@@ -16180,13 +16333,9 @@ mod tests {
         );
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                this.composer
-                    .as_ref()
-                    .unwrap()
-                    .input
-                    .update(cx, |state, cx| {
-                        state.set_value("visible immediately", window, cx)
-                    });
+                this.composer().unwrap().input.update(cx, |state, cx| {
+                    state.set_value("visible immediately", window, cx)
+                });
                 this.submit_composer(window, cx);
                 let data = this.active_data().unwrap();
                 assert_eq!(
@@ -16204,7 +16353,7 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             let app = app.read(cx);
-            assert!(app.composer.is_none());
+            assert!(app.composer().is_none());
             let data = app.active_data().unwrap();
             assert_eq!(
                 data.posts.pending.len(),
@@ -16392,7 +16541,7 @@ mod tests {
                     window,
                     cx,
                 );
-                this.composer.as_ref().unwrap().input.clone()
+                this.composer().unwrap().input.clone()
             })
         });
         vcx.simulate_input("beforeafter");
@@ -16404,7 +16553,7 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             assert_eq!(input.read(cx).value().as_str(), "before\nafter");
-            assert!(app.read(cx).composer.is_none());
+            assert!(app.read(cx).composer().is_none());
             assert!(app.read(cx).review.is_none());
         });
         if existing_review || keystroke == "shift-cmd-enter" {
@@ -16478,7 +16627,7 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             let app = app.read(cx);
-            let composer = app.composer.as_ref().unwrap();
+            let composer = app.composer().unwrap();
             assert!(!composer.in_flight);
             assert!(composer.error.is_some());
             assert_eq!(composer.input.read(cx).value().as_str(), "keep this text");
@@ -16489,8 +16638,247 @@ mod tests {
         });
         vcx.simulate_keystrokes("escape");
         cx.run_until_parked();
-        cx.update(|cx| assert!(app.read(cx).composer.is_none()));
+        cx.update(|cx| assert!(app.read(cx).composer().is_none()));
         assert_eq!(fake.posts().len(), 1);
+    }
+
+    #[gpui::test]
+    fn inline_composers_are_scoped_to_files_and_keep_independent_drafts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(Vec::new());
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, loop_pr_item(Vec::new()), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let first = vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_composer_on_selection(window, cx);
+                let input = app.composer().unwrap().input.clone();
+                input.update(cx, |input, cx| input.set_value("first draft", window, cx));
+                input
+            })
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(vcx.debug_bounds("composer-card").is_some());
+
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.active_data_mut().unwrap().open_file(1, None);
+                assert!(app.composer().is_none());
+                assert_eq!(
+                    app.diff_tail_rows(600.),
+                    diff_padding_rows(600., row_height())
+                );
+                app.submit_composer(window, cx); // A hidden draft cannot be submitted.
+                cx.notify();
+            })
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(vcx.debug_bounds("composer-card").is_none());
+        assert!(fake.posts().is_empty());
+
+        let second = vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_composer_on_selection(window, cx);
+                let composer = app.composer().unwrap();
+                assert_eq!(composer.path, "b.rs");
+                let input = composer.input.clone();
+                input.update(cx, |input, cx| input.set_value("second draft", window, cx));
+                assert_ne!(first, input);
+                app.active_data_mut().unwrap().open_file(0, None);
+                assert_eq!(app.composer().unwrap().input, first);
+                assert_eq!(first.read(cx).value(), "first draft");
+                app.close_composer(window, cx);
+                assert!(app.composer().is_none());
+                app.active_data_mut().unwrap().open_file(1, None);
+                assert_eq!(app.composer().unwrap().input, input);
+                assert_eq!(input.read(cx).value(), "second draft");
+                app.submit_composer(window, cx);
+                input
+            })
+        });
+        vcx.run_until_parked();
+        cx.update(|cx| {
+            assert!(app.read(cx).composers.is_empty());
+            assert_eq!(second.read(cx).value(), "second draft");
+        });
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Comment {
+                commit_id: "dead10cc".into(),
+                path: "b.rs".into(),
+                side: "LEFT".into(),
+                line: 1,
+                body: "second draft".into(),
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn inline_edits_keep_their_reserved_rows_when_switching_files(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(Vec::new());
+        *fake.pending.lock().unwrap() = Some(github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: String::new(),
+            comments: [
+                (12, "a.rs", CommentSide::Right),
+                (13, "b.rs", CommentSide::Left),
+            ]
+            .into_iter()
+            .map(|(id, path, side)| github::PendingComment {
+                id,
+                node_id: format!("draft-{id}"),
+                path: path.into(),
+                side,
+                line: Some(1),
+                start_line: None,
+                body: format!("draft {id}"),
+                in_reply_to_id: None,
+            })
+            .collect(),
+        });
+        let (window, app) = queue_window(cx, fake);
+        install_item(&app, loop_pr_item(Vec::new()), cx);
+        cx.update(|cx| app.update(cx, |app, cx| app.resume_session(0, cx)));
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.edit_pending(12, window, cx);
+                assert_eq!(app.composer().unwrap().edit_id, Some(12));
+                app.active_data_mut().unwrap().open_file(1, None);
+                app.edit_pending(13, window, cx);
+                assert_eq!(app.composer().unwrap().edit_id, Some(13));
+                assert_eq!(app.active_data().unwrap().editing_comments.len(), 2);
+                app.active_data_mut().unwrap().open_file(0, None);
+                let first = app.composer().unwrap();
+                assert_eq!(first.edit_id, Some(12));
+                let data = app.active_data().unwrap();
+                assert!(matches!(
+                    data.rows[first.row_ix + 1],
+                    Row::CommentEditor { .. }
+                ));
+                app.close_composer(window, cx);
+                assert!(!app
+                    .active_data()
+                    .unwrap()
+                    .editing_comments
+                    .contains_key(&12));
+                app.active_data_mut().unwrap().open_file(1, None);
+                let second = app.composer().unwrap();
+                assert_eq!(second.edit_id, Some(13));
+                let data = app.active_data().unwrap();
+                assert!(matches!(
+                    data.rows[second.row_ix + 1],
+                    Row::CommentEditor { .. }
+                ));
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn inline_composers_are_scoped_to_items_and_removed_when_an_item_closes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, FakePr::with_threads(Vec::new()));
+        install_item(&app, loop_pr_item(Vec::new()), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_composer_on_selection(window, cx);
+                let first_id = app.composer().unwrap().id;
+                let mut second = loop_pr_item(Vec::new());
+                second.id = 1;
+                app.items.push(second);
+                app.activate(1, window, cx);
+                assert!(app.composer().is_none());
+                app.open_composer_on_selection(window, cx);
+                let second_id = app.composer().unwrap().id;
+                assert_ne!(first_id, second_id);
+                app.activate(0, window, cx);
+                assert_eq!(app.composer().unwrap().id, first_id);
+                app.close_item(0, cx);
+                assert_eq!(app.composers.len(), 1);
+                assert_eq!(app.composer().unwrap().id, second_id);
+                app.close_composer_id(first_id, window, cx); // A late completion is harmless.
+                assert_eq!(app.composer().unwrap().id, second_id);
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn inline_post_completion_targets_its_draft_after_switching_files(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for fail in [false, true] {
+            for reply in [false, true] {
+                // Replies exercise run_session; immediate comments have a
+                // separate completion handler. Test success and failure in both.
+                let fake = FakePr::with_threads(vec![rc(
+                    11,
+                    "a.rs",
+                    Some("RIGHT"),
+                    Some(1),
+                    "root",
+                    "alice",
+                    "",
+                    None,
+                )]);
+                fake.fail.store(fail, std::sync::atomic::Ordering::SeqCst);
+                let (window, app) = queue_window(cx, fake);
+                install_item(&app, loop_pr_item(Vec::new()), cx);
+                let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+                vcx.update(|window, cx| {
+                    app.update(cx, |app, cx| {
+                        app.open_composer(
+                            reply.then_some(11),
+                            "a.rs".into(),
+                            CommentSide::Right,
+                            1,
+                            1,
+                            window,
+                            cx,
+                        );
+                        app.composer()
+                            .unwrap()
+                            .input
+                            .update(cx, |input, cx| input.set_value("posting a", window, cx));
+                        app.submit_composer(window, cx);
+                        assert!(app.composer().unwrap().in_flight);
+                        // Navigate and compose before the asynchronous result is handled.
+                        app.active_data_mut().unwrap().open_file(1, None);
+                        app.open_composer_on_selection(window, cx);
+                        app.composer()
+                            .unwrap()
+                            .input
+                            .update(cx, |input, cx| input.set_value("keep b", window, cx));
+                    })
+                });
+                vcx.run_until_parked();
+                vcx.update(|window, cx| {
+                    app.update(cx, |app, cx| {
+                        let second = app.composer().unwrap();
+                        assert_eq!(second.path, "b.rs");
+                        assert_eq!(second.input.read(cx).value(), "keep b");
+                        assert!(!second.in_flight);
+                        assert!(second.error.is_none());
+                        assert!(second.input.focus_handle(cx).is_focused(window));
+                        app.active_data_mut().unwrap().open_file(0, None);
+                        if fail {
+                            let first = app.composer().unwrap();
+                            assert!(!first.in_flight);
+                            assert!(first.error.is_some());
+                            assert_eq!(first.input.read(cx).value(), "posting a");
+                        } else {
+                            assert!(app.composer().is_none());
+                        }
+                    })
+                });
+            }
+        }
     }
 
     /// The loop's first leg: `C` opens the composer on the selected line,
@@ -16509,7 +16897,7 @@ mod tests {
                 // `C` with no mouse selection anchors on the cursor's line —
                 // the reveal put it on a.rs's added line 1.
                 this.open_composer_on_selection(window, cx);
-                let composer = this.composer.as_ref().expect("C opens the composer");
+                let composer = this.composer().expect("C opens the composer");
                 assert_eq!(composer.reply_to, None, "C starts a new thread");
                 assert_eq!(composer.commit_id, "dead10cc");
                 assert_eq!(composer.path, "a.rs");
@@ -16521,7 +16909,7 @@ mod tests {
                 });
                 this.submit_composer(window, cx);
                 assert!(
-                    this.composer.as_ref().unwrap().in_flight,
+                    this.composer().unwrap().in_flight,
                     "posting is in flight until gh answers"
                 );
             });
@@ -16542,7 +16930,7 @@ mod tests {
         cx.update(|cx| {
             app.update(cx, |this, _cx| {
                 assert!(
-                    this.composer.is_none(),
+                    this.composer().is_none(),
                     "a posted comment closes the composer"
                 );
                 // The post landed and the refetch shows it: the thread rides
@@ -16570,8 +16958,7 @@ mod tests {
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.open_composer_on_selection(window, cx);
-                this.composer
-                    .as_ref()
+                this.composer()
                     .unwrap()
                     .input
                     .update(cx, |state, cx| state.set_value("doomed", window, cx));
@@ -16582,10 +16969,7 @@ mod tests {
 
         cx.update(|cx| {
             app.update(cx, |this, _cx| {
-                let composer = this
-                    .composer
-                    .as_ref()
-                    .expect("the composer stays open on failure");
+                let composer = this.composer().expect("the composer stays open on failure");
                 assert!(!composer.in_flight, "a failed post is retryable");
                 assert!(composer.error.is_some(), "gh's failure shows inline");
             });
@@ -16597,7 +16981,7 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             app.update(cx, |this, _cx| {
-                assert!(this.composer.is_none(), "escape closes the composer");
+                assert!(this.composer().is_none(), "escape closes the composer");
             });
         });
         assert_eq!(fake.posts().len(), 1, "cancelling posts nothing");
@@ -16644,7 +17028,7 @@ mod tests {
                     _ => unreachable!(),
                 };
                 this.open_composer(Some(11), path.to_string(), side, line, row_ix, window, cx);
-                let composer = this.composer.as_ref().expect("the reply composer opens");
+                let composer = this.composer().expect("the reply composer opens");
                 assert_eq!(composer.reply_to, Some(11), "it targets the thread's root");
                 composer.input.update(cx, |state, cx| {
                     state.set_value("nil is fine on this path", window, cx)
@@ -16664,7 +17048,7 @@ mod tests {
         );
         cx.update(|cx| {
             app.update(cx, |this, _cx| {
-                assert!(this.composer.is_none());
+                assert!(this.composer().is_none());
                 // The refetch shows the reply inside the thread it belongs to.
                 let data = this.active_data().expect("the item is ready");
                 let thread = &data.comments.as_ref().expect("comments refetched").threads["a.rs"]
@@ -16709,18 +17093,17 @@ mod tests {
                 // composer must switch to draft-only actions when resume finishes.
                 this.open_composer(None, "a.rs".into(), CommentSide::Right, 1, 1, window, cx);
                 assert_eq!(
-                    this.composer_submit_label(this.composer.as_ref().unwrap()),
+                    this.composer_submit_label(this.composer().unwrap()),
                     "Add single comment"
                 );
-                this.composer
-                    .as_ref()
+                this.composer()
                     .unwrap()
                     .input
                     .update(cx, |state, cx| state.set_value("new draft", window, cx));
                 this.resume_session(0, cx);
                 this.submit_composer(window, cx);
                 assert!(
-                    !this.composer.as_ref().unwrap().in_flight,
+                    !this.composer().unwrap().in_flight,
                     "keyboard submit waits for reconciliation"
                 );
             })
@@ -16728,7 +17111,7 @@ mod tests {
         cx.run_until_parked();
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                let composer = this.composer.as_ref().unwrap();
+                let composer = this.composer().unwrap();
                 assert!(!composer.pending, "no manual draft toggle is necessary");
                 assert!(this.composer_uses_pending_review(composer));
                 assert_eq!(this.composer_submit_label(composer), "Add to review");
@@ -16741,7 +17124,7 @@ mod tests {
         cx.run_until_parked();
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                assert!(this.composer.is_none());
+                assert!(this.composer().is_none());
                 assert_eq!(this.sessions[&0].state.count(), 1);
                 this.open_composer(
                     Some(11),
@@ -16752,7 +17135,7 @@ mod tests {
                     window,
                     cx,
                 );
-                let composer = this.composer.as_ref().unwrap();
+                let composer = this.composer().unwrap();
                 assert_eq!(this.composer_submit_label(composer), "Add to review");
                 composer
                     .input
@@ -16764,7 +17147,7 @@ mod tests {
         cx.update(|cx| {
             app.update(cx, |this, _| {
                 assert!(
-                    this.composer.is_none(),
+                    this.composer().is_none(),
                     "reply succeeded without an immediate-post error"
                 );
                 assert_eq!(this.sessions[&0].state.count(), 2);
@@ -17251,7 +17634,7 @@ mod tests {
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.open_composer(None, "a.rs".into(), CommentSide::Left, 6, 2, window, cx);
-                let composer = this.composer.as_mut().unwrap();
+                let composer = this.composer_mut().unwrap();
                 composer.pending = true;
                 composer.start_line = Some(5);
                 composer
@@ -17286,13 +17669,9 @@ mod tests {
                 let data = this.active_data().unwrap();
                 assert_eq!(data.comments.as_ref().unwrap().counts["a.rs"], (1, 0));
                 this.edit_pending(12, window, cx);
-                this.composer
-                    .as_ref()
-                    .unwrap()
-                    .input
-                    .update(cx, |state, cx| {
-                        state.set_value("edited removed draft", window, cx)
-                    });
+                this.composer().unwrap().input.update(cx, |state, cx| {
+                    state.set_value("edited removed draft", window, cx)
+                });
                 this.submit_composer(window, cx);
             })
         });
@@ -17379,13 +17758,9 @@ mod tests {
         click_commenting(&mut vcx, "comment-edit-local-2");
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                this.composer
-                    .as_ref()
-                    .unwrap()
-                    .input
-                    .update(cx, |input, cx| {
-                        input.set_value("edited local reply", window, cx)
-                    });
+                this.composer().unwrap().input.update(cx, |input, cx| {
+                    input.set_value("edited local reply", window, cx)
+                });
                 this.submit_composer(window, cx);
                 assert_eq!(
                     this.active_data()
@@ -17569,11 +17944,10 @@ mod tests {
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 assert_eq!(
-                    this.composer.as_ref().unwrap().placement,
+                    this.composer().unwrap().placement,
                     ComposerPlacement::ConversationComment("draft-12".into())
                 );
-                this.composer
-                    .as_ref()
+                this.composer()
                     .unwrap()
                     .input
                     .update(cx, |input, cx| input.set_value("edited reply", window, cx));
@@ -17587,7 +17961,7 @@ mod tests {
                 assert!(!this.sessions[&0].comments_expanded);
                 this.edit_pending(13, window, cx);
                 assert_eq!(
-                    this.composer.as_ref().unwrap().placement,
+                    this.composer().unwrap().placement,
                     ComposerPlacement::PendingTray(13)
                 );
             });
@@ -17605,13 +17979,9 @@ mod tests {
         );
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                this.composer
-                    .as_ref()
-                    .unwrap()
-                    .input
-                    .update(cx, |input, cx| {
-                        input.set_value("edited outdated draft", window, cx)
-                    });
+                this.composer().unwrap().input.update(cx, |input, cx| {
+                    input.set_value("edited outdated draft", window, cx)
+                });
                 this.submit_composer(window, cx);
             })
         });
@@ -17651,7 +18021,7 @@ mod tests {
         cx.run_until_parked();
         click_commenting(&mut vcx, "comment-edit-draft-12");
         vcx.update(|window, cx| app.update(cx, |this, cx| {
-            let composer = this.composer.as_ref().unwrap();
+            let composer = this.composer().unwrap();
             assert_eq!(composer.edit_target, Some(CommentTarget::Pending(12)));
             assert!(composer.row_ix > 0, "not the old top-of-diff editor");
             let data = this.active_data().unwrap();
@@ -17664,8 +18034,7 @@ mod tests {
         click_commenting(&mut vcx, "comment-edit-draft-12");
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                this.composer
-                    .as_ref()
+                this.composer()
                     .unwrap()
                     .input
                     .update(cx, |input, cx| input.set_value("edited draft", window, cx));
@@ -17674,7 +18043,7 @@ mod tests {
         vcx.simulate_keystrokes("cmd-enter");
         vcx.run_until_parked();
         cx.update(|cx| {
-            assert!(app.read(cx).composer.is_none());
+            assert!(app.read(cx).composer().is_none());
             assert_eq!(
                 app.read(cx).sessions[&0]
                     .state
@@ -17689,8 +18058,8 @@ mod tests {
                 .read(cx)
                 .active_data()
                 .unwrap()
-                .editing_comment
-                .is_none());
+                .editing_comments
+                .is_empty());
         });
         click_commenting(&mut vcx, "comment-delete-draft-12");
         assert!(cx.has_pending_prompt());
@@ -17960,7 +18329,7 @@ mod tests {
                     cx,
                 );
                 assert!(
-                    this.composer.is_none(),
+                    this.composer().is_none(),
                     "handlers also enforce edit permission"
                 );
             })
@@ -18045,7 +18414,7 @@ mod tests {
             click_commenting(&mut vcx, "comment-edit-review-comment-PRRC11");
             vcx.update(|window, cx| {
                 app.update(cx, |this, cx| {
-                    let composer = this.composer.as_ref().unwrap();
+                    let composer = this.composer().unwrap();
                     assert_eq!(this.composer_submit_label(composer), "Save changes");
                     assert!(!this.composer_uses_pending_review(composer));
                     if pane == ItemPane::Conversation {
@@ -18062,7 +18431,7 @@ mod tests {
             vcx.simulate_keystrokes("cmd-enter");
             vcx.run_until_parked();
             cx.update(|cx| {
-                assert!(app.read(cx).composer.is_none());
+                assert!(app.read(cx).composer().is_none());
                 assert_eq!(
                     app.read(cx)
                         .active_data()
@@ -18125,8 +18494,7 @@ mod tests {
         fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                this.composer
-                    .as_ref()
+                this.composer()
                     .unwrap()
                     .input
                     .update(cx, |input, cx| input.set_value("retry me", window, cx));
@@ -18135,7 +18503,7 @@ mod tests {
         });
         cx.run_until_parked();
         cx.update(|cx| {
-            let composer = app.read(cx).composer.as_ref().unwrap();
+            let composer = app.read(cx).composer().unwrap();
             assert!(!composer.in_flight);
             assert!(composer.error.as_ref().unwrap().contains("edit rejected"));
             assert_eq!(composer.input.read(cx).value().as_str(), "retry me");
@@ -18166,13 +18534,9 @@ mod tests {
         click_commenting(&mut vcx, "comment-edit-review-PRR12");
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                this.composer
-                    .as_ref()
-                    .unwrap()
-                    .input
-                    .update(cx, |input, cx| {
-                        input.set_value("updated review summary", window, cx)
-                    });
+                this.composer().unwrap().input.update(cx, |input, cx| {
+                    input.set_value("updated review summary", window, cx)
+                });
                 this.submit_composer(window, cx);
             })
         });
@@ -18221,7 +18585,7 @@ mod tests {
                     head: RowCol { row: 1, col: 0 },
                 });
                 this.open_composer_on_selection(window, cx);
-                let composer = this.composer.as_mut().unwrap();
+                let composer = this.composer_mut().unwrap();
                 assert_eq!((composer.start_line, composer.line), (Some(1), 3));
                 composer.pending = true;
                 composer
@@ -18238,11 +18602,11 @@ mod tests {
         cx.run_until_parked();
         vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                assert!(this.composer.is_none());
+                assert!(this.composer().is_none());
                 assert_eq!(this.sessions[&0].state.count(), 2);
                 assert_eq!(this.store.review_session(&loop_loc()).count(), 2);
                 this.edit_pending(12, window, cx);
-                let composer = this.composer.as_ref().unwrap();
+                let composer = this.composer().unwrap();
                 assert_eq!(composer.edit_id, Some(12));
                 composer
                     .input
@@ -18334,7 +18698,7 @@ mod tests {
                     },
                 });
                 this.open_composer_on_selection(window, cx);
-                let composer = this.composer.as_ref().unwrap();
+                let composer = this.composer().unwrap();
                 assert_eq!((composer.start_line, composer.line), (Some(1), 10));
                 assert_eq!(composer.position.as_ref().unwrap().commit_id, "dead10cc");
                 this.close_composer(window, cx);
@@ -18354,7 +18718,7 @@ mod tests {
                 data.selection = None;
                 data.cursor = 5;
                 this.open_composer_on_selection(window, cx);
-                let composer = this.composer.as_ref().unwrap();
+                let composer = this.composer().unwrap();
                 assert_eq!((composer.start_line, composer.line), (None, 5));
                 assert!(
                     composer.position.is_some(),
@@ -18363,7 +18727,7 @@ mod tests {
                 this.close_composer(window, cx);
                 // Hover's + button reaches the same validation, without a selection.
                 this.open_composer(None, "a.rs".into(), CommentSide::Right, 5, 5, window, cx);
-                assert!(this.composer.as_ref().unwrap().position.is_some());
+                assert!(this.composer().unwrap().position.is_some());
             })
         });
     }
@@ -18436,7 +18800,7 @@ mod tests {
                             data.selection.is_none(),
                             "the cue must not select or recolour code"
                         );
-                        assert!(app.composer.is_none());
+                        assert!(app.composer().is_none());
                     });
                 }
             }
@@ -18527,7 +18891,7 @@ mod tests {
                     assert_eq!(selection_text(&selection, &data.rows), expected);
                     assert_eq!((data.cursor, data.cursor_side), (row, Some(side)));
                     assert!(this.drag_anchor.is_none());
-                    assert!(this.composer.is_none());
+                    assert!(this.composer().is_none());
                     assert!(this.focus_handle.is_focused(window));
                 });
                 vcx.dispatch_action(CopySelection);
@@ -18644,7 +19008,7 @@ mod tests {
                     // Growing the card must reserve more space and reveal it
                     // again, including when there are no source rows below it.
                     vcx.update(|window, cx| {
-                        let input = app.read(cx).composer.as_ref().unwrap().input.clone();
+                        let input = app.read(cx).composer().unwrap().input.clone();
                         input.update(cx, |state, cx| {
                             state.set_value("a long comment\n".repeat(8), window, cx)
                         });
@@ -18682,7 +19046,7 @@ mod tests {
                 }
                 vcx.update(|window, cx| {
                     app.update(cx, |this, cx| {
-                        let composer = this.composer.as_ref().unwrap();
+                        let composer = this.composer().unwrap();
                         let last = anchor.max(head);
                         assert_eq!(composer.row_ix, last);
                         assert_eq!(composer.line, last.min(101) as u64);
@@ -18739,7 +19103,7 @@ mod tests {
         vcx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.open_composer(None, "a.rs".into(), CommentSide::Right, 3, 3, window, cx);
-                let composer = app.composer.as_ref().unwrap();
+                let composer = app.composer().unwrap();
                 // Unsupported files fail locally; this exercises a pending
                 // upload without creating any GitHub assets in the test suite.
                 comment_media::start(
@@ -18754,7 +19118,7 @@ mod tests {
                     .input
                     .update(cx, |input, cx| input.set_value("comment", window, cx));
                 app.submit_composer(window, cx);
-                assert!(!app.composer.as_ref().unwrap().in_flight);
+                assert!(!app.composer().unwrap().in_flight);
                 app.close_composer(window, cx);
                 app.open_review(window, cx);
                 let review = app.review.as_ref().unwrap();
@@ -18791,7 +19155,8 @@ mod tests {
         vcx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.open_composer(None, "a.rs".into(), CommentSide::Right, 3, 3, window, cx);
-                let composer = app.composer.as_mut().unwrap();
+                let ix = app.composer_index().unwrap();
+                let composer = &mut app.composers[ix];
                 composer.start_line = Some(1);
                 let item_id = composer.item_id;
                 // A wrapped context fragment has both source numbers, even
@@ -18888,7 +19253,10 @@ mod tests {
         vcx.run_until_parked();
         vcx.update(|window, cx| {
             let app = app.read(cx);
-            assert!(app.composer.is_none(), "selecting does not start a comment");
+            assert!(
+                app.composer().is_none(),
+                "selecting does not start a comment"
+            );
             assert!(app.focus_handle.is_focused(window));
             let data = app.active_data().unwrap();
             assert_eq!(data.selection.unwrap().ordered().0.row, 1);
@@ -18926,10 +19294,7 @@ mod tests {
         vcx.simulate_input("range feedback");
         vcx.update(|window, cx| {
             let app = app.read(cx);
-            let composer = app
-                .composer
-                .as_ref()
-                .expect("C composes the selected range");
+            let composer = app.composer().expect("C composes the selected range");
             assert!(composer.input.focus_handle(cx).is_focused(window));
             assert_eq!(composer.input.read(cx).value(), "range feedback");
             assert!(
@@ -18947,7 +19312,7 @@ mod tests {
         });
         vcx.update(|window, cx| {
             app.update(cx, |app, cx| app.close_composer(window, cx));
-            assert!(app.read(cx).composer.is_none());
+            assert!(app.read(cx).composer().is_none());
         });
     }
 }

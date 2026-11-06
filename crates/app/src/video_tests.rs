@@ -386,7 +386,7 @@ fn conversation_media_expands_over_a_composer_and_preserves_its_draft(
         draw_settled(&mut vcx);
         click_selector(&mut vcx, "conversation-compose-0-0");
         let input = vcx.update(|window, cx| {
-            let input = app.read(cx).composer.as_ref().unwrap().input.clone();
+            let input = app.read(cx).composer().unwrap().input.clone();
             input.update(cx, |state, cx| {
                 state.set_value("Keep this unfinished comment", window, cx);
                 state.set_selected_range(5..9, cx);
@@ -401,7 +401,7 @@ fn conversation_media_expands_over_a_composer_and_preserves_its_draft(
         vcx.update(|window, cx| {
             let app = app.read(cx);
             assert!(app.image_viewer.is_none());
-            assert_eq!(app.composer.as_ref().unwrap().input, input);
+            assert_eq!(app.composer().unwrap().input, input);
             assert_eq!(input.read(cx).value(), "Keep this unfinished comment");
             assert_eq!(input.read(cx).selected_range(), 5..9);
             assert!(input.focus_handle(cx).is_focused(window));

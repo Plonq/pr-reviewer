@@ -187,7 +187,7 @@ impl ReviewApp {
                             .tooltip("Edit comment")
                             .ghost()
                             .xsmall()
-                            .disabled(busy || self.composer.is_some() || self.review.is_some())
+                            .disabled(busy || self.composer().is_some() || self.review.is_some())
                             .on_click(move |_, window, cx| {
                                 entity.update(cx, |this, cx| {
                                     if this.active_item().map(|item| item.id) == Some(item_id) {
@@ -215,7 +215,7 @@ impl ReviewApp {
                             .tooltip("Delete comment")
                             .ghost()
                             .xsmall()
-                            .disabled(busy || self.composer.is_some() || self.review.is_some())
+                            .disabled(busy || self.composer().is_some() || self.review.is_some())
                             .on_click(move |_, window, cx| {
                                 entity.update(cx, |this, cx| {
                                     if this.active_item().map(|item| item.id) == Some(item_id) {
@@ -236,7 +236,9 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.comment_permissions(&target).0 || self.composer.is_some() || self.review.is_some()
+        if !self.comment_permissions(&target).0
+            || self.composer().is_some()
+            || self.review.is_some()
         {
             return;
         }
@@ -359,7 +361,7 @@ impl ReviewApp {
             window,
             cx,
         );
-        if let Some(composer) = &mut self.composer {
+        if let Some(composer) = self.composer_mut() {
             composer.reply_to = None;
             composer.edit_id = Some(id);
             composer.edit_target = Some(target);
@@ -369,13 +371,12 @@ impl ReviewApp {
                 .update(cx, |state, cx| state.set_value(body, window, cx));
         }
         if let Some(composer) = self
-            .composer
-            .as_ref()
+            .composer()
             .filter(|composer| composer.placement == ComposerPlacement::Diff)
         {
             let height = composer.height.clone();
             if let Some(data) = self.active_data_mut() {
-                data.editing_comment = Some((id, height));
+                data.editing_comments.insert(id, height);
                 data.rebuild_rows_anchored();
             }
         }
@@ -421,7 +422,9 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.comment_permissions(&target).1 || self.composer.is_some() || self.review.is_some()
+        if !self.comment_permissions(&target).1
+            || self.composer().is_some()
+            || self.review.is_some()
         {
             return;
         }

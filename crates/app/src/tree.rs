@@ -11,6 +11,7 @@ use gpui::component::{
     tree::{TreeEvent, TreeItem, TreeState},
 };
 use gpui::{div, prelude::*, px, Hsla, KeyBinding, ScrollStrategy, SharedString};
+use gpui_kit_assets::IconName;
 
 gpui::actions!(file_filter, [HighlightNextFile, HighlightPreviousFile]);
 
@@ -333,6 +334,7 @@ pub(crate) fn render_tree_row(
     row: TreeListRow,
     pos: usize,
     current: bool,
+    composing: bool,
     data: &ItemData,
     entity: &gpui::Entity<ReviewApp>,
     reloading: bool,
@@ -471,6 +473,20 @@ pub(crate) fn render_tree_row(
                         .text_color(status_color)
                         .child(entry.name.clone()),
                 )
+                .when(composing, |row| {
+                    row.child(
+                        div()
+                            .debug_selector(move || format!("file-composer-{file_ix}"))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .child(
+                                Icon::new(IconName::Pencil)
+                                    .xsmall()
+                                    .text_color(theme::overlay0(cx)),
+                            ),
+                    )
+                })
                 .children(comments(file_ix))
                 .child(stats(file))
                 .when(data.pr_meta.is_some(), |row| row.child(checkbox(file_ix)))
