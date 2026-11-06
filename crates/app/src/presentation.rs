@@ -718,6 +718,7 @@ mod tests {
             );
             let selected = Selection {
                 side,
+                linewise: false,
                 anchor: RowCol { row: ix, col: 0 },
                 head: RowCol {
                     row: wrapped.rows.len() - 1,

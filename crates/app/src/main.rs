@@ -6255,7 +6255,7 @@ impl ReviewApp {
                                                                 .into_any_element();
                                                         };
                                                         let row_sel = sel.and_then(|sel| {
-                                                            row_selection_range(&sel, ix, row)
+                                                            sel.text_range(ix, row)
                                                                 .filter(|range| !range.is_empty())
                                                                 .map(|range| (sel.side, range))
                                                         });
@@ -9349,6 +9349,7 @@ mod tests {
                 .unwrap();
             data.selection = Some(Selection {
                 side,
+                linewise: false,
                 anchor: RowCol { row, col: end },
                 head: RowCol { row, col: start },
             });
@@ -17806,6 +17807,7 @@ mod tests {
                 );
                 this.active_data_mut().unwrap().selection = Some(Selection {
                     side: SelSide::Unified,
+                    linewise: false,
                     anchor: RowCol { row: 3, col: 2 },
                     head: RowCol { row: 1, col: 0 },
                 });
@@ -17915,6 +17917,7 @@ mod tests {
                     .0;
                 data.selection = Some(Selection {
                     side: SelSide::Unified,
+                    linewise: false,
                     anchor: RowCol { row: 1, col: 0 },
                     head: RowCol {
                         row: end_row,
@@ -18214,6 +18217,7 @@ mod tests {
                         drop(scroll);
                         data.selection = Some(Selection {
                             side,
+                            linewise: false,
                             anchor: RowCol {
                                 row: anchor,
                                 col: 0,

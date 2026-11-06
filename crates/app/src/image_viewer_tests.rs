@@ -36,6 +36,7 @@ fn image_viewer_is_below_header_modal_and_restores_review_state(cx: &mut gpui::T
     draw_settled(&mut vcx);
     let selection = Selection {
         side: SelSide::Right,
+        linewise: false,
         anchor: RowCol { row: 1, col: 0 },
         head: RowCol { row: 1, col: 2 },
     };
