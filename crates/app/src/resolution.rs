@@ -80,7 +80,7 @@ impl ReviewApp {
         let Some(item) = self.items.iter().find(|item| item.id == item_id) else {
             return;
         };
-        if item.reloading || self.composer.is_some() || self.review.is_some() {
+        if item.reloading || self.composer().is_some() || self.review.is_some() {
             return;
         }
         let ItemState::Ready(data) = &item.state else {
@@ -126,7 +126,7 @@ impl ReviewApp {
         let item = self.items.iter().find(|item| item.id == item_id);
         let busy = item.is_none_or(|item| item.reloading)
             || self.sessions.get(&item_id).is_some_and(|ui| ui.busy)
-            || self.composer.is_some()
+            || self.composer().is_some()
             || self.review.is_some();
         let mut controls = div()
             .id(SharedString::from(format!(
@@ -157,7 +157,7 @@ impl ReviewApp {
                             })
                             .ghost()
                             .xsmall()
-                            .disabled(self.composer.is_some())
+                            .disabled(self.composer().is_some())
                             .on_click(move |_, _, cx| {
                                 entity.update(cx, |this, cx| {
                                     this.toggle_thread_expanded(item_id, &thread_id, cx)

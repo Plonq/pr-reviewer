@@ -346,7 +346,7 @@ impl ReviewApp {
     }
 
     pub(crate) fn open_diff_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.search_visible() || self.composer.is_some() || self.review.is_some() {
+        if !self.search_visible() || self.composer().is_some() || self.review.is_some() {
             return;
         }
         self.open_search(window, cx);
@@ -354,7 +354,7 @@ impl ReviewApp {
     }
 
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.search_visible() || self.composer.is_some() || self.review.is_some() {
+        if !self.search_visible() || self.composer().is_some() || self.review.is_some() {
             return;
         }
         let Some(data) = self.active_data() else {

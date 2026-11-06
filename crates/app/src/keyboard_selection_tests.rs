@@ -44,7 +44,7 @@ fn keyboard_line_selection_extends_shrinks_reverses_and_comments(cx: &mut gpui::
             selection_text(&data.selection.unwrap(), &data.rows),
             "two\nthree"
         );
-        assert!(app.composer.is_none());
+        assert!(app.composer().is_none());
     });
     vcx.simulate_keystrokes("shift-up");
     vcx.update(|_, cx| {
@@ -71,7 +71,7 @@ fn keyboard_line_selection_extends_shrinks_reverses_and_comments(cx: &mut gpui::
     vcx.simulate_keystrokes("shift-c");
     vcx.update(|window, cx| {
         let app = app.read(cx);
-        let composer = app.composer.as_ref().unwrap();
+        let composer = app.composer().unwrap();
         assert_eq!((composer.start_line, composer.line), (Some(1), 2));
         assert_eq!(composer.side, CommentSide::Right);
         assert!(composer.input.focus_handle(cx).is_focused(window));
@@ -154,7 +154,7 @@ fn keyboard_ranges_skip_comment_rows_and_keep_the_clicked_split_side(
     });
     vcx.simulate_keystrokes("shift-c");
     vcx.update(|_, cx| {
-        let composer = app.read(cx).composer.as_ref().unwrap();
+        let composer = app.read(cx).composer().unwrap();
         assert_eq!((composer.start_line, composer.line), (Some(1), 3));
         assert_eq!(composer.side, CommentSide::Left);
     });

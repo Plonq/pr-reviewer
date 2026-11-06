@@ -310,8 +310,7 @@ impl ReviewApp {
             ComposerPlacement::ConversationThread(thread.id.clone())
         });
         if let Some(composer) = self
-            .composer
-            .as_ref()
+            .composer()
             .filter(|composer| composer.item_id == item_id && composer.placement == placement)
         {
             let scroll = self
@@ -381,7 +380,7 @@ impl ReviewApp {
                     "Leave a comment"
                 })
                 .small()
-                .disabled(self.composer.is_some() || self.review.is_some())
+                .disabled(self.composer().is_some() || self.review.is_some())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.active_item().map(|item| item.id) != Some(item_id) {
                         return;
@@ -698,7 +697,7 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let composing = self.composer.as_ref().is_some_and(|composer| {
+        let composing = self.composer().is_some_and(|composer| {
             composer.item_id == item.id
                 && (composer.placement == ComposerPlacement::ConversationThread(thread.id.clone())
                     || thread.comments.iter().any(|comment| {
@@ -956,7 +955,7 @@ impl ReviewApp {
                 {
                     let target = crate::CommentTarget::Pending(draft.id);
                     let placement = ComposerPlacement::ConversationComment(target.key());
-                    if self.composer.as_ref().is_some_and(|composer| {
+                    if self.composer().is_some_and(|composer| {
                         composer.item_id == item.id && composer.placement == placement
                     }) {
                         card = card.child(
@@ -1024,7 +1023,7 @@ impl ReviewApp {
         let target = crate::comment_actions::published_target(kind, comment);
         let placement = ComposerPlacement::ConversationComment(target.key());
         if kind != "optimistic"
-            && self.composer.as_ref().is_some_and(|composer| {
+            && self.composer().is_some_and(|composer| {
                 composer.item_id == item_id && composer.placement == placement
             })
         {

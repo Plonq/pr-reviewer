@@ -83,16 +83,25 @@ impl ReviewApp {
             || !data.viewed.pending.is_empty()
             || self.sessions.get(&item.id).is_some_and(|ui| ui.busy)
             || self
-                .composer
-                .as_ref()
-                .is_some_and(|composer| composer.in_flight)
+                .composers
+                .iter()
+                .any(|composer| composer.item_id == item.id && composer.in_flight)
             || self.review.is_some()
         {
             return;
         }
         let (id, source, mode) = (item.id, item.source.clone(), data.mode);
         self.persist_positions();
-        self.close_composer(window, cx);
+        // Draft anchors belong to the old review scope, including hidden files.
+        let drafts: Vec<_> = self
+            .composers
+            .iter()
+            .filter(|composer| composer.item_id == id)
+            .map(|composer| composer.id)
+            .collect();
+        for draft in drafts {
+            self.close_composer_id(draft, window, cx);
+        }
         self.drag_anchor = None;
         self.spawn_fetch_scoped(id, source, mode, since_review, cx);
         cx.notify();
@@ -109,9 +118,9 @@ impl ReviewApp {
             || !data.viewed.pending.is_empty()
             || self.sessions.get(&item.id).is_some_and(|ui| ui.busy)
             || self
-                .composer
-                .as_ref()
-                .is_some_and(|composer| composer.in_flight)
+                .composers
+                .iter()
+                .any(|composer| composer.item_id == item.id && composer.in_flight)
             || self.review.is_some();
         let detail = match &data.review_changes {
             github::ReviewChanges::Unavailable(reason) => reason.clone(),
