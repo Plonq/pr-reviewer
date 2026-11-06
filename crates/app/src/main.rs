@@ -1084,6 +1084,9 @@ struct ReviewItem {
     /// Which pane the item shows; lives here — not in `ItemData` — so a
     /// refresh (which swaps the data in) never flips the reviewer's view.
     pane: ItemPane,
+    /// Unsubmitted review summary, retained only while this item is open.
+    /// Keep the editor and uploads together so attachments can finish while hidden.
+    review_draft: Option<ReviewDraft>,
 }
 
 impl ReviewItem {
@@ -1651,6 +1654,11 @@ impl Composer {
         };
         range.contains(&(line as u64)).then_some(side)
     }
+}
+
+struct ReviewDraft {
+    input: gpui::Entity<gpui::component::input::EditorState>,
+    uploads: Option<gpui::Entity<comment_media::Uploads>>,
 }
 
 /// The "submit review" modal: a verdict (approve / request changes /
@@ -2623,6 +2631,7 @@ impl ReviewApp {
         let id = self.next_id;
         self.next_id += 1;
         self.items.push(ReviewItem {
+            review_draft: None,
             id,
             source: source.clone(),
             state: ItemState::Loading,
@@ -3613,7 +3622,13 @@ impl ReviewApp {
                         }
                     },
                     SessionCompletion::Review(gen) if app.review_gen == gen => match &result {
-                        Ok(()) => app.close_review(window, cx),
+                        Ok(()) => {
+                            app.close_review(window, cx);
+                            if let Some(item) = app.items.iter_mut().find(|item| item.id == item_id)
+                            {
+                                item.review_draft = None;
+                            }
+                        }
                         Err(error) => {
                             if let Some(review) = &mut app.review {
                                 review.in_flight = false;
@@ -4207,20 +4222,26 @@ impl ReviewApp {
             return;
         };
         let item_id = item.id;
+        let draft = self.items[self.active].review_draft.take();
         self.review_gen += 1;
-        let input = cx.new(|cx| {
-            comment_editor::new(window, cx)
-                .placeholder("review summary… (optional with pending comments)")
-        });
-        if let Some(pending) = self
-            .sessions
-            .get(&item_id)
-            .and_then(|ui| ui.state.pending.as_ref())
-        {
-            input.update(cx, |state, cx| {
-                state.set_value(pending.body.clone(), window, cx)
+        let input = if let Some(draft) = &draft {
+            draft.input.clone()
+        } else {
+            let input = cx.new(|cx| {
+                comment_editor::new(window, cx)
+                    .placeholder("review summary… (optional with pending comments)")
             });
-        }
+            if let Some(pending) = self
+                .sessions
+                .get(&item_id)
+                .and_then(|ui| ui.state.pending.as_ref())
+            {
+                input.update(cx, |state, cx| {
+                    state.set_value(pending.body.clone(), window, cx)
+                });
+            }
+            input
+        };
         if let Some(data) = self.active_data() {
             seed_mentions(&data.mentions, data);
             comment_editor::candidates(&input, data.mentions.clone(), cx);
@@ -4233,15 +4254,18 @@ impl ReviewApp {
         {
             self.ensure_mentions(item_id, loc, cx);
         }
-        let uploads = self
-            .items
-            .iter()
-            .find(|item| item.id == item_id)
-            .and_then(|item| match &item.source {
-                Source::Pr(loc) => Some(loc.clone()),
-                _ => None,
-            })
-            .map(|loc| comment_media::Uploads::new(loc, &input, cx));
+        let uploads = if let Some(draft) = draft {
+            draft.uploads
+        } else {
+            self.items
+                .iter()
+                .find(|item| item.id == item_id)
+                .and_then(|item| match &item.source {
+                    Source::Pr(loc) => Some(loc.clone()),
+                    _ => None,
+                })
+                .map(|loc| comment_media::Uploads::new(loc, &input, cx))
+        };
         self.review = Some(ReviewDialog {
             item_id,
             verdict: github::ReviewVerdict::Approve,
@@ -4296,8 +4320,17 @@ impl ReviewApp {
     /// Toolkit user dismissal and imperative close do not share callbacks.
     /// Cleanup is generation-owned and never requests another toolkit close.
     fn cleanup_review(&mut self, generation: u64, cx: &mut Context<Self>) -> bool {
-        if self.review_gen != generation || self.review.take().is_none() {
+        if self.review_gen != generation {
             return false;
+        }
+        let Some(review) = self.review.take() else {
+            return false;
+        };
+        if let Some(item) = self.items.iter_mut().find(|item| item.id == review.item_id) {
+            item.review_draft = Some(ReviewDraft {
+                input: review.input,
+                uploads: review.uploads,
+            });
         }
         self.review_gen += 1;
         cx.notify();
@@ -11559,6 +11592,7 @@ mod tests {
             app.update(cx, |this, _cx| {
                 this.items = vec![
                     ReviewItem {
+                        review_draft: None,
                         id: 0,
                         source: Source::Pr(github::PrLocator {
                             owner: "acme".into(),
@@ -11572,6 +11606,7 @@ mod tests {
                         pane: ItemPane::default(),
                     },
                     ReviewItem {
+                        review_draft: None,
                         id: 1,
                         source: Source::Pr(github::PrLocator {
                             owner: "acme".into(),
@@ -11740,6 +11775,7 @@ mod tests {
         });
 
         let mut item = ReviewItem {
+            review_draft: None,
             id: 1,
             source: Source::Pr(github::PrLocator {
                 owner: "acme".into(),
@@ -11781,6 +11817,7 @@ mod tests {
         // A PR the store has never seen has nothing to stand in: the
         // caller falls back to the error.
         let mut unknown = ReviewItem {
+            review_draft: None,
             id: 2,
             source: Source::Pr(github::PrLocator {
                 owner: "acme".into(),
@@ -12501,6 +12538,7 @@ mod tests {
             number: 7,
         };
         let mut item = ReviewItem {
+            review_draft: None,
             id: 1,
             source: Source::Pr(loc),
             state: ItemState::Loading,
@@ -13205,6 +13243,7 @@ mod tests {
             },
         });
         ReviewItem {
+            review_draft: None,
             id: 0,
             source: Source::Pr(loop_loc()),
             state: ItemState::Ready(Box::new({
@@ -16612,11 +16651,170 @@ mod tests {
                 body: "lgtm".into(),
             }]
         );
-        cx.update(|cx| {
-            app.update(cx, |this, _cx| {
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
                 assert!(
                     this.review.is_none(),
                     "a submitted review closes the dialog"
+                );
+                assert!(this.items[0].review_draft.is_none());
+                this.open_review(window, cx);
+                assert!(
+                    this.review
+                        .as_ref()
+                        .unwrap()
+                        .input
+                        .read(cx)
+                        .value()
+                        .is_empty(),
+                    "a submitted summary is not reused as a new draft"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn review_dialog_preserves_summary_after_cancel_and_escape(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, loop_pr_item(vec![]), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let body = "  Unfinished review 🦀\n\nMore to check…\n";
+        let (input, uploads) = vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_review(window, cx);
+                let review = app.review.as_ref().unwrap();
+                let input = review.input.clone();
+                let uploads = review.uploads.clone();
+                input.update(cx, |input, cx| input.set_value(body, window, cx));
+                app.close_review(window, cx);
+                assert!(app.review.is_none());
+                app.open_review(window, cx);
+                let review = app.review.as_ref().unwrap();
+                assert_eq!(review.input, input);
+                assert_eq!(review.uploads, uploads);
+                assert_eq!(review.input.read(cx).value().as_str(), body);
+                (input, uploads)
+            })
+        });
+        draw_window(&mut vcx);
+        vcx.simulate_keystrokes("escape");
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                assert!(
+                    app.review.is_none(),
+                    "toolkit dismissal also saves the draft"
+                );
+                app.open_review(window, cx);
+                let review = app.review.as_ref().unwrap();
+                assert_eq!(review.input, input);
+                assert_eq!(review.uploads, uploads);
+                assert_eq!(review.input.read(cx).value().as_str(), body);
+            });
+        });
+        assert!(
+            fake.posts().is_empty(),
+            "cancellation never submits the draft"
+        );
+    }
+
+    #[gpui::test]
+    fn review_dialog_local_draft_overrides_pending_summary_even_when_empty(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![]);
+        *fake.pending.lock().unwrap() = Some(github::PendingReview {
+            id: 91,
+            node_id: "pending".into(),
+            body: "Summary from GitHub".into(),
+            comments: vec![],
+        });
+        let (window, app) = queue_window(cx, fake);
+        install_item(&app, loop_pr_item(vec![]), cx);
+        cx.update(|cx| app.update(cx, |app, cx| app.resume_session(0, cx)));
+        cx.run_until_parked();
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_review(window, cx);
+                assert_eq!(
+                    app.review.as_ref().unwrap().input.read(cx).value().as_str(),
+                    "Summary from GitHub"
+                );
+                for body in ["Edited locally", ""] {
+                    app.review
+                        .as_ref()
+                        .unwrap()
+                        .input
+                        .update(cx, |input, cx| input.set_value(body, window, cx));
+                    app.close_review(window, cx);
+                    app.open_review(window, cx);
+                    assert_eq!(
+                        app.review.as_ref().unwrap().input.read(cx).value().as_str(),
+                        body
+                    );
+                }
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn review_summary_draft_lives_only_on_its_open_item(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake);
+        install_item(&app, loop_pr_item(vec![]), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_review(window, cx);
+                app.review.as_ref().unwrap().input.update(cx, |input, cx| {
+                    input.set_value("First PR summary", window, cx)
+                });
+                app.close_review(window, cx);
+                let mut second = loop_pr_item(vec![]);
+                second.id = 1;
+                if let Source::Pr(loc) = &mut second.source {
+                    loc.number += 1;
+                }
+                app.items.push(second);
+                app.activate(1, window, cx);
+                app.open_review(window, cx);
+                assert!(app
+                    .review
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .read(cx)
+                    .value()
+                    .is_empty());
+                app.close_review(window, cx);
+                app.activate(0, window, cx);
+                app.refresh(cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_review(window, cx);
+                assert_eq!(
+                    app.review.as_ref().unwrap().input.read(cx).value().as_str(),
+                    "First PR summary",
+                    "refresh and item switching retain the draft"
+                );
+                app.close_review(window, cx);
+                app.close_item(0, cx);
+                app.items.push(loop_pr_item(vec![]));
+                app.activate(1, window, cx);
+                app.open_review(window, cx);
+                assert!(
+                    app.review
+                        .as_ref()
+                        .unwrap()
+                        .input
+                        .read(cx)
+                        .value()
+                        .is_empty(),
+                    "closing and reopening the PR discards the local draft"
                 );
             });
         });
