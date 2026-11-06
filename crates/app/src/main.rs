@@ -5923,7 +5923,7 @@ impl ReviewApp {
                     .flex()
                     .flex_col()
                     .when(matches!(item.source, Source::Pr(_)), |pane| {
-                        pane.child(self.render_review_scope(item, data, cx))
+                        pane.child(self.render_changes_header(item, data, cx))
                     })
                     .children(file_media::render_svg_controls(data, cx))
                     .child(file_media::render(
@@ -5937,11 +5937,8 @@ impl ReviewApp {
                     .size_full()
                     .flex()
                     .flex_col()
-                    .when(matches!(item.source, Source::Pr(_)), |pane| {
-                        pane.child(self.render_review_scope(item, data, cx))
-                    })
+                    .child(self.render_changes_header(item, data, cx))
                     .children(file_media::render_svg_controls(data, cx))
-                    .child(self.render_presentation_controls(data, cx))
                     .child(
                         div()
                             .size_full()
@@ -8165,6 +8162,82 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[gpui::test]
+    fn changes_header_combines_scope_and_right_aligned_diff_controls(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut item = loop_pr_item(Vec::new());
+        item.pane = ItemPane::Changes;
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            for width in [1100., 1440.] {
+                vcx.simulate_resize(size(px(width), px(900.)));
+                vcx.update(|_, cx| {
+                    app.update(cx, |app, cx| {
+                        let data = app.active_data_mut().unwrap();
+                        data.mode = mode;
+                        data.rebuild_rows_anchored();
+                        cx.notify();
+                    });
+                });
+                draw_window(&mut vcx);
+                let header = vcx.debug_bounds("changes-header").unwrap();
+                let scope = vcx.debug_bounds("review-scope-controls").unwrap();
+                let controls = vcx.debug_bounds("diff-view-controls").unwrap();
+                assert_eq!(
+                    scope.center().y,
+                    controls.center().y,
+                    "controls share one row"
+                );
+                assert!(scope.right() <= controls.left());
+                assert_eq!(controls.right(), header.right() - px(8.));
+                assert!(header.size.height < px(40.), "no separate toolbar row");
+            }
+        }
+
+        // Narrow panes wrap the control groups rather than overlapping them.
+        vcx.simulate_resize(size(px(840.), px(900.)));
+        draw_window(&mut vcx);
+        let scope = vcx.debug_bounds("review-scope-controls").unwrap();
+        let controls = vcx.debug_bounds("diff-view-controls").unwrap();
+        let header = vcx.debug_bounds("changes-header").unwrap();
+        assert!(scope.bottom() <= controls.top());
+        assert_eq!(controls.right(), header.right() - px(8.));
+
+        // Media previews retain the scope selector, but not code-only toggles.
+        vcx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.active_data_mut().unwrap().diff.files[0].status = diff_core::FileStatus::Binary;
+                cx.notify();
+            });
+        });
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("review-scope-controls").is_some());
+        assert!(vcx.debug_bounds("diff-view-controls").is_none());
+
+        // Local code diffs still have view controls, without PR scope controls.
+        vcx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.items[app.active].source = Source::Local(git::LocalSource {
+                    repo_root: std::env::temp_dir(),
+                    branch: "main".into(),
+                    base_ref: None,
+                    base_label: "HEAD".into(),
+                    base_oid: None,
+                });
+                let data = app.active_data_mut().unwrap();
+                data.pr_meta = None;
+                data.diff.files[0].status = diff_core::FileStatus::Modified;
+                cx.notify();
+            });
+        });
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("review-scope-controls").is_none());
+        assert!(vcx.debug_bounds("diff-view-controls").is_some());
     }
 
     #[gpui::test]

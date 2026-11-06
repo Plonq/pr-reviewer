@@ -330,7 +330,7 @@ impl ReviewApp {
         cx: &mut Context<Self>,
     ) -> impl gpui::IntoElement {
         use gpui::component::{button::Button, Selectable as _, Sizable as _};
-        use gpui::{div, prelude::*, px};
+        use gpui::{div, prelude::*};
         use gpui_kit_assets::IconName;
         let toggle = |id, name, shortcut, enabled| {
             Button::new(id)
@@ -346,15 +346,12 @@ impl ReviewApp {
                 .tooltip(format!("{name} ({shortcut})"))
         };
         div()
-            .h(px(36.))
+            .debug_selector(|| "diff-view-controls".into())
             .flex_shrink_0()
+            .ml_auto()
             .flex()
             .items_center()
             .gap_2()
-            .px_2()
-            .bg(crate::theme::mantle(cx))
-            .border_b_1()
-            .border_color(crate::theme::surface0(cx))
             .child(
                 toggle(
                     "hide-whitespace",
