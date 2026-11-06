@@ -28,6 +28,18 @@ fn keyboard_line_selection_extends_shrinks_reverses_and_comments(cx: &mut gpui::
         let app = app.read(cx);
         let data = app.active_data().unwrap();
         assert_eq!(data.cursor, 3);
+        let selection = data.selection.unwrap();
+        assert!(selection.linewise);
+        for (ix, row) in data.rows.iter().enumerate() {
+            assert!(
+                selection.text_range(ix, row).is_none(),
+                "keyboard line selection must not highlight code"
+            );
+        }
+        assert!(
+            row_selection_range(&selection, 2, &data.rows[2]).is_some(),
+            "keep the selected-line gutter cue"
+        );
         assert_eq!(
             selection_text(&data.selection.unwrap(), &data.rows),
             "two\nthree"
@@ -125,6 +137,10 @@ fn keyboard_ranges_skip_comment_rows_and_keep_the_clicked_split_side(
         let data = app.read(cx).active_data().unwrap();
         let selection = data.selection.unwrap();
         assert_eq!(selection.side, SelSide::Left);
+        assert!(selection.linewise);
+        for (ix, row) in data.rows.iter().enumerate() {
+            assert!(selection.text_range(ix, row).is_none());
+        }
         assert_eq!(data.cursor, 4);
         assert_eq!(
             selection_text(&selection, &data.rows),

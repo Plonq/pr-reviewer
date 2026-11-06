@@ -175,6 +175,19 @@ pub(crate) fn comment_anchor(
     (line > 0).then_some((side, line))
 }
 
+/// Source line on a fixed comment side, including context lines on LEFT in
+/// unified view. Unlike `comment_anchor`, this does not choose a side from kind.
+pub(crate) fn comment_line(row: &Row, side: CommentSide) -> Option<u64> {
+    let line = match (source_row(row), side) {
+        (Row::Line { old_no, .. }, CommentSide::Left) => (*old_no)?,
+        (Row::Line { new_no, .. }, CommentSide::Right) => (*new_no)?,
+        (Row::SplitLine { left, .. }, CommentSide::Left) => left.as_ref()?.no,
+        (Row::SplitLine { right, .. }, CommentSide::Right) => right.as_ref()?.no,
+        _ => return None,
+    };
+    (line > 0).then_some(u64::from(line))
+}
+
 pub(crate) fn cursor_anchor(rows: &[Row], row_ix: usize) -> Option<(CommentSide, u64)> {
     let side = match rows.get(row_ix).map(source_row) {
         Some(Row::SplitLine { right: None, .. }) => SelSide::Left,

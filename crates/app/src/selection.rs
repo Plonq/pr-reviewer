@@ -41,9 +41,21 @@ pub(crate) struct Selection {
     pub(crate) side: SelSide,
     pub(crate) anchor: RowCol,
     pub(crate) head: RowCol,
+    /// Whole-line navigation selects gutters, not individual code characters.
+    pub(crate) linewise: bool,
 }
 
 impl Selection {
+    /// Character-level paint range. Linewise selections still supply gutter
+    /// cues, copy text and comment anchors, but leave code backgrounds alone.
+    pub(crate) fn text_range(&self, row_ix: usize, row: &Row) -> Option<Range<usize>> {
+        if self.linewise {
+            None
+        } else {
+            row_selection_range(self, row_ix, row)
+        }
+    }
+
     pub(crate) fn ordered(&self) -> (RowCol, RowCol) {
         if self.anchor <= self.head {
             (self.anchor, self.head)
@@ -93,12 +105,14 @@ pub(crate) fn line_selection(
             side,
             anchor: end,
             head: start,
+            linewise: true,
         }
     } else {
         Selection {
             side,
             anchor: start,
             head: end,
+            linewise: true,
         }
     })
 }
@@ -139,9 +153,12 @@ impl SelectionDrag {
 
     pub(crate) fn selection(self, rows: &[Row], head: RowCol) -> Option<Selection> {
         match self {
-            Self::Character { side, anchor } => {
-                (head != anchor).then_some(Selection { side, anchor, head })
-            }
+            Self::Character { side, anchor } => (head != anchor).then_some(Selection {
+                side,
+                anchor,
+                head,
+                linewise: false,
+            }),
             Self::Word(initial) => {
                 // A drag can move past a line's end or through non-text rows.
                 let col = rows
@@ -221,6 +238,7 @@ pub(crate) fn word_selection(rows: &[Row], side: SelSide, hit: RowCol) -> Option
                 side,
                 anchor: point(start, false),
                 head: point(end, true),
+                linewise: false,
             });
         }
         start = end;
@@ -332,6 +350,7 @@ mod tests {
     fn sel(side: SelSide, anchor: (usize, usize), head: (usize, usize)) -> Selection {
         Selection {
             side,
+            linewise: false,
             anchor: RowCol {
                 row: anchor.0,
                 col: anchor.1,
@@ -356,6 +375,10 @@ mod tests {
         for (anchor, head) in [(1, 5), (5, 1), (2, 5), (5, 2)] {
             let selection = line_selection(&rows, SelSide::Unified, anchor, head).unwrap();
             assert_eq!(selection_text(&selection, &rows), "héllo\n\nlast");
+            assert!(selection.linewise);
+            for (ix, row) in rows.iter().enumerate() {
+                assert!(selection.text_range(ix, row).is_none());
+            }
         }
         let selection = line_selection(&rows, SelSide::Unified, 1, 2).unwrap();
         assert_eq!(
@@ -387,8 +410,12 @@ mod tests {
         assert_eq!(next_source_line(&rows, SelSide::Right, 4, -1), Some(0));
         let left = line_selection(&rows, SelSide::Left, 0, 0).unwrap();
         assert_eq!(selection_text(&left, &rows), "left");
+        assert!(left.text_range(0, &rows[0]).is_none());
         let right = line_selection(&rows, SelSide::Right, 4, 0).unwrap();
         assert_eq!(selection_text(&right, &rows), "right\nright only");
+        assert!(right.text_range(0, &rows[0]).is_none());
+        assert!(right.text_range(1, &rows[1]).is_none());
+        assert!(right.text_range(4, &rows[4]).is_none());
         assert!(line_selection(&rows, SelSide::Right, 0, 2).is_none());
     }
 
@@ -415,6 +442,7 @@ mod tests {
                         "{text:?}, col {col}"
                     );
                     let bytes = char_to_byte(text, range.start)..char_to_byte(text, range.end);
+                    assert_eq!(word.text_range(0, &rows[0]), Some(bytes.clone()));
                     assert_eq!(selection_text(&word, &rows), &text[bytes]);
                 }
             }
