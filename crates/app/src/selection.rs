@@ -1,9 +1,20 @@
-//! Selection state over the diff rows: drag anchoring, per-row range math, and copy text.
+//! Selection over diff rows: mouse/keyboard anchoring, source-line navigation,
+//! per-row range math, and copy text.
 
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::rows::Row;
+
+pub(crate) fn keybindings() -> [gpui::KeyBinding; 4] {
+    use crate::{ExtendNextLine, ExtendPreviousLine, SelectNextLine, SelectPreviousLine};
+    [
+        gpui::KeyBinding::new("up", SelectPreviousLine, Some("ReviewApp")),
+        gpui::KeyBinding::new("down", SelectNextLine, Some("ReviewApp")),
+        gpui::KeyBinding::new("shift-up", ExtendPreviousLine, Some("ReviewApp")),
+        gpui::KeyBinding::new("shift-down", ExtendNextLine, Some("ReviewApp")),
+    ]
+}
 
 /// Which text stream a selection runs through. Split selections are locked to
 /// the side where the drag started, like GitHub; the other side paints nothing.
@@ -23,8 +34,8 @@ pub(crate) struct RowCol {
     pub(crate) col: usize,
 }
 
-/// Anchor stays where the drag started; head follows the mouse. The ordered
-/// pair is derived on use, so dragging upward needs no special casing.
+/// Anchor stays where selection started; head follows the mouse or keyboard.
+/// The ordered pair is derived on use, so backward selection needs no special casing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Selection {
     pub(crate) side: SelSide,
@@ -39,6 +50,75 @@ impl Selection {
         } else {
             (self.head, self.anchor)
         }
+    }
+}
+
+/// The first display row of the logical source line containing `row`.
+pub(crate) fn source_line_start(rows: &[Row], mut row: usize) -> usize {
+    while row > 0 && matches!(rows.get(row), Some(Row::Continuation(_))) {
+        row -= 1;
+    }
+    row
+}
+
+/// Select complete source lines, including every wrapped fragment. Endpoint
+/// orientation retains the original anchor when extending back through it.
+pub(crate) fn line_selection(
+    rows: &[Row],
+    side: SelSide,
+    anchor: usize,
+    head: usize,
+) -> Option<Selection> {
+    let anchor = source_line_start(rows, anchor);
+    let head = source_line_start(rows, head);
+    let start = RowCol {
+        row: anchor.min(head),
+        col: 0,
+    };
+    let mut last = anchor.max(head);
+    row_side_text(rows.get(start.row)?, side)?;
+    row_side_text(rows.get(last)?, side)?;
+    while matches!(rows.get(last + 1), Some(Row::Continuation(_))) {
+        last += 1;
+    }
+    // Unequal split wrapping can leave the last fragment absent on this side.
+    let end = (anchor.max(head)..=last).rev().find_map(|row| {
+        row_side_text(&rows[row], side).map(|text| RowCol {
+            row,
+            col: text.chars().count(),
+        })
+    })?;
+    Some(if head < anchor {
+        Selection {
+            side,
+            anchor: end,
+            head: start,
+        }
+    } else {
+        Selection {
+            side,
+            anchor: start,
+            head: end,
+        }
+    })
+}
+
+/// The next source line on a text stream, skipping headers, comments, folds,
+/// absent split cells and visual continuations. Stops at the file's ends.
+pub(crate) fn next_source_line(
+    rows: &[Row],
+    side: SelSide,
+    row: usize,
+    direction: i32,
+) -> Option<usize> {
+    let row = source_line_start(rows, row);
+    let selectable = |ix: &usize| {
+        !matches!(rows[*ix], Row::Continuation(_)) && row_side_text(&rows[*ix], side).is_some()
+    };
+    if direction > 0 {
+        (row.saturating_add(1)..rows.len()).find(selectable)
+    } else {
+        (0..row.min(rows.len())).rev().find(selectable)
     }
 }
 
@@ -261,6 +341,55 @@ mod tests {
                 col: head.1,
             },
         }
+    }
+
+    #[test]
+    fn line_ranges_include_wrapped_unicode_and_empty_lines_in_both_directions() {
+        let rows = vec![
+            Row::Binary,
+            line("hé"),
+            Row::Continuation(Box::new(line("llo"))),
+            Row::Binary,
+            line(""),
+            line("last"),
+        ];
+        for (anchor, head) in [(1, 5), (5, 1), (2, 5), (5, 2)] {
+            let selection = line_selection(&rows, SelSide::Unified, anchor, head).unwrap();
+            assert_eq!(selection_text(&selection, &rows), "héllo\n\nlast");
+        }
+        let selection = line_selection(&rows, SelSide::Unified, 1, 2).unwrap();
+        assert_eq!(
+            selection.ordered(),
+            (RowCol { row: 1, col: 0 }, RowCol { row: 2, col: 3 })
+        );
+        assert_eq!(selection_text(&selection, &rows), "héllo");
+        assert!(line_selection(&rows, SelSide::Unified, 0, 1).is_none());
+        assert!(line_selection(&rows, SelSide::Unified, 1, 99).is_none());
+        assert_eq!(next_source_line(&rows, SelSide::Unified, 1, 1), Some(4));
+        assert_eq!(next_source_line(&rows, SelSide::Unified, 2, 1), Some(4));
+        assert_eq!(next_source_line(&rows, SelSide::Unified, 4, -1), Some(1));
+        assert_eq!(next_source_line(&rows, SelSide::Unified, 1, -1), None);
+        assert_eq!(next_source_line(&rows, SelSide::Unified, 5, 1), None);
+        assert_eq!(next_source_line(&[], SelSide::Unified, 0, 1), None);
+    }
+
+    #[test]
+    fn line_navigation_and_ranges_stay_on_the_selected_split_side() {
+        let rows = vec![
+            split(Some("left"), Some("ri")),
+            Row::Continuation(Box::new(split(None, Some("ght")))),
+            split(Some("left only"), None),
+            Row::Binary,
+            split(None, Some("right only")),
+        ];
+        assert_eq!(next_source_line(&rows, SelSide::Right, 0, 1), Some(4));
+        assert_eq!(next_source_line(&rows, SelSide::Left, 0, 1), Some(2));
+        assert_eq!(next_source_line(&rows, SelSide::Right, 4, -1), Some(0));
+        let left = line_selection(&rows, SelSide::Left, 0, 0).unwrap();
+        assert_eq!(selection_text(&left, &rows), "left");
+        let right = line_selection(&rows, SelSide::Right, 4, 0).unwrap();
+        assert_eq!(selection_text(&right, &rows), "right\nright only");
+        assert!(line_selection(&rows, SelSide::Right, 0, 2).is_none());
     }
 
     #[test]

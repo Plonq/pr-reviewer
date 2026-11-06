@@ -85,8 +85,10 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   Rendered / Code diff toggle, with unified/split source views. Additions and
   deletions leave the missing side empty. Video and other non-image media
   are links only, with no inline playback in the diff
-- unified + split views; double-click a word to select it, then drag to extend
-  the selection by whole words (`cmd-c` copies the selection)
+- unified + split views; `↑`/`↓` move the selected source line, and
+  `Shift-↑`/`Shift-↓` extend or shrink a whole-line range, staying on the same
+  side in split view. `Esc` clears the range. Double-click a word to select it,
+  then drag to extend by whole words (`cmd-c` copies the selection)
 - **All changes / Changed since last review** in the Changes pane: compare the
   commit from your latest submitted GitHub review with the current PR head,
   including reviews submitted on GitHub. No manual commit selection. The scope
@@ -174,8 +176,10 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - review threads show resolved/unresolved status in both views, with
   permission-aware resolve/unresolve controls; resolved threads start collapsed
   (one line in the diff) and expand on click
-- multi-line comments: click then shift-click a line, or drag a selection and
-  press `C` (ranges stay on one side); comments outside a patch hunk, including
+- multi-line comments: select a range with `Shift-↑`/`Shift-↓`, click then
+  Shift-click a line, or drag a text selection; `C` starts a comment for the
+  selected range (ranges stay on one side). Selecting does not open the composer.
+  Comments outside a patch hunk, including
   cross-hunk ranges, use GitHub's experimental positioning API and may depend
   on GitHub's rollout for the repository
 - pending reviews: start/add to a review without posting, resume drafts started
