@@ -187,7 +187,9 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   The tray starts collapsed, keeping the comment count, Refresh drafts, and
   Finish review controls visible; Show comments expands the draft list.
   Replies join the pending review too; **Add single comment** is available
-  only without a pending review and posts immediately
+  only without a pending review and posts immediately. In the comment composer,
+  `cmd-enter` submits immediately without a review, or adds a draft to an existing
+  review; `shift-cmd-enter` adds a draft and starts a review if needed
 - submitting reviews (approve / request changes / comment, `cmd-enter` or the Review button)
 - dark-only theme with soft blue-grey surfaces and pastel accents
 
@@ -331,7 +333,8 @@ only by your account. Delete that directory to clear downloaded images.
 | `c` | toggle inline comments |
 | `C` | comment on the selected line (Esc cancels) |
 | `r` | refresh active item |
-| `cmd-enter` | submit review (approve / request changes / comment) |
+| `cmd-enter` | submit review; in a comment composer, post now or add to the pending review |
+| `shift-cmd-enter` | comment composer: add a draft and start a review if needed |
 | `home` / `end` | top / bottom |
 | `cmd-c` | copy selection |
 | `cmd-q` | quit |

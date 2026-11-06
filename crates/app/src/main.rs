@@ -273,6 +273,17 @@ fn file_navigation_keybindings() -> [KeyBinding; 4] {
     ]
 }
 
+fn comment_composer_keybindings() -> [KeyBinding; 1] {
+    [KeyBinding::new(
+        "shift-cmd-enter",
+        InputEnter {
+            secondary: true,
+            shift: true,
+        },
+        Some("CommentComposer"),
+    )]
+}
+
 /// Environment that makes every `git` we (or anything below us) run use the
 /// token from `gh auth login` and never block on a prompt.
 ///
@@ -431,6 +442,7 @@ fn main() {
             cx.bind_keys(file_history::keybindings());
             cx.bind_keys(tree::keybindings());
             cx.bind_keys(file_navigation_keybindings());
+            cx.bind_keys(comment_composer_keybindings());
             cx.bind_keys(selection::keybindings());
             cx.bind_keys([
                 KeyBinding::new("n", NextHunk, Some("ReviewApp")),
@@ -3708,6 +3720,28 @@ impl ReviewApp {
         }
     }
 
+    fn composer_can_start_review(&self, composer: &Composer) -> bool {
+        (composer.reply_to.is_none() || composer.placement != ComposerPlacement::Diff)
+            && composer.edit_id.is_none()
+            && !self.composer_uses_pending_review(composer)
+            && matches!(
+                self.active_item().map(|item| &item.source),
+                Some(Source::Pr(_))
+            )
+    }
+
+    fn submit_composer_to_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(composer) = &self.composer else {
+            return;
+        };
+        if self.composer_can_start_review(composer) {
+            self.composer.as_mut().unwrap().pending = true;
+        } else if !self.composer_uses_pending_review(composer) {
+            return;
+        }
+        self.submit_composer(window, cx);
+    }
+
     /// Submit the composer's comment (or reply): local items update in-memory
     /// drafts immediately; PR items post via gh on the background executor.
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4473,15 +4507,21 @@ impl ReviewApp {
         };
         div()
             .debug_selector(|| "composer-card".into())
+            .key_context("CommentComposer")
             .w_full()
             .min_w_0()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             // The multiline input inserts a newline before emitting PressEnter.
-            // Capture Cmd+Enter first; leave plain Enter to the input.
+            // Capture Cmd+Enter / Shift+Cmd+Enter first; leave plain Enter
+            // to the input. The shifted binding is scoped to this card.
             .capture_action(cx.listener(|this, action: &InputEnter, window, cx| {
                 if action.secondary {
                     cx.stop_propagation();
-                    this.submit_composer(window, cx);
+                    if action.shift {
+                        this.submit_composer_to_review(window, cx);
+                    } else {
+                        this.submit_composer(window, cx);
+                    }
                 }
             }))
             // The input propagates Escape when it has nothing of its own to
@@ -4545,34 +4585,21 @@ impl ReviewApp {
                                 this.submit_composer(window, cx);
                             })),
                     )
-                    .when(
-                        (composer.reply_to.is_none()
-                            || composer.placement != ComposerPlacement::Diff)
-                            && composer.edit_id.is_none()
-                            && !pending
-                            && matches!(
-                                self.active_item().map(|item| &item.source),
-                                Some(Source::Pr(_))
-                            ),
-                        |row| {
-                            row.child(
-                                div()
-                                    .debug_selector(|| "composer-start-review".into())
-                                    .child(
-                                        Button::new("composer-add-to-review")
-                                            .label("Start review")
-                                            .small()
-                                            .disabled(submit_disabled)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                if let Some(composer) = &mut this.composer {
-                                                    composer.pending = true;
-                                                }
-                                                this.submit_composer(window, cx);
-                                            })),
-                                    ),
-                            )
-                        },
-                    ),
+                    .when(self.composer_can_start_review(composer), |row| {
+                        row.child(
+                            div()
+                                .debug_selector(|| "composer-start-review".into())
+                                .child(
+                                    Button::new("composer-add-to-review")
+                                        .label("Start review")
+                                        .small()
+                                        .disabled(submit_disabled)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.submit_composer_to_review(window, cx);
+                                        })),
+                                ),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -9994,6 +10021,7 @@ mod tests {
     ) -> (gpui::AnyWindowHandle, gpui::Entity<ReviewApp>) {
         cx.update(|cx| {
             gpui::component::init(cx);
+            cx.bind_keys(comment_composer_keybindings());
             theme::apply_ui_theme(cx);
         });
         let stash = std::rc::Rc::new(std::cell::RefCell::new(None::<gpui::Entity<ReviewApp>>));
@@ -15685,20 +15713,80 @@ mod tests {
 
     #[gpui::test]
     fn cmd_enter_submits_diff_comment_without_a_newline(cx: &mut gpui::TestAppContext) {
-        composer_cmd_enter(cx, ComposerPlacement::Diff);
+        composer_enter(cx, ComposerPlacement::Diff, "cmd-enter", false);
     }
 
     #[gpui::test]
     fn cmd_enter_submits_conversation_comment_without_a_newline(cx: &mut gpui::TestAppContext) {
-        composer_cmd_enter(cx, ComposerPlacement::ConversationMain);
+        composer_enter(cx, ComposerPlacement::ConversationMain, "cmd-enter", false);
     }
 
     #[gpui::test]
     fn cmd_enter_submits_conversation_reply_without_a_newline(cx: &mut gpui::TestAppContext) {
-        composer_cmd_enter(cx, ComposerPlacement::ConversationThread("11".into()));
+        composer_enter(
+            cx,
+            ComposerPlacement::ConversationThread("11".into()),
+            "cmd-enter",
+            false,
+        );
     }
 
-    fn composer_cmd_enter(cx: &mut gpui::TestAppContext, placement: ComposerPlacement) {
+    #[gpui::test]
+    fn shift_cmd_enter_starts_review_with_diff_comment(cx: &mut gpui::TestAppContext) {
+        composer_enter(cx, ComposerPlacement::Diff, "shift-cmd-enter", false);
+    }
+
+    #[gpui::test]
+    fn shift_cmd_enter_starts_review_with_conversation_comment(cx: &mut gpui::TestAppContext) {
+        composer_enter(
+            cx,
+            ComposerPlacement::ConversationMain,
+            "shift-cmd-enter",
+            false,
+        );
+    }
+
+    #[gpui::test]
+    fn shift_cmd_enter_starts_review_with_conversation_reply(cx: &mut gpui::TestAppContext) {
+        composer_enter(
+            cx,
+            ComposerPlacement::ConversationThread("11".into()),
+            "shift-cmd-enter",
+            false,
+        );
+    }
+
+    #[gpui::test]
+    fn cmd_enter_adds_diff_comment_to_existing_review(cx: &mut gpui::TestAppContext) {
+        composer_enter(cx, ComposerPlacement::Diff, "cmd-enter", true);
+    }
+
+    #[gpui::test]
+    fn cmd_enter_adds_conversation_comment_to_existing_review(cx: &mut gpui::TestAppContext) {
+        composer_enter(cx, ComposerPlacement::ConversationMain, "cmd-enter", true);
+    }
+
+    #[gpui::test]
+    fn cmd_enter_adds_conversation_reply_to_existing_review(cx: &mut gpui::TestAppContext) {
+        composer_enter(
+            cx,
+            ComposerPlacement::ConversationThread("11".into()),
+            "cmd-enter",
+            true,
+        );
+    }
+
+    #[gpui::test]
+    fn shift_cmd_enter_adds_to_existing_review(cx: &mut gpui::TestAppContext) {
+        composer_enter(cx, ComposerPlacement::Diff, "shift-cmd-enter", true);
+    }
+
+    fn composer_enter(
+        cx: &mut gpui::TestAppContext,
+        placement: ComposerPlacement,
+        keystroke: &str,
+        existing_review: bool,
+    ) {
         let fake = FakePr::with_threads(vec![rc(
             11,
             "a.rs",
@@ -15715,7 +15803,20 @@ mod tests {
             item.pane = ItemPane::Changes;
         }
         install_item(&app, item, cx);
+        if existing_review {
+            *fake.pending.lock().unwrap() = Some(github::PendingReview {
+                id: 91,
+                node_id: "pending".into(),
+                body: "web summary".into(),
+                comments: vec![],
+            });
+            cx.update(|cx| app.update(cx, |this, cx| this.resume_session(0, cx)));
+            cx.run_until_parked();
+        }
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        // The shifted shortcut must not open/submit a review outside the card.
+        vcx.simulate_keystrokes("shift-cmd-enter");
+        cx.update(|cx| assert!(app.read(cx).review.is_none()));
         let input = vcx.update(|window, cx| {
             app.update(cx, |this, cx| {
                 this.open_comment_composer(
@@ -15736,13 +15837,50 @@ mod tests {
         vcx.simulate_keystrokes("left left left left left enter");
         cx.update(|cx| assert_eq!(input.read(cx).value().as_str(), "before\nafter"));
         assert!(fake.posts().is_empty());
-        vcx.simulate_keystrokes("cmd-enter");
+        vcx.simulate_keystrokes(keystroke);
         cx.run_until_parked();
         cx.update(|cx| {
             assert_eq!(input.read(cx).value().as_str(), "before\nafter");
             assert!(app.read(cx).composer.is_none());
             assert!(app.read(cx).review.is_none());
         });
+        if existing_review || keystroke == "shift-cmd-enter" {
+            assert!(fake.posts().is_empty(), "drafts are never published");
+            cx.update(|cx| {
+                let review = app
+                    .read(cx)
+                    .store
+                    .review_session(&loop_loc())
+                    .pending
+                    .unwrap();
+                if existing_review {
+                    assert_eq!(review.id, 91, "reuse the existing review");
+                }
+                if placement == ComposerPlacement::ConversationMain {
+                    assert_eq!(
+                        review.body,
+                        if existing_review {
+                            "web summary\n\nbefore\nafter"
+                        } else {
+                            "before\nafter"
+                        }
+                    );
+                    assert!(review.comments.is_empty());
+                } else {
+                    assert_eq!(
+                        review.body,
+                        if existing_review { "web summary" } else { "" }
+                    );
+                    assert_eq!(review.comments.len(), 1);
+                    assert_eq!(review.comments[0].body, "before\nafter");
+                    assert_eq!(
+                        review.comments[0].in_reply_to_id,
+                        matches!(placement, ComposerPlacement::ConversationThread(_)).then_some(11)
+                    );
+                }
+            });
+            return;
+        }
         let body = "before\nafter".into();
         let expected = match placement {
             ComposerPlacement::Diff => Post::Comment {
