@@ -1102,6 +1102,23 @@ struct ReviewItem {
 }
 
 impl ReviewItem {
+    /// The tree can still be waiting for changes after the conversation is ready.
+    /// Derive this from the fetch state so failures and offline copies never spin.
+    fn file_tree_loading_message(&self) -> Option<&'static str> {
+        match &self.state {
+            ItemState::Loading => Some(match &self.source {
+                Source::Pr(_) => "loading review…",
+                Source::Local(_) => "loading changes…",
+            }),
+            ItemState::Ready(data) if self.reloading => Some(if data.diff_loaded {
+                "refreshing changes…"
+            } else {
+                "loading changes…"
+            }),
+            _ => None,
+        }
+    }
+
     fn primary(&self) -> SharedString {
         match &self.source {
             Source::Pr(loc) => format!("{}#{}", loc.repo_slug(), loc.number).into(),
@@ -1417,7 +1434,11 @@ impl ReviewItem {
 // Explicitly shared with media overlays so native window controls stay clear.
 const APP_HEADER_HEIGHT: Pixels = px(34.);
 
-fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
+fn pr_titlebar_content(
+    meta: &github::PrMeta,
+    loading: Option<&'static str>,
+    cx: &mut Context<ReviewApp>,
+) -> gpui::AnyElement {
     let (state_color, state_label) = match meta.state.as_str() {
         "OPEN" => (theme::green(cx), "open"),
         "MERGED" => (theme::mauve(cx), "merged"),
@@ -1502,7 +1523,8 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
                                 .xsmall()
                                 .tooltip("Open PR in GitHub")
                                 .on_click(move |_, _, cx| cx.open_url(&url)),
-                        ),
+                        )
+                        .children(loading.map(|message| chrome::header_loading_spinner(message, cx))),
                 ),
         )
         .child(
@@ -1527,7 +1549,11 @@ fn pr_titlebar_content(meta: &github::PrMeta, cx: &mut Context<ReviewApp>) -> gp
         .into_any_element()
 }
 
-fn local_titlebar_content(src: &git::LocalSource, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
+fn local_titlebar_content(
+    src: &git::LocalSource,
+    loading: Option<&'static str>,
+    cx: &mut Context<ReviewApp>,
+) -> gpui::AnyElement {
     let blue: Hsla = theme::blue(cx).into();
     div()
         .flex()
@@ -1551,7 +1577,8 @@ fn local_titlebar_content(src: &git::LocalSource, cx: &mut Context<ReviewApp>) -
                         .font_weight(gpui::FontWeight::BOLD)
                         .truncate()
                         .child(SharedString::from(dir_name(&src.repo_root))),
-                ),
+                )
+                .children(loading.map(|message| chrome::header_loading_spinner(message, cx))),
         )
         .child(
             div()
@@ -5184,10 +5211,14 @@ impl ReviewApp {
                 Some(item) => match &item.state {
                     ItemState::Ready(data) => match &item.source {
                         Source::Pr(_) => match &data.pr_meta {
-                            Some(meta) => pr_titlebar_content(meta, cx),
+                            Some(meta) => {
+                                pr_titlebar_content(meta, item.file_tree_loading_message(), cx)
+                            }
                             None => app_title(None, cx),
                         },
-                        Source::Local(src) => local_titlebar_content(src, cx),
+                        Source::Local(src) => {
+                            local_titlebar_content(src, item.file_tree_loading_message(), cx)
+                        }
                     },
                     ItemState::Loading => {
                         app_title(Some(format!("loading {}…", item.primary())), cx)
@@ -5200,7 +5231,8 @@ impl ReviewApp {
         };
         // On the queue screen the pane itself spells out the empty and
         // first-failure cases; with rows up, the title bar carries the
-        // refresh status beside the account chip, like an item's.
+        // refresh status beside the account chip. Item loading lives beside
+        // the title links instead; only item errors remain on the right.
         let note: Option<SharedString> = if self.show_queue {
             if !self.queue.prs.is_empty() {
                 if self.queue.loading {
@@ -5217,13 +5249,7 @@ impl ReviewApp {
         } else {
             self.active_item().and_then(|item| {
                 if item.reloading {
-                    Some(
-                        if matches!(&item.state, ItemState::Ready(data) if !data.diff_loaded) {
-                            "loading changes…".into()
-                        } else {
-                            "reloading…".into()
-                        },
-                    )
+                    None
                 } else {
                     item.refresh_error
                         .as_ref()
@@ -5339,6 +5365,7 @@ impl ReviewApp {
         if let Some(note) = note {
             right = right.child(
                 div()
+                    .debug_selector(|| "header-note".into())
                     .max_w(px(280.))
                     .truncate()
                     .text_color(theme::overlay0(cx))
@@ -5608,8 +5635,13 @@ impl ReviewApp {
                         window.focus(&this.focus_handle, cx);
                         cx.notify();
                     }))
+                    .child(chrome::file_tree_loading_strip(
+                        self.active_item().and_then(ReviewItem::file_tree_loading_message),
+                        cx,
+                    ))
                     .child(
                         div()
+                            .debug_selector(|| "file-tree-filter".into())
                             .p_2()
                             .child(Input::new(&self.tree_filter_input).small())
                             .when(filtered, |area| {
@@ -8639,6 +8671,49 @@ mod tests {
     }
 
     #[gpui::test]
+    fn titlebar_loading_spinner_follows_pr_link_and_errors_still_show(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for pane in [ItemPane::Conversation, ItemPane::Changes] {
+            for (diff_loaded, reloading) in
+                [(true, false), (true, true), (false, true), (false, false)]
+            {
+                let mut item = loop_pr_item(Vec::new());
+                item.pane = pane;
+                item.reloading = reloading;
+                item.refresh_error = Some("refresh failed".into());
+                let ItemState::Ready(data) = &mut item.state else {
+                    unreachable!()
+                };
+                data.diff_loaded = diff_loaded;
+                install_item(&app, item, cx);
+                draw_window(&mut vcx);
+                assert_eq!(vcx.debug_bounds("header-loading").is_some(), reloading);
+                assert_eq!(vcx.debug_bounds("header-note").is_some(), !reloading);
+                if let Some(spinner) = vcx.debug_bounds("header-loading") {
+                    let open = vcx.debug_bounds("open-in-browser").unwrap();
+                    let navigation = vcx.debug_bounds("review-queue-navigation").unwrap();
+                    assert!(open.right() <= spinner.left());
+                    assert!(spinner.left() - open.right() <= px(8.));
+                    assert_eq!(spinner.center().y, open.center().y);
+                    assert!(spinner.right() + px(100.) < navigation.left());
+                }
+            }
+        }
+        // Background item activity must not leak into the queue's header.
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.items[0].reloading = true;
+                app.back_to_queue(cx);
+            });
+        });
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("header-loading").is_none());
+    }
+
+    #[gpui::test]
     fn titlebar_pr_links_stay_together_on_the_left_and_use_the_metadata_url(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -10761,6 +10836,76 @@ mod tests {
     fn draw_window(vcx: &mut gpui::VisualTestContext) {
         vcx.update(|window, cx| window.draw(cx).clear(cx));
         vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn file_tree_loading_tracks_fetch_stages_and_keeps_refresh_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        let ready = || loop_pr_item(Vec::new()).state;
+        let conversation_only = || {
+            let mut data = file_mode_data(PrDiff::default());
+            data.diff_loaded = false;
+            ItemState::Ready(data)
+        };
+        let mut filter_bounds = None;
+        let mut row_bounds = None;
+        for (state, reloading, expected, has_rows) in [
+            (ItemState::Loading, true, Some("loading review…"), false),
+            (conversation_only(), true, Some("loading changes…"), false),
+            (ready(), false, None, true),
+            (ready(), true, Some("refreshing changes…"), true),
+            // Refresh failure retains its old rows, but must stop spinning.
+            (ready(), false, None, true),
+            (ItemState::Failed("fetch failed".into()), false, None, false),
+            // Offline/conversation-only copies are not still loading.
+            (conversation_only(), false, None, false),
+        ] {
+            let mut item = loop_pr_item(Vec::new());
+            item.state = state;
+            item.reloading = reloading;
+            if expected.is_none() {
+                item.refresh_error = Some("fetch failed".into());
+            }
+            assert_eq!(item.file_tree_loading_message(), expected);
+            install_item(&app, item, cx);
+            draw_window(&mut vcx);
+            assert_eq!(
+                vcx.debug_bounds("file-tree-loading").is_some(),
+                expected.is_some(),
+                "loading status: {expected:?}"
+            );
+            let filter = vcx.debug_bounds("file-tree-filter").unwrap();
+            let track = vcx.debug_bounds("file-tree-loading-track").unwrap();
+            assert_eq!(track.size.height, px(2.));
+            assert_eq!(track.bottom(), filter.top());
+            assert_eq!(vcx.debug_bounds("tree-row-0").is_some(), has_rows);
+            if let Some(row) = vcx.debug_bounds("tree-row-0") {
+                // The item header can change height when metadata first arrives;
+                // refresh, in contrast, must keep both filter and rows stationary.
+                assert_eq!(*filter_bounds.get_or_insert(filter), filter, "refresh must not move filter");
+                assert_eq!(*row_bounds.get_or_insert(row), row, "refresh must not move tree rows");
+            }
+            if let Some(status) = vcx.debug_bounds("file-tree-loading") {
+                assert_eq!(status, track, "animation must stay inside the reserved strip");
+            }
+        }
+    }
+
+    #[test]
+    fn local_file_tree_loading_uses_changes_label() {
+        let mut item = loop_pr_item(Vec::new());
+        item.source = Source::Local(git::LocalSource {
+            repo_root: "/tmp/repo".into(),
+            branch: "feature".into(),
+            base_ref: None,
+            base_label: "HEAD".into(),
+            base_oid: None,
+        });
+        item.state = ItemState::Loading;
+        assert_eq!(item.file_tree_loading_message(), Some("loading changes…"));
     }
 
     #[gpui::test]
