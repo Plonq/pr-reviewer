@@ -74,8 +74,10 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
   boundaries read from the highlighting — revealed at its first change on
   first visit, with each file's scroll position remembered while the review is open;
   `Shift+N`/`Shift+P` (or `]`/`[`) move between files and `n`/`p` between hunks
-(both wrap), following
-  the sidebar's directory-first, name-sorted order. New reviews start at the top
+  (both wrap), following the sidebar's directory-first, name-sorted order.
+  Hunk navigation selects the changed range, excluding leading and trailing
+  context, for commenting with `Shift+C` (new side for replacements, old side for
+  deletion-only hunks). New reviews start at the top
   file; returning to a PR resumes its last file and scroll position, even after restarting
 - file-selection history per open review: `cmd-[` / `cmd-]`, title-bar arrows,
   or mouse back/forward buttons revisit files at their remembered scroll positions.

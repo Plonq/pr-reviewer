@@ -869,6 +869,18 @@ impl ItemData {
         matches
     }
 
+    /// A range replaces the single-line cursor cue, rather than leaving a
+    /// second highlighted gutter at the navigation target's context line.
+    fn active_line_side(&self, row_ix: usize) -> Option<SelSide> {
+        if let Some(selection) = self.selection {
+            row_selection_range(&selection, row_ix, self.rows.get(row_ix)?).map(|_| selection.side)
+        } else if row_ix == self.cursor {
+            self.cursor_side
+        } else {
+            None
+        }
+    }
+
     /// Rebuild the display rows for the displayed file and mode.
     fn row_build(&self) -> BuiltRows {
         rows::build_presented_rows(
@@ -3075,8 +3087,26 @@ impl ReviewApp {
                 }
                 cx.notify();
             }
-            None => {}
+            None => return,
         }
+        if let Some(data) = self.active_data_mut() {
+            data.selection = data
+                .hunk_rows
+                .iter()
+                .position(|&row| row == data.cursor)
+                .and_then(|ix| {
+                    let hunk = data.diff.files.get(data.file_ix)?.hunks.get(ix)?;
+                    let end = data
+                        .hunk_rows
+                        .get(ix + 1)
+                        .copied()
+                        .unwrap_or(data.rows.len());
+                    selection::hunk_selection(&data.rows, hunk, data.cursor..end)
+                });
+            data.cursor_side = data.selection.map(|selection| selection.side);
+        }
+        self.drag_anchor = None;
+        cx.notify();
     }
 
     /// `]`/`[`: step to the next/previous file in tree order, wrapping —
@@ -3326,7 +3356,12 @@ impl ReviewApp {
             // selected row so it doesn't cover the rest of the range.
             Some(sel) => {
                 let (start, end) = sel.ordered();
-                (end.row, comment_anchor(&data.rows, start.row, sel.side))
+                let anchor = if sel.linewise {
+                    sel.comment_points(&data.rows).first().copied()
+                } else {
+                    comment_anchor(&data.rows, start.row, sel.side)
+                };
+                (end.row, anchor)
             }
             // No selection: the keyboard cursor names the line; a split
             // row's side falls out of its shape.
@@ -3349,17 +3384,15 @@ impl ReviewApp {
         let range = if matches!(item.source, Source::Pr(_)) {
             let points = match data.selection {
                 Some(sel) => {
-                    let (start, end) = sel.ordered();
-                    if comment_anchor(&data.rows, end.row, sel.side).is_none() {
+                    let (_, end) = sel.ordered();
+                    if !sel.linewise && comment_anchor(&data.rows, end.row, sel.side).is_none() {
                         if let Some(item) = self.items.get_mut(self.active) {
                             item.refresh_error = Some("end the range on a source line".into());
                             cx.notify();
                         }
                         return;
                     }
-                    (start.row..=end.row)
-                        .filter_map(|row| comment_anchor(&data.rows, row, sel.side))
-                        .collect::<Vec<_>>()
+                    sel.comment_points(&data.rows)
                 }
                 None => vec![(anchor_side, line)],
             };
@@ -6436,17 +6469,7 @@ impl ReviewApp {
                                                                 .filter(|range| !range.is_empty())
                                                                 .map(|range| (sel.side, range))
                                                         });
-                                                        let active = sel
-                                                            .filter(|sel| {
-                                                                row_selection_range(sel, ix, row)
-                                                                    .is_some()
-                                                            })
-                                                            .map(|sel| sel.side)
-                                                            .or_else(|| {
-                                                                (ix == data.cursor)
-                                                                    .then_some(data.cursor_side)
-                                                                    .flatten()
-                                                            });
+                                                        let active = data.active_line_side(ix);
                                                         let dragging =
                                                             this.comment_drag.and_then(|drag| {
                                                                 drag.highlighted_side(
