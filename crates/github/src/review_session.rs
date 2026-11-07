@@ -1,7 +1,7 @@
 //! Review lifecycle independent of UI. Cached drafts are display-only until
 //! reconciled with GitHub; every mutation re-reads the viewer's pending review.
 
-use crate::{ClientError, GitHubClient, PrLocator, ReviewVerdict};
+use crate::{ClientError, GitHubClient, MutationReceipt, MutationTarget, PrLocator, ReviewVerdict};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -211,33 +211,42 @@ impl ReviewSession {
         self.execute_with_receipt(client, loc, command).map(|_| ())
     }
 
-    /// Returns the published comment's identity when the backend supplies it.
-    /// Pending-review mutations return None: their drafts are already in state.
+    /// Exact outcome plus the resulting confirmed session (including partial
+    /// lifecycle success on failure). Creation never discards its server identity.
     pub fn execute_with_receipt(
         &mut self,
         client: &dyn GitHubClient,
         loc: &PrLocator,
         command: Command,
-    ) -> Result<Option<u64>, ClientError> {
+    ) -> Result<MutationReceipt, ClientError> {
         // Immediate comments never start, resume, modify, or submit a draft.
         if let Command::Immediate { anchor, body } = command {
             anchor.validate()?;
             nonempty(&body)?;
             return client
                 .post_anchored_comment(loc, &anchor, body.trim())
-                .map(|_| None);
+                .map(MutationReceipt::PublishedCreated);
         }
         if let Command::Conversation { body } = command {
             nonempty(&body)?;
-            return client.post_conversation_comment_id(loc, body.trim());
+            return client
+                .post_conversation_comment(loc, body.trim())
+                .map(MutationReceipt::PublishedCreated);
         }
         // Published mutations must never resume, create, or submit a draft review.
         if let Command::EditPublished { target, body } = command {
             nonempty(&body)?;
-            return client.edit_comment(&target, body.trim()).map(|_| None);
+            client.edit_comment(&target, body.trim())?;
+            return Ok(MutationReceipt::Edited {
+                target: MutationTarget::Published(target),
+                body: body.trim().into(),
+            });
         }
         if let Command::DeletePublished { target } = command {
-            return client.delete_comment(&target).map(|_| None);
+            client.delete_comment(&target)?;
+            return Ok(MutationReceipt::Deleted {
+                target: MutationTarget::Published(target),
+            });
         }
         if let Command::SetReaction {
             target,
@@ -247,7 +256,7 @@ impl ReviewSession {
         {
             return client
                 .set_comment_reaction(&target, &content, reacted)
-                .map(|_| None);
+                .map(|_| MutationReceipt::NoCommentChange);
         }
         if let Command::SetThreadResolved {
             thread_id,
@@ -256,7 +265,7 @@ impl ReviewSession {
         {
             return client
                 .set_thread_resolved(&thread_id, resolved)
-                .map(|_| None);
+                .map(|_| MutationReceipt::NoCommentChange);
         }
         match &command {
             Command::Add { anchor, body } => {
@@ -272,6 +281,7 @@ impl ReviewSession {
         self.verified = false;
         self.pending = client.pending_review(loc)?;
         self.verified = true;
+        let mut receipt = MutationReceipt::NoCommentChange;
         match command {
             Command::Resume => {}
             Command::Start { commit_id } => {
@@ -287,20 +297,43 @@ impl ReviewSession {
                     self.pending = Some(client.start_review(loc, &anchor.commit_id)?);
                 }
                 let review = self.pending.as_mut().unwrap();
-                let comment = client.add_pending_comment(loc, review, &anchor, body.trim())?;
-                review.comments.push(comment);
+                let created = client.add_pending_comment(loc, review, &anchor, body.trim())?;
+                review.comments.push(created.comment.clone());
+                receipt = MutationReceipt::PendingCreated {
+                    review_id: review.id,
+                    review_node_id: review.node_id.clone(),
+                    created,
+                };
             }
             Command::Edit { id, body } => {
+                let review_id = self.pending.as_ref().map(|r| r.id);
                 let comment = self.comment_mut(id)?;
                 client.edit_pending_comment(loc, comment, body.trim())?;
                 comment.body = body.trim().into();
+                receipt = MutationReceipt::Edited {
+                    target: MutationTarget::Pending {
+                        review_id: review_id.unwrap(),
+                        id,
+                        node_id: comment.node_id.clone(),
+                    },
+                    body: comment.body.clone(),
+                };
             }
             Command::Reply { comment_id, body } => {
                 if let Some(review) = &mut self.pending {
-                    let comment = client.add_pending_reply(loc, review, comment_id, body.trim())?;
-                    review.comments.push(comment);
+                    let created = client.add_pending_reply(loc, review, comment_id, body.trim())?;
+                    review.comments.push(created.comment.clone());
+                    receipt = MutationReceipt::PendingCreated {
+                        review_id: review.id,
+                        review_node_id: review.node_id.clone(),
+                        created,
+                    };
                 } else {
-                    client.post_reply(loc, comment_id, body.trim())?;
+                    receipt = MutationReceipt::PublishedCreated(client.post_reply(
+                        loc,
+                        comment_id,
+                        body.trim(),
+                    )?);
                 }
             }
             Command::ConversationReply {
@@ -316,10 +349,19 @@ impl ReviewSession {
                     self.pending = Some(client.start_review(loc, &commit_id)?);
                 }
                 if let Some(review) = &mut self.pending {
-                    let comment = client.add_pending_reply(loc, review, comment_id, body.trim())?;
-                    review.comments.push(comment);
+                    let created = client.add_pending_reply(loc, review, comment_id, body.trim())?;
+                    review.comments.push(created.comment.clone());
+                    receipt = MutationReceipt::PendingCreated {
+                        review_id: review.id,
+                        review_node_id: review.node_id.clone(),
+                        created,
+                    };
                 } else {
-                    return client.post_reply_id(loc, comment_id, body.trim());
+                    receipt = MutationReceipt::PublishedCreated(client.post_reply(
+                        loc,
+                        comment_id,
+                        body.trim(),
+                    )?);
                 }
             }
             Command::AddSummary { commit_id, body } => {
@@ -339,8 +381,16 @@ impl ReviewSession {
                 review.body = summary;
             }
             Command::Delete { id } => {
+                let review_id = self.pending.as_ref().map(|r| r.id);
                 let comment = self.comment_mut(id)?;
                 client.delete_pending_comment(loc, comment)?;
+                receipt = MutationReceipt::Deleted {
+                    target: MutationTarget::Pending {
+                        review_id: review_id.unwrap(),
+                        id,
+                        node_id: comment.node_id.clone(),
+                    },
+                };
                 self.pending
                     .as_mut()
                     .unwrap()
@@ -364,7 +414,7 @@ impl ReviewSession {
             | Command::SetReaction { .. }
             | Command::SetThreadResolved { .. } => unreachable!(),
         }
-        Ok(None)
+        Ok(receipt)
     }
 
     fn comment_mut(&mut self, id: u64) -> Result<&mut PendingComment, ClientError> {

@@ -777,7 +777,7 @@ mod tests {
             _: &str,
             _: u64,
             _: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             unreachable!()
         }
         fn post_reply(
@@ -785,7 +785,7 @@ mod tests {
             _: &github::PrLocator,
             _: u64,
             _: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             unreachable!()
         }
         fn submit_review(

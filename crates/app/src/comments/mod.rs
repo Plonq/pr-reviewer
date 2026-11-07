@@ -1,5 +1,6 @@
 //! App-owned, pure comment projection. Confirmed discussion/session storage stays
-//! with its existing owners; only transient posts and identity aliases live here.
+//! with its existing owners; transient posts, identity aliases and read/write
+//! reconciliation barriers live here.
 //!
 //! Surface adapters deliberately preserve today's visibility: Conversation shows
 //! published entries and pending replies; the tray also shows pending roots;
@@ -8,6 +9,7 @@
 
 pub(crate) mod index;
 pub(crate) mod posting;
+pub(crate) mod sync;
 #[cfg(test)]
 mod tests;
 
@@ -95,25 +97,7 @@ impl<'a> Projection<'a> {
     }
 
     pub fn published(&self, target: &github::CommentTarget) -> Option<&'a DiscussionComment> {
-        let discussion = self.discussion?;
-        let (node, inline) = match target {
-            github::CommentTarget::Issue(node) | github::CommentTarget::Review(node) => {
-                (node, false)
-            }
-            github::CommentTarget::ReviewComment(node) => (node, true),
-        };
-        if inline {
-            discussion
-                .threads
-                .iter()
-                .flat_map(|t| &t.comments)
-                .find(|c| &c.permissions.node_id == node)
-        } else {
-            discussion
-                .comments
-                .iter()
-                .find(|c| &c.permissions.node_id == node)
-        }
+        published(self.discussion?, target)
     }
 
     pub fn thread_for_inline(&self, id: u64) -> Option<&'a ReviewThread> {
@@ -241,6 +225,28 @@ impl<'a> Projection<'a> {
             .map(index::ReviewComment::from)
             .collect();
         index::group_comments(merge_pending(published, self.pending.iter().copied()))
+    }
+}
+
+fn published<'a>(
+    discussion: &'a PrDiscussion,
+    target: &github::CommentTarget,
+) -> Option<&'a DiscussionComment> {
+    let (node, inline) = match target {
+        github::CommentTarget::Issue(node) | github::CommentTarget::Review(node) => (node, false),
+        github::CommentTarget::ReviewComment(node) => (node, true),
+    };
+    if inline {
+        discussion
+            .threads
+            .iter()
+            .flat_map(|t| &t.comments)
+            .find(|c| &c.permissions.node_id == node)
+    } else {
+        discussion
+            .comments
+            .iter()
+            .find(|c| &c.permissions.node_id == node)
     }
 }
 

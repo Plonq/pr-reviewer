@@ -107,11 +107,6 @@ impl ReviewApp {
         if self.sessions.get(&item_id).is_some_and(|ui| ui.busy) {
             return;
         }
-        if let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) {
-            if let ItemState::Ready(data) = &mut item.state {
-                data.discussion_generation += 1;
-            }
-        }
         self.run_session(item_id, command, SessionCompletion::None, window, cx);
     }
 

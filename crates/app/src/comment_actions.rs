@@ -455,10 +455,20 @@ impl ReviewApp {
 
     /// Apply successful published writes before the refresh, even if the editor
     /// was closed or another PR was opened while GitHub was processing the write.
-    pub(crate) fn apply_comment_mutation(&mut self, item_id: u64, command: &SessionCommand) {
-        let (target, body) = match command {
-            SessionCommand::EditPublished { target, body } => (target, Some(body.trim())),
-            SessionCommand::DeletePublished { target } => (target, None),
+    pub(crate) fn apply_comment_mutation(
+        &mut self,
+        item_id: u64,
+        receipt: &github::MutationReceipt,
+    ) {
+        use github::{MutationReceipt, MutationTarget};
+        let (target, body) = match receipt {
+            MutationReceipt::Edited {
+                target: MutationTarget::Published(target),
+                body,
+            } => (target, Some(body.as_str())),
+            MutationReceipt::Deleted {
+                target: MutationTarget::Published(target),
+            } => (target, None),
             _ => return,
         };
         let Some(ItemState::Ready(data)) = self

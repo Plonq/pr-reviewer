@@ -644,8 +644,6 @@ pub(crate) struct ItemData {
     /// height is available before the scroller clamps its retained offset.
     conv_markdown: RefCell<HashMap<String, gpui::Entity<gpui::component::text::TextViewState>>>,
     discussion: Option<github::PrDiscussion>,
-    /// Invalidate older comment fetches when a resolution write starts.
-    discussion_generation: u64,
     posts: comments::posting::Posts,
     commits: Option<github::PrCommits>,
     commits_expanded: bool,
@@ -762,7 +760,6 @@ impl ItemData {
             conv_scroll: ScrollHandle::new(),
             conv_markdown: RefCell::new(HashMap::new()),
             discussion: None,
-            discussion_generation: 0,
             posts: Default::default(),
             commits: None,
             commits_expanded: false,
@@ -1132,6 +1129,8 @@ struct ReviewItem {
     refresh_error: Option<SharedString>,
     /// Bumped at fetch start; only the latest fetch may install its result.
     upgrade_gen: u64,
+    /// Survives ItemData replacement; orders all comment reads and writes.
+    comment_sync: comments::sync::SyncState,
     /// Which pane the item shows; lives here — not in `ItemData` — so a
     /// refresh (which swaps the data in) never flips the reviewer's view.
     pane: ItemPane,
@@ -1315,7 +1314,53 @@ impl ReviewItem {
     /// Returns the PR's snapshot, when the fetch was a PR's: the caller
     /// keeps it in the local store, so the next launch knows what the app
     /// last saw of this PR.
+    #[cfg(test)]
     fn install(&mut self, loaded: Loaded) -> Option<local_store::StoredPrSnapshot> {
+        let ticket = self.comment_sync.begin_read();
+        self.install_fetched(loaded, ticket)
+    }
+
+    fn install_fetched(
+        &mut self,
+        mut loaded: Loaded,
+        ticket: comments::sync::ReadTicket,
+    ) -> Option<local_store::StoredPrSnapshot> {
+        if matches!(self.source, Source::Pr(_))
+            && !loaded
+                .discussion
+                .as_ref()
+                .is_some_and(|discussion| self.comment_sync.accept(ticket, discussion))
+        {
+            // A stale full fetch may still deliver useful metadata and a diff.
+            // Keep the last confirmed discussion and rebuild its index/rows on
+            // that diff. Never persist the rejected snapshot as authoritative.
+            loaded.snapshot = None;
+            loaded.discussion = match &self.state {
+                ItemState::Ready(data) => data.discussion.clone(),
+                _ => None,
+            };
+            let mut index = comments::Projection::new(
+                loaded.discussion.as_ref(),
+                None,
+                &comments::posting::Posts::default(),
+            )
+            .diff_index();
+            if loaded.review_base.is_some() {
+                index.hide_left_anchors();
+            }
+            loaded.comments = Some(index);
+            loaded.built_rows = build_rows(RowsView {
+                diff: &loaded.diff,
+                upgrades: &loaded.upgrades,
+                comments: loaded.comments.as_ref(),
+                options: RowOptions {
+                    mode: loaded.mode,
+                    file_ix: loaded.file_ix,
+                    comments_visible: true,
+                    comment_wrap: COMMENT_WRAP_CHARS,
+                },
+            });
+        }
         let Loaded {
             meta,
             diff,
@@ -1363,7 +1408,6 @@ impl ReviewItem {
                 data.review_changes = review_changes;
                 data.review_base = review_base;
                 data.review_base_files = review_base_files;
-                data.discussion_generation += 1;
                 data.upgrades = upgrades;
                 data.file_media = file_media;
                 data.expanded_regions.clear();
@@ -1561,7 +1605,9 @@ fn pr_titlebar_content(
                                 .tooltip("Open PR in GitHub")
                                 .on_click(move |_, _, cx| cx.open_url(&url)),
                         )
-                        .children(loading.map(|message| chrome::header_loading_spinner(message, cx))),
+                        .children(
+                            loading.map(|message| chrome::header_loading_spinner(message, cx)),
+                        ),
                 ),
         )
         .child(
@@ -2705,6 +2751,7 @@ impl ReviewApp {
         let id = self.next_id;
         self.next_id += 1;
         self.items.push(ReviewItem {
+            comment_sync: Default::default(),
             review_draft: None,
             id,
             source: source.clone(),
@@ -2756,6 +2803,7 @@ impl ReviewApp {
         // Supersede any older fetch before starting its replacement.
         item.upgrade_gen += 1;
         let fetch_gen = item.upgrade_gen;
+        let comment_ticket = item.comment_sync.begin_read();
         let github = self.github.clone();
         // Build rows for what the item will show when they land: the ready
         // item's displayed file, or the first file for a first load.
@@ -2783,6 +2831,7 @@ impl ReviewApp {
                     if item.upgrade_gen != fetch_gen || matches!(item.state, ItemState::Ready(_)) {
                         return;
                     }
+                    if !item.comment_sync.accept(comment_ticket, &conversation.discussion) { return; }
                     item.install_conversation(conversation, mode);
                     if let (Source::Pr(loc), ItemState::Ready(data)) = (&item.source, &mut item.state) {
                         data.load_preferences(&app.store, Some(loc));
@@ -2814,7 +2863,7 @@ impl ReviewApp {
                         } else {
                             None
                         };
-                        let snapshot = item.install(loaded);
+                        let snapshot = item.install_fetched(loaded, comment_ticket);
                         if let ItemState::Ready(data) = &mut item.state {
                             let loc = match &item.source {
                                 Source::Pr(loc) => Some(loc),
@@ -3561,7 +3610,12 @@ impl ReviewApp {
         item_id: u64,
         command: SessionCommand,
         cx: &mut Context<Self>,
-    ) -> Option<Task<(ReviewSession, Result<Option<u64>, github::ClientError>)>> {
+    ) -> Option<
+        Task<(
+            ReviewSession,
+            Result<github::MutationReceipt, github::ClientError>,
+        )>,
+    > {
         let item = self.items.iter().find(|item| item.id == item_id)?;
         let Source::Pr(loc) = &item.source else {
             return None;
@@ -3574,6 +3628,11 @@ impl ReviewApp {
         ui.busy = true;
         ui.error = None;
         let mut session = ui.state.clone();
+        if !matches!(command, SessionCommand::Resume) {
+            if let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) {
+                item.comment_sync.begin_write();
+            }
+        }
         let github = self.github.clone();
         let store = self.store.clone();
         cx.notify();
@@ -3629,9 +3688,8 @@ impl ReviewApp {
         };
         cx.spawn(async move |this, cx| {
             let (session, result) = job.await;
-            let result = result.map(|_| ());
             this.update(cx, |app, cx| {
-                app.finish_session(item_id, session, &result, cx)
+                app.finish_session(item_id, session, &result.map(|_| ()), cx)
             })
             .ok();
         })
@@ -3651,7 +3709,10 @@ impl ReviewApp {
             command,
             SessionCommand::Reply { .. } | SessionCommand::ConversationReply { .. }
         );
-        let commented = matches!(command, SessionCommand::Conversation { .. });
+        let commented = matches!(
+            command,
+            SessionCommand::Conversation { .. } | SessionCommand::Immediate { .. }
+        );
         let mutation = command.clone();
         let mutated = matches!(
             command,
@@ -3665,19 +3726,27 @@ impl ReviewApp {
         };
         cx.spawn_in(window, async move |this, cx| {
             let (session, result) = job.await;
-            let receipt = result.as_ref().ok().copied().flatten();
+            let receipt = result.as_ref().ok().cloned();
             let result = result.map(|_| ());
             this.update_in(cx, |app, window, cx| {
+                if let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) {
+                    item.comment_sync.finish_write(receipt.as_ref());
+                }
                 app.finish_session(item_id, session, &result, cx);
                 if result.is_ok() {
-                    app.apply_comment_mutation(item_id, &mutation);
+                    app.apply_comment_mutation(item_id, receipt.as_ref().unwrap());
                     app.apply_reaction(item_id, &mutation);
                     app.apply_thread_resolution(item_id, &mutation);
                 }
                 if let SessionCompletion::Composer(gen) = completion {
                     if let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) {
                         if let ItemState::Ready(data) = &mut item.state {
-                            data.posts.complete(gen, receipt);
+                            data.posts.complete(
+                                gen,
+                                receipt
+                                    .as_ref()
+                                    .and_then(github::MutationReceipt::published_id),
+                            );
                             if let Some(discussion) = &data.discussion {
                                 data.posts.reconcile(discussion);
                             }
@@ -4185,40 +4254,13 @@ impl ReviewApp {
             self.close_composer_id(gen, window, cx);
             return;
         }
-        let Source::Pr(loc) = source else {
-            return;
-        };
-        cx.notify();
-        let github = self.github.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let post_loc = loc.clone();
-            let result = cx
-                .background_spawn(async move {
-                    ReviewSession::default().execute(
-                        github.as_ref(),
-                        &post_loc,
-                        SessionCommand::Immediate { anchor, body },
-                    )
-                })
-                .await;
-            this.update_in(cx, |app, window, cx| {
-                match result {
-                    Ok(()) => {
-                        app.close_composer_id(gen, window, cx);
-                        app.refetch_comments(item_id, loc, cx);
-                    }
-                    Err(err) => {
-                        if let Some(composer) = app.composers.iter_mut().find(|c| c.id == gen) {
-                            composer.in_flight = false;
-                            composer.error = Some(err.to_string().into());
-                        }
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.run_session(
+            item_id,
+            SessionCommand::Immediate { anchor, body },
+            SessionCompletion::Composer(gen),
+            window,
+            cx,
+        );
     }
 
     fn add_local_comment(
@@ -4266,14 +4308,10 @@ impl ReviewApp {
     /// rebuild the rows with the viewport anchored — the counterpart of a
     /// full refresh for the post-comment path.
     fn refetch_comments(&mut self, item_id: u64, loc: github::PrLocator, cx: &mut Context<Self>) {
-        let generation = self
-            .items
-            .iter()
-            .find(|item| item.id == item_id)
-            .and_then(|item| match &item.state {
-                ItemState::Ready(data) => Some(data.discussion_generation),
-                _ => None,
-            });
+        let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) else {
+            return;
+        };
+        let ticket = item.comment_sync.begin_read();
         let github = self.github.clone();
         cx.spawn(async move |this, cx| {
             let fetched = cx
@@ -4283,12 +4321,17 @@ impl ReviewApp {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) else {
                     return;
                 };
+                if !item.comment_sync.eligible(ticket) {
+                    return;
+                }
+                if let Ok(discussion) = &fetched {
+                    if !item.comment_sync.accept(ticket, discussion) {
+                        return;
+                    }
+                }
                 let ItemState::Ready(data) = &mut item.state else {
                     return;
                 };
-                if generation != Some(data.discussion_generation) {
-                    return;
-                }
                 match fetched {
                     Ok(discussion) => {
                         data.posts.reconcile(&discussion);
@@ -5693,7 +5736,8 @@ impl ReviewApp {
                         cx.notify();
                     }))
                     .child(chrome::file_tree_loading_strip(
-                        self.active_item().and_then(ReviewItem::file_tree_loading_message),
+                        self.active_item()
+                            .and_then(ReviewItem::file_tree_loading_message),
                         cx,
                     ))
                     .child(
@@ -7146,6 +7190,10 @@ mod tests {
 
     include!("keyboard_selection_tests.rs");
     include!("selection_match_tests.rs");
+
+    mod comment_sync {
+        include!("comment_sync_tests.rs");
+    }
 
     mod markdown_hosts {
         include!("markdown_tests.rs");
@@ -10822,7 +10870,7 @@ mod tests {
             _side: &str,
             _line: u64,
             _body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             unimplemented!("queue tests never post comments")
         }
 
@@ -10831,7 +10879,7 @@ mod tests {
             _loc: &github::PrLocator,
             _comment_id: u64,
             _body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             unimplemented!("queue tests never post replies")
         }
 
@@ -10899,9 +10947,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn file_tree_loading_tracks_fetch_stages_and_keeps_refresh_rows(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn file_tree_loading_tracks_fetch_stages_and_keeps_refresh_rows(cx: &mut gpui::TestAppContext) {
         let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
         let ready = || loop_pr_item(Vec::new()).state;
@@ -10945,11 +10991,22 @@ mod tests {
             if let Some(row) = vcx.debug_bounds("tree-row-0") {
                 // The item header can change height when metadata first arrives;
                 // refresh, in contrast, must keep both filter and rows stationary.
-                assert_eq!(*filter_bounds.get_or_insert(filter), filter, "refresh must not move filter");
-                assert_eq!(*row_bounds.get_or_insert(row), row, "refresh must not move tree rows");
+                assert_eq!(
+                    *filter_bounds.get_or_insert(filter),
+                    filter,
+                    "refresh must not move filter"
+                );
+                assert_eq!(
+                    *row_bounds.get_or_insert(row),
+                    row,
+                    "refresh must not move tree rows"
+                );
             }
             if let Some(status) = vcx.debug_bounds("file-tree-loading") {
-                assert_eq!(status, track, "animation must stay inside the reserved strip");
+                assert_eq!(
+                    status, track,
+                    "animation must stay inside the reserved strip"
+                );
             }
         }
     }
@@ -11793,7 +11850,7 @@ mod tests {
             _side: &str,
             _line: u64,
             _body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             unimplemented!("queue tests never post comments")
         }
 
@@ -11802,7 +11859,7 @@ mod tests {
             _loc: &github::PrLocator,
             _comment_id: u64,
             _body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             unimplemented!("queue tests never post replies")
         }
 
@@ -12055,6 +12112,7 @@ mod tests {
                             repo: "widgets".into(),
                             number: 1,
                         }),
+                        comment_sync: Default::default(),
                         state: ItemState::Failed("stale".into()),
                         reloading: false,
                         refresh_error: None,
@@ -12069,6 +12127,7 @@ mod tests {
                             repo: "widgets".into(),
                             number: 2,
                         }),
+                        comment_sync: Default::default(),
                         state: ItemState::Failed("stale".into()),
                         reloading: false,
                         refresh_error: None,
@@ -12238,6 +12297,7 @@ mod tests {
                 repo: "widgets".into(),
                 number: 7,
             }),
+            comment_sync: Default::default(),
             state: ItemState::Loading,
             reloading: false,
             refresh_error: None,
@@ -12280,6 +12340,7 @@ mod tests {
                 repo: "widgets".into(),
                 number: 8,
             }),
+            comment_sync: Default::default(),
             state: ItemState::Loading,
             reloading: false,
             refresh_error: None,
@@ -12997,6 +13058,7 @@ mod tests {
             review_draft: None,
             id: 1,
             source: Source::Pr(loc),
+            comment_sync: Default::default(),
             state: ItemState::Loading,
             reloading: false,
             refresh_error: None,
@@ -13681,6 +13743,26 @@ mod tests {
         }
     }
 
+    fn fake_receipt(
+        id: u64,
+        body: &str,
+        anchor: Option<github::CommentAnchor>,
+        in_reply_to_id: Option<u64>,
+    ) -> github::PublishedComment {
+        github::PublishedComment {
+            id,
+            node_id: format!("fake-created-{id}"),
+            body: Some(body.into()),
+            author: Some("tester".into()),
+            created_at: None,
+            anchor,
+            in_reply_to_id,
+            thread_id: None,
+            review_node_id: None,
+            review_id: None,
+        }
+    }
+
     /// A ready PR item over two_file_diff — the state a finished open
     /// leaves behind: file mode on a.rs, cursor revealed at its first
     /// change (the added line 1), carrying `comments` on the diff.
@@ -13702,6 +13784,7 @@ mod tests {
             review_draft: None,
             id: 0,
             source: Source::Pr(loop_loc()),
+            comment_sync: Default::default(),
             state: ItemState::Ready(Box::new({
                 let mut data = ItemData::new(
                     Some(loop_pr_meta()),
@@ -14051,40 +14134,11 @@ mod tests {
             Ok(discussion)
         }
 
-        fn post_conversation_comment_id(
-            &self,
-            loc: &github::PrLocator,
-            body: &str,
-        ) -> Result<Option<u64>, github::ClientError> {
-            self.post_conversation_comment(loc, body)?;
-            Ok(self
-                .conversation
-                .lock()
-                .unwrap()
-                .last()
-                .map(|comment| comment.id))
-        }
-
-        fn post_reply_id(
-            &self,
-            loc: &github::PrLocator,
-            comment_id: u64,
-            body: &str,
-        ) -> Result<Option<u64>, github::ClientError> {
-            self.post_reply(loc, comment_id, body)?;
-            Ok(self
-                .comments
-                .lock()
-                .unwrap()
-                .last()
-                .map(|comment| comment.id))
-        }
-
         fn post_conversation_comment(
             &self,
             _loc: &github::PrLocator,
             body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             self.posted
                 .lock()
                 .unwrap()
@@ -14092,15 +14146,19 @@ mod tests {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(github::ClientError::Failed("comment rejected".into()));
             }
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 100;
             self.conversation
                 .lock()
                 .unwrap()
                 .push(github::DiscussionComment {
-                    permissions: Default::default(),
-                    id: self
-                        .next_id
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                        + 100,
+                    permissions: github::CommentPermissions {
+                        node_id: format!("fake-created-{id}"),
+                        ..Default::default()
+                    },
+                    id,
                     author: "tester".into(),
                     body: body.into(),
                     created_at: "2026-10-25T00:00:00Z".into(),
@@ -14108,7 +14166,7 @@ mod tests {
                     review_state: None,
                     review_id: None,
                 });
-            Ok(())
+            Ok(fake_receipt(id, body, None, None))
         }
 
         fn update_pending_body(
@@ -14198,7 +14256,7 @@ mod tests {
             review: &github::PendingReview,
             anchor: &github::CommentAnchor,
             body: &str,
-        ) -> Result<github::PendingComment, github::ClientError> {
+        ) -> Result<github::PendingCommentReceipt, github::ClientError> {
             assert_eq!(review.id, 91);
             let comment = github::PendingComment {
                 id: 12,
@@ -14217,7 +14275,10 @@ mod tests {
                 .unwrap()
                 .comments
                 .push(comment.clone());
-            Ok(comment)
+            Ok(github::PendingCommentReceipt {
+                comment,
+                thread_id: None,
+            })
         }
 
         fn add_pending_reply(
@@ -14226,7 +14287,7 @@ mod tests {
             review: &github::PendingReview,
             comment_id: u64,
             body: &str,
-        ) -> Result<github::PendingComment, github::ClientError> {
+        ) -> Result<github::PendingCommentReceipt, github::ClientError> {
             assert_eq!(review.id, 91);
             let parent = self
                 .comments
@@ -14256,7 +14317,10 @@ mod tests {
                 .unwrap()
                 .comments
                 .push(comment.clone());
-            Ok(comment)
+            Ok(github::PendingCommentReceipt {
+                comment,
+                thread_id: None,
+            })
         }
 
         fn edit_pending_comment(
@@ -14407,7 +14471,7 @@ mod tests {
             side: &str,
             line: u64,
             body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             if self.pending.lock().unwrap().is_some() {
                 return Err(github::ClientError::Failed(
                     "pending review already exists".into(),
@@ -14437,7 +14501,30 @@ mod tests {
                 "2026-10-22T00:00:00Z",
                 None,
             ));
-            Ok(())
+            self.comment_permissions.lock().unwrap().insert(
+                id,
+                github::CommentPermissions {
+                    node_id: format!("fake-created-{id}"),
+                    ..Default::default()
+                },
+            );
+            Ok(fake_receipt(
+                id,
+                body,
+                Some(github::CommentAnchor {
+                    path: path.into(),
+                    commit_id: commit_id.into(),
+                    side: if side == "LEFT" {
+                        CommentSide::Left
+                    } else {
+                        CommentSide::Right
+                    },
+                    line,
+                    start_line: None,
+                    position: None,
+                }),
+                None,
+            ))
         }
 
         fn post_reply(
@@ -14445,7 +14532,7 @@ mod tests {
             _loc: &github::PrLocator,
             comment_id: u64,
             body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             if self.pending.lock().unwrap().is_some() {
                 return Err(github::ClientError::Failed(
                     "pending review already exists".into(),
@@ -14472,7 +14559,14 @@ mod tests {
                 "2026-10-22T00:00:00Z",
                 Some(comment_id),
             ));
-            Ok(())
+            self.comment_permissions.lock().unwrap().insert(
+                id,
+                github::CommentPermissions {
+                    node_id: format!("fake-created-{id}"),
+                    ..Default::default()
+                },
+            );
+            Ok(fake_receipt(id, body, None, Some(comment_id)))
         }
 
         fn submit_review(
@@ -16592,6 +16686,21 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let (window, app) = queue_window(cx, fake.clone());
         install_item(&app, commenting_item(&fake), cx);
+        // Seed the same confirmed cache as a normal initial fetch. Rejected
+        // post-write stale reads must leave it unchanged, not write it anew.
+        cx.update(|cx| {
+            app.update(cx, |app, _| {
+                let data = app.active_data().unwrap();
+                let snapshot = review_target::discussion_snapshot(
+                    &loop_loc(),
+                    data.pr_meta.as_ref().unwrap(),
+                    data.discussion.as_ref().unwrap(),
+                    None,
+                )
+                .unwrap();
+                app.store.save_snapshot(&snapshot);
+            })
+        });
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
         click_commenting(
             &mut vcx,
@@ -17082,8 +17191,8 @@ mod tests {
     ) {
         for fail in [false, true] {
             for reply in [false, true] {
-                // Replies exercise run_session; immediate comments have a
-                // separate completion handler. Test success and failure in both.
+                // Both replies and immediate comments use run_session. Keep
+                // success and failure coverage for each command variant.
                 let fake = FakePr::with_threads(vec![rc(
                     11,
                     "a.rs",
