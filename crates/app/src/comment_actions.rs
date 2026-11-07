@@ -52,7 +52,11 @@ fn node_id(target: &github::CommentTarget) -> &str {
 }
 
 /// Preserve the uniform-list contract while an editor replaces a comment body.
-pub(crate) fn reserve_editor_rows(built: &mut BuiltRows, id: u64, count: usize) {
+pub(crate) fn reserve_editor_rows(
+    built: &mut BuiltRows,
+    id: crate::comments::CommentKey,
+    count: usize,
+) {
     let Some(header) = built
         .rows
         .iter()
@@ -100,13 +104,17 @@ impl ReviewApp {
         self.active_comment_projection()?.published(target)
     }
 
-    pub(crate) fn diff_comment_target(&self, id: u64) -> Option<CommentTarget> {
+    pub(crate) fn diff_comment_target(
+        &self,
+        key: crate::comments::CommentKey,
+    ) -> Option<CommentTarget> {
+        let id = self.active_comment_projection()?.remote_id(key)?;
         let data = self.active_data()?;
         if let Some(local) = &data.local_review {
             return local
                 .comments
                 .iter()
-                .any(|c| c.id == id)
+                .any(|c| c.id == crate::comments::CommentKey::Inline(id))
                 .then_some(CommentTarget::Local(id));
         }
         match self.active_comment_projection()?.inline(id)? {
@@ -136,7 +144,12 @@ impl ReviewApp {
                 let exists = self
                     .active_data()
                     .and_then(|data| data.local_review.as_ref())
-                    .is_some_and(|review| review.comments.iter().any(|c| c.id == *id));
+                    .is_some_and(|review| {
+                        review
+                            .comments
+                            .iter()
+                            .any(|c| c.id == crate::comments::CommentKey::Inline(*id))
+                    });
                 (exists, exists)
             }
         }
@@ -153,7 +166,7 @@ impl ReviewApp {
             return div().into_any_element();
         };
         let item_id = item.id;
-        let busy = self.sessions.get(&item_id).is_some_and(|ui| ui.busy);
+        let busy = self.comment_write_blocked(item_id);
         let key = target.key();
         let mut controls = div()
             .flex()
@@ -231,7 +244,7 @@ impl ReviewApp {
         let Some(item) = self.active_item() else {
             return;
         };
-        if self.sessions.get(&item.id).is_some_and(|ui| ui.busy) {
+        if self.comment_write_blocked(item.id) {
             return;
         }
         let (id, path, side, line, start_line, body) = match &target {
@@ -259,10 +272,10 @@ impl ReviewApp {
                     .unwrap()
                     .comments
                     .iter()
-                    .find(|c| c.id == *id)
+                    .find(|c| c.id == crate::comments::CommentKey::Inline(*id))
                     .unwrap();
                 (
-                    c.id,
+                    *id,
                     c.path.clone(),
                     c.side,
                     c.line,
@@ -313,7 +326,7 @@ impl ReviewApp {
                     data.rebuild_rows_anchored();
                 }
                 if let Some(ix) = data.rows.iter().position(
-                    |row| matches!(row, Row::CommentHeader { comment_id, .. } if *comment_id == id),
+                    |row| matches!(row, Row::CommentHeader { comment_id, .. } if data.posts.remote_id(*comment_id) == Some(id)),
                 ) {
                     row_ix = ix;
                 } else {
@@ -403,7 +416,7 @@ impl ReviewApp {
         let Some(item_id) = self.active_item().map(|item| item.id) else {
             return;
         };
-        if self.sessions.get(&item_id).is_some_and(|ui| ui.busy) {
+        if self.comment_write_blocked(item_id) {
             return;
         }
         match target {
@@ -428,18 +441,20 @@ impl ReviewApp {
                         let parent = local
                             .comments
                             .iter()
-                            .find(|c| c.id == id)
+                            .find(|c| c.id == crate::comments::CommentKey::Inline(id))
                             .and_then(|c| c.in_reply_to_id);
                         let replacement = parent.or_else(|| {
                             local
                                 .comments
                                 .iter()
-                                .find(|c| c.in_reply_to_id == Some(id))
+                                .find(|c| c.in_reply_to_id == Some(id.into()))
                                 .map(|c| c.id)
                         });
-                        local.comments.retain(|c| c.id != id);
+                        local
+                            .comments
+                            .retain(|c| c.id != crate::comments::CommentKey::Inline(id));
                         for c in &mut local.comments {
-                            if c.in_reply_to_id == Some(id) {
+                            if c.in_reply_to_id == Some(id.into()) {
                                 c.in_reply_to_id =
                                     replacement.filter(|replacement| *replacement != c.id);
                             }
@@ -504,6 +519,7 @@ impl ReviewApp {
             }
             _ => update(&mut discussion.comments),
         }
+        data.posts.reconcile(discussion);
         data.project_comments(
             self.sessions
                 .get(&item_id)

@@ -11,6 +11,7 @@ pub(crate) enum CommentTime {
     Posted(String),
     Draft,
     Pending,
+    Posting(super::posting::Status, bool),
 }
 
 impl CommentTime {
@@ -18,6 +19,7 @@ impl CommentTime {
         match self {
             Self::Posted(raw) => raw,
             Self::Draft | Self::Pending => "draft",
+            Self::Posting(_, _) => "posting",
         }
     }
 
@@ -25,15 +27,16 @@ impl CommentTime {
         match self {
             Self::Posted(raw) => crate::threads::short_age(raw, now),
             Self::Draft | Self::Pending => "draft".to_string(),
+            Self::Posting(status, _) => status.label().into(),
         }
     }
 }
 
-/// A comment used by the app. Local drafts and PR comments live in separate
-/// item collections, so their numeric identities never need to be combined.
+/// A card used by the app. Its identity is a stable UI key, not an API target;
+/// rendering adapters resolve confirmed remote identities through the projection.
 #[derive(Clone, Debug)]
 pub(crate) struct ReviewComment {
-    pub(crate) id: u64,
+    pub(crate) id: super::CommentKey,
     pub(crate) path: String,
     pub(crate) line: Option<u64>,
     pub(crate) side: CommentSide,
@@ -41,14 +44,14 @@ pub(crate) struct ReviewComment {
     pub(crate) body: String,
     pub(crate) author: String,
     pub(crate) time: CommentTime,
-    pub(crate) in_reply_to_id: Option<u64>,
+    pub(crate) in_reply_to_id: Option<super::CommentKey>,
 }
 
 impl From<github::ReviewComment> for ReviewComment {
     fn from(comment: github::ReviewComment) -> Self {
         let position = crate::comment_anchor::display_line(comment.line, comment.start_line);
         Self {
-            id: comment.id,
+            id: super::CommentKey::Inline(comment.id),
             path: comment.path,
             line: position.map(|(_, line)| line),
             side: if comment.side.as_deref() == Some("LEFT") {
@@ -60,7 +63,7 @@ impl From<github::ReviewComment> for ReviewComment {
             body: comment.body,
             author: comment.user.login,
             time: CommentTime::Posted(comment.created_at),
-            in_reply_to_id: comment.in_reply_to_id,
+            in_reply_to_id: comment.in_reply_to_id.map(super::CommentKey::Inline),
         }
     }
 }
@@ -140,7 +143,7 @@ pub(crate) fn assemble_threads(mut comments: Vec<ReviewComment>) -> Vec<CommentT
     let mut threads: Vec<CommentThread> = Vec::new();
     // Comment id (root or reply) → thread index, so replies-to-replies still
     // land in the right thread.
-    let mut thread_of: HashMap<u64, usize> = HashMap::new();
+    let mut thread_of: HashMap<super::CommentKey, usize> = HashMap::new();
     for comment in comments {
         match comment.in_reply_to_id {
             None => {

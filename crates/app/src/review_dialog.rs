@@ -114,7 +114,9 @@ impl ReviewApp {
                             .label(submit_label)
                             .primary()
                             .small()
-                            .disabled(busy || uploading)
+                            .disabled(
+                                busy || uploading || self.comment_write_blocked(review.item_id),
+                            )
                             .loading(busy)
                             .on_click(
                                 cx.listener(|app, _, window, cx| app.submit_review(window, cx)),

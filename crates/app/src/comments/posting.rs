@@ -1,9 +1,10 @@
-//! Transient Conversation posts and exact-receipt identity aliases.
+//! Transient comment creates, recovery payloads and exact-receipt identity aliases.
 //! Never written to the GitHub cache; no remote identities are fabricated.
 
 use github::{DiscussionComment, PrDiscussion};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+#[derive(Clone)]
 pub(crate) struct Post {
     pub token: u64,
     pub reply_to: Option<u64>,
@@ -11,12 +12,18 @@ pub(crate) struct Post {
     pub body: String,
     pub status: Status,
     receipt: Option<u64>,
+    pub anchor: Option<github::CommentAnchor>,
+    pub context: Vec<String>,
+    pub pending: bool,
+    pub command: Option<github::review_session::Command>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Status {
     Posting,
     Syncing,
+    Unverified,
 }
 
 impl Status {
@@ -24,6 +31,7 @@ impl Status {
         match self {
             Self::Posting => "Posting…",
             Self::Syncing => "Posted · syncing…",
+            Self::Unverified => "Unverified · check GitHub before retrying",
         }
     }
 }
@@ -31,12 +39,18 @@ impl Status {
 #[derive(Default)]
 pub(crate) struct Posts {
     pub pending: Vec<Post>,
+    pub roots: Vec<Post>,
+    pub failed: Vec<Post>,
     // Retain the view identity after loading, so markdown/media update in place.
     loaded: HashMap<super::CommentKey, super::CommentKey>,
+    authors: HashMap<super::CommentKey, String>,
+    public: HashSet<super::CommentKey>,
 }
 
 impl Posts {
     pub fn begin(&mut self, token: u64, reply_to: Option<u64>, author: String, body: String) {
+        self.authors
+            .insert(super::CommentKey::Post(token), author.clone());
         self.pending.push(Post {
             token,
             reply_to,
@@ -44,9 +58,15 @@ impl Posts {
             author,
             body,
             status: Status::Posting,
+            anchor: None,
+            context: Vec::new(),
+            pending: false,
+            command: None,
+            error: None,
         });
     }
 
+    #[cfg(test)]
     pub fn complete(&mut self, token: u64, receipt: Option<u64>) {
         // A failure keeps the composer retryable; a saved draft is already in
         // the review session. Neither should leave an optimistic published card.
@@ -61,31 +81,171 @@ impl Posts {
     }
 
     pub fn reconcile(&mut self, discussion: &PrDiscussion) {
+        let mut roots = Vec::new();
         self.pending.retain(|post| {
             let Some(id) = post.receipt else {
                 return true;
             };
             let found = match post.reply_to {
-                None => discussion
+                None if post.anchor.is_none() => discussion
                     .comments
                     .iter()
                     .any(|c| c.id == id && c.review_state.is_none()),
+                None => discussion
+                    .threads
+                    .iter()
+                    .any(|thread| thread.comments.first().is_some_and(|c| c.id == id)),
                 Some(root) => discussion.threads.iter().any(|thread| {
                     thread.comments.first().is_some_and(|c| c.id == root)
                         && thread.comments.iter().any(|c| c.id == id)
                 }),
             };
             if found {
-                let remote = if post.reply_to.is_some() {
+                let remote = if post.anchor.is_some() || post.reply_to.is_some() {
                     super::CommentKey::Inline(id)
                 } else {
                     super::CommentKey::Issue(id)
                 };
                 self.loaded
                     .insert(remote, super::CommentKey::Post(post.token));
+                if post.anchor.is_some() && post.reply_to.is_none() && !post.pending {
+                    roots.push(post.clone());
+                }
             }
             !found
         });
+        self.roots.extend(roots);
+        self.roots.retain(|post| {
+            discussion.threads.iter().any(|t| {
+                t.comments
+                    .first()
+                    .is_some_and(|c| Some(c.id) == post.receipt)
+            })
+        });
+    }
+
+    pub fn begin_create(
+        &mut self,
+        token: u64,
+        command: github::review_session::Command,
+        anchor: Option<github::CommentAnchor>,
+        pending: bool,
+        author: String,
+        body: String,
+        reply_to: Option<u64>,
+    ) {
+        self.begin(token, reply_to, author, body);
+        let post = self.pending.last_mut().unwrap();
+        post.command = Some(command);
+        post.anchor = anchor;
+        post.pending = pending;
+        if !pending {
+            self.public.insert(super::CommentKey::Post(token));
+        }
+    }
+
+    pub fn finish_create(
+        &mut self,
+        token: u64,
+        result: &Result<github::MutationReceipt, github::ClientError>,
+    ) {
+        let Some(ix) = self.pending.iter().position(|p| p.token == token) else {
+            return;
+        };
+        match result {
+            Ok(receipt) => {
+                let post = &mut self.pending[ix];
+                post.status = Status::Syncing;
+                let remote = match receipt {
+                    github::MutationReceipt::PublishedCreated(c) => {
+                        self.public.insert(super::CommentKey::Post(token));
+                        post.receipt = Some(c.id);
+                        if let Some(body) = &c.body {
+                            post.body = body.clone();
+                        }
+                        if let Some(author) = &c.author {
+                            post.author = author.clone();
+                        }
+                        if let Some(anchor) = &c.anchor {
+                            post.anchor = Some(anchor.clone());
+                        }
+                        post.pending = false;
+                        if post.anchor.is_some() || post.reply_to.is_some() {
+                            super::CommentKey::Inline(c.id)
+                        } else {
+                            super::CommentKey::Issue(c.id)
+                        }
+                    }
+                    github::MutationReceipt::PendingCreated { created, .. } => {
+                        post.pending = true;
+                        self.public.remove(&super::CommentKey::Post(token));
+                        self.loaded.insert(
+                            super::CommentKey::Inline(created.comment.id),
+                            super::CommentKey::Post(token),
+                        );
+                        super::CommentKey::Pending(created.comment.id)
+                    }
+                    _ => return,
+                };
+                self.loaded.insert(remote, super::CommentKey::Post(token));
+                if matches!(receipt, github::MutationReceipt::PendingCreated { .. }) {
+                    self.pending.remove(ix);
+                }
+            }
+            Err(error) if error.mutation_is_uncertain() => {
+                let post = &mut self.pending[ix];
+                post.status = Status::Unverified;
+                post.error = Some(error.to_string());
+            }
+            Err(error) => {
+                let mut post = self.pending.remove(ix);
+                post.error = Some(error.to_string());
+                self.failed.push(post);
+            }
+        }
+    }
+
+    pub fn has_uncertain(&self) -> bool {
+        self.pending.iter().any(|p| p.status == Status::Unverified)
+    }
+
+    pub fn remote_id(&self, key: super::CommentKey) -> Option<u64> {
+        match key {
+            super::CommentKey::Inline(id) | super::CommentKey::Pending(id) => Some(id),
+            super::CommentKey::Post(_) => self.loaded.iter().find_map(|(remote, local)| {
+                if *local != key {
+                    return None;
+                }
+                match remote {
+                    super::CommentKey::Inline(id) | super::CommentKey::Pending(id) => Some(*id),
+                    _ => None,
+                }
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn reserve_reactions(&self, key: super::CommentKey) -> bool {
+        self.public.contains(&key)
+    }
+
+    pub fn author(&self, key: super::CommentKey) -> Option<&str> {
+        self.authors.get(&key).map(String::as_str)
+    }
+
+    pub fn alias(&self, remote: super::CommentKey) -> super::CommentKey {
+        self.loaded.get(&remote).copied().unwrap_or(remote)
+    }
+
+    pub fn root_id(&self, post: &Post) -> Option<u64> {
+        post.receipt
+    }
+
+    pub fn root_shell(&self, id: u64) -> Option<&Post> {
+        self.roots
+            .iter()
+            .chain(&self.pending)
+            .find(|p| p.anchor.is_some() && p.reply_to.is_none() && p.receipt == Some(id))
     }
 
     pub fn identity(&self, comment: &DiscussionComment, inline: bool) -> super::CommentKey {

@@ -15,7 +15,10 @@ use crate::{
 
 /// Keep only the root header for collapsed threads. Remap navigation indices
 /// alongside the rows so file/hunk jumps and the minimap stay aligned.
-pub(crate) fn collapse_threads(built: &mut BuiltRows, collapsed: &HashSet<u64>) {
+pub(crate) fn collapse_threads(
+    built: &mut BuiltRows,
+    collapsed: &HashSet<crate::comments::CommentKey>,
+) {
     if collapsed.is_empty() {
         return;
     }
@@ -104,7 +107,7 @@ impl ReviewApp {
             thread_id: thread.id.clone(),
             resolved: !thread.is_resolved,
         };
-        if self.sessions.get(&item_id).is_some_and(|ui| ui.busy) {
+        if self.comment_write_blocked(item_id) {
             return;
         }
         self.run_session(item_id, command, SessionCompletion::None, window, cx);
@@ -120,7 +123,7 @@ impl ReviewApp {
     ) -> gpui::AnyElement {
         let item = self.items.iter().find(|item| item.id == item_id);
         let busy = item.is_none_or(|item| item.reloading)
-            || self.sessions.get(&item_id).is_some_and(|ui| ui.busy)
+            || self.comment_write_blocked(item_id)
             || self.composer().is_some()
             || self.review.is_some();
         let mut controls = div()
@@ -216,12 +219,18 @@ impl ReviewApp {
 
     pub(crate) fn diff_comment_controls(
         &self,
-        id: u64,
+        key: crate::comments::CommentKey,
         top: bool,
         entity: &gpui::Entity<Self>,
         cx: &gpui::App,
     ) -> gpui::AnyElement {
         let mut controls = div().flex().items_center().gap_2();
+        let Some(id) = self
+            .active_comment_projection()
+            .and_then(|p| p.remote_id(key))
+        else {
+            return controls.into_any_element();
+        };
         if top {
             if let Some(item) = self.active_item() {
                 if let ItemState::Ready(data) = &item.state {
@@ -236,7 +245,7 @@ impl ReviewApp {
                 }
             }
         }
-        if let Some(target) = self.diff_comment_target(id) {
+        if let Some(target) = self.diff_comment_target(key) {
             controls = controls.child(self.comment_controls(
                 target,
                 crate::ComposerPlacement::Diff,

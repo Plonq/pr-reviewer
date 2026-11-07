@@ -9,7 +9,7 @@ use gpui::component::{
     button::{Button, ButtonVariants as _},
     tag::Tag,
     tooltip::Tooltip,
-    ActiveTheme as _, Sizable as _,
+    ActiveTheme as _, Disableable as _, Sizable as _,
 };
 use gpui::{div, prelude::*, px, HighlightStyle, Hsla, SharedString, StyledText};
 use std::collections::HashMap;
@@ -89,7 +89,7 @@ pub(crate) enum Row {
     /// like headers. In split mode `half` places the card in the pane the
     /// comment was left on (LEFT/RIGHT, like GitHub); None spans full width.
     CommentHeader {
-        comment_id: u64,
+        comment_id: crate::comments::CommentKey,
         author: SharedString,
         when: SharedString,
         /// Full posted time for hover; local and pending drafts have no date.
@@ -111,7 +111,7 @@ pub(crate) enum Row {
     },
     /// Published reaction controls below this comment's Markdown body.
     CommentReactions {
-        comment_id: u64,
+        comment_id: crate::comments::CommentKey,
         half: Option<CommentSide>,
     },
     /// Space for the root-level editor, replacing this comment's body in place.
@@ -121,7 +121,7 @@ pub(crate) enum Row {
     /// The "↳ reply" affordance closing a thread; clicking opens the
     /// composer targeting `post_reply` on the thread's root comment.
     CommentActions {
-        root_id: u64,
+        root_id: crate::comments::CommentKey,
         path: SharedString,
         side: CommentSide,
         line: u64,
@@ -268,7 +268,7 @@ fn push_thread_rows(
                 when: comment.time.short_age(now).into(),
                 timestamp: match &comment.time {
                     CommentTime::Posted(raw) => Some(raw.clone().into()),
-                    CommentTime::Draft | CommentTime::Pending => None,
+                    CommentTime::Draft | CommentTime::Pending | CommentTime::Posting(_, _) => None,
                 },
                 is_reply: ix > 0,
                 half,
@@ -297,7 +297,9 @@ fn push_thread_rows(
         }
         // Pending threads are edited/deleted in the review tray, not replied
         // to through the immediate-comment endpoint. Local drafts still reply.
-        if thread.root.time == CommentTime::Pending {
+        if thread.root.time == CommentTime::Pending
+            || matches!(thread.root.time, CommentTime::Posting(_, true))
+        {
             continue;
         }
         rows.push(Row::CommentActions {
@@ -1476,15 +1478,32 @@ fn render_row_content(
             let path = path.clone();
             let entity = entity.clone();
             comment_row(
-                Button::new(("reply", root_id as usize))
+                Button::new(SharedString::from(format!("reply-{root_id}")))
                     .ghost()
                     .xsmall()
                     .h(row_height)
                     .label("↳ reply")
+                    .disabled(
+                        entity
+                            .read(cx)
+                            .active_comment_projection()
+                            .and_then(|p| p.remote_id(root_id))
+                            .is_none()
+                            || entity
+                                .read(cx)
+                                .active_item()
+                                .is_some_and(|i| entity.read(cx).comment_write_blocked(i.id)),
+                    )
                     .on_click(move |_, window, cx| {
                         entity.update(cx, |this, cx| {
+                            let Some(remote_id) = this
+                                .active_comment_projection()
+                                .and_then(|p| p.remote_id(root_id))
+                            else {
+                                return;
+                            };
                             this.open_composer(
-                                Some(root_id),
+                                Some(remote_id),
                                 path.to_string(),
                                 side,
                                 line,
@@ -1841,7 +1860,7 @@ mod tests {
             ));
             assert!(matches!(
                 comment_body_edge(Some(&Row::CommentReactions {
-                    comment_id: 3,
+                    comment_id: crate::comments::CommentKey::Inline(3),
                     half: None
                 })),
                 CardEdge::Middle
@@ -2602,10 +2621,20 @@ mod tests {
             assert_eq!(
                 headers,
                 vec![
-                    (1, "2m ago", Some(posted), false),
-                    (2, "2m ago", Some(posted), true),
-                    (3, "draft", None, false),
-                    (4, "draft", None, false),
+                    (
+                        crate::comments::CommentKey::Inline(1),
+                        "2m ago",
+                        Some(posted),
+                        false
+                    ),
+                    (
+                        crate::comments::CommentKey::Inline(2),
+                        "2m ago",
+                        Some(posted),
+                        true
+                    ),
+                    (crate::comments::CommentKey::Inline(3), "draft", None, false),
+                    (crate::comments::CommentKey::Inline(4), "draft", None, false),
                 ]
             );
         }
@@ -2877,11 +2906,21 @@ mod tests {
                 .collect();
             assert_eq!(
                 bodies,
-                [(1, body), (2, "<img src='https://example.com/a.svg'>")]
+                [
+                    (crate::comments::CommentKey::Inline(1), body),
+                    (
+                        crate::comments::CommentKey::Inline(2),
+                        "<img src='https://example.com/a.svg'>"
+                    )
+                ]
             );
-            assert!(rows
-                .iter()
-                .any(|row| matches!(row, Row::CommentActions { root_id: 1, .. })));
+            assert!(rows.iter().any(|row| matches!(
+                row,
+                Row::CommentActions {
+                    root_id: crate::comments::CommentKey::Inline(1),
+                    ..
+                }
+            )));
         }
     }
 
@@ -3165,7 +3204,12 @@ mod tests {
             } => {
                 assert_eq!(
                     (*root_id, path.as_ref(), *side, *line),
-                    (1, "a.rs", CommentSide::Right, 1)
+                    (
+                        crate::comments::CommentKey::Inline(1),
+                        "a.rs",
+                        CommentSide::Right,
+                        1
+                    )
                 );
             }
             other => panic!("expected actions row, got {}", row_name(other)),
@@ -3208,7 +3252,12 @@ mod tests {
             } => {
                 assert_eq!(
                     (*root_id, path.as_ref(), *side, *line),
-                    (2, "b.rs", CommentSide::Left, 1)
+                    (
+                        crate::comments::CommentKey::Inline(2),
+                        "b.rs",
+                        CommentSide::Left,
+                        1
+                    )
                 );
             }
             other => panic!("expected actions row, got {}", row_name(other)),

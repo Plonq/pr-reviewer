@@ -576,6 +576,130 @@ impl ReviewApp {
                             .into_any_element(),
                     );
                 }
+                Entry::CreatedThread(post, comments) => {
+                    let anchor = post.anchor.as_ref().expect("inline root anchor");
+                    let key = format!("created-thread-{}-{}", item.id, post.token);
+                    let confirmed = data.discussion.as_ref().and_then(|d| {
+                        d.threads.iter().find(|t| {
+                            t.comments
+                                .first()
+                                .is_some_and(|c| data.posts.root_id(post) == Some(c.id))
+                        })
+                    });
+                    let composing = self.composer().is_some_and(|c| {
+                        c.item_id == item.id
+                            && confirmed.is_some_and(|t| {
+                                c.placement == ComposerPlacement::ConversationThread(t.id.clone())
+                                    || comments.iter().any(|comment| match comment {
+                                        Comment::Published(comment) => {
+                                            c.placement
+                                                == ComposerPlacement::ConversationComment(
+                                                    crate::comment_actions::published_target(
+                                                        "review", comment,
+                                                    )
+                                                    .key(),
+                                                )
+                                        }
+                                        Comment::Pending(comment) => {
+                                            c.placement
+                                                == ComposerPlacement::ConversationComment(
+                                                    crate::CommentTarget::Pending(comment.id).key(),
+                                                )
+                                        }
+                                        _ => false,
+                                    })
+                            })
+                    });
+                    let expanded = composing
+                        || confirmed.is_none_or(|t| {
+                            !t.is_resolved || data.expanded_threads.contains(&t.id)
+                        });
+                    let mut location = div().h_6().flex().items_center().gap_2().child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_color(theme::subtext(cx))
+                            .child(format!(
+                                "{}:{}{} · {}",
+                                anchor.path,
+                                anchor
+                                    .start_line
+                                    .map(|n| format!("{n}–"))
+                                    .unwrap_or_default(),
+                                anchor.line,
+                                if anchor.side == CommentSide::Left {
+                                    "old"
+                                } else {
+                                    "new"
+                                }
+                            )),
+                    );
+                    if let Some(thread) = confirmed {
+                        location = location.child(self.thread_controls(
+                            item.id,
+                            thread,
+                            true,
+                            &cx.entity(),
+                            cx,
+                        ));
+                    }
+                    let mut card = timeline_comment_card(cx)
+                        .id(SharedString::from(key.clone()))
+                        .debug_selector(move || key.clone())
+                        .child(location);
+                    if expanded {
+                        // Freeze the known revision's bounded context in the local
+                        // shell; acknowledgement must not move it to a review wrapper.
+                        card = card.child(
+                            div()
+                                .h(px(3. * crate::row_height()))
+                                .overflow_hidden()
+                                .font_family(crate::MONO)
+                                .text_size(px(text_size()))
+                                .children(post.context.iter().map(|line| {
+                                    div()
+                                        .h(px(crate::row_height()))
+                                        .whitespace_nowrap()
+                                        .child(line.clone())
+                                })),
+                        );
+                        for (ix, comment) in comments.into_iter().enumerate() {
+                            card = card.child(
+                                div()
+                                    .when(ix > 0, |row| {
+                                        row.pl(px(crate::threads::REPLY_INDENT)).mt_3()
+                                    })
+                                    .child(self.discussion_comment(
+                                        item.id, "review", comment, &slug, window, cx,
+                                    )),
+                            );
+                        }
+                        if let Some(thread) = confirmed {
+                            card =
+                                card.child(div().min_h(px(32.)).child(self.conversation_composer(
+                                    item.id,
+                                    Some(thread),
+                                    cx,
+                                )));
+                        } else {
+                            card = card.child(
+                                div()
+                                    .h_8()
+                                    .text_color(theme::overlay0(cx))
+                                    .child("↳ reply available after syncing"),
+                            );
+                        }
+                    }
+                    elements.push(
+                        div()
+                            .relative()
+                            .pl(px(TIMELINE_INDENT))
+                            .child(card)
+                            .into_any_element(),
+                    );
+                }
                 Entry::Thread(thread) => elements.push(
                     div()
                         .relative()
@@ -877,31 +1001,11 @@ impl ReviewApp {
             }) {
                 return self.render_composer_card(cx);
             }
-            return div()
-                .child(
-                    div()
-                        .debug_selector(|| format!("conversation-draft-{item_id}-{}", draft.id))
-                        .mb_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_color(theme::yellow(cx))
-                        .child(
-                            div()
-                                .flex_1()
-                                .child("Pending reply · only you can see this"),
-                        )
-                        .child(self.comment_controls(target, placement, &cx.entity())),
-                )
-                .child(render_markdown(
-                    &format!("conversation-draft-{item_id}-{}", draft.id),
-                    preprocess(&draft.body, slug),
-                    self,
-                    window,
-                    cx,
-                ))
-                .into_any_element();
         }
+        let pending_author = match &self.account {
+            crate::AccountStatus::SignedIn(viewer) => viewer.login.as_str(),
+            _ => "you",
+        };
         let (author, body, timestamp, heading, target) = match projected {
             Comment::Published(comment) => (
                 comment.author.as_str(),
@@ -914,10 +1018,21 @@ impl ReviewApp {
                 post.author.as_str(),
                 post.body.as_str(),
                 post.status.label().to_owned(),
-                format!("{} · {}", post.author, post.status.label()),
+                format!(
+                    "{} · {}{}",
+                    post.author,
+                    if post.pending { "Pending · " } else { "" },
+                    post.status.label()
+                ),
                 None,
             ),
-            Comment::Pending(_) => unreachable!(),
+            Comment::Pending(draft) => (
+                pending_author,
+                draft.body.as_str(),
+                "Pending reply · only you can see this".into(),
+                format!("{pending_author} · Pending reply · only you can see this"),
+                Some(crate::CommentTarget::Pending(draft.id)),
+            ),
         };
         let controls = target.clone().map(|target| {
             let placement = ComposerPlacement::ConversationComment(target.key());
@@ -930,27 +1045,35 @@ impl ReviewApp {
         }) {
             return self.render_composer_card(cx);
         }
-        let key = self
+        let (key, reserve_reactions) = self
             .items
             .iter()
             .find(|item| item.id == item_id)
             .and_then(|item| {
                 if let ItemState::Ready(data) = &item.state {
-                    Some(
-                        data.comment_projection(None)
-                            .key(projected, kind == "review")
-                            .markdown_key(),
-                    )
+                    let key = data
+                        .comment_projection(None)
+                        .key(projected, kind == "review");
+                    Some((key.markdown_key(), data.posts.reserve_reactions(key)))
                 } else {
                     None
                 }
             })
             .expect("discussion cards belong to an open item");
+        let markdown_id = match projected {
+            Comment::Pending(draft) if key == format!("draft-{}", draft.id) => {
+                format!("conversation-draft-{item_id}-{}", draft.id)
+            }
+            _ => format!("discussion-{item_id}-{key}"),
+        };
         let controls = controls
             .map(|(target, placement)| self.comment_controls(target, placement, &cx.entity()));
         let mut card = div()
             .id(SharedString::from(format!("discussion-{item_id}-{key}")))
-            .debug_selector(|| format!("discussion-{item_id}-{key}"))
+            .debug_selector(|| match projected {
+                Comment::Pending(draft) => format!("conversation-draft-{item_id}-{}", draft.id),
+                _ => format!("discussion-{item_id}-{key}"),
+            })
             .w_full()
             .min_w_0()
             .child(
@@ -969,6 +1092,9 @@ impl ReviewApp {
                         div()
                             .id("heading")
                             .flex_1()
+                            .when(key.starts_with("post-"), |heading| {
+                                heading.min_w_0().whitespace_nowrap().overflow_hidden()
+                            })
                             .child(StyledText::new(heading).with_highlights([(
                                 0..author.len(),
                                 HighlightStyle {
@@ -985,26 +1111,34 @@ impl ReviewApp {
             );
         if markdown::has_content(body) {
             card = card.child(render_markdown(
-                &format!("discussion-{item_id}-{key}"),
+                &markdown_id,
                 preprocess(body, slug),
                 self,
                 window,
                 cx,
             ));
         }
-        if let Comment::Published(comment) = projected {
-            if comment.review_state.is_none()
-                && (comment.reactions.iter().any(|r| r.count > 0)
-                    || (comment.permissions.can_react && !comment.permissions.node_id.is_empty()))
+        let reaction_controls = match (projected, target) {
+            (Comment::Published(comment), Some(crate::CommentTarget::Published(target)))
+                if comment.review_state.is_none()
+                    && (comment.reactions.iter().any(|r| r.count > 0)
+                        || (comment.permissions.can_react
+                            && !comment.permissions.node_id.is_empty())) =>
             {
-                if let Some(crate::CommentTarget::Published(target)) = target {
-                    card = card.child(div().mt_3().child(self.comment_reactions(
-                        target,
-                        comment,
-                        &cx.entity(),
-                    )));
-                }
+                Some(self.comment_reactions(target, comment, &cx.entity()))
             }
+            _ => None,
+        };
+        if reserve_reactions {
+            card = card.child(
+                div()
+                    .mt_3()
+                    .h_6()
+                    .overflow_hidden()
+                    .children(reaction_controls),
+            );
+        } else if let Some(controls) = reaction_controls {
+            card = card.child(div().mt_3().child(controls));
         }
         card.into_any_element()
     }

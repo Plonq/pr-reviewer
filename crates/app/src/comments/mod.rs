@@ -2,11 +2,12 @@
 //! with its existing owners; transient posts, identity aliases and read/write
 //! reconciliation barriers live here.
 //!
-//! Surface adapters deliberately preserve today's visibility: Conversation shows
-//! published entries and pending replies; the tray also shows pending roots;
-//! Changes indexes confirmed published/pending inline comments, not in-flight
-//! Conversation posts. No projected data is passed to the persistence layer.
+//! Conversation shows published entries and pending replies; the tray also shows
+//! pending roots. Inline creation overlays feed all applicable surfaces from the
+//! same projection. No projected data is passed to the persistence layer.
 
+#[cfg(test)]
+mod creation_tests;
 pub(crate) mod index;
 pub(crate) mod posting;
 pub(crate) mod sync;
@@ -18,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 /// UI identity is not an API target. In particular local post tokens never
 /// occupy a reserved numeric range of GitHub comment IDs.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum CommentKey {
     Issue(u64),
     Review(u64),
@@ -43,6 +44,28 @@ impl CommentKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ThreadKey(pub String);
 
+impl From<u64> for CommentKey {
+    fn from(id: u64) -> Self {
+        Self::Inline(id)
+    }
+}
+#[cfg(test)]
+impl PartialEq<u64> for CommentKey {
+    fn eq(&self, id: &u64) -> bool {
+        matches!(self, Self::Inline(n) | Self::Pending(n) if n == id)
+    }
+}
+impl std::fmt::Display for CommentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inline(id) | Self::Pending(id) | Self::Issue(id) | Self::Review(id) => {
+                write!(f, "{id}")
+            }
+            Self::Post(token) => write!(f, "post-{token}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Comment<'a> {
     Published(&'a DiscussionComment),
@@ -63,6 +86,7 @@ pub(crate) enum Entry<'a> {
     Comment(Comment<'a>),
     Review(&'a DiscussionComment, Vec<Thread<'a>>),
     Thread(Thread<'a>),
+    CreatedThread(&'a posting::Post, Vec<Comment<'a>>),
 }
 
 pub(crate) struct Projection<'a> {
@@ -120,7 +144,7 @@ impl<'a> Projection<'a> {
 
     pub fn key(&self, comment: Comment<'_>, inline: bool) -> CommentKey {
         match comment {
-            Comment::Pending(c) => CommentKey::Pending(c.id),
+            Comment::Pending(c) => self.posts.alias(CommentKey::Pending(c.id)),
             Comment::Posting(post) => CommentKey::Post(post.token),
             Comment::Published(c) => self.posts.identity(c, inline),
         }
@@ -183,6 +207,11 @@ impl<'a> Projection<'a> {
             .filter(|t| {
                 t.comments
                     .first()
+                    .is_none_or(|c| self.posts.root_shell(c.id).is_none())
+            })
+            .filter(|t| {
+                t.comments
+                    .first()
                     .is_some_and(|root| self.pending_comment(root.id).is_none())
             })
             .collect();
@@ -211,10 +240,61 @@ impl<'a> Projection<'a> {
             self.posts
                 .pending
                 .iter()
-                .filter(|post| post.reply_to.is_none())
+                .filter(|post| post.reply_to.is_none() && post.anchor.is_none() && !post.pending)
                 .map(|post| Entry::Comment(Comment::Posting(post))),
         );
+        let mut roots: Vec<_> = self
+            .posts
+            .roots
+            .iter()
+            .chain(&self.posts.pending)
+            .filter(|p| p.anchor.is_some() && p.reply_to.is_none() && !p.pending)
+            .collect();
+        roots.sort_by_key(|post| post.token);
+        for post in roots {
+            let thread = self
+                .posts
+                .root_id(post)
+                .and_then(|id| self.thread_for_inline(id));
+            let comments = thread
+                .map(|t| self.thread(t).comments)
+                .unwrap_or_else(|| vec![Comment::Posting(post)]);
+            entries.push(Entry::CreatedThread(post, comments));
+        }
         entries
+    }
+
+    pub fn pending_entries(&self) -> Vec<Comment<'a>> {
+        self.pending
+            .iter()
+            .copied()
+            .map(Comment::Pending)
+            .chain(
+                self.posts
+                    .pending
+                    .iter()
+                    .filter(|p| p.pending)
+                    .map(Comment::Posting),
+            )
+            .collect()
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending_entries().len()
+    }
+    pub fn has_pending(&self) -> bool {
+        self.pending_count() > 0
+    }
+
+    pub fn remote_id(&self, key: CommentKey) -> Option<u64> {
+        self.posts.remote_id(key)
+    }
+    pub fn inline_key(&self, id: u64) -> CommentKey {
+        self.posts.alias(if self.pending_comment(id).is_some() {
+            CommentKey::Pending(id)
+        } else {
+            CommentKey::Inline(id)
+        })
     }
 
     pub fn diff_index(&self) -> index::CommentIndex {
@@ -224,7 +304,40 @@ impl<'a> Projection<'a> {
             .flat_map(|d| d.review_comments())
             .map(index::ReviewComment::from)
             .collect();
-        index::group_comments(merge_pending(published, self.pending.iter().copied()))
+        let mut comments = merge_pending(published, self.pending.iter().copied());
+        for comment in &mut comments {
+            comment.id = self.posts.alias(comment.id);
+            if comment.time == index::CommentTime::Pending {
+                if let Some(author) = self.posts.author(comment.id) {
+                    comment.author = author.into();
+                }
+            }
+            comment.in_reply_to_id = comment.in_reply_to_id.map(|id| match id {
+                CommentKey::Inline(id) | CommentKey::Pending(id) => self.inline_key(id),
+                _ => id,
+            });
+        }
+        comments.extend(
+            self.posts
+                .pending
+                .iter()
+                .filter(|p| p.anchor.is_some())
+                .map(|post| {
+                    let anchor = post.anchor.as_ref().unwrap();
+                    index::ReviewComment {
+                        id: CommentKey::Post(post.token),
+                        path: anchor.path.clone(),
+                        line: Some(anchor.line),
+                        side: anchor.side,
+                        start_line: anchor.start_line,
+                        body: post.body.clone(),
+                        author: post.author.clone(),
+                        time: index::CommentTime::Posting(post.status, post.pending),
+                        in_reply_to_id: post.reply_to.map(|id| self.inline_key(id)),
+                    }
+                }),
+        );
+        index::group_comments(comments)
     }
 }
 
@@ -285,11 +398,11 @@ fn merge_pending<'a>(
 ) -> Vec<index::ReviewComment> {
     let mut seen = HashSet::new();
     let pending: Vec<_> = pending.into_iter().filter(|c| seen.insert(c.id)).collect();
-    published.retain(|c| c.time != index::CommentTime::Pending && !seen.contains(&c.id));
+    published.retain(|c| c.time != index::CommentTime::Pending && !matches!(c.id, CommentKey::Inline(id) | CommentKey::Pending(id) if seen.contains(&id)));
     published.extend(pending.into_iter().map(|comment| {
         let position = crate::comment_anchor::display_line(comment.line, comment.start_line);
         index::ReviewComment {
-            id: comment.id,
+            id: CommentKey::Pending(comment.id),
             path: comment.path.clone(),
             line: position.map(|(_, line)| line),
             side: comment.side,
@@ -297,7 +410,7 @@ fn merge_pending<'a>(
             body: comment.body.clone(),
             author: "you".into(),
             time: index::CommentTime::Pending,
-            in_reply_to_id: comment.in_reply_to_id,
+            in_reply_to_id: comment.in_reply_to_id.map(CommentKey::Inline),
         }
     }));
     published

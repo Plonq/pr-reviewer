@@ -17,8 +17,9 @@ use gpui::{div, prelude::*, Context, Entity, MouseButton, SharedString, Window};
 pub(crate) fn reserve_reaction_rows(
     built: &mut BuiltRows,
     discussion: Option<&github::PrDiscussion>,
+    posts: &crate::comments::posting::Posts,
 ) {
-    let eligible: HashSet<_> = discussion
+    let mut eligible: HashSet<_> = discussion
         .into_iter()
         .flat_map(|d| &d.threads)
         .flat_map(|t| &t.comments)
@@ -26,8 +27,14 @@ pub(crate) fn reserve_reaction_rows(
             c.reactions.iter().any(|r| r.count > 0)
                 || (c.permissions.can_react && !c.permissions.node_id.is_empty())
         })
-        .map(|c| c.id)
+        .map(|c| posts.alias(crate::comments::CommentKey::Inline(c.id)))
         .collect();
+    eligible.extend(built.rows.iter().filter_map(|row| match row {
+        Row::CommentBody { text, .. } if posts.reserve_reactions(text.comment_id) => {
+            Some(text.comment_id)
+        }
+        _ => None,
+    }));
     if eligible.is_empty() {
         return;
     }
@@ -68,7 +75,7 @@ fn react_button() -> Button {
 impl ReviewApp {
     pub(crate) fn diff_comment_reactions(
         &self,
-        id: u64,
+        id: crate::comments::CommentKey,
         entity: &Entity<Self>,
     ) -> gpui::AnyElement {
         if let Some(crate::CommentTarget::Published(target)) = self.diff_comment_target(id) {
@@ -98,7 +105,7 @@ impl ReviewApp {
         let key = crate::CommentTarget::Published(target.clone()).key();
         let enabled = comment.permissions.can_react
             && !comment.permissions.node_id.is_empty()
-            && !self.sessions.get(&item_id).is_some_and(|ui| ui.busy);
+            && !self.comment_write_blocked(item_id);
         let mut controls = div()
             .flex()
             .items_center()
@@ -217,7 +224,7 @@ impl ReviewApp {
     ) {
         if matches!(target, github::CommentTarget::Review(_))
             || self.active_item().map(|item| item.id) != Some(item_id)
-            || self.sessions.get(&item_id).is_some_and(|ui| ui.busy)
+            || self.comment_write_blocked(item_id)
             || !self
                 .published_comment(&target)
                 .is_some_and(|c| c.permissions.can_react && !c.permissions.node_id.is_empty())
@@ -314,12 +321,12 @@ mod tests {
     #[test]
     fn reaction_footers_follow_each_complete_body_and_preserve_navigation_indices() {
         let discussion = crate::conversation::tests::sample_discussion();
-        let body = |id, slot, half| Row::CommentBody {
+        let body = |id: u64, slot, half| Row::CommentBody {
             line: "text".into(),
             half,
             slot,
             text: std::sync::Arc::new(crate::diff_media::CommentText {
-                comment_id: id,
+                comment_id: id.into(),
                 is_reply: false,
                 part: 0,
                 source: "text".into(),
@@ -335,19 +342,19 @@ mod tests {
             file_rows: vec![0, 3],
             hunk_rows: vec![3],
         };
-        reserve_reaction_rows(&mut built, Some(&discussion));
+        reserve_reaction_rows(&mut built, Some(&discussion), &Default::default());
         assert_eq!(built.rows.len(), 6);
         assert!(matches!(
             built.rows[2],
             Row::CommentReactions {
-                comment_id: 1,
+                comment_id: crate::comments::CommentKey::Inline(1),
                 half: Some(crate::CommentSide::Left)
             }
         ));
         assert!(matches!(
             built.rows[4],
             Row::CommentReactions {
-                comment_id: 3,
+                comment_id: crate::comments::CommentKey::Inline(3),
                 half: Some(crate::CommentSide::Right)
             }
         ));
@@ -365,18 +372,21 @@ mod tests {
             file_rows: vec![0],
             hunk_rows: vec![],
         };
-        reserve_reaction_rows(&mut built, Some(&discussion));
+        reserve_reaction_rows(&mut built, Some(&discussion), &Default::default());
         assert_eq!(built.rows.len(), 2);
         discussion.threads[0].comments[0].permissions = github::CommentPermissions {
             node_id: "RC1".into(),
             can_react: true,
             ..Default::default()
         };
-        reserve_reaction_rows(&mut built, Some(&discussion));
+        reserve_reaction_rows(&mut built, Some(&discussion), &Default::default());
         assert_eq!(built.rows.len(), 3);
         assert!(matches!(
             built.rows[1],
-            Row::CommentReactions { comment_id: 1, .. }
+            Row::CommentReactions {
+                comment_id: crate::comments::CommentKey::Inline(1),
+                ..
+            }
         ));
         assert!(matches!(built.rows[2], Row::CommentEditor { .. }));
     }

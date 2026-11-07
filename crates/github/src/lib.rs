@@ -546,6 +546,9 @@ pub enum ClientError {
     /// The operation failed for any other reason — network, API, or a
     /// response we couldn't digest. The string is a short human cause.
     Failed(String),
+    /// The server explicitly rejected a write; unlike transport/decoding
+    /// failures, retrying a recovered draft cannot duplicate a committed create.
+    Rejected(String),
 }
 
 impl std::fmt::Display for ClientError {
@@ -563,8 +566,17 @@ impl std::fmt::Display for ClientError {
                 )
             }
             Self::Invalid(cause) => write!(f, "{cause}"),
-            Self::Failed(cause) => write!(f, "GitHub operation failed: {cause}"),
+            Self::Failed(cause) | Self::Rejected(cause) => {
+                write!(f, "GitHub operation failed: {cause}")
+            }
         }
+    }
+}
+
+impl ClientError {
+    /// Generic failures are conservatively unknown outcomes for creation.
+    pub fn mutation_is_uncertain(&self) -> bool {
+        matches!(self, Self::Failed(_))
     }
 }
 

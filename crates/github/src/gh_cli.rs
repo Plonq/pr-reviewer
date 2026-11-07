@@ -120,6 +120,14 @@ impl<P: GhProcess> GhCliClient<P> {
         Ok(value)
     }
 
+    fn creation_api(&self, args: &[String]) -> Result<serde_json::Value, ClientError> {
+        self.review_api(args).map_err(create_api_error)
+    }
+
+    fn creation_graphql(&self, query: String) -> Result<serde_json::Value, ClientError> {
+        self.review_graphql(query).map_err(create_api_error)
+    }
+
     /// Review-specific REST comments are legacy payloads: even current drafts
     /// can omit line and side. Read the authoritative thread anchors instead.
     fn pending_comments(
@@ -923,7 +931,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         loc: &PrLocator,
         body: &str,
     ) -> Result<crate::PublishedComment, ClientError> {
-        let value = self.review_api(&[
+        let value = self.creation_api(&[
             "api".into(),
             "-X".into(),
             "POST".into(),
@@ -940,7 +948,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         comment_id: u64,
         body: &str,
     ) -> Result<crate::PublishedComment, ClientError> {
-        let value = self.review_api(&[
+        let value = self.creation_api(&[
             "api".into(),
             "-X".into(),
             "POST".into(),
@@ -977,7 +985,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         let query = format!("mutation {{ addPullRequestReviewThread(input:{{pullRequestReviewId:{},path:{},side:{},line:{},body:{}{range}{positioning}}}) {{ thread {{ id side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:1) {{ nodes {{ id:fullDatabaseId node_id:id path body }} }} }} }} }}",
             json_string(&review.node_id), json_string(&anchor.path), anchor.side.api_str(), anchor.line, json_string(body));
         let value = self
-            .review_graphql(query)
+            .creation_graphql(query)
             .map_err(|error| positioning_error(anchor, error))?;
         let thread = &value["data"]["addPullRequestReviewThread"]["thread"];
         Ok(crate::PendingCommentReceipt {
@@ -1021,7 +1029,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 "this comment is no longer available; refresh and try again".into(),
             )
         })?;
-        let value = self.review_graphql(format!(
+        let value = self.creation_graphql(format!(
             "mutation {{ addPullRequestReviewComment(input:{{pullRequestReviewId:{},inReplyTo:{},body:{}}}) {{ comment {{ id:fullDatabaseId node_id:id path body replyTo {{ id:fullDatabaseId }} }} }} }}",
             json_string(&review.node_id), json_string(&node_id), json_string(body)
         ))?;
@@ -1115,7 +1123,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             ))?;
             let id: String =
                 decode_value(value["data"]["repository"]["pullRequest"]["id"].clone())?;
-            let value = self.review_graphql(format!(
+            let value = self.creation_graphql(format!(
                 "mutation {{ addPullRequestReview(input:{{pullRequestId:{},commitOID:{},event:COMMENT,threads:[{{path:{},side:{},body:{}{}}}]}}) {{ pullRequestReview {{ id state comments(first:2) {{ nodes {{ id:fullDatabaseId node_id:id body createdAt author {{ login }} }} }} pullRequest {{ reviewThreads(last:1) {{ nodes {{ id comments(first:1) {{ nodes {{ id:fullDatabaseId }} }} }} }} }} }} }} }}",
                 json_string(&id), json_string(&anchor.commit_id), json_string(&anchor.path), anchor.side.api_str(), json_string(body), positioning_input(anchor)
             )).map_err(|error| positioning_error(anchor, error))?;
@@ -1137,7 +1145,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 body,
             );
         }
-        let value = self.review_api(&[
+        let value = self.creation_api(&[
             "api".into(),
             "-X".into(),
             "POST".into(),
@@ -1568,7 +1576,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             "-F".to_string(),
             format!("line={line}"),
         ];
-        let value = self.review_api(&args)?;
+        let value = self.creation_api(&args)?;
         published_rest_receipt(
             &value,
             Some(CommentAnchor {
@@ -1753,6 +1761,22 @@ fn positioning_input(anchor: &CommentAnchor) -> String {
     match anchor.start_line {
         Some(start) => format!(",multilinePositioning:{{startPath:{path},endPath:{path},startLine:{start},endLine:{},startCommitOid:{commit},endCommitOid:{commit},headCommitOid:{head}{base}}}", anchor.line),
         None => format!(",linePositioning:{{path:{path},line:{},commitOid:{commit},headCommitOid:{head}{base}}}", anchor.line),
+    }
+}
+
+/// Only explicit CLI HTTP rejections establish that a create did not commit.
+/// Parse/transport failures and GraphQL partial data remain unverified. This
+/// classification is intentionally confined to the comment write call itself.
+fn create_api_error(error: ClientError) -> ClientError {
+    match error {
+        ClientError::Failed(message)
+            if [400, 403, 404, 405, 409, 410, 422, 429]
+                .iter()
+                .any(|code| message.ends_with(&format!("(HTTP {code})"))) =>
+        {
+            ClientError::Rejected(message)
+        }
+        other => other,
     }
 }
 
@@ -2454,6 +2478,34 @@ mod tests {
     use crate::{QueueFilter, QueueSort};
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    #[test]
+    fn create_failures_distinguish_explicit_rejection_from_uncertain_outcomes() {
+        for code in [400, 403, 404, 405, 409, 410, 422, 429] {
+            let error = create_api_error(ClientError::Failed(format!(
+                "validation failed (HTTP {code})"
+            )));
+            assert!(matches!(error, ClientError::Rejected(_)));
+            assert!(!error.mutation_is_uncertain());
+        }
+        for message in [
+            "connection reset",
+            "timeout (HTTP 408)",
+            "upstream error (HTTP 503)",
+            "GitHub returned no created comment identity",
+            "invalid JSON containing (HTTP 422) inside a body",
+        ] {
+            let error = create_api_error(ClientError::Failed(message.into()));
+            assert!(error.mutation_is_uncertain(), "{message}");
+        }
+        for error in [
+            ClientError::Invalid("anchor".into()),
+            ClientError::Unauthenticated,
+            ClientError::NoCredentialSource,
+        ] {
+            assert!(!error.mutation_is_uncertain());
+        }
+    }
 
     #[test]
     fn complete_discussion_paginates_all_connections_and_keeps_published_metadata() {
@@ -6360,7 +6412,10 @@ mod tests {
         let err = client(ok(Some(1), "", "gh: Forbidden (HTTP 403)"))
             .post_review_comment(&loc(), "a66406e", "src/main.rs", "RIGHT", 42, "nice")
             .unwrap_err();
-        assert_eq!(err, ClientError::Failed("Forbidden (HTTP 403)".to_string()));
+        assert_eq!(
+            err,
+            ClientError::Rejected("Forbidden (HTTP 403)".to_string())
+        );
     }
 
     #[test]

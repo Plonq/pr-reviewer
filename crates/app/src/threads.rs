@@ -214,7 +214,7 @@ mod tests {
             assert_eq!(comment.side, expected);
             assert_eq!(comment.body, "body\nunchanged");
             assert_eq!(comment.author, "alice");
-            assert_eq!(comment.in_reply_to_id, Some(u64::MAX - 1));
+            assert_eq!(comment.in_reply_to_id, Some((u64::MAX - 1).into()));
             assert_eq!(
                 comment.time,
                 CommentTime::Posted("raw malformed timestamp".into())

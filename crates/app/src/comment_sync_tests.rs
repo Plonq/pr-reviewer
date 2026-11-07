@@ -1,9 +1,7 @@
 use super::*;
 
 #[gpui::test]
-fn immediate_inline_uses_shared_completion_and_keeps_editor_until_response(
-    cx: &mut gpui::TestAppContext,
-) {
+fn immediate_inline_projects_and_closes_editor_before_response(cx: &mut gpui::TestAppContext) {
     let fake = Arc::new(FakePr::default());
     let (window, app) = queue_window(cx, fake.clone());
     install_item(&app, commenting_item(&fake), cx);
@@ -20,13 +18,21 @@ fn immediate_inline_uses_shared_completion_and_keeps_editor_until_response(
                 app.sessions[&0].busy,
                 "immediate writes obey the same per-PR single flight"
             );
+            assert!(app.composer().is_none(), "creation closes immediately");
+            let data = app.active_data().unwrap();
+            assert_eq!(data.posts.pending.len(), 1);
+            assert_eq!(data.comments.as_ref().unwrap().counts["a.rs"], (1, 0));
+            assert!(matches!(
+                data.comments.as_ref().unwrap().threads["a.rs"][&(CommentSide::Right, 1)][0]
+                    .root
+                    .id,
+                comments::CommentKey::Post(_)
+            ));
             assert!(
-                app.composer().unwrap().in_flight,
-                "step 2 does not close the editor early"
-            );
-            assert!(
-                app.active_data().unwrap().posts.pending.is_empty(),
-                "no diff optimism in step 2"
+                data.discussion
+                    .as_ref()
+                    .is_none_or(|d| d.threads.is_empty()),
+                "confirmed data is untouched"
             );
             app.submit_composer(window, cx); // Repeated keyboard submission is ignored.
             app.close_composer(window, cx);
