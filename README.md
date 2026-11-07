@@ -6,7 +6,7 @@ Gander is personal software with a singular focus: make it easier to understand 
 
 The priorities are two features GitHub itself lacks: **fast diff navigation** and **full-file context** (by default). Keep the information dense, leave out what doesn't help the review, and stay out of the way.
 
-<!-- TODO: Main screenshot — a PR open in Changes, showing full-file context. -->
+![Screenshot of Gander, showing an open PR and the diff view](docs/screenshot1.png)
 
 ## Features
 
@@ -17,8 +17,6 @@ The priorities are two features GitHub itself lacks: **fast diff navigation** an
 - **The whole conversation.** Read the PR description, discussion, and review threads, including images and videos, alongside the code.
 - **Review without switching tools.** Write inline and multi-line comments, reply to and resolve threads, keep drafts, and submit approvals or change requests.
 - **Local diffs too.** Open a local repository to inspect its changes without a GitHub PR.
-
-<!-- TODO: Supporting screenshots — review queue and conversation / inline comments. -->
 
 ## Quick Start
 
