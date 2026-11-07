@@ -614,14 +614,17 @@ impl ReviewApp {
                         || confirmed.is_none_or(|t| {
                             !t.is_resolved || data.expanded_threads.contains(&t.id)
                         });
-                    let mut location = div().h_6().flex().items_center().gap_2().child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_color(theme::subtext(cx))
-                            .child(format!(
+                    let location_label = confirmed
+                        .map(|thread| {
+                            format!(
+                                "{}{} · {}",
+                                thread.path,
+                                anchor_range(thread),
+                                if thread.side == "LEFT" { "old" } else { "new" }
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            format!(
                                 "{}:{}{} · {}",
                                 anchor.path,
                                 anchor
@@ -634,7 +637,16 @@ impl ReviewApp {
                                 } else {
                                     "new"
                                 }
-                            )),
+                            )
+                        });
+                    let mut location = div().h_6().flex().items_center().gap_2().child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_color(theme::subtext(cx))
+                            .child(location_label),
                     );
                     if let Some(thread) = confirmed {
                         location = location.child(self.thread_controls(
