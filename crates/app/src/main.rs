@@ -10926,7 +10926,7 @@ mod tests {
             );
             let filter = vcx.debug_bounds("file-tree-filter").unwrap();
             let track = vcx.debug_bounds("file-tree-loading-track").unwrap();
-            assert_eq!(track.size.height, px(2.));
+            assert_eq!(track.size.height, px(1.));
             assert_eq!(track.bottom(), filter.top());
             assert_eq!(vcx.debug_bounds("tree-row-0").is_some(), has_rows);
             if let Some(row) = vcx.debug_bounds("tree-row-0") {

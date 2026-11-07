@@ -26,7 +26,7 @@ pub(crate) fn file_tree_loading_strip(
     message: Option<&'static str>,
     cx: &gpui::App,
 ) -> gpui::AnyElement {
-    // Always reserve the same two pixels, including when idle. Loading must
+    // Always reserve the same pixel, including when idle. Loading must
     // never move the filter, tree rows, or the user's current click target.
     div()
         .id("file-tree-loading-track")

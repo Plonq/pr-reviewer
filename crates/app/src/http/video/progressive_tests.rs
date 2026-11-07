@@ -22,6 +22,9 @@ impl Origin {
                     Ok((mut socket, _)) => {
                         let seen = seen.clone();
                         std::thread::spawn(move || {
+                            // macOS inherits the listener's nonblocking mode. Wait for
+                            // request bytes instead of closing on a transient WouldBlock.
+                            socket.set_nonblocking(false).unwrap();
                             socket
                                 .set_read_timeout(Some(Duration::from_secs(3)))
                                 .unwrap();
