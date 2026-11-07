@@ -4,7 +4,8 @@
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::rows::Row;
+use crate::rows::{comment_anchor, comment_line, source_row, LineKind, Row};
+use crate::threads::CommentSide;
 
 pub(crate) fn keybindings() -> [gpui::KeyBinding; 4] {
     use crate::{ExtendNextLine, ExtendPreviousLine, SelectNextLine, SelectPreviousLine};
@@ -54,6 +55,25 @@ impl Selection {
         } else {
             row_selection_range(self, row_ix, row)
         }
+    }
+
+    /// Whole-line ranges use one source side, like dragging the comment gutter.
+    /// Prefer additions for replacements, and the old side for deletion-only
+    /// ranges. Character selections retain their existing mixed-side validation.
+    pub(crate) fn comment_points(&self, rows: &[Row]) -> Vec<(CommentSide, u64)> {
+        let (start, end) = self.ordered();
+        let range = start.row..end.row.saturating_add(1).min(rows.len());
+        let side = self.linewise.then(|| match self.side {
+            SelSide::Unified => preferred_comment_side(rows, range.clone()),
+            SelSide::Left => CommentSide::Left,
+            SelSide::Right => CommentSide::Right,
+        });
+        range
+            .filter_map(|ix| match side {
+                Some(side) => comment_line(&rows[ix], side).map(|line| (side, line)),
+                None => comment_anchor(rows, ix, self.side),
+            })
+            .collect()
     }
 
     pub(crate) fn ordered(&self) -> (RowCol, RowCol) {
@@ -115,6 +135,96 @@ pub(crate) fn line_selection(
             linewise: true,
         }
     })
+}
+
+fn preferred_comment_side(rows: &[Row], range: Range<usize>) -> CommentSide {
+    let mut removed = false;
+    for ix in range {
+        match source_row(&rows[ix]) {
+            Row::Line {
+                kind: LineKind::Added,
+                ..
+            }
+            | Row::SplitLine {
+                right:
+                    Some(crate::rows::Cell {
+                        kind: LineKind::Added,
+                        ..
+                    }),
+                ..
+            } => {
+                return CommentSide::Right;
+            }
+            Row::Line {
+                kind: LineKind::Removed,
+                ..
+            }
+            | Row::SplitLine {
+                left:
+                    Some(crate::rows::Cell {
+                        kind: LineKind::Removed,
+                        ..
+                    }),
+                ..
+            } => {
+                removed = true;
+            }
+            _ => {}
+        }
+    }
+    if removed {
+        CommentSide::Left
+    } else {
+        CommentSide::Right
+    }
+}
+
+/// Select from the first changed line to the last, excluding the hunk's leading
+/// and trailing context as well as full-file gaps. Source coordinates survive
+/// comment insertion, folding and wrapping.
+pub(crate) fn hunk_selection(
+    rows: &[Row],
+    hunk: &diff_core::Hunk,
+    range: Range<usize>,
+) -> Option<Selection> {
+    let displayed = rows.get(range.clone())?;
+    let side = if displayed
+        .iter()
+        .any(|row| matches!(source_row(row), Row::Line { .. }))
+    {
+        SelSide::Unified
+    } else {
+        match preferred_comment_side(rows, range.clone()) {
+            CommentSide::Left => SelSide::Left,
+            CommentSide::Right => SelSide::Right,
+        }
+    };
+    let changed_in_hunk = |ix: &usize| {
+        let changed = match (source_row(&rows[*ix]), side) {
+            (Row::Line { kind, .. }, SelSide::Unified) => *kind != LineKind::Context,
+            (Row::SplitLine { left, .. }, SelSide::Left) => left
+                .as_ref()
+                .is_some_and(|cell| cell.kind != LineKind::Context),
+            (Row::SplitLine { right, .. }, SelSide::Right) => right
+                .as_ref()
+                .is_some_and(|cell| cell.kind != LineKind::Context),
+            _ => false,
+        };
+        changed
+            && [
+                (CommentSide::Left, hunk.old_start, hunk.old_count),
+                (CommentSide::Right, hunk.new_start, hunk.new_count),
+            ]
+            .into_iter()
+            .any(|(side, start, count)| {
+                comment_line(&rows[*ix], side).is_some_and(|line| {
+                    line >= u64::from(start) && line < u64::from(start) + u64::from(count)
+                })
+            })
+    };
+    let first = range.clone().find(changed_in_hunk)?;
+    let last = range.rev().find(changed_in_hunk)?;
+    line_selection(rows, side, first, last)
 }
 
 /// The next source line on a text stream, skipping headers, comments, folds,
@@ -360,6 +470,109 @@ mod tests {
                 col: head.1,
             },
         }
+    }
+
+    #[test]
+    fn hunk_ranges_exclude_surrounding_context_with_wrapping_folding_and_comments() {
+        use crate::rows::{build_presented_rows, RowOptions, RowsView, ViewMode};
+        use crate::test_util::upgraded_diff;
+        use std::collections::HashSet;
+
+        let (diff, upgrades) = upgraded_diff();
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            for decorated in [false, true] {
+                let mut built = build_presented_rows(
+                    RowsView {
+                        diff: &diff,
+                        upgrades: &upgrades,
+                        comments: None,
+                        options: RowOptions {
+                            mode,
+                            file_ix: 0,
+                            comments_visible: true,
+                            comment_wrap: 80,
+                        },
+                    },
+                    store::DiffPreferences {
+                        soft_wrap: Some(decorated),
+                        collapse_unchanged: Some(decorated),
+                        ..Default::default()
+                    },
+                    &HashSet::new(),
+                    3,
+                );
+                // Comment cards are selectable-through but contribute no text.
+                built
+                    .rows
+                    .insert(built.hunk_rows[0] + 1, Row::CommentEditor { half: None });
+                let selection = hunk_selection(
+                    &built.rows,
+                    &diff.files[0].hunks[0],
+                    built.hunk_rows[0]..built.rows.len(),
+                )
+                .unwrap();
+                assert!(selection.linewise);
+                let text = selection_text(&selection, &built.rows);
+                assert_eq!(
+                    text,
+                    match mode {
+                        ViewMode::Unified => "line 10\nline ten",
+                        ViewMode::Split => "line ten",
+                    }
+                );
+                let points = selection.comment_points(&built.rows);
+                assert!(points
+                    .iter()
+                    .all(|(side, line)| *side == CommentSide::Right && *line == 10));
+                assert_eq!(points.first(), Some(&(CommentSide::Right, 10)));
+                assert_eq!(points.last(), Some(&(CommentSide::Right, 10)));
+            }
+        }
+    }
+
+    #[test]
+    fn linewise_comments_choose_one_side_but_text_selections_still_reject_mixed_sides() {
+        let rows = vec![
+            line("context"),
+            Row::Line {
+                old_no: Some(2),
+                new_no: None,
+                kind: LineKind::Removed,
+                text: "old".into(),
+                intra: vec![],
+                syntax: vec![],
+            },
+            Row::Line {
+                old_no: None,
+                new_no: Some(2),
+                kind: LineKind::Added,
+                text: "new".into(),
+                intra: vec![],
+                syntax: vec![],
+            },
+        ];
+        let selection = line_selection(&rows, SelSide::Unified, 0, 2).unwrap();
+        assert_eq!(
+            selection.comment_points(&rows),
+            vec![(CommentSide::Right, 1), (CommentSide::Right, 2)]
+        );
+        let deletion = line_selection(&rows, SelSide::Unified, 0, 1).unwrap();
+        assert_eq!(
+            deletion.comment_points(&rows),
+            vec![(CommentSide::Left, 1), (CommentSide::Left, 2)]
+        );
+        let text = Selection {
+            linewise: false,
+            ..selection
+        };
+        assert_eq!(
+            text.comment_points(&rows),
+            vec![
+                (CommentSide::Right, 1),
+                (CommentSide::Left, 2),
+                (CommentSide::Right, 2)
+            ]
+        );
     }
 
     #[test]

@@ -7,8 +7,96 @@ fn bind_line_selection_keys(cx: &mut gpui::TestAppContext) {
             KeyBinding::new("shift-c", NewComment, Some("ReviewApp")),
             KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
             KeyBinding::new("cmd-c", CopySelection, Some("ReviewApp")),
+            KeyBinding::new("n", NextHunk, Some("ReviewApp")),
+            KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
         ]);
     });
+}
+
+#[gpui::test]
+fn hunk_navigation_selects_and_comments_ranges_in_both_modes(cx: &mut gpui::TestAppContext) {
+    bind_line_selection_keys(cx);
+    let (window, app) = queue_window(cx, FakePr::with_threads(Vec::new()));
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        let mut item = range_pr_item();
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,4 +1,4 @@\n before\n-old one\n-old two\n+new one\n+new two\n after\n@@ -9,0 +10 @@\n+ten\ndiff --git a/b.rs b/b.rs\ndeleted file mode 100644\n--- a/b.rs\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-gone one\n-gone two\n");
+        data.anchor_hunks = data
+            .diff
+            .files
+            .iter()
+            .map(|file| file.hunks.clone())
+            .collect();
+        data.mode = mode;
+        data.set_rows(data.row_build());
+        data.cursor = 0;
+        install_item(&app, item, cx);
+        vcx.update(|window, cx| {
+            let focus = app.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        });
+        vcx.run_until_parked();
+
+        for (key, file_ix, hunk_ix, side, start, end) in [
+            ("n", 0, 0, CommentSide::Right, Some(2), 3),
+            ("n", 0, 1, CommentSide::Right, None, 10),
+            ("n", 1, 0, CommentSide::Left, Some(1), 2),
+            ("n", 0, 0, CommentSide::Right, Some(2), 3),
+            ("p", 1, 0, CommentSide::Left, Some(1), 2),
+            ("p", 0, 1, CommentSide::Right, None, 10),
+            ("p", 0, 0, CommentSide::Right, Some(2), 3),
+        ] {
+            vcx.simulate_keystrokes(key);
+            vcx.update(|_, cx| {
+                let data = app.read(cx).active_data().unwrap();
+                assert_eq!(data.file_ix, file_ix);
+                assert_eq!(data.cursor, data.hunk_rows[hunk_ix]);
+                let selection = data.selection.unwrap();
+                assert!(selection.linewise);
+                if file_ix == 0 && hunk_ix == 0 {
+                    assert!(selection.ordered().0.row > data.cursor);
+                    assert_eq!(data.active_line_side(data.cursor), None,
+                        "the context line at the navigation cursor must not get a separate gutter cue");
+                }
+                for (ix, row) in data.rows.iter().enumerate() {
+                    assert_eq!(data.active_line_side(ix),
+                        row_selection_range(&selection, ix, row).map(|_| selection.side));
+                }
+                let expected = match (file_ix, hunk_ix, mode) {
+                    (1, _, _) => "gone one\ngone two",
+                    (_, 1, _) => "ten",
+                    (_, _, ViewMode::Unified) => "old one\nold two\nnew one\nnew two",
+                    _ => "new one\nnew two",
+                };
+                assert_eq!(selection_text(&selection, &data.rows), expected);
+                assert!(data
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .all(|(ix, row)| selection.text_range(ix, row).is_none()));
+            });
+            vcx.simulate_keystrokes("shift-c");
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    let composer = app
+                        .composer()
+                        .expect("hunk selection should be commentable");
+                    assert_eq!(
+                        (composer.start_line, composer.line, composer.side),
+                        (start, end, side)
+                    );
+                    assert!(composer.position.is_none());
+                    assert!(composer.input.focus_handle(cx).is_focused(window));
+                    app.close_composer(window, cx);
+                });
+            });
+        }
+        vcx.simulate_keystrokes("escape");
+        vcx.update(|_, cx| assert!(app.read(cx).active_data().unwrap().selection.is_none()));
+    }
 }
 
 #[gpui::test]
@@ -95,6 +183,11 @@ fn keyboard_line_selection_extends_shrinks_reverses_and_comments(cx: &mut gpui::
             "an unmodified arrow clears the range"
         );
         assert_eq!(data.cursor, 4);
+        assert_eq!(
+            data.active_line_side(data.cursor),
+            Some(SelSide::Unified),
+            "the single-line cursor cue returns when there is no selection"
+        );
     });
 }
 
