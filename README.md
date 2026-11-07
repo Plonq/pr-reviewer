@@ -88,7 +88,11 @@ Kit's platform enables the font backend and runtime Metal shader compilation.
 - unified + split views; `↑`/`↓` move the selected source line, and
   `Shift-↑`/`Shift-↓` extend or shrink a whole-line range, staying on the same
   side in split view. `Esc` clears the range. Double-click a word to select it,
-  then drag to extend by whole words (`cmd-c` copies the selection)
+  then drag to extend by whole words (`cmd-c` copies the selection).
+  Selecting text outlines literal, case-sensitive matches on both sides of the
+  displayed file and marks them in the minimap, without opening Find or unfolding
+  hidden context. Clearing the selection clears the marks; whitespace-only and
+  whole-line navigation selections do not trigger matching.
 - **All changes / Changed since last review** in the Changes pane: compare the
   commit from your latest submitted GitHub review with the current PR head,
   including reviews submitted on GitHub. No manual commit selection. The scope
