@@ -26,6 +26,7 @@ mod review_target;
 mod rows;
 mod search;
 mod selection;
+mod selection_matches;
 mod svg_image;
 mod theme;
 mod threads;
@@ -659,6 +660,9 @@ pub(crate) struct ItemData {
     /// Per item (survives item switching); cleared on view-mode toggle and
     /// refresh, where row indices change meaning.
     selection: Option<Selection>,
+    /// Lazily recomputed on selection changes; invalidated when rows change.
+    selection_matches:
+        RefCell<Option<(Option<Selection>, Rc<selection_matches::SelectionMatches>)>>,
     /// Full-file contents by file index into `diff.files`: whole-file span
     /// tables and full new-side lines. The re-diffed hunks themselves
     /// replace `diff.files[ix].hunks`. Reset on refresh.
@@ -753,6 +757,7 @@ impl ItemData {
             additions: 0,
             deletions: 0,
             selection: None,
+            selection_matches: RefCell::new(None),
             upgrades: HashMap::new(),
             file_media: HashMap::new(),
             svg_code: HashSet::new(),
@@ -843,9 +848,25 @@ impl ItemData {
             .max()
             .unwrap_or(0);
         self.rows = rows;
+        self.selection_matches.replace(None);
         self.file_rows = file_rows;
         self.hunk_rows = hunk_rows;
         self.reindex_search();
+    }
+
+    fn selection_matches(&self) -> Rc<selection_matches::SelectionMatches> {
+        let mut cache = self.selection_matches.borrow_mut();
+        if let Some((selection, matches)) = cache.as_ref() {
+            if *selection == self.selection {
+                return matches.clone();
+            }
+        }
+        let matches = Rc::new(selection_matches::SelectionMatches::find(
+            &self.rows,
+            self.selection,
+        ));
+        *cache = Some((self.selection, matches.clone()));
+        matches
     }
 
     /// Rebuild the display rows for the displayed file and mode.
@@ -5131,7 +5152,30 @@ impl ReviewApp {
                                 color,
                             ));
                         }
-                        // Viewport indicator — the only per-frame math.
+                        // Highlight just the matching characters within each lane.
+                        // Quantize vertically like the base minimap when downsampled.
+                        for mark in &data.selection_matches().marks {
+                            let (lane_x, lane_w) = match mark.side {
+                                SelSide::Unified => (0., usable),
+                                SelSide::Left => (0., half),
+                                SelSide::Right => (half + MINIMAP_GAP, half),
+                            };
+                            let x = lane_x + lane_w * mark.range.start;
+                            // Keep short matches visible, without spilling into
+                            // the divider or the neighboring lane.
+                            let w = (lane_w * (mark.range.end - mark.range.start))
+                                .max(1.)
+                                .min(lane_w * (1. - mark.range.start));
+                            let y = (mark.row / layout.group) as f32 * layout.slot_h;
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(px(x0 + MINIMAP_PAD + x), px(y0 + y)),
+                                    size(px(w), px(layout.slot_h.max(2.))),
+                                ),
+                                Hsla::from(theme::yellow(cx)).opacity(0.85),
+                            ));
+                        }
+                        // Viewport indicator.
                         let offset_y = f32::from(-data.scroll.0.borrow().base_handle.offset().y);
                         let px_per_row = layout.slot_h / layout.group as f32;
                         let top_row = offset_y / row_height();
@@ -6347,6 +6391,7 @@ impl ReviewApp {
                                                     return Vec::new();
                                                 };
                                                 let sel = data.selection;
+                                                let selection_matches = data.selection_matches();
                                                 range
                                                     .map(|ix| {
                                                         let Some(row) = data.rows.get(ix) else {
@@ -6416,6 +6461,7 @@ impl ReviewApp {
                                                             commenting,
                                                             split_layout,
                                                             data.search.as_ref(),
+                                                            &selection_matches,
                                                             &rows_entity,
                                                             match row {
                                                                 Row::CommentHeader {
@@ -7054,6 +7100,7 @@ mod tests {
     }
 
     include!("keyboard_selection_tests.rs");
+    include!("selection_match_tests.rs");
 
     mod markdown_hosts {
         include!("markdown_tests.rs");

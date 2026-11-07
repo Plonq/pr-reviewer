@@ -51,6 +51,22 @@ fn line_frac(text: &str) -> f32 {
     text.chars().take(MAX_MINIMAP_CHARS).count() as f32 / MAX_MINIMAP_CHARS as f32
 }
 
+/// Project a source byte range onto the same character scale as the text bars.
+/// The minimap truncates at MAX_MINIMAP_CHARS; do not highlight outside it.
+pub(crate) fn text_range_frac(
+    text: &str,
+    range: &std::ops::Range<usize>,
+) -> Option<std::ops::Range<f32>> {
+    let start = text[..range.start].chars().take(MAX_MINIMAP_CHARS).count();
+    let end = start
+        + text[range.clone()]
+            .chars()
+            .take(MAX_MINIMAP_CHARS - start)
+            .count();
+    (start < end)
+        .then(|| start as f32 / MAX_MINIMAP_CHARS as f32..end as f32 / MAX_MINIMAP_CHARS as f32)
+}
+
 /// Reduce display rows to minimap rows, one per row, index-aligned.
 pub(crate) fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
     rows.iter()
@@ -287,6 +303,31 @@ mod tests {
     use crate::test_util::{mrow, sample_comments, sample_diff};
     use crate::threads::COMMENT_WRAP_CHARS;
     use std::collections::HashMap;
+
+    #[test]
+    fn match_ranges_use_the_text_bar_character_scale() {
+        assert_eq!(
+            text_range_frac("    word tail", &(4..8)),
+            Some((4. / 160.)..(8. / 160.))
+        );
+        // Byte offsets must not shift or widen Unicode matches.
+        assert_eq!(
+            text_range_frac("é word é", &(3..7)),
+            Some((2. / 160.)..(6. / 160.))
+        );
+        assert_eq!(
+            text_range_frac("word", &(0..4)).unwrap().end,
+            line_frac("word")
+        );
+        assert_eq!(text_range_frac("word", &(0..0)), None);
+    }
+
+    #[test]
+    fn match_ranges_clip_at_the_same_column_as_long_text_bars() {
+        let text = "é".repeat(200);
+        assert_eq!(text_range_frac(&text, &(316..326)), Some((158. / 160.)..1.));
+        assert_eq!(text_range_frac(&text, &(320..326)), None);
+    }
 
     #[test]
     fn minimap_rows_unified_kinds_and_fracs() {

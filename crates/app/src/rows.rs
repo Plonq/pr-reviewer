@@ -1074,6 +1074,7 @@ fn line_content(
     word_bg: Option<gpui::Rgba>,
     selection: Option<Range<usize>>,
     search: &[(Range<usize>, gpui::Rgba)],
+    matches: Vec<Range<usize>>,
     cx: &gpui::App,
 ) -> gpui::AnyElement {
     let highlights = if search.is_empty() {
@@ -1081,13 +1082,52 @@ fn line_content(
     } else {
         merge_search_highlights(syntax, intra, word_bg, selection, search, cx)
     };
-    if highlights.is_empty() {
-        div().child(text.clone()).into_any_element()
-    } else {
-        StyledText::new(text.clone())
+    if matches.is_empty() {
+        if highlights.is_empty() {
+            return div().child(text.clone()).into_any_element();
+        }
+        return StyledText::new(text.clone())
             .with_highlights(highlights)
-            .into_any_element()
+            .into_any_element();
     }
+    let content = StyledText::new(text.clone()).with_highlights(highlights);
+    let layout = content.layout().clone();
+    // Use actual shaped text positions, including Unicode and syntax font
+    // styles. The overlay changes neither layout nor existing backgrounds,
+    // and inherits the code pane's horizontal scroll and clip.
+    div()
+        .debug_selector(|| "selection-match-outlines".into())
+        .relative()
+        .child(content)
+        .child(
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, _, window, cx| {
+                    for range in &matches {
+                        let Some(start) = layout.position_for_index(range.start) else {
+                            continue;
+                        };
+                        let Some(end) = layout.position_for_index(range.end) else {
+                            continue;
+                        };
+                        window.paint_quad(
+                            gpui::fill(
+                                gpui::Bounds::new(
+                                    gpui::point(start.x, bounds.top()),
+                                    gpui::size(end.x - start.x, bounds.size.height),
+                                ),
+                                Hsla::transparent_black(),
+                            )
+                            .border_widths(1.)
+                            .border_color(theme::yellow(cx)),
+                        );
+                    }
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .into_any_element()
 }
 
 /// Shared shape of every comment row: indented card with a mantle background
@@ -1243,6 +1283,7 @@ pub(crate) fn render_row(
     commenting: Option<SelSide>,
     split_layout: Option<SplitLayout>,
     search: Option<&crate::search::Search>,
+    matches: &crate::selection_matches::SelectionMatches,
     entity: &gpui::Entity<ReviewApp>,
     controls: Option<gpui::AnyElement>,
     cx: &gpui::App,
@@ -1256,6 +1297,7 @@ pub(crate) fn render_row(
         commenting,
         split_layout.map(|layout| layout.offset),
         search,
+        matches,
         entity,
         controls,
         cx,
@@ -1289,6 +1331,7 @@ fn render_row_content(
     commenting: Option<SelSide>,
     horizontal_offset: Option<gpui::Pixels>,
     search: Option<&crate::search::Search>,
+    matches: &crate::selection_matches::SelectionMatches,
     entity: &gpui::Entity<ReviewApp>,
     controls: Option<gpui::AnyElement>,
     cx: &gpui::App,
@@ -1305,6 +1348,7 @@ fn render_row_content(
             commenting,
             horizontal_offset,
             search,
+            matches,
             entity,
             controls,
             cx,
@@ -1604,6 +1648,7 @@ fn render_row_content(
                         &search
                             .map(|s| s.highlights(ix, SelSide::Unified, cx))
                             .unwrap_or_default(),
+                        matches.ranges(ix, SelSide::Unified),
                         cx,
                     )),
             )
@@ -1688,6 +1733,7 @@ fn render_row_content(
                                     &search
                                         .map(|s| s.highlights(ix, text_side, cx))
                                         .unwrap_or_default(),
+                                    matches.ranges(ix, text_side),
                                     cx,
                                 )),
                         ),
