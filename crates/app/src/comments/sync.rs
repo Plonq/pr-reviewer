@@ -62,7 +62,85 @@ impl SyncState {
     /// deletion resurrection. Metadata/diff from a full fetch can still install.
     /// A failed read never calls this, so it cannot acknowledge a write.
     pub fn accept(&mut self, ticket: ReadTicket, discussion: &PrDiscussion) -> bool {
-        if !self.eligible(ticket) || !self.awaiting.iter().all(|r| acknowledged(r, discussion)) {
+        self.accept_with_changes(ticket, discussion, None)
+    }
+
+    pub fn accept_projected(
+        &mut self,
+        ticket: ReadTicket,
+        discussion: &PrDiscussion,
+        changes: &super::mutations::Changes,
+    ) -> bool {
+        self.accept_with_changes(ticket, discussion, Some(changes))
+    }
+
+    fn accept_with_changes(
+        &mut self,
+        ticket: ReadTicket,
+        discussion: &PrDiscussion,
+        changes: Option<&super::mutations::Changes>,
+    ) -> bool {
+        if !self.eligible(ticket) {
+            return false;
+        }
+        if !self.awaiting.iter().all(|old| {
+            if acknowledged(old, discussion) {
+                return true;
+            }
+            let Some(changes) = changes else {
+                return false;
+            };
+            // A newer unknown edit/delete can positively supersede a protected
+            // older version. Merely failing that write is never enough.
+            let superseded = changes
+                .active
+                .iter()
+                .filter(|c| {
+                    c.uncertain
+                        && matches!(c.target, MutationTarget::Published(_))
+                        && c.acknowledged(Some(discussion), None)
+                })
+                .any(|c| {
+                    let proof = match &c.body {
+                        Some(body) => MutationReceipt::Edited {
+                            target: c.target.clone(),
+                            body: body.clone(),
+                        },
+                        None => MutationReceipt::Deleted {
+                            target: c.target.clone(),
+                        },
+                    };
+                    supersedes(&proof, old)
+                });
+            if superseded {
+                return true;
+            }
+            // A created reply remains in the original thread after its parent
+            // is deleted. Require that exact retained thread identity as well
+            // as the receipt's exact comment/review identities, not a body match.
+            let MutationReceipt::PublishedCreated(created) = old else {
+                return false;
+            };
+            let Some(parent) = created.in_reply_to_id else {
+                return false;
+            };
+            let Some(thread) = changes.members.get(&parent) else {
+                return false;
+            };
+            if created.thread_id.as_ref().is_some_and(|id| id != thread)
+                || discussion
+                    .threads
+                    .iter()
+                    .flat_map(|t| &t.comments)
+                    .any(|c| c.id == parent)
+            {
+                return false;
+            }
+            discussion
+                .threads
+                .iter()
+                .any(|t| &t.id == thread && t.comments.iter().any(|c| created_identity(created, c)))
+        }) {
             return false;
         }
         self.awaiting.clear();
@@ -111,17 +189,22 @@ fn supersedes(new: &MutationReceipt, old: &MutationReceipt) -> bool {
     !matches!(new, MutationReceipt::PublishedCreated(_)) && target(new) == target(old)
 }
 
+fn created_identity(
+    created: &github::PublishedComment,
+    comment: &github::DiscussionComment,
+) -> bool {
+    comment.id == created.id
+        && comment.permissions.node_id == created.node_id
+        && created
+            .review_node_id
+            .as_ref()
+            .is_none_or(|id| comment.review_id.as_ref() == Some(id))
+}
+
 fn acknowledged(receipt: &MutationReceipt, discussion: &PrDiscussion) -> bool {
     match receipt {
         MutationReceipt::PublishedCreated(created) => {
-            let identity = |c: &github::DiscussionComment| {
-                c.id == created.id
-                    && c.permissions.node_id == created.node_id
-                    && created
-                        .review_node_id
-                        .as_ref()
-                        .is_none_or(|id| c.review_id.as_ref() == Some(id))
-            };
+            let identity = |c: &github::DiscussionComment| created_identity(created, c);
             if created.anchor.is_some() || created.in_reply_to_id.is_some() {
                 discussion.threads.iter().any(|thread| {
                     created.thread_id.as_ref().is_none_or(|id| &thread.id == id)

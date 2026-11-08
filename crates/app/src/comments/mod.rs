@@ -9,6 +9,9 @@
 #[cfg(test)]
 mod creation_tests;
 pub(crate) mod index;
+#[cfg(test)]
+mod mutation_tests;
+pub(crate) mod mutations;
 pub(crate) mod posting;
 pub(crate) mod sync;
 #[cfg(test)]
@@ -93,6 +96,7 @@ pub(crate) struct Projection<'a> {
     discussion: Option<&'a PrDiscussion>,
     posts: &'a posting::Posts,
     pub pending: Vec<&'a PendingComment>,
+    all_pending: Vec<&'a PendingComment>,
 }
 
 impl<'a> Projection<'a> {
@@ -102,14 +106,20 @@ impl<'a> Projection<'a> {
         posts: &'a posting::Posts,
     ) -> Self {
         let mut seen = HashSet::new();
+        let all_pending: Vec<_> = pending
+            .into_iter()
+            .flat_map(|r| &r.comments)
+            .filter(|c| seen.insert(c.id))
+            .collect();
         Self {
             discussion,
             posts,
-            pending: pending
-                .into_iter()
-                .flat_map(|review| &review.comments)
-                .filter(|comment| seen.insert(comment.id))
+            pending: all_pending
+                .iter()
+                .copied()
+                .filter(|c| !posts.changes.hidden(CommentKey::Pending(c.id)))
                 .collect(),
+            all_pending,
         }
     }
 
@@ -121,7 +131,12 @@ impl<'a> Projection<'a> {
     }
 
     pub fn published(&self, target: &github::CommentTarget) -> Option<&'a DiscussionComment> {
-        published(self.discussion?, target)
+        published(self.discussion?, target).filter(|c| {
+            !self.posts.changes.hidden(published_key(
+                c,
+                matches!(target, github::CommentTarget::ReviewComment(_)),
+            ))
+        })
     }
 
     pub fn thread_for_inline(&self, id: u64) -> Option<&'a ReviewThread> {
@@ -137,9 +152,20 @@ impl<'a> Projection<'a> {
                 .threads
                 .iter()
                 .flat_map(|t| &t.comments)
-                .find(|c| c.id == id)
+                .find(|c| c.id == id && !self.posts.changes.hidden(CommentKey::Inline(c.id)))
                 .map(Comment::Published)
         })
+    }
+
+    pub fn reply_target(&self, thread: &'a ReviewThread) -> Option<u64> {
+        self.thread(thread)
+            .comments
+            .into_iter()
+            .find_map(|c| match c {
+                Comment::Published(c) => Some(c.id),
+                Comment::Pending(c) => Some(c.id),
+                Comment::Posting(_) => None,
+            })
     }
 
     pub fn key(&self, comment: Comment<'_>, inline: bool) -> CommentKey {
@@ -150,26 +176,86 @@ impl<'a> Projection<'a> {
         }
     }
 
+    pub fn body(&self, comment: Comment<'a>, inline: bool) -> &'a str {
+        match comment {
+            Comment::Published(c) => self.posts.changes.body(published_key(c, inline), &c.body),
+            Comment::Pending(c) => self.posts.changes.body(CommentKey::Pending(c.id), &c.body),
+            Comment::Posting(p) => &p.body,
+        }
+    }
+
+    fn threads(&self) -> Vec<&'a ReviewThread> {
+        let mut threads: Vec<_> = self
+            .discussion
+            .into_iter()
+            .flat_map(|d| &d.threads)
+            .filter(|t| !t.comments.is_empty())
+            .collect();
+        threads.extend(self.posts.changes.threads.values().filter(|t| {
+            !self
+                .discussion
+                .is_some_and(|d| d.threads.iter().any(|current| current.id == t.id))
+        }));
+        threads
+    }
+
+    fn placement(&self, thread: &'a ReviewThread) -> &'a ReviewThread {
+        self.posts.changes.threads.get(&thread.id).unwrap_or(thread)
+    }
+
+    fn belongs(&self, thread: &ReviewThread, mut parent: u64) -> bool {
+        let mut seen = HashSet::new();
+        while seen.insert(parent) {
+            if thread.comments.iter().any(|c| c.id == parent)
+                || self.posts.changes.members.get(&parent) == Some(&thread.id)
+            {
+                return true;
+            }
+            let Some(next) = self
+                .all_pending
+                .iter()
+                .find(|c| c.id == parent)
+                .copied()
+                .or_else(|| self.posts.changes.pending_roots.get(&parent))
+                .and_then(|c| c.in_reply_to_id)
+            else {
+                return false;
+            };
+            parent = next;
+        }
+        false
+    }
+
     fn thread(&self, thread: &'a ReviewThread) -> Thread<'a> {
-        let root = thread.comments[0].id;
+        let actual = self
+            .discussion
+            .is_some_and(|d| d.threads.iter().any(|t| t.id == thread.id));
         let mut comments: Vec<_> = thread
             .comments
             .iter()
-            .filter(|c| self.pending_comment(c.id).is_none())
+            .filter(|c| {
+                actual
+                    && !self.posts.changes.hidden(CommentKey::Inline(c.id))
+                    && !self.all_pending.iter().any(|p| p.id == c.id)
+            })
             .map(Comment::Published)
             .collect();
         comments.extend(
             self.posts
                 .pending
                 .iter()
-                .filter(|post| post.reply_to == Some(root))
+                .filter(|post| post.reply_to.is_some_and(|id| self.belongs(thread, id)))
                 .map(Comment::Posting),
         );
         comments.extend(
             self.pending
                 .iter()
                 .copied()
-                .filter(|draft| draft.in_reply_to_id == Some(root))
+                .filter(|draft| {
+                    draft
+                        .in_reply_to_id
+                        .is_some_and(|id| self.belongs(thread, id))
+                })
                 .map(Comment::Pending),
         );
         Thread {
@@ -185,6 +271,7 @@ impl<'a> Projection<'a> {
             .discussion
             .into_iter()
             .flat_map(|d| &d.comments)
+            .filter(|c| !self.posts.changes.hidden(published_key(c, false)))
             .enumerate()
             .map(|(ix, comment)| {
                 if comment.review_state.is_some() {
@@ -201,23 +288,27 @@ impl<'a> Projection<'a> {
         // it is also returned in the discussion. Do not leave an empty public
         // thread shell after deduplicating that root.
         let mut threads: Vec<_> = self
-            .discussion
+            .threads()
             .into_iter()
-            .flat_map(|d| &d.threads)
+            .filter(|t| self.posts.thread_shell(t).is_none())
             .filter(|t| {
-                t.comments
-                    .first()
-                    .is_none_or(|c| self.posts.root_shell(c.id).is_none())
-            })
-            .filter(|t| {
-                t.comments
-                    .first()
-                    .is_some_and(|root| self.pending_comment(root.id).is_none())
+                let root = self.placement(t).comments[0].id;
+                !self.all_pending.iter().any(|c| c.id == root)
+                    && !self
+                        .posts
+                        .changes
+                        .pending_roots
+                        .get(&root)
+                        .is_some_and(|c| c.in_reply_to_id.is_none())
             })
             .collect();
-        threads.sort_by(|a, b| thread_order(a).cmp(&thread_order(b)));
+        threads
+            .sort_by(|a, b| thread_order(self.placement(a)).cmp(&thread_order(self.placement(b))));
         for thread in threads {
-            let review = thread.comments[0]
+            if self.thread(thread).comments.is_empty() {
+                continue;
+            }
+            let review = self.placement(thread).comments[0]
                 .review_id
                 .as_deref()
                 .and_then(|id| reviews.get(id));
@@ -232,7 +323,7 @@ impl<'a> Projection<'a> {
             Entry::Review(comment, threads) => {
                 !threads.is_empty()
                     || !matches!(comment.review_state.as_deref(), Some("COMMENTED"))
-                    || has_content(&comment.body)
+                    || has_content(self.body(Comment::Published(comment), false))
             }
             _ => true,
         });
@@ -253,13 +344,15 @@ impl<'a> Projection<'a> {
         roots.sort_by_key(|post| post.token);
         for post in roots {
             let thread = self
-                .posts
-                .root_id(post)
-                .and_then(|id| self.thread_for_inline(id));
+                .threads()
+                .into_iter()
+                .find(|t| self.posts.is_thread_shell(post, t));
             let comments = thread
                 .map(|t| self.thread(t).comments)
                 .unwrap_or_else(|| vec![Comment::Posting(post)]);
-            entries.push(Entry::CreatedThread(post, comments));
+            if !comments.is_empty() {
+                entries.push(Entry::CreatedThread(post, comments));
+            }
         }
         entries
     }
@@ -290,22 +383,79 @@ impl<'a> Projection<'a> {
         self.posts.remote_id(key)
     }
     pub fn inline_key(&self, id: u64) -> CommentKey {
-        self.posts.alias(if self.pending_comment(id).is_some() {
-            CommentKey::Pending(id)
-        } else {
-            CommentKey::Inline(id)
-        })
+        self.posts.alias(
+            if self.all_pending.iter().any(|c| c.id == id)
+                || self.posts.changes.pending_roots.contains_key(&id)
+            {
+                CommentKey::Pending(id)
+            } else {
+                CommentKey::Inline(id)
+            },
+        )
     }
 
     pub fn diff_index(&self) -> index::CommentIndex {
-        let published = self
-            .discussion
-            .into_iter()
-            .flat_map(|d| d.review_comments())
-            .map(index::ReviewComment::from)
-            .collect();
-        let mut comments = merge_pending(published, self.pending.iter().copied());
+        let mut ghosts = HashSet::new();
+        let mut published = Vec::new();
+        for thread in self.threads() {
+            let placement = self.placement(thread);
+            let root = &placement.comments[0];
+            let actual = self
+                .discussion
+                .is_some_and(|d| d.threads.iter().any(|t| t.id == thread.id));
+            let mut members: Vec<_> = if actual {
+                thread.comments.iter().collect()
+            } else {
+                Vec::new()
+            };
+            if !members.iter().any(|c| c.id == root.id) {
+                ghosts.insert(CommentKey::Inline(root.id));
+                members.insert(0, root);
+            }
+            let position = crate::comment_anchor::display_line(thread.line, thread.start_line);
+            for c in members {
+                published.push(index::ReviewComment {
+                    id: CommentKey::Inline(c.id),
+                    path: thread.path.clone(),
+                    line: position.map(|(_, line)| line),
+                    start_line: position.and_then(|(start, _)| start),
+                    side: if thread.side == "LEFT" {
+                        github::DiffSide::Left
+                    } else {
+                        github::DiffSide::Right
+                    },
+                    body: c.body.clone(),
+                    author: c.author.clone(),
+                    time: index::CommentTime::Posted(c.created_at.clone()),
+                    in_reply_to_id: (c.id != root.id).then_some(CommentKey::Inline(root.id)),
+                });
+            }
+        }
+        let mut pending = self.all_pending.clone();
+        for root in self
+            .posts
+            .changes
+            .pending_roots
+            .values()
+            .filter(|c| !self.all_pending.iter().any(|p| p.id == c.id))
+        {
+            ghosts.insert(CommentKey::Pending(root.id));
+            pending.push(root);
+        }
+        let mut comments = merge_pending(published, pending);
+        let mut hidden = HashSet::new();
         for comment in &mut comments {
+            let remote = comment.id;
+            if self.posts.changes.hidden(remote) || ghosts.contains(&remote) {
+                hidden.insert(self.posts.alias(remote));
+            }
+            comment.body = self.posts.changes.body(remote, &comment.body).to_owned();
+            if let Some(CommentKey::Inline(parent)) = comment.in_reply_to_id {
+                if let Some(thread) = self.threads().into_iter().find(|t| self.belongs(t, parent)) {
+                    comment.in_reply_to_id =
+                        Some(CommentKey::Inline(self.placement(thread).comments[0].id));
+                }
+            }
             comment.id = self.posts.alias(comment.id);
             if comment.time == index::CommentTime::Pending {
                 if let Some(author) = self.posts.author(comment.id) {
@@ -337,7 +487,25 @@ impl<'a> Projection<'a> {
                     }
                 }),
         );
-        index::group_comments(comments)
+        index::group_comments(index::retain_thread_members(comments, &hidden))
+    }
+}
+
+fn published_key(comment: &DiscussionComment, inline: bool) -> CommentKey {
+    if inline {
+        CommentKey::Inline(comment.id)
+    } else if comment.review_state.is_some() {
+        CommentKey::Review(comment.id)
+    } else {
+        CommentKey::Issue(comment.id)
+    }
+}
+
+pub(crate) fn published_node(target: &github::CommentTarget) -> &str {
+    match target {
+        github::CommentTarget::Issue(id)
+        | github::CommentTarget::Review(id)
+        | github::CommentTarget::ReviewComment(id) => id,
     }
 }
 

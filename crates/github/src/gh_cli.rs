@@ -88,9 +88,28 @@ impl Default for GhCliClient<GhSubprocess> {
 
 impl<P: GhProcess> GhCliClient<P> {
     fn review_api(&self, args: &[String]) -> Result<serde_json::Value, ClientError> {
+        self.review_api_kind(args, false)
+    }
+
+    fn review_api_kind(
+        &self,
+        args: &[String],
+        comment_write: bool,
+    ) -> Result<serde_json::Value, ClientError> {
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = self.process.run(&argv).map_err(spawn_failure)?;
         if out.code != Some(0) {
+            if comment_write {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    if definite_graphql_rejection(&value) {
+                        return Err(ClientError::Rejected(format!(
+                            "GitHub rejected the comment operation: {}",
+                            value["errors"]
+                        )));
+                    }
+                }
+                return Err(create_api_error(classify_failure(&out)));
+            }
             return Err(classify_failure(&out));
         }
         if out.stdout.is_empty() {
@@ -98,9 +117,12 @@ impl<P: GhProcess> GhCliClient<P> {
         }
         let value: serde_json::Value = decode(out.text()?)?;
         if let Some(errors) = value.get("errors") {
-            return Err(ClientError::Failed(format!(
-                "GitHub rejected the review operation: {errors}"
-            )));
+            let message = format!("GitHub rejected the review operation: {errors}");
+            return Err(if comment_write && definite_graphql_rejection(&value) {
+                ClientError::Rejected(message)
+            } else {
+                ClientError::Failed(message)
+            });
         }
         Ok(value)
     }
@@ -121,11 +143,29 @@ impl<P: GhProcess> GhCliClient<P> {
     }
 
     fn creation_api(&self, args: &[String]) -> Result<serde_json::Value, ClientError> {
-        self.review_api(args).map_err(create_api_error)
+        self.review_api_kind(args, true)
     }
 
     fn creation_graphql(&self, query: String) -> Result<serde_json::Value, ClientError> {
-        self.review_graphql(query).map_err(create_api_error)
+        self.comment_write_graphql(query)
+    }
+
+    fn comment_write_graphql(&self, query: String) -> Result<serde_json::Value, ClientError> {
+        let value = self.review_api_kind(
+            &[
+                "api".into(),
+                "graphql".into(),
+                "-f".into(),
+                format!("query={query}"),
+                "-H".into(),
+                "GraphQL-Features: graphql_pr_comment_positioning".into(),
+            ],
+            true,
+        )?;
+        if !value["data"].is_object() {
+            return Err(ClientError::Failed("GitHub returned no review data".into()));
+        }
+        Ok(value)
     }
 
     /// Review-specific REST comments are legacy payloads: even current drafts
@@ -780,7 +820,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 "missing comment identity or body".into(),
             ));
         }
-        let value = self.review_graphql(format!(
+        let value = self.comment_write_graphql(format!(
             "mutation {{ {mutation}(input:{{{input}:{},body:{}}}) {{ {output} {{ id }} }} }}",
             json_string(id),
             json_string(body)
@@ -803,7 +843,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         if id.is_empty() {
             return Err(ClientError::Invalid("missing comment identity".into()));
         }
-        let value = self.review_graphql(format!(
+        let value = self.comment_write_graphql(format!(
             "mutation {{ {mutation}(input:{{{input}:{},clientMutationId:{}}}) {{ clientMutationId }} }}",
             json_string(id), json_string(id)
         ))?;
@@ -1057,7 +1097,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         body: &str,
     ) -> Result<(), ClientError> {
         let id = pending_node_id(comment)?;
-        let value = self.review_graphql(format!("mutation {{ updatePullRequestReviewComment(input:{{pullRequestReviewCommentId:{},body:{}}}) {{ pullRequestReviewComment {{ id }} }} }}", json_string(id), json_string(body)))?;
+        let value = self.comment_write_graphql(format!("mutation {{ updatePullRequestReviewComment(input:{{pullRequestReviewCommentId:{},body:{}}}) {{ pullRequestReviewComment {{ id }} }} }}", json_string(id), json_string(body)))?;
         if value["data"]["updatePullRequestReviewComment"]["pullRequestReviewComment"]["id"]
             .as_str()
             != Some(id)
@@ -1075,7 +1115,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         comment: &PendingComment,
     ) -> Result<(), ClientError> {
         let id = pending_node_id(comment)?;
-        let value = self.review_graphql(format!("mutation {{ deletePullRequestReviewComment(input:{{id:{},clientMutationId:{}}}) {{ clientMutationId }} }}", json_string(id), json_string(id)))?;
+        let value = self.comment_write_graphql(format!("mutation {{ deletePullRequestReviewComment(input:{{id:{},clientMutationId:{}}}) {{ clientMutationId }} }}", json_string(id), json_string(id)))?;
         if value["data"]["deletePullRequestReviewComment"]["clientMutationId"].as_str() != Some(id)
         {
             return Err(ClientError::Failed(
@@ -1764,7 +1804,36 @@ fn positioning_input(anchor: &CommentAnchor) -> String {
     }
 }
 
-/// Only explicit CLI HTTP rejections establish that a create did not commit.
+// A failure at the mutation field (not a nested response resolver) with an
+// explicit rejection type establishes that the write itself was rejected.
+// Partial data, nested field errors, and unknown types remain uncertain.
+fn definite_graphql_rejection(value: &serde_json::Value) -> bool {
+    value["errors"]
+        .as_array()
+        .filter(|errors| !errors.is_empty())
+        .is_some_and(|errors| {
+            errors.iter().all(|error| {
+                let kind = error["type"]
+                    .as_str()
+                    .or_else(|| error["extensions"]["code"].as_str())
+                    .unwrap_or("");
+                if kind == "GRAPHQL_VALIDATION_FAILED" && value["data"].is_null() {
+                    return true;
+                }
+                matches!(
+                    kind,
+                    "FORBIDDEN" | "NOT_FOUND" | "UNPROCESSABLE" | "RATE_LIMITED"
+                ) && error["path"].as_array().is_some_and(|path| {
+                    path.len() == 1
+                        && path[0]
+                            .as_str()
+                            .is_some_and(|field| value["data"][field].is_null())
+                })
+            })
+        })
+}
+
+/// Only explicit CLI HTTP rejections establish that a comment write did not commit.
 /// Parse/transport failures and GraphQL partial data remain unverified. This
 /// classification is intentionally confined to the comment write call itself.
 fn create_api_error(error: ClientError) -> ClientError {
@@ -1781,8 +1850,15 @@ fn create_api_error(error: ClientError) -> ClientError {
 }
 
 fn positioning_error(anchor: &CommentAnchor, error: ClientError) -> ClientError {
-    if anchor.position.is_some() && matches!(error, ClientError::Failed(_)) {
-        ClientError::Failed(format!("outside-diff comments use GitHub's experimental positioning API, which may not be enabled for this repository: {error}"))
+    if anchor.position.is_some()
+        && matches!(error, ClientError::Failed(_) | ClientError::Rejected(_))
+    {
+        let message = format!("outside-diff comments use GitHub's experimental positioning API, which may not be enabled for this repository: {error}");
+        if matches!(error, ClientError::Rejected(_)) {
+            ClientError::Rejected(message)
+        } else {
+            ClientError::Failed(message)
+        }
     } else {
         error
     }
@@ -2478,6 +2554,95 @@ mod tests {
     use crate::{QueueFilter, QueueSort};
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    #[test]
+    fn edit_delete_classify_only_explicit_mutation_rejections_as_definite() {
+        use crate::CommentTarget;
+        for code in [0, 1] {
+            for (target, edit, delete) in [
+                (
+                    CommentTarget::Issue("node".into()),
+                    "updateIssueComment",
+                    "deleteIssueComment",
+                ),
+                (
+                    CommentTarget::Review("node".into()),
+                    "updatePullRequestReview",
+                    "deletePullRequestReview",
+                ),
+                (
+                    CommentTarget::ReviewComment("node".into()),
+                    "updatePullRequestReviewComment",
+                    "deletePullRequestReviewComment",
+                ),
+            ] {
+                for deleting in [false, true] {
+                    let mutation = if deleting { delete } else { edit };
+                    let value = serde_json::json!({"data":{mutation:null},"errors":[{"type":"FORBIDDEN","path":[mutation],"message":"permission denied"}]});
+                    let api = client(ok(Some(code), &value.to_string(), "gh: permission denied"));
+                    let error = if deleting {
+                        api.delete_comment(&target)
+                    } else {
+                        api.edit_comment(&target, "edit")
+                    }
+                    .unwrap_err();
+                    assert!(matches!(error, ClientError::Rejected(_)), "{error:?}");
+                }
+            }
+        }
+        let comment = PendingComment {
+            id: 1,
+            node_id: "node".into(),
+            path: "a.rs".into(),
+            side: crate::DiffSide::Right,
+            line: Some(1),
+            start_line: None,
+            body: "old".into(),
+            in_reply_to_id: None,
+        };
+        for deleting in [false, true] {
+            let mutation = if deleting {
+                "deletePullRequestReviewComment"
+            } else {
+                "updatePullRequestReviewComment"
+            };
+            let value = serde_json::json!({"data":{mutation:null},"errors":[{"type":"NOT_FOUND","path":[mutation],"message":"not found"}]});
+            let api = client(ok(Some(1), &value.to_string(), "gh: not found"));
+            let error = if deleting {
+                api.delete_pending_comment(&loc(), &comment)
+            } else {
+                api.edit_pending_comment(&loc(), &comment, "edit")
+            }
+            .unwrap_err();
+            assert!(matches!(error, ClientError::Rejected(_)));
+        }
+    }
+
+    #[test]
+    fn partial_graphql_responses_and_unrecognized_write_failures_remain_uncertain() {
+        let mutation = "updatePullRequestReviewComment";
+        for value in [
+            serde_json::json!({"data":{mutation:{"pullRequestReviewComment":null}},"errors":[{"type":"FORBIDDEN","path":[mutation,"pullRequestReviewComment"]}]}),
+            serde_json::json!({"data":{mutation:null},"errors":[{"type":"INTERNAL","path":[mutation]}]}),
+            serde_json::json!({"data":{mutation:{}}}),
+        ] {
+            for code in [0, 1] {
+                let error = client(ok(Some(code), &value.to_string(), "gh: response failed"))
+                    .edit_comment(&crate::CommentTarget::ReviewComment("node".into()), "edit")
+                    .unwrap_err();
+                assert!(error.mutation_is_uncertain(), "{error:?}");
+            }
+        }
+        for code in [408, 503] {
+            let error = client(ok(Some(1), "", &format!("gh: timeout (HTTP {code})")))
+                .delete_comment(&crate::CommentTarget::Issue("node".into()))
+                .unwrap_err();
+            assert!(error.mutation_is_uncertain());
+        }
+        assert!(definite_graphql_rejection(
+            &serde_json::json!({"data":null,"errors":[{"extensions":{"code":"GRAPHQL_VALIDATION_FAILED"}}]})
+        ));
+    }
 
     #[test]
     fn create_failures_distinguish_explicit_rejection_from_uncertain_outcomes() {

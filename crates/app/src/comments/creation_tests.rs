@@ -83,6 +83,48 @@ fn begin(posts: &mut posting::Posts, token: u64, pending: bool, parent: Option<u
 }
 
 #[test]
+fn deleting_a_locally_created_root_keeps_its_created_thread_shell_for_surviving_replies() {
+    let mut posts = posting::Posts::default();
+    begin(&mut posts, 7, false, None);
+    let mut confirmed = discussion(&[11]);
+    confirmed.threads[0]
+        .comments
+        .push(discussion(&[12]).threads[0].comments[0].clone());
+    posts.finish_create(7, &Ok(published(11, None)));
+    posts.reconcile(&confirmed);
+    let change = super::mutations::Change {
+        token: 8,
+        key: CommentKey::Inline(11),
+        target: github::MutationTarget::Published(github::CommentTarget::ReviewComment(
+            "node-11".into(),
+        )),
+        body: None,
+        recovery_body: "identical".into(),
+        placement: crate::ComposerPlacement::Diff,
+        uncertain: false,
+        error: None,
+    };
+    posts.changes.begin(change.clone(), Some(&confirmed), None);
+    for saved in [false, true] {
+        if saved {
+            confirmed.threads[0].comments.remove(0);
+            posts.changes.finish(
+                8,
+                &Ok(MutationReceipt::Deleted {
+                    target: change.target.clone(),
+                }),
+            );
+            posts.reconcile(&confirmed);
+        }
+        let view = Projection::new(Some(&confirmed), None, &posts);
+        assert!(
+            matches!(view.conversation().as_slice(), [Entry::CreatedThread(post, comments)] if post.token == 7 && comments.len() == 1 && matches!(comments[0], Comment::Published(c) if c.id == 12))
+        );
+        assert_eq!(view.diff_index().counts["a.rs"], (1, 0));
+    }
+}
+
+#[test]
 fn public_roots_bind_in_place_without_moving_into_a_new_review_wrapper() {
     let mut posts = posting::Posts::default();
     let mut confirmed = discussion(&[]);

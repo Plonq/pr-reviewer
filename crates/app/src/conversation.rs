@@ -289,9 +289,8 @@ impl ReviewApp {
                 .child(self.render_composer_card(cx))
                 .into_any_element();
         }
-        let reply_to = thread
-            .and_then(|thread| thread.comments.first())
-            .map(|c| c.id);
+        let reply_to =
+            thread.and_then(|thread| self.active_comment_projection()?.reply_target(thread));
         let path = thread.map_or(String::new(), |thread| thread.path.clone());
         let side = if thread.is_some_and(|thread| thread.side == "LEFT") {
             CommentSide::Left
@@ -318,7 +317,11 @@ impl ReviewApp {
                     "Leave a comment"
                 })
                 .small()
-                .disabled(self.composer().is_some() || self.review.is_some())
+                .disabled(
+                    self.composer().is_some()
+                        || self.review.is_some()
+                        || (thread.is_some() && reply_to.is_none()),
+                )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.active_item().map(|item| item.id) != Some(item_id) {
                         return;
@@ -579,13 +582,13 @@ impl ReviewApp {
                 Entry::CreatedThread(post, comments) => {
                     let anchor = post.anchor.as_ref().expect("inline root anchor");
                     let key = format!("created-thread-{}-{}", item.id, post.token);
-                    let confirmed = data.discussion.as_ref().and_then(|d| {
-                        d.threads.iter().find(|t| {
-                            t.comments
-                                .first()
-                                .is_some_and(|c| data.posts.root_id(post) == Some(c.id))
-                        })
-                    });
+                    let confirmed = data
+                        .discussion
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|d| &d.threads)
+                        .chain(data.posts.changes.threads.values())
+                        .find(|t| data.posts.is_thread_shell(post, t));
                     let composing = self.composer().is_some_and(|c| {
                         c.item_id == item.id
                             && confirmed.is_some_and(|t| {
@@ -1046,6 +1049,18 @@ impl ReviewApp {
                 Some(crate::CommentTarget::Pending(draft.id)),
             ),
         };
+        let body = self
+            .items
+            .iter()
+            .find(|i| i.id == item_id)
+            .and_then(|i| match &i.state {
+                ItemState::Ready(data) => Some(
+                    data.comment_projection(None)
+                        .body(projected, kind == "review"),
+                ),
+                _ => None,
+            })
+            .unwrap_or(body);
         let controls = target.clone().map(|target| {
             let placement = ComposerPlacement::ConversationComment(target.key());
             (target, placement)

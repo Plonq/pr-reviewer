@@ -1339,12 +1339,17 @@ impl ReviewItem {
         mut loaded: Loaded,
         ticket: comments::sync::ReadTicket,
     ) -> Option<local_store::StoredPrSnapshot> {
-        if matches!(self.source, Source::Pr(_))
-            && !loaded
-                .discussion
-                .as_ref()
-                .is_some_and(|discussion| self.comment_sync.accept(ticket, discussion))
-        {
+        let accepted = loaded
+            .discussion
+            .as_ref()
+            .is_some_and(|d| match &self.state {
+                ItemState::Ready(data) => {
+                    self.comment_sync
+                        .accept_projected(ticket, d, &data.posts.changes)
+                }
+                _ => self.comment_sync.accept(ticket, d),
+            });
+        if matches!(self.source, Source::Pr(_)) && !accepted {
             // A stale full fetch may still deliver useful metadata and a diff.
             // Keep the last confirmed discussion and rebuild its index/rows on
             // that diff. Never persist the rejected snapshot as authoritative.
@@ -1426,6 +1431,11 @@ impl ReviewItem {
                 data.file_media = file_media;
                 data.expanded_regions.clear();
                 data.discussion = discussion;
+                if accepted {
+                    data.posts
+                        .changes
+                        .reconcile(data.discussion.as_ref(), None, true);
+                }
                 if let Some(discussion) = &data.discussion {
                     data.posts.reconcile(discussion);
                 }
@@ -3635,6 +3645,7 @@ impl ReviewApp {
         Task<(
             ReviewSession,
             Result<github::MutationReceipt, github::ClientError>,
+            github::PrLocator,
         )>,
     > {
         let item = self.items.iter().find(|item| item.id == item_id)?;
@@ -3642,6 +3653,10 @@ impl ReviewApp {
             return None;
         };
         let loc = loc.clone();
+        let mut protection = match &item.state {
+            ItemState::Ready(data) => data.posts.changes.session_protection(),
+            _ => Default::default(),
+        };
         if !matches!(command, SessionCommand::Resume)
             && matches!(&item.state, ItemState::Ready(data) if data.posts.has_uncertain())
         {
@@ -3661,24 +3676,52 @@ impl ReviewApp {
         }
         let github = self.github.clone();
         let store = self.store.clone();
+        let previous = session.clone();
+        let submitted = matches!(command, SessionCommand::Submit { .. });
+        let resuming = matches!(command, SessionCommand::Resume);
         cx.notify();
         Some(cx.background_spawn(async move {
             let result = session.execute_with_receipt(github.as_ref(), &loc, command);
-            // Also mirror partial success (e.g. start succeeded, add failed).
-            store.save_review_session(&loc, &session);
-            (session, result)
+            let mut confirmed = session.clone();
+            if resuming && result.is_ok() && session.verified {
+                protection.reconcile(None, session.pending.as_ref(), false);
+            }
+            if let Ok(receipt) = &result {
+                protection.supersede_pending(receipt);
+                if submitted {
+                    protection.review_ended();
+                }
+            }
+            protection.protect_session(&mut confirmed, &previous);
+            // Also finish persistence if the window/item has gone away. The raw
+            // read still goes to the UI: a receipt-repaired cache cannot serve
+            // as positive acknowledgement of itself.
+            store.save_review_session(&loc, &confirmed);
+            (session, result, loc)
         }))
     }
 
     fn finish_session(
         &mut self,
         item_id: u64,
-        state: ReviewSession,
+        loc: &github::PrLocator,
+        mut state: ReviewSession,
         result: &Result<(), github::ClientError>,
         cx: &mut Context<Self>,
     ) {
         if self.items.iter().any(|item| item.id == item_id) {
             let ui = self.sessions.entry(item_id).or_default();
+            if let Some(ItemState::Ready(data)) = self
+                .items
+                .iter_mut()
+                .find(|i| i.id == item_id)
+                .map(|i| &mut i.state)
+            {
+                data.posts.changes.protect_session(&mut state, &ui.state);
+            }
+            // Mirror confirmed state and partial lifecycle success only after
+            // the reconciliation boundary has protected accepted receipts.
+            self.store.save_review_session(loc, &state);
             // Reconciliation must not collapse a tray the user has expanded.
             // Once the review ends, the next review starts collapsed again.
             ui.comments_expanded &= state.pending.is_some();
@@ -3712,10 +3755,31 @@ impl ReviewApp {
         let Some(job) = self.session_job(item_id, SessionCommand::Resume, cx) else {
             return;
         };
+        let ticket = self
+            .items
+            .iter_mut()
+            .find(|i| i.id == item_id)
+            .unwrap()
+            .comment_sync
+            .begin_read();
         cx.spawn(async move |this, cx| {
-            let (session, result) = job.await;
+            let (session, result, loc) = job.await;
             this.update(cx, |app, cx| {
-                app.finish_session(item_id, session, &result.map(|_| ()), cx)
+                if result.is_ok() && session.verified {
+                    if let Some(item) = app
+                        .items
+                        .iter_mut()
+                        .find(|i| i.id == item_id)
+                        .filter(|i| i.comment_sync.eligible(ticket))
+                    {
+                        if let ItemState::Ready(data) = &mut item.state {
+                            data.posts
+                                .changes
+                                .reconcile(None, session.pending.as_ref(), false);
+                        }
+                    }
+                }
+                app.finish_session(item_id, &loc, session, &result.map(|_| ()), cx)
             })
             .ok();
         })
@@ -3796,9 +3860,42 @@ impl ReviewApp {
                 }
             }
         }
+        let change_token = match completion {
+            SessionCompletion::Composer(gen) => gen,
+            _ => self.composer_gen + 1,
+        };
+        let placement = self
+            .composers
+            .iter()
+            .find(|c| c.id == change_token)
+            .map(|c| c.placement.clone())
+            .unwrap_or(ComposerPlacement::Diff);
+        let change = self.comment_change(item_id, &command, change_token, placement);
+        let changing = change.is_some();
         let Some(job) = self.session_job(item_id, command, cx) else {
             return;
         };
+        if let Some(change) = change {
+            self.composer_gen = self.composer_gen.max(change.token);
+            if let Some(ItemState::Ready(data)) = self
+                .items
+                .iter_mut()
+                .find(|i| i.id == item_id)
+                .map(|i| &mut i.state)
+            {
+                data.posts.changes.begin(
+                    change,
+                    data.discussion.as_ref(),
+                    self.sessions
+                        .get(&item_id)
+                        .and_then(|ui| ui.state.pending.as_ref()),
+                );
+            }
+            self.sync_pending_comments(item_id);
+            if let SessionCompletion::Composer(gen) = completion {
+                self.close_composer_id(gen, window, cx);
+            }
+        }
         if let Some((gen, reply_to, anchor, pending, body)) = submission {
             let author = match &self.account {
                 AccountStatus::SignedIn(viewer) => viewer.login.clone(),
@@ -3854,7 +3951,7 @@ impl ReviewApp {
             self.close_composer_id(gen, window, cx);
         }
         cx.spawn_in(window, async move |this, cx| {
-            let (session, result) = job.await;
+            let (session, result, loc) = job.await;
             let receipt = result.as_ref().ok().cloned();
             let creation_result = result.clone();
             let result = result.map(|_| ());
@@ -3877,9 +3974,33 @@ impl ReviewApp {
                         }
                     }
                 }
-                app.finish_session(item_id, session, &result, cx);
+                // Install authoritative write effects and retire only this overlay
+                // in one UI update. Refresh barriers protect successful receipts.
                 if result.is_ok() {
                     app.apply_comment_mutation(item_id, receipt.as_ref().unwrap());
+                }
+                if changing {
+                    if let Some(ItemState::Ready(data)) = app
+                        .items
+                        .iter_mut()
+                        .find(|i| i.id == item_id)
+                        .map(|i| &mut i.state)
+                    {
+                        data.posts.changes.finish(change_token, &creation_result);
+                    }
+                }
+                if submitted && result.is_ok() {
+                    if let Some(ItemState::Ready(data)) = app
+                        .items
+                        .iter_mut()
+                        .find(|i| i.id == item_id)
+                        .map(|i| &mut i.state)
+                    {
+                        data.posts.changes.review_ended();
+                    }
+                }
+                app.finish_session(item_id, &loc, session, &result, cx);
+                if result.is_ok() {
                     app.apply_reaction(item_id, &mutation);
                     app.apply_thread_resolution(item_id, &mutation);
                 }
@@ -3910,13 +4031,27 @@ impl ReviewApp {
                     },
                     _ => {}
                 }
-                if ((submitted || replied || commented || mutated) && result.is_ok())
-                    || (creating
-                        && creation_result
+                let pending_change = matches!(
+                    mutation,
+                    SessionCommand::Edit { .. } | SessionCommand::Delete { .. }
+                );
+                if pending_change
+                    && (result.is_ok()
+                        || creation_result
                             .as_ref()
                             .err()
                             .is_some_and(github::ClientError::mutation_is_uncertain))
-                    || matches!(mutation, SessionCommand::SetThreadResolved { .. })
+                {
+                    app.resume_session(item_id, cx);
+                }
+                if !pending_change
+                    && (((submitted || replied || commented || mutated) && result.is_ok())
+                        || ((creating || changing)
+                            && creation_result
+                                .as_ref()
+                                .err()
+                                .is_some_and(github::ClientError::mutation_is_uncertain))
+                        || matches!(mutation, SessionCommand::SetThreadResolved { .. }))
                 {
                     if let Some(Source::Pr(loc)) = app
                         .items
@@ -4251,6 +4386,12 @@ impl ReviewApp {
             return;
         }
         if let Some(target) = composer.edit_target.clone() {
+            if !self.comment_permissions(&target).0 {
+                self.composer_mut().unwrap().error =
+                    Some("This comment is no longer editable; refresh and try again.".into());
+                cx.notify();
+                return;
+            }
             match target {
                 CommentTarget::Local(id) => {
                     if let Some(data) = self.active_data_mut() {
@@ -4444,7 +4585,15 @@ impl ReviewApp {
                     return;
                 }
                 if let Ok(discussion) = &fetched {
-                    if !item.comment_sync.accept(ticket, discussion) {
+                    let accepted = match &item.state {
+                        ItemState::Ready(data) => item.comment_sync.accept_projected(
+                            ticket,
+                            discussion,
+                            &data.posts.changes,
+                        ),
+                        _ => item.comment_sync.accept(ticket, discussion),
+                    };
+                    if !accepted {
                         return;
                     }
                 }
@@ -4453,6 +4602,7 @@ impl ReviewApp {
                 };
                 match fetched {
                     Ok(discussion) => {
+                        data.posts.changes.reconcile(Some(&discussion), None, true);
                         data.posts.reconcile(&discussion);
                         if item
                             .refresh_error
@@ -5259,7 +5409,7 @@ impl ReviewApp {
                                 .truncate()
                                 .child(SharedString::from(format!(
                                     "{location} · {}",
-                                    comment.body
+                                    projection.body(comments::Comment::Pending(comment), true)
                                 ))),
                         )
                         .child(
@@ -5385,6 +5535,14 @@ impl ReviewApp {
                 tray = tray.child(recovery);
             }
         }
+        if editing_in_tray
+            && self
+                .composer()
+                .is_some_and(|c| matches!(c.edit_target, Some(CommentTarget::Published(_))))
+        {
+            tray = tray.child(self.render_composer_card(cx));
+        }
+        tray = tray.children(self.render_comment_changes(id, cx));
         tray.into_any_element()
     }
 
@@ -7489,6 +7647,9 @@ mod tests {
     }
     mod comment_creation {
         include!("comment_creation_tests.rs");
+    }
+    mod comment_mutation {
+        include!("comment_mutation_tests.rs");
     }
 
     mod markdown_hosts {
@@ -14159,6 +14320,9 @@ mod tests {
         fail_discussion: std::sync::atomic::AtomicBool,
         fail_pending_create: std::sync::atomic::AtomicBool,
         unknown_create: std::sync::atomic::AtomicBool,
+        unknown_mutation: std::sync::atomic::AtomicBool,
+        mutation_calls: std::sync::atomic::AtomicUsize,
+        thread_ids: std::sync::Mutex<HashMap<u64, String>>,
         /// The id the next posted comment gets.
         next_id: std::sync::atomic::AtomicU64,
         pending: std::sync::Mutex<Option<github::PendingReview>>,
@@ -14195,6 +14359,33 @@ mod tests {
 
         fn posts(&self) -> Vec<Post> {
             self.posted.lock().unwrap().clone()
+        }
+
+        fn before_mutation(&self, action: &str) -> Result<(), github::ClientError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.mutation_calls.fetch_add(1, SeqCst);
+            if self.fail.load(SeqCst) {
+                let message = format!("{action} rejected");
+                return Err(if self.unknown_mutation.load(SeqCst) {
+                    github::ClientError::Failed(message)
+                } else {
+                    github::ClientError::Rejected(message)
+                });
+            }
+            Ok(())
+        }
+
+        fn after_mutation(&self) -> Result<(), github::ClientError> {
+            if self
+                .unknown_mutation
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(github::ClientError::Failed(
+                    "response lost after committing".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
 
         fn patch_text(&self) -> String {
@@ -14264,9 +14455,7 @@ mod tests {
                 target: target.clone(),
                 body: body.into(),
             });
-            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(github::ClientError::Failed("edit rejected".into()));
-            }
+            self.before_mutation("edit")?;
             match target {
                 github::CommentTarget::ReviewComment(node_id) => {
                     let permissions = self.comment_permissions.lock().unwrap();
@@ -14293,7 +14482,7 @@ mod tests {
                         .body = body.into();
                 }
             }
-            Ok(())
+            self.after_mutation()
         }
 
         fn delete_comment(
@@ -14303,9 +14492,7 @@ mod tests {
             self.posted.lock().unwrap().push(Post::Delete {
                 target: target.clone(),
             });
-            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(github::ClientError::Failed("delete rejected".into()));
-            }
+            self.before_mutation("delete")?;
             match target {
                 github::CommentTarget::ReviewComment(node_id) => {
                     let permissions = self.comment_permissions.lock().unwrap();
@@ -14314,7 +14501,33 @@ mod tests {
                         .find(|(_, p)| &p.node_id == node_id)
                         .unwrap()
                         .0;
-                    self.comments.lock().unwrap().retain(|c| c.id != *id);
+                    let mut comments = self.comments.lock().unwrap();
+                    let removed = comments.iter().find(|c| c.id == *id).cloned().unwrap();
+                    let replacement = removed.in_reply_to_id.or_else(|| {
+                        comments
+                            .iter()
+                            .find(|c| c.in_reply_to_id == Some(*id))
+                            .map(|c| c.id)
+                    });
+                    comments.retain(|c| c.id != *id);
+                    for c in &mut *comments {
+                        if c.in_reply_to_id == Some(*id) {
+                            c.in_reply_to_id = replacement.filter(|id| *id != c.id);
+                            if c.in_reply_to_id.is_none() {
+                                c.path = removed.path.clone();
+                                c.line = removed.line;
+                                c.start_line = removed.start_line;
+                                c.side = removed.side.clone();
+                            }
+                        }
+                    }
+                    if removed.in_reply_to_id.is_none() {
+                        if let Some(new) = replacement {
+                            let mut ids = self.thread_ids.lock().unwrap();
+                            let thread = ids.get(id).cloned().unwrap_or_else(|| id.to_string());
+                            ids.insert(new, thread);
+                        }
+                    }
                 }
                 github::CommentTarget::Issue(node_id) | github::CommentTarget::Review(node_id) => {
                     self.conversation
@@ -14323,7 +14536,7 @@ mod tests {
                         .retain(|c| &c.permissions.node_id != node_id);
                 }
             }
-            Ok(())
+            self.after_mutation()
         }
 
         fn viewed_files(
@@ -14400,6 +14613,13 @@ mod tests {
                 github::PrDiscussion::from_review_comments(self.comments.lock().unwrap().clone());
             discussion.comments = self.conversation.lock().unwrap().clone();
             for thread in &mut discussion.threads {
+                if let Some(id) = thread
+                    .comments
+                    .first()
+                    .and_then(|c| self.thread_ids.lock().unwrap().get(&c.id).cloned())
+                {
+                    thread.id = id;
+                }
                 if let Some(resolved) = self.resolutions.lock().unwrap().get(&thread.id) {
                     thread.is_resolved = *resolved;
                     thread.viewer_can_resolve = true;
@@ -14633,6 +14853,7 @@ mod tests {
             comment: &github::PendingComment,
             body: &str,
         ) -> Result<(), github::ClientError> {
+            self.before_mutation("edit")?;
             self.pending
                 .lock()
                 .unwrap()
@@ -14643,7 +14864,7 @@ mod tests {
                 .find(|draft| draft.id == comment.id)
                 .unwrap()
                 .body = body.into();
-            Ok(())
+            self.after_mutation()
         }
 
         fn delete_pending_comment(
@@ -14651,6 +14872,7 @@ mod tests {
             _loc: &github::PrLocator,
             comment: &github::PendingComment,
         ) -> Result<(), github::ClientError> {
+            self.before_mutation("delete")?;
             self.pending
                 .lock()
                 .unwrap()
@@ -14658,7 +14880,7 @@ mod tests {
                 .unwrap()
                 .comments
                 .retain(|draft| draft.id != comment.id);
-            Ok(())
+            self.after_mutation()
         }
 
         fn submit_pending_review(
@@ -18654,7 +18876,7 @@ mod tests {
         cx.update(|cx| {
             app.update(cx, |this, cx| {
                 this.sessions.get_mut(&0).unwrap().comments_expanded = true;
-                this.finish_session(0, ReviewSession::default(), &Ok(()), cx);
+                this.finish_session(0, &loop_loc(), ReviewSession::default(), &Ok(()), cx);
                 assert!(!this.sessions[&0].comments_expanded);
             })
         });

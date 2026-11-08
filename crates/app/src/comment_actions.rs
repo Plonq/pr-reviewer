@@ -124,7 +124,7 @@ impl ReviewApp {
         }
     }
 
-    fn comment_permissions(&self, target: &CommentTarget) -> (bool, bool) {
+    pub(crate) fn comment_permissions(&self, target: &CommentTarget) -> (bool, bool) {
         match target {
             CommentTarget::Published(target) => {
                 self.published_comment(target).map_or((false, false), |c| {
@@ -466,6 +466,274 @@ impl ReviewApp {
                 cx.notify();
             }
         }
+    }
+
+    pub(crate) fn comment_change(
+        &self,
+        item_id: u64,
+        command: &SessionCommand,
+        token: u64,
+        placement: ComposerPlacement,
+    ) -> Option<crate::comments::mutations::Change> {
+        use crate::comments::{mutations::Change, CommentKey};
+        let item = self.items.iter().find(|i| i.id == item_id)?;
+        let ItemState::Ready(data) = &item.state else {
+            return None;
+        };
+        let (target, key, confirmed, body) = match command {
+            SessionCommand::EditPublished { target, .. }
+            | SessionCommand::DeletePublished { target } => {
+                let c = data.comment_projection(None).published(target)?;
+                let key = match target {
+                    github::CommentTarget::ReviewComment(_) => CommentKey::Inline(c.id),
+                    // Part 4 is inline-only. Issue comments and submitted-review
+                    // summaries retain their existing completion/editor timing.
+                    _ => return None,
+                };
+                let body = match command {
+                    SessionCommand::EditPublished { body, .. } => Some(body.trim().to_owned()),
+                    _ => None,
+                };
+                (
+                    github::MutationTarget::Published(target.clone()),
+                    key,
+                    c.body.clone(),
+                    body,
+                )
+            }
+            SessionCommand::Edit { id, .. } | SessionCommand::Delete { id } => {
+                let review = self.sessions.get(&item_id)?.state.pending.as_ref()?;
+                let c = review.comments.iter().find(|c| c.id == *id)?;
+                let body = match command {
+                    SessionCommand::Edit { body, .. } => Some(body.trim().to_owned()),
+                    _ => None,
+                };
+                (
+                    github::MutationTarget::Pending {
+                        review_id: review.id,
+                        id: *id,
+                        node_id: c.node_id.clone(),
+                    },
+                    CommentKey::Pending(*id),
+                    c.body.clone(),
+                    body,
+                )
+            }
+            _ => return None,
+        };
+        Some(Change {
+            token,
+            key,
+            target,
+            recovery_body: body.clone().unwrap_or(confirmed),
+            body,
+            placement,
+            uncertain: false,
+            error: None,
+        })
+    }
+
+    pub(crate) fn render_comment_changes(
+        &self,
+        item_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let Some(item) = self.items.iter().find(|i| i.id == item_id) else {
+            return Vec::new();
+        };
+        let ItemState::Ready(data) = &item.state else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for change in data
+            .posts
+            .changes
+            .active
+            .iter()
+            .chain(&data.posts.changes.failed)
+        {
+            let token = change.token;
+            let editing = change.body.is_some();
+            let active = data.posts.changes.active.iter().any(|c| c.token == token);
+            let message = if change.uncertain && !active {
+                "Outcome dismissed after checking; showing confirmed content. No write retried."
+                    .to_owned()
+            } else if change.uncertain {
+                format!("{} unverified. Check GitHub before changing comments or submitting the review.", if editing { "Edit" } else { "Deletion" })
+            } else if active {
+                if editing {
+                    "Saving comment…".to_owned()
+                } else {
+                    "Deleting comment…".to_owned()
+                }
+            } else {
+                format!(
+                    "{} rejected: {}",
+                    if editing {
+                        "Edit"
+                    } else {
+                        "Deletion (comment restored)"
+                    },
+                    change.error.as_deref().unwrap_or("rejected")
+                )
+            };
+            let mut row = div()
+                .debug_selector(move || format!("comment-change-{item_id}-{token}"))
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().flex_1().min_w_0().child(message));
+            if change.error.is_some() {
+                let body = change.recovery_body.clone();
+                row = row.child(
+                    Button::new(SharedString::from(format!("copy-change-{token}")))
+                        .label("Copy text")
+                        .ghost()
+                        .small()
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(body.clone()))
+                        }),
+                );
+                if change.uncertain {
+                    let url = match &item.source {
+                        crate::Source::Pr(loc) => {
+                            format!("https://github.com/{}/pull/{}", loc.repo_slug(), loc.number)
+                        }
+                        _ => String::new(),
+                    };
+                    row = row.child(
+                        Button::new(SharedString::from(format!("verify-change-{token}")))
+                            .label("Check GitHub")
+                            .ghost()
+                            .small()
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    );
+                    if active {
+                        row = row.child(
+                            Button::new(SharedString::from(format!("dismiss-change-{token}")))
+                                .label("Dismiss after checking")
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.dismiss_comment_change(item_id, token, cx)
+                                })),
+                        );
+                    }
+                } else if editing && !active {
+                    row = row.child(
+                        Button::new(SharedString::from(format!("restore-change-{token}")))
+                            .label("Restore edit")
+                            .ghost()
+                            .small()
+                            .disabled(
+                                self.comment_write_blocked(item_id)
+                                    || self.composers.iter().any(|c| c.item_id == item_id)
+                                    || self.review.is_some(),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.restore_comment_change(item_id, token, window, cx)
+                            })),
+                    );
+                }
+            }
+            rows.push(row.into_any_element());
+        }
+        rows
+    }
+
+    pub(crate) fn dismiss_comment_change(
+        &mut self,
+        item_id: u64,
+        token: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ItemState::Ready(data)) = self
+            .items
+            .iter_mut()
+            .find(|i| i.id == item_id)
+            .map(|i| &mut i.state)
+        {
+            if let Some(ix) = data
+                .posts
+                .changes
+                .active
+                .iter()
+                .position(|c| c.token == token && c.uncertain)
+            {
+                let change = data.posts.changes.active.remove(ix);
+                data.posts.changes.failed.push(change);
+            }
+        }
+        self.sync_pending_comments(item_id);
+        cx.notify();
+    }
+
+    pub(crate) fn restore_comment_change(
+        &mut self,
+        item_id: u64,
+        token: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_item().map(|i| i.id) != Some(item_id)
+            || self.composers.iter().any(|c| c.item_id == item_id)
+            || self.review.is_some()
+            || self.comment_write_blocked(item_id)
+        {
+            return;
+        }
+        let Some(change) = self
+            .active_data()
+            .and_then(|d| {
+                d.posts
+                    .changes
+                    .failed
+                    .iter()
+                    .find(|c| c.token == token && !c.uncertain && c.body.is_some())
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let target = match &change.target {
+            github::MutationTarget::Published(target) => CommentTarget::Published(target.clone()),
+            github::MutationTarget::Pending {
+                review_id,
+                id,
+                node_id,
+            } => {
+                if !self
+                    .sessions
+                    .get(&item_id)
+                    .and_then(|ui| ui.state.pending.as_ref())
+                    .is_some_and(|r| {
+                        r.id == *review_id
+                            && r.comments
+                                .iter()
+                                .any(|c| c.id == *id && c.node_id == *node_id)
+                    })
+                {
+                    return;
+                }
+                CommentTarget::Pending(*id)
+            }
+        };
+        self.edit_comment(target.clone(), change.placement, window, cx);
+        if let Some(composer) = self
+            .composer_mut()
+            .filter(|c| c.item_id == item_id && c.edit_target.as_ref() == Some(&target))
+        {
+            composer.input.update(cx, |input, cx| {
+                input.set_value(change.recovery_body, window, cx)
+            });
+            self.active_data_mut()
+                .unwrap()
+                .posts
+                .changes
+                .failed
+                .retain(|c| c.token != token);
+        }
+        cx.notify();
     }
 
     /// Apply successful published writes before the refresh, even if the editor

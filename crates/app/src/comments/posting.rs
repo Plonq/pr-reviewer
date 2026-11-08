@@ -12,6 +12,7 @@ pub(crate) struct Post {
     pub body: String,
     pub status: Status,
     receipt: Option<u64>,
+    thread_id: Option<String>,
     pub anchor: Option<github::CommentAnchor>,
     pub context: Vec<String>,
     pub pending: bool,
@@ -41,6 +42,7 @@ pub(crate) struct Posts {
     pub pending: Vec<Post>,
     pub roots: Vec<Post>,
     pub failed: Vec<Post>,
+    pub changes: super::mutations::Changes,
     // Retain the view identity after loading, so markdown/media update in place.
     loaded: HashMap<super::CommentKey, super::CommentKey>,
     authors: HashMap<super::CommentKey, String>,
@@ -55,6 +57,7 @@ impl Posts {
             token,
             reply_to,
             receipt: None,
+            thread_id: None,
             author,
             body,
             status: Status::Posting,
@@ -82,7 +85,7 @@ impl Posts {
 
     pub fn reconcile(&mut self, discussion: &PrDiscussion) {
         let mut roots = Vec::new();
-        self.pending.retain(|post| {
+        self.pending.retain_mut(|post| {
             let Some(id) = post.receipt else {
                 return true;
             };
@@ -109,6 +112,11 @@ impl Posts {
                 self.loaded
                     .insert(remote, super::CommentKey::Post(post.token));
                 if post.anchor.is_some() && post.reply_to.is_none() && !post.pending {
+                    post.thread_id = discussion
+                        .threads
+                        .iter()
+                        .find(|t| t.comments.iter().any(|c| c.id == id))
+                        .map(|t| t.id.clone());
                     roots.push(post.clone());
                 }
             }
@@ -117,10 +125,12 @@ impl Posts {
         self.roots.extend(roots);
         self.roots.retain(|post| {
             discussion.threads.iter().any(|t| {
-                t.comments
-                    .first()
-                    .is_some_and(|c| Some(c.id) == post.receipt)
-            })
+                post.thread_id.as_ref() == Some(&t.id)
+                    || t.comments.iter().any(|c| Some(c.id) == post.receipt)
+            }) || post
+                .thread_id
+                .as_ref()
+                .is_some_and(|id| self.changes.threads.contains_key(id))
         });
     }
 
@@ -206,7 +216,7 @@ impl Posts {
     }
 
     pub fn has_uncertain(&self) -> bool {
-        self.pending.iter().any(|p| p.status == Status::Unverified)
+        self.pending.iter().any(|p| p.status == Status::Unverified) || self.changes.has_uncertain()
     }
 
     pub fn remote_id(&self, key: super::CommentKey) -> Option<u64> {
@@ -237,15 +247,16 @@ impl Posts {
         self.loaded.get(&remote).copied().unwrap_or(remote)
     }
 
-    pub fn root_id(&self, post: &Post) -> Option<u64> {
-        post.receipt
+    pub fn is_thread_shell(&self, post: &Post, thread: &github::ReviewThread) -> bool {
+        post.thread_id.as_ref() == Some(&thread.id)
+            || thread.comments.iter().any(|c| Some(c.id) == post.receipt)
     }
 
-    pub fn root_shell(&self, id: u64) -> Option<&Post> {
+    pub fn thread_shell(&self, thread: &github::ReviewThread) -> Option<&Post> {
         self.roots
             .iter()
             .chain(&self.pending)
-            .find(|p| p.anchor.is_some() && p.reply_to.is_none() && p.receipt == Some(id))
+            .find(|p| p.anchor.is_some() && p.reply_to.is_none() && self.is_thread_shell(p, thread))
     }
 
     pub fn identity(&self, comment: &DiscussionComment, inline: bool) -> super::CommentKey {

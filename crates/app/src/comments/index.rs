@@ -189,6 +189,57 @@ pub(crate) fn index_threads(threads: Vec<CommentThread>) -> CommentIndex {
     index
 }
 
+/// Delete only the target, not its descendants. Promote the earliest surviving
+/// member, retaining the original root's anchor; flatten surviving parent links
+/// to it. Flat pending snapshots can still refer to a deleted (missing) root:
+/// group those by that exact missing identity, never by body/path/line.
+pub(crate) fn retain_thread_members(
+    mut comments: Vec<ReviewComment>,
+    hidden: &std::collections::HashSet<super::CommentKey>,
+) -> Vec<ReviewComment> {
+    comments.sort_by(|a, b| {
+        a.time
+            .sort_key()
+            .cmp(b.time.sort_key())
+            .then(a.id.cmp(&b.id))
+    });
+    let by_id: HashMap<_, _> = comments.iter().map(|c| (c.id, c)).collect();
+    let mut groups: HashMap<super::CommentKey, Vec<&ReviewComment>> = HashMap::new();
+    for comment in &comments {
+        let mut root = comment.id;
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(root) {
+            let Some(parent) = by_id.get(&root).and_then(|c| c.in_reply_to_id) else {
+                break;
+            };
+            root = parent;
+        }
+        groups.entry(root).or_default().push(comment);
+    }
+    let mut result = Vec::new();
+    for (original, members) in groups {
+        let anchor = by_id.get(&original).copied().unwrap_or(members[0]);
+        let visible: Vec<_> = members
+            .into_iter()
+            .filter(|c| !hidden.contains(&c.id))
+            .collect();
+        let Some(first) = visible.first() else {
+            continue;
+        };
+        let root = first.id;
+        for c in visible {
+            let mut c = c.clone();
+            c.path = anchor.path.clone();
+            c.line = anchor.line;
+            c.start_line = anchor.start_line;
+            c.side = anchor.side;
+            c.in_reply_to_id = (c.id != root).then_some(root);
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Assemble and index comments for row building.
 pub(crate) fn group_comments(comments: Vec<ReviewComment>) -> CommentIndex {
     index_threads(assemble_threads(comments))
