@@ -555,17 +555,16 @@ impl ReviewApp {
             let token = change.token;
             let editing = change.body.is_some();
             let active = data.posts.changes.active.iter().any(|c| c.token == token);
+            if active && editing && !change.uncertain {
+                continue;
+            }
             let message = if change.uncertain && !active {
                 "Outcome dismissed after checking; showing confirmed content. No write retried."
                     .to_owned()
             } else if change.uncertain {
                 format!("{} unverified. Check GitHub before changing comments or submitting the review.", if editing { "Edit" } else { "Deletion" })
             } else if active {
-                if editing {
-                    "Saving comment…".to_owned()
-                } else {
-                    "Deleting comment…".to_owned()
-                }
+                "Deleting comment…".to_owned()
             } else {
                 format!(
                     "{} rejected: {}",
