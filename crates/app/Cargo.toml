@@ -30,6 +30,11 @@ unicode-segmentation = "1"
 emojis = "0.9"
 # Kit's Markdown parser, used to auto-link Jira keys only in prose.
 markdown = "1"
+# Native, local-only diagram layout. Keep the supported family surface explicit.
+merman = { version = "=0.10.0-alpha.2", default-features = false, features = ["svg", "native-fonts", "diagram-flowchart", "diagram-sequence", "diagram-class", "diagram-state", "diagram-er"] }
+# Decode/rasterize with host-owned resolvers, never GPUI's default SVG resolver.
+resvg = { version = "=0.47.0", default-features = false, features = ["text"] }
+roxmltree = "0.21"
 http_client = { version = "=0.3.10", package = "gpui-pre-http-client" }
 futures = "0.3"
 ureq = "2"
