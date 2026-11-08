@@ -3,6 +3,7 @@ mod comment_actions;
 mod comment_anchor;
 mod comment_editor;
 mod comment_media;
+mod comments;
 mod conversation;
 mod diff_media;
 mod file_history;
@@ -571,7 +572,7 @@ impl LocalReview {
     ) {
         self.next_id += 1;
         self.comments.push(ReviewComment {
-            id: self.next_id,
+            id: self.next_id.into(),
             path,
             line: Some(line),
             side,
@@ -579,7 +580,7 @@ impl LocalReview {
             body,
             author: "you".to_string(),
             time: CommentTime::Draft,
-            in_reply_to_id: reply_to,
+            in_reply_to_id: reply_to.map(Into::into),
         });
     }
 }
@@ -643,9 +644,7 @@ pub(crate) struct ItemData {
     /// height is available before the scroller clamps its retained offset.
     conv_markdown: RefCell<HashMap<String, gpui::Entity<gpui::component::text::TextViewState>>>,
     discussion: Option<github::PrDiscussion>,
-    /// Invalidate older comment fetches when a resolution write starts.
-    discussion_generation: u64,
-    posts: conversation::posting::Posts,
+    posts: comments::posting::Posts,
     commits: Option<github::PrCommits>,
     commits_expanded: bool,
     review_changes: github::ReviewChanges,
@@ -708,6 +707,23 @@ pub(crate) struct ItemData {
 }
 
 impl ItemData {
+    fn comment_projection<'a>(
+        &'a self,
+        pending: Option<&'a github::PendingReview>,
+    ) -> comments::Projection<'a> {
+        comments::Projection::new(self.discussion.as_ref(), pending, &self.posts)
+    }
+
+    /// Rebuild only the display index. Confirmed storage and transient identity
+    /// aliases remain separate, and scope filtering runs after projection.
+    fn project_comments(&mut self, pending: Option<&github::PendingReview>) {
+        if self.local_review.is_some() {
+            return;
+        }
+        self.comments = Some(self.comment_projection(pending).diff_index());
+        self.filter_scope_comments();
+    }
+
     /// A fresh item's data, showing the sidebar's first file at its first change.
     /// `file_ix` identifies the supplied background-built rows, not tree order.
     fn new(
@@ -744,7 +760,6 @@ impl ItemData {
             conv_scroll: ScrollHandle::new(),
             conv_markdown: RefCell::new(HashMap::new()),
             discussion: None,
-            discussion_generation: 0,
             posts: Default::default(),
             commits: None,
             commits_expanded: false,
@@ -796,29 +811,55 @@ impl ItemData {
     /// (every row rebuild goes through here).
     fn set_rows(&mut self, mut built_rows: BuiltRows) {
         let collapsed = self
-            .discussion
-            .iter()
-            .flat_map(|d| &d.threads)
-            .filter(|thread| {
-                thread.is_resolved
-                    && !self.expanded_threads.contains(&thread.id)
-                    && !thread
-                        .comments
-                        .iter()
-                        .any(|c| self.editing_comments.contains_key(&c.id))
+            .comment_projection(None)
+            .threads()
+            .into_iter()
+            .filter(|thread| thread.is_resolved && !self.expanded_threads.contains(&thread.id))
+            .filter_map(|thread| {
+                let index = self.comments.as_ref()?;
+                let root = index.thread_roots.get(&thread.id).copied().or_else(|| {
+                    // A plain imported index may not have projection metadata;
+                    // only its exact, still-visible original root is a fallback.
+                    let root = self
+                        .posts
+                        .alias(comments::CommentKey::Inline(thread.comments.first()?.id));
+                    index
+                        .all_threads()
+                        .any(|t| t.root.id == root)
+                        .then_some(root)
+                })?;
+                let editing = index
+                    .all_threads()
+                    .find(|t| t.root.id == root)
+                    .is_some_and(|t| {
+                        std::iter::once(&t.root).chain(&t.replies).any(|c| {
+                            self.posts
+                                .remote_id(c.id)
+                                .is_some_and(|id| self.editing_comments.contains_key(&id))
+                        })
+                    });
+                (!editing).then_some(root)
             })
-            .filter_map(|thread| thread.comments.first().map(|c| c.id))
             .collect();
         resolution::collapse_threads(&mut built_rows, &collapsed);
         diff_media::resize_text_rows(&mut built_rows, &self.comment_text_layouts);
         for (id, height) in &self.editing_comments {
+            let key = built_rows.rows.iter().find_map(|row| match row {
+                Row::CommentHeader { comment_id, .. }
+                    if self.posts.remote_id(*comment_id) == Some(*id) =>
+                {
+                    Some(*comment_id)
+                }
+                _ => None,
+            });
+            let Some(key) = key else { continue };
             comment_actions::reserve_editor_rows(
                 &mut built_rows,
-                *id,
+                key,
                 (f32::from(height.get()) / row_height()).ceil() as usize,
             );
         }
-        reactions::reserve_reaction_rows(&mut built_rows, self.discussion.as_ref());
+        reactions::reserve_reaction_rows(&mut built_rows, self.discussion.as_ref(), &self.posts);
         let BuiltRows {
             rows,
             file_rows,
@@ -1126,6 +1167,8 @@ struct ReviewItem {
     refresh_error: Option<SharedString>,
     /// Bumped at fetch start; only the latest fetch may install its result.
     upgrade_gen: u64,
+    /// Survives ItemData replacement; orders all comment reads and writes.
+    comment_sync: comments::sync::SyncState,
     /// Which pane the item shows; lives here — not in `ItemData` — so a
     /// refresh (which swaps the data in) never flips the reviewer's view.
     pane: ItemPane,
@@ -1256,14 +1299,12 @@ impl ReviewItem {
             return;
         }
         let diff = PrDiff::default();
-        let comments = group_comments(
-            loaded
-                .discussion
-                .review_comments()
-                .into_iter()
-                .map(ReviewComment::from)
-                .collect(),
-        );
+        let comments = comments::Projection::new(
+            Some(&loaded.discussion),
+            None,
+            &comments::posting::Posts::default(),
+        )
+        .diff_index();
         let built = build_rows(RowsView {
             diff: &diff,
             upgrades: &HashMap::new(),
@@ -1311,7 +1352,58 @@ impl ReviewItem {
     /// Returns the PR's snapshot, when the fetch was a PR's: the caller
     /// keeps it in the local store, so the next launch knows what the app
     /// last saw of this PR.
+    #[cfg(test)]
     fn install(&mut self, loaded: Loaded) -> Option<local_store::StoredPrSnapshot> {
+        let ticket = self.comment_sync.begin_read();
+        self.install_fetched(loaded, ticket)
+    }
+
+    fn install_fetched(
+        &mut self,
+        mut loaded: Loaded,
+        ticket: comments::sync::ReadTicket,
+    ) -> Option<local_store::StoredPrSnapshot> {
+        let accepted = loaded
+            .discussion
+            .as_ref()
+            .is_some_and(|d| match &self.state {
+                ItemState::Ready(data) => {
+                    self.comment_sync
+                        .accept_projected(ticket, d, &data.posts.changes)
+                }
+                _ => self.comment_sync.accept(ticket, d),
+            });
+        if matches!(self.source, Source::Pr(_)) && !accepted {
+            // A stale full fetch may still deliver useful metadata and a diff.
+            // Keep the last confirmed discussion and rebuild its index/rows on
+            // that diff. Never persist the rejected snapshot as authoritative.
+            loaded.snapshot = None;
+            loaded.discussion = match &self.state {
+                ItemState::Ready(data) => data.discussion.clone(),
+                _ => None,
+            };
+            let mut index = comments::Projection::new(
+                loaded.discussion.as_ref(),
+                None,
+                &comments::posting::Posts::default(),
+            )
+            .diff_index();
+            if loaded.review_base.is_some() {
+                index.hide_left_anchors();
+            }
+            loaded.comments = Some(index);
+            loaded.built_rows = build_rows(RowsView {
+                diff: &loaded.diff,
+                upgrades: &loaded.upgrades,
+                comments: loaded.comments.as_ref(),
+                options: RowOptions {
+                    mode: loaded.mode,
+                    file_ix: loaded.file_ix,
+                    comments_visible: true,
+                    comment_wrap: COMMENT_WRAP_CHARS,
+                },
+            });
+        }
         let Loaded {
             meta,
             diff,
@@ -1359,11 +1451,15 @@ impl ReviewItem {
                 data.review_changes = review_changes;
                 data.review_base = review_base;
                 data.review_base_files = review_base_files;
-                data.discussion_generation += 1;
                 data.upgrades = upgrades;
                 data.file_media = file_media;
                 data.expanded_regions.clear();
                 data.discussion = discussion;
+                if accepted {
+                    data.posts
+                        .changes
+                        .reconcile(data.discussion.as_ref(), None, true);
+                }
                 if let Some(discussion) = &data.discussion {
                     data.posts.reconcile(discussion);
                 }
@@ -1557,7 +1653,9 @@ fn pr_titlebar_content(
                                 .tooltip("Open PR in GitHub")
                                 .on_click(move |_, _, cx| cx.open_url(&url)),
                         )
-                        .children(loading.map(|message| chrome::header_loading_spinner(message, cx))),
+                        .children(
+                            loading.map(|message| chrome::header_loading_spinner(message, cx)),
+                        ),
                 ),
         )
         .child(
@@ -2701,6 +2799,7 @@ impl ReviewApp {
         let id = self.next_id;
         self.next_id += 1;
         self.items.push(ReviewItem {
+            comment_sync: Default::default(),
             review_draft: None,
             id,
             source: source.clone(),
@@ -2752,6 +2851,7 @@ impl ReviewApp {
         // Supersede any older fetch before starting its replacement.
         item.upgrade_gen += 1;
         let fetch_gen = item.upgrade_gen;
+        let comment_ticket = item.comment_sync.begin_read();
         let github = self.github.clone();
         // Build rows for what the item will show when they land: the ready
         // item's displayed file, or the first file for a first load.
@@ -2779,6 +2879,7 @@ impl ReviewApp {
                     if item.upgrade_gen != fetch_gen || matches!(item.state, ItemState::Ready(_)) {
                         return;
                     }
+                    if !item.comment_sync.accept(comment_ticket, &conversation.discussion) { return; }
                     item.install_conversation(conversation, mode);
                     if let (Source::Pr(loc), ItemState::Ready(data)) = (&item.source, &mut item.state) {
                         data.load_preferences(&app.store, Some(loc));
@@ -2810,7 +2911,7 @@ impl ReviewApp {
                         } else {
                             None
                         };
-                        let snapshot = item.install(loaded);
+                        let snapshot = item.install_fetched(loaded, comment_ticket);
                         if let ItemState::Ready(data) = &mut item.state {
                             let loc = match &item.source {
                                 Source::Pr(loc) => Some(loc),
@@ -3571,6 +3672,13 @@ impl ReviewApp {
         cx.notify();
     }
 
+    fn comment_write_blocked(&self, item_id: u64) -> bool {
+        self.sessions.get(&item_id).is_some_and(|ui| ui.busy)
+            || self.items.iter().find(|i| i.id == item_id).is_some_and(
+                |i| matches!(&i.state, ItemState::Ready(data) if data.posts.has_uncertain()),
+            )
+    }
+
     /// Serialize per-PR operations, not dialog generations: a closed dialog
     /// must not lose the result of a write that has already reached GitHub.
     fn session_job(
@@ -3578,12 +3686,27 @@ impl ReviewApp {
         item_id: u64,
         command: SessionCommand,
         cx: &mut Context<Self>,
-    ) -> Option<Task<(ReviewSession, Result<Option<u64>, github::ClientError>)>> {
+    ) -> Option<
+        Task<(
+            ReviewSession,
+            Result<github::MutationReceipt, github::ClientError>,
+            github::PrLocator,
+        )>,
+    > {
         let item = self.items.iter().find(|item| item.id == item_id)?;
         let Source::Pr(loc) = &item.source else {
             return None;
         };
         let loc = loc.clone();
+        let mut protection = match &item.state {
+            ItemState::Ready(data) => data.posts.changes.session_protection(),
+            _ => Default::default(),
+        };
+        if !matches!(command, SessionCommand::Resume)
+            && matches!(&item.state, ItemState::Ready(data) if data.posts.has_uncertain())
+        {
+            return None;
+        }
         let ui = self.sessions.entry(item_id).or_default();
         if ui.busy {
             return None;
@@ -3591,26 +3714,59 @@ impl ReviewApp {
         ui.busy = true;
         ui.error = None;
         let mut session = ui.state.clone();
+        if !matches!(command, SessionCommand::Resume) {
+            if let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) {
+                item.comment_sync.begin_write();
+            }
+        }
         let github = self.github.clone();
         let store = self.store.clone();
+        let previous = session.clone();
+        let submitted = matches!(command, SessionCommand::Submit { .. });
+        let resuming = matches!(command, SessionCommand::Resume);
         cx.notify();
         Some(cx.background_spawn(async move {
             let result = session.execute_with_receipt(github.as_ref(), &loc, command);
-            // Also mirror partial success (e.g. start succeeded, add failed).
-            store.save_review_session(&loc, &session);
-            (session, result)
+            let mut confirmed = session.clone();
+            if resuming && result.is_ok() && session.verified {
+                protection.reconcile(None, session.pending.as_ref(), false);
+            }
+            if let Ok(receipt) = &result {
+                protection.supersede_pending(receipt);
+                if submitted {
+                    protection.review_ended();
+                }
+            }
+            protection.protect_session(&mut confirmed, &previous);
+            // Also finish persistence if the window/item has gone away. The raw
+            // read still goes to the UI: a receipt-repaired cache cannot serve
+            // as positive acknowledgement of itself.
+            store.save_review_session(&loc, &confirmed);
+            (session, result, loc)
         }))
     }
 
     fn finish_session(
         &mut self,
         item_id: u64,
-        state: ReviewSession,
+        loc: &github::PrLocator,
+        mut state: ReviewSession,
         result: &Result<(), github::ClientError>,
         cx: &mut Context<Self>,
     ) {
         if self.items.iter().any(|item| item.id == item_id) {
             let ui = self.sessions.entry(item_id).or_default();
+            if let Some(ItemState::Ready(data)) = self
+                .items
+                .iter_mut()
+                .find(|i| i.id == item_id)
+                .map(|i| &mut i.state)
+            {
+                data.posts.changes.protect_session(&mut state, &ui.state);
+            }
+            // Mirror confirmed state and partial lifecycle success only after
+            // the reconciliation boundary has protected accepted receipts.
+            self.store.save_review_session(loc, &state);
             // Reconciliation must not collapse a tray the user has expanded.
             // Once the review ends, the next review starts collapsed again.
             ui.comments_expanded &= state.pending.is_some();
@@ -3636,10 +3792,7 @@ impl ReviewApp {
         let ItemState::Ready(data) = &mut item.state else {
             return;
         };
-        data.comments
-            .get_or_insert_with(CommentIndex::default)
-            .replace_pending(ui.state.pending.as_ref());
-        data.filter_scope_comments();
+        data.project_comments(ui.state.pending.as_ref());
         data.rebuild_rows_anchored();
     }
 
@@ -3647,11 +3800,31 @@ impl ReviewApp {
         let Some(job) = self.session_job(item_id, SessionCommand::Resume, cx) else {
             return;
         };
+        let ticket = self
+            .items
+            .iter_mut()
+            .find(|i| i.id == item_id)
+            .unwrap()
+            .comment_sync
+            .begin_read();
         cx.spawn(async move |this, cx| {
-            let (session, result) = job.await;
-            let result = result.map(|_| ());
+            let (session, result, loc) = job.await;
             this.update(cx, |app, cx| {
-                app.finish_session(item_id, session, &result, cx)
+                if result.is_ok() && session.verified {
+                    if let Some(item) = app
+                        .items
+                        .iter_mut()
+                        .find(|i| i.id == item_id)
+                        .filter(|i| i.comment_sync.eligible(ticket))
+                    {
+                        if let ItemState::Ready(data) = &mut item.state {
+                            data.posts
+                                .changes
+                                .reconcile(None, session.pending.as_ref(), false);
+                        }
+                    }
+                }
+                app.finish_session(item_id, &loc, session, &result.map(|_| ()), cx)
             })
             .ok();
         })
@@ -3671,7 +3844,10 @@ impl ReviewApp {
             command,
             SessionCommand::Reply { .. } | SessionCommand::ConversationReply { .. }
         );
-        let commented = matches!(command, SessionCommand::Conversation { .. });
+        let commented = matches!(
+            command,
+            SessionCommand::Conversation { .. } | SessionCommand::Immediate { .. }
+        );
         let mutation = command.clone();
         let mutated = matches!(
             command,
@@ -3680,29 +3856,198 @@ impl ReviewApp {
                 | SessionCommand::SetReaction { .. }
                 | SessionCommand::SetThreadResolved { .. }
         );
+        let creating = matches!(
+            command,
+            SessionCommand::Immediate { .. }
+                | SessionCommand::Add { .. }
+                | SessionCommand::Reply { .. }
+                | SessionCommand::Conversation { .. }
+                | SessionCommand::ConversationReply { .. }
+        );
+        let submission = if creating {
+            if let SessionCompletion::Composer(gen) = completion {
+                self.composers.iter().find(|c| c.id == gen).map(|c| {
+                    (
+                        gen,
+                        c.reply_to,
+                        (!matches!(&command, SessionCommand::Conversation { .. })).then(|| {
+                            github::CommentAnchor {
+                                commit_id: c.commit_id.clone(),
+                                path: c.path.clone(),
+                                side: c.side,
+                                line: c.line,
+                                start_line: c.start_line,
+                                position: c.position.clone(),
+                            }
+                        }),
+                        self.composer_uses_pending_review(c),
+                        c.input.read(cx).value().trim().to_owned(),
+                    )
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((gen, _, Some(anchor), _, _)) = &submission {
+            if matches!(
+                command,
+                SessionCommand::Immediate { .. } | SessionCommand::Add { .. }
+            ) {
+                if let Err(error) = anchor.validate() {
+                    if let Some(composer) = self.composers.iter_mut().find(|c| c.id == *gen) {
+                        composer.in_flight = false;
+                        composer.error = Some(error.to_string().into());
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        let change_token = match completion {
+            SessionCompletion::Composer(gen) => gen,
+            _ => self.composer_gen + 1,
+        };
+        let placement = self
+            .composers
+            .iter()
+            .find(|c| c.id == change_token)
+            .map(|c| c.placement.clone())
+            .unwrap_or(ComposerPlacement::Diff);
+        let change = self.comment_change(item_id, &command, change_token, placement);
+        let changing = change.is_some();
         let Some(job) = self.session_job(item_id, command, cx) else {
             return;
         };
+        if let Some(change) = change {
+            self.composer_gen = self.composer_gen.max(change.token);
+            if let Some(ItemState::Ready(data)) = self
+                .items
+                .iter_mut()
+                .find(|i| i.id == item_id)
+                .map(|i| &mut i.state)
+            {
+                data.posts.changes.begin(
+                    change,
+                    data.discussion.as_ref(),
+                    self.sessions
+                        .get(&item_id)
+                        .and_then(|ui| ui.state.pending.as_ref()),
+                );
+            }
+            self.sync_pending_comments(item_id);
+            if let SessionCompletion::Composer(gen) = completion {
+                self.close_composer_id(gen, window, cx);
+            }
+        }
+        if let Some((gen, reply_to, anchor, pending, body)) = submission {
+            let author = match &self.account {
+                AccountStatus::SignedIn(viewer) => viewer.login.clone(),
+                _ => "you".into(),
+            };
+            let anchor_row = self
+                .composers
+                .iter()
+                .find(|c| c.id == gen)
+                .map_or(0, |c| c.row_ix);
+            if let Some(ItemState::Ready(data)) = self
+                .items
+                .iter_mut()
+                .find(|i| i.id == item_id)
+                .map(|i| &mut i.state)
+            {
+                let side = anchor.as_ref().map(|a| a.side);
+                let context = data
+                    .rows
+                    .iter()
+                    .take(anchor_row + 1)
+                    .rev()
+                    .filter_map(|row| match row {
+                        Row::Line { text, .. } => Some(text.to_string()),
+                        Row::SplitLine { left, right } => if side == Some(CommentSide::Left) {
+                            left.as_ref()
+                        } else {
+                            right.as_ref()
+                        }
+                        .map(|c| c.text.to_string()),
+                        _ => None,
+                    })
+                    .take(3)
+                    .collect::<Vec<_>>();
+                data.posts.begin_create(
+                    gen,
+                    mutation.clone(),
+                    anchor,
+                    pending,
+                    author,
+                    body,
+                    reply_to,
+                );
+                data.posts.pending.last_mut().unwrap().context =
+                    context.into_iter().rev().collect();
+                if let Some(thread) =
+                    reply_to.and_then(|id| data.comment_projection(None).thread_for_inline(id))
+                {
+                    data.expanded_threads.insert(thread.id.clone());
+                }
+            }
+            self.sync_pending_comments(item_id);
+            self.close_composer_id(gen, window, cx);
+        }
         cx.spawn_in(window, async move |this, cx| {
-            let (session, result) = job.await;
-            let receipt = result.as_ref().ok().copied().flatten();
+            let (session, result, loc) = job.await;
+            let receipt = result.as_ref().ok().cloned();
+            let creation_result = result.clone();
             let result = result.map(|_| ());
             this.update_in(cx, |app, window, cx| {
-                app.finish_session(item_id, session, &result, cx);
-                if result.is_ok() {
-                    app.apply_comment_mutation(item_id, &mutation);
-                    app.apply_reaction(item_id, &mutation);
-                    app.apply_thread_resolution(item_id, &mutation);
+                if let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) {
+                    item.comment_sync.finish_write(receipt.as_ref());
                 }
-                if let SessionCompletion::Composer(gen) = completion {
-                    if let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) {
-                        if let ItemState::Ready(data) = &mut item.state {
-                            data.posts.complete(gen, receipt);
+                if creating {
+                    if let SessionCompletion::Composer(gen) = completion {
+                        if let Some(ItemState::Ready(data)) = app
+                            .items
+                            .iter_mut()
+                            .find(|i| i.id == item_id)
+                            .map(|i| &mut i.state)
+                        {
+                            data.posts.finish_create(gen, &creation_result);
                             if let Some(discussion) = &data.discussion {
                                 data.posts.reconcile(discussion);
                             }
                         }
                     }
+                }
+                // Install authoritative write effects and retire only this overlay
+                // in one UI update. Refresh barriers protect successful receipts.
+                if result.is_ok() {
+                    app.apply_comment_mutation(item_id, receipt.as_ref().unwrap());
+                }
+                if changing {
+                    if let Some(ItemState::Ready(data)) = app
+                        .items
+                        .iter_mut()
+                        .find(|i| i.id == item_id)
+                        .map(|i| &mut i.state)
+                    {
+                        data.posts.changes.finish(change_token, &creation_result);
+                    }
+                }
+                if submitted && result.is_ok() {
+                    if let Some(ItemState::Ready(data)) = app
+                        .items
+                        .iter_mut()
+                        .find(|i| i.id == item_id)
+                        .map(|i| &mut i.state)
+                    {
+                        data.posts.changes.review_ended();
+                    }
+                }
+                app.finish_session(item_id, &loc, session, &result, cx);
+                if result.is_ok() {
+                    app.apply_reaction(item_id, &mutation);
+                    app.apply_thread_resolution(item_id, &mutation);
                 }
                 match completion {
                     SessionCompletion::Composer(gen) => match &result {
@@ -3731,8 +4076,27 @@ impl ReviewApp {
                     },
                     _ => {}
                 }
-                if ((submitted || replied || commented || mutated) && result.is_ok())
-                    || matches!(mutation, SessionCommand::SetThreadResolved { .. })
+                let pending_change = matches!(
+                    mutation,
+                    SessionCommand::Edit { .. } | SessionCommand::Delete { .. }
+                );
+                if pending_change
+                    && (result.is_ok()
+                        || creation_result
+                            .as_ref()
+                            .err()
+                            .is_some_and(github::ClientError::mutation_is_uncertain))
+                {
+                    app.resume_session(item_id, cx);
+                }
+                if !pending_change
+                    && (((submitted || replied || commented || mutated) && result.is_ok())
+                        || ((creating || changing)
+                            && creation_result
+                                .as_ref()
+                                .err()
+                                .is_some_and(github::ClientError::mutation_is_uncertain))
+                        || matches!(mutation, SessionCommand::SetThreadResolved { .. }))
                 {
                     if let Some(Source::Pr(loc)) = app
                         .items
@@ -4063,16 +4427,25 @@ impl ReviewApp {
         let gen = composer.id;
         // Keyboard submission must obey the same per-PR serialization as the
         // disabled button, including while pending-review reconciliation runs.
-        if matches!(source, Source::Pr(_)) && self.sessions.get(&item_id).is_some_and(|ui| ui.busy)
-        {
+        if matches!(source, Source::Pr(_)) && self.comment_write_blocked(item_id) {
             return;
         }
         if let Some(target) = composer.edit_target.clone() {
+            if !self.comment_permissions(&target).0 {
+                self.composer_mut().unwrap().error =
+                    Some("This comment is no longer editable; refresh and try again.".into());
+                cx.notify();
+                return;
+            }
             match target {
                 CommentTarget::Local(id) => {
                     if let Some(data) = self.active_data_mut() {
                         if let Some(local) = &mut data.local_review {
-                            if let Some(comment) = local.comments.iter_mut().find(|c| c.id == id) {
+                            if let Some(comment) = local
+                                .comments
+                                .iter_mut()
+                                .find(|c| c.id == comments::CommentKey::Inline(id))
+                            {
                                 comment.body = body;
                             }
                             data.comments = Some(local.index());
@@ -4112,9 +4485,7 @@ impl ReviewApp {
         }
         if matches!(source, Source::Pr(_)) && composer.placement != ComposerPlacement::Diff {
             let pending = self.composer_uses_pending_review(composer);
-            let reply_to = composer.reply_to;
-            let placement = composer.placement.clone();
-            let optimistic_body = body.clone();
+
             let command = if let Some(comment_id) = composer.reply_to {
                 SessionCommand::ConversationReply {
                     comment_id,
@@ -4133,23 +4504,6 @@ impl ReviewApp {
             let composer = self.composer_mut().unwrap();
             composer.in_flight = true;
             composer.error = None;
-            if !pending {
-                let author = match &self.account {
-                    AccountStatus::SignedIn(viewer) => viewer.login.clone(),
-                    _ => "you".into(),
-                };
-                if let Some(ItemState::Ready(data)) = self
-                    .items
-                    .iter_mut()
-                    .find(|item| item.id == item_id)
-                    .map(|item| &mut item.state)
-                {
-                    data.posts.begin(gen, reply_to, author, optimistic_body);
-                    if let ComposerPlacement::ConversationThread(id) = placement {
-                        data.expanded_threads.insert(id);
-                    }
-                }
-            }
             self.run_session(
                 item_id,
                 command,
@@ -4205,40 +4559,13 @@ impl ReviewApp {
             self.close_composer_id(gen, window, cx);
             return;
         }
-        let Source::Pr(loc) = source else {
-            return;
-        };
-        cx.notify();
-        let github = self.github.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let post_loc = loc.clone();
-            let result = cx
-                .background_spawn(async move {
-                    ReviewSession::default().execute(
-                        github.as_ref(),
-                        &post_loc,
-                        SessionCommand::Immediate { anchor, body },
-                    )
-                })
-                .await;
-            this.update_in(cx, |app, window, cx| {
-                match result {
-                    Ok(()) => {
-                        app.close_composer_id(gen, window, cx);
-                        app.refetch_comments(item_id, loc, cx);
-                    }
-                    Err(err) => {
-                        if let Some(composer) = app.composers.iter_mut().find(|c| c.id == gen) {
-                            composer.in_flight = false;
-                            composer.error = Some(err.to_string().into());
-                        }
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.run_session(
+            item_id,
+            SessionCommand::Immediate { anchor, body },
+            SessionCompletion::Composer(gen),
+            window,
+            cx,
+        );
     }
 
     fn add_local_comment(
@@ -4286,14 +4613,10 @@ impl ReviewApp {
     /// rebuild the rows with the viewport anchored — the counterpart of a
     /// full refresh for the post-comment path.
     fn refetch_comments(&mut self, item_id: u64, loc: github::PrLocator, cx: &mut Context<Self>) {
-        let generation = self
-            .items
-            .iter()
-            .find(|item| item.id == item_id)
-            .and_then(|item| match &item.state {
-                ItemState::Ready(data) => Some(data.discussion_generation),
-                _ => None,
-            });
+        let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) else {
+            return;
+        };
+        let ticket = item.comment_sync.begin_read();
         let github = self.github.clone();
         cx.spawn(async move |this, cx| {
             let fetched = cx
@@ -4303,14 +4626,28 @@ impl ReviewApp {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) else {
                     return;
                 };
+                if !item.comment_sync.eligible(ticket) {
+                    return;
+                }
+                if let Ok(discussion) = &fetched {
+                    let accepted = match &item.state {
+                        ItemState::Ready(data) => item.comment_sync.accept_projected(
+                            ticket,
+                            discussion,
+                            &data.posts.changes,
+                        ),
+                        _ => item.comment_sync.accept(ticket, discussion),
+                    };
+                    if !accepted {
+                        return;
+                    }
+                }
                 let ItemState::Ready(data) = &mut item.state else {
                     return;
                 };
-                if generation != Some(data.discussion_generation) {
-                    return;
-                }
                 match fetched {
                     Ok(discussion) => {
+                        data.posts.changes.reconcile(Some(&discussion), None, true);
                         data.posts.reconcile(&discussion);
                         if item
                             .refresh_error
@@ -4329,21 +4666,12 @@ impl ReviewApp {
                                 app.store.save_snapshot(&snapshot);
                             }
                         }
-                        data.comments = Some(group_comments(
-                            discussion
-                                .review_comments()
-                                .into_iter()
-                                .map(ReviewComment::from)
-                                .collect(),
-                        ));
                         data.discussion = Some(discussion);
-                        if let Some(ui) = app.sessions.get(&item_id) {
-                            data.comments
-                                .as_mut()
-                                .unwrap()
-                                .replace_pending(ui.state.pending.as_ref());
-                        }
-                        data.filter_scope_comments();
+                        data.project_comments(
+                            app.sessions
+                                .get(&item_id)
+                                .and_then(|ui| ui.state.pending.as_ref()),
+                        );
                         data.rebuild_rows_anchored();
                     }
                     Err(err) => {
@@ -4510,7 +4838,7 @@ impl ReviewApp {
         let body = review.input.read(cx).value().trim().to_string();
         let verdict = review.verdict;
         let item_id = review.item_id;
-        if self.sessions.get(&item_id).is_some_and(|ui| ui.busy) {
+        if self.comment_write_blocked(item_id) {
             return;
         }
         let Some(item) = self.items.iter().find(|item| item.id == review.item_id) else {
@@ -4660,7 +4988,7 @@ impl ReviewApp {
         };
         let row_ix = if let Some(id) = composer.edit_id {
             let Some(ix) = data.rows.iter().position(
-                |row| matches!(row, Row::CommentHeader { comment_id, .. } if *comment_id == id),
+                |row| matches!(row, Row::CommentHeader { comment_id, .. } if data.posts.remote_id(*comment_id) == Some(id)),
             ) else {
                 return empty();
             };
@@ -4775,10 +5103,7 @@ impl ReviewApp {
     fn render_composer_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let composer = self.composer().expect("an open composer");
         let pending = self.composer_uses_pending_review(composer);
-        let session_busy = self
-            .sessions
-            .get(&composer.item_id)
-            .is_some_and(|ui| ui.busy);
+        let session_busy = self.comment_write_blocked(composer.item_id);
         let submit_disabled = composer.in_flight
             || session_busy
             || comment_media::blocks_submission(composer.uploads.as_ref(), &composer.input, cx);
@@ -4950,7 +5275,13 @@ impl ReviewApp {
                 .unwrap_or_default(),
             _ => String::new(),
         };
-        let pending = ui.state.pending.is_some();
+        let no_posts = comments::posting::Posts::default();
+        let projection = match &item.state {
+            ItemState::Ready(data) => data.comment_projection(ui.state.pending.as_ref()),
+            _ => comments::Projection::new(None, ui.state.pending.as_ref(), &no_posts),
+        };
+        let pending = ui.state.pending.is_some() || projection.has_pending();
+        let write_blocked = self.comment_write_blocked(id);
         // A fallback editor for an outdated/unanchorable draft lives here.
         // Keep it visible until it is submitted or cancelled, even if the
         // user had not expanded the tray before opening that editor.
@@ -4962,8 +5293,12 @@ impl ReviewApp {
         let label = if pending {
             format!(
                 "Pending review · {} comment{}{}",
-                ui.state.count(),
-                if ui.state.count() == 1 { "" } else { "s" },
+                projection.pending_count(),
+                if projection.pending_count() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 if ui.busy {
                     " · syncing…"
                 } else if !ui.state.verified {
@@ -4996,9 +5331,11 @@ impl ReviewApp {
                         div()
                             .debug_selector(|| "pending-status".into())
                             .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .child(SharedString::from(label)),
                     )
-                    .when(ui.state.count() > 0, |row| {
+                    .when(projection.has_pending(), |row| {
                         row.child(
                             Button::new("pending-comments-toggle")
                                 .debug_selector(|| "pending-comments-toggle".into())
@@ -5038,7 +5375,7 @@ impl ReviewApp {
                                 "Start review"
                             })
                             .small()
-                            .disabled(ui.busy || (!pending && commit.is_empty()))
+                            .disabled(write_blocked || (!pending && commit.is_empty()))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if pending {
                                     this.open_review(window, cx);
@@ -5059,7 +5396,7 @@ impl ReviewApp {
         if let Some(error) = &ui.error {
             tray = tray.child(div().text_color(theme::red(cx)).child(error.clone()));
         }
-        if let Some(review) = ui.state.pending.as_ref().filter(|_| expanded) {
+        if pending && expanded {
             let mut comments = div()
                 .id("pending-comments")
                 .debug_selector(|| "pending-comments".into())
@@ -5068,30 +5405,57 @@ impl ReviewApp {
                 .flex()
                 .flex_col()
                 .gap_1();
-            for comment in &review.comments {
-                let comment_id = comment.id;
+            for entry in projection.pending_entries() {
+                let (comment_id, path, line, start_line, side) = match entry {
+                    comments::Comment::Pending(comment) => (
+                        Some(comment.id),
+                        &comment.path,
+                        comment.line,
+                        comment.start_line,
+                        comment.side,
+                    ),
+                    comments::Comment::Posting(post) => {
+                        let anchor = post.anchor.as_ref().expect("pending inline anchor");
+                        (
+                            None,
+                            &anchor.path,
+                            Some(anchor.line),
+                            anchor.start_line,
+                            anchor.side,
+                        )
+                    }
+                    _ => unreachable!("pending entries only"),
+                };
+                let key = projection.key(entry, true);
                 if self.composer().is_some_and(|composer| {
                     composer.item_id == id
-                        && composer.placement == ComposerPlacement::PendingTray(comment_id)
+                        && comment_id.is_some_and(|id| {
+                            composer.placement == ComposerPlacement::PendingTray(id)
+                        })
                 }) {
                     comments = comments.child(self.render_composer_card(cx));
                     continue;
                 }
-                let location = match comment.line {
+                let location = match line {
                     Some(line) => format!(
-                        "{}:{}{} ({})",
-                        comment.path,
-                        comment
-                            .start_line
+                        "{path}:{}{line} ({})",
+                        start_line
                             .map(|start| format!("{start}–"))
                             .unwrap_or_default(),
-                        line,
-                        comment.side.api_str()
+                        side.api_str()
                     ),
-                    None => format!("{} (outdated)", comment.path),
+                    None => format!("{path} (outdated)"),
+                };
+                let status = match entry {
+                    comments::Comment::Posting(post) => format!(" · {}", post.status.label()),
+                    _ => String::new(),
                 };
                 comments = comments.child(
                     div()
+                        .id(SharedString::from(format!("pending-comment-{id}-{key}")))
+                        .debug_selector(move || format!("pending-comment-{id}-{key}"))
+                        .h_8()
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .gap_2()
@@ -5101,43 +5465,220 @@ impl ReviewApp {
                                 .min_w_0()
                                 .truncate()
                                 .child(SharedString::from(format!(
-                                    "{location} · {}",
-                                    comment.body
+                                    "{location} · {}{status}",
+                                    projection.body(entry, true)
                                 ))),
                         )
                         .child(
-                            Button::new(("pending-edit", comment_id))
+                            Button::new(SharedString::from(format!("pending-edit-{key}")))
                                 .label("Edit")
                                 .ghost()
                                 .small()
                                 .disabled(
-                                    ui.busy || self.composer().is_some() || self.review.is_some(),
+                                    comment_id.is_none()
+                                        || ui.busy
+                                        || self.composer().is_some()
+                                        || self.review.is_some(),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.edit_pending(comment_id, window, cx)
+                                    if let Some(comment_id) = comment_id {
+                                        this.edit_pending(comment_id, window, cx);
+                                    }
                                 })),
                         )
                         .child(
-                            Button::new(("pending-delete", comment_id))
+                            Button::new(SharedString::from(format!("pending-delete-{key}")))
                                 .label("Delete")
                                 .ghost()
                                 .small()
                                 .disabled(
-                                    ui.busy || self.composer().is_some() || self.review.is_some(),
+                                    comment_id.is_none()
+                                        || ui.busy
+                                        || self.composer().is_some()
+                                        || self.review.is_some(),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.confirm_delete_comment(
-                                        CommentTarget::Pending(comment_id),
-                                        window,
-                                        cx,
-                                    )
+                                    if let Some(comment_id) = comment_id {
+                                        this.confirm_delete_comment(
+                                            CommentTarget::Pending(comment_id),
+                                            window,
+                                            cx,
+                                        );
+                                    }
                                 })),
                         ),
                 );
             }
             tray = tray.child(comments);
         }
+        if let ItemState::Ready(data) = &item.state {
+            for post in data.posts.failed.iter().chain(
+                data.posts
+                    .pending
+                    .iter()
+                    .filter(|p| p.status == comments::posting::Status::Unverified),
+            ) {
+                let token = post.token;
+                let body = post.body.clone();
+                let uncertain = post.status == comments::posting::Status::Unverified;
+                let mut recovery = div()
+                    .debug_selector(|| format!("comment-recovery-{id}-{token}"))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(if uncertain {
+                        "Comment outcome unverified. Check GitHub before posting again.".to_owned()
+                    } else {
+                        format!(
+                            "Comment not posted: {}",
+                            post.error.as_deref().unwrap_or("rejected")
+                        )
+                    }));
+                recovery = recovery.child(
+                    Button::new(SharedString::from(format!("copy-comment-{token}")))
+                        .label("Copy text")
+                        .ghost()
+                        .small()
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(body.clone()))
+                        }),
+                );
+                if uncertain {
+                    let url = match &item.source {
+                        Source::Pr(loc) => {
+                            format!("https://github.com/{}/pull/{}", loc.repo_slug(), loc.number)
+                        }
+                        _ => String::new(),
+                    };
+                    recovery = recovery.child(
+                        Button::new(SharedString::from(format!("verify-comment-{token}")))
+                            .label("Check GitHub")
+                            .ghost()
+                            .small()
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    );
+                    if data.posts.pending.iter().any(|p| p.token == token) {
+                        recovery = recovery.child(
+                            Button::new(SharedString::from(format!("dismiss-comment-{token}")))
+                                .label("Dismiss after checking")
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(ItemState::Ready(data)) = this
+                                        .items
+                                        .iter_mut()
+                                        .find(|i| i.id == id)
+                                        .map(|i| &mut i.state)
+                                    {
+                                        if let Some(ix) =
+                                            data.posts.pending.iter().position(|p| p.token == token)
+                                        {
+                                            let post = data.posts.pending.remove(ix);
+                                            data.posts.failed.push(post);
+                                        }
+                                    }
+                                    this.sync_pending_comments(id);
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                } else {
+                    recovery = recovery.child(
+                        Button::new(SharedString::from(format!("recover-comment-{token}")))
+                            .debug_selector(|| format!("recover-comment-{token}"))
+                            .label("Restore draft")
+                            .ghost()
+                            .small()
+                            .disabled(
+                                write_blocked
+                                    || self.composers.iter().any(|c| c.item_id == id)
+                                    || self.review.is_some(),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.restore_comment_draft(id, token, window, cx)
+                            })),
+                    );
+                }
+                tray = tray.child(recovery);
+            }
+        }
+        if editing_in_tray
+            && self
+                .composer()
+                .is_some_and(|c| matches!(c.edit_target, Some(CommentTarget::Published(_))))
+        {
+            tray = tray.child(self.render_composer_card(cx));
+        }
+        tray = tray.children(self.render_comment_changes(id, cx));
         tray.into_any_element()
+    }
+
+    fn restore_comment_draft(
+        &mut self,
+        item_id: u64,
+        token: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_item().map(|i| i.id) != Some(item_id)
+            || self.composers.iter().any(|c| c.item_id == item_id)
+            || self.review.is_some()
+            || self.comment_write_blocked(item_id)
+        {
+            return;
+        }
+        let Some(post) = self
+            .active_data()
+            .and_then(|d| d.posts.failed.iter().find(|p| p.token == token))
+            .cloned()
+        else {
+            return;
+        };
+        if post.status == comments::posting::Status::Unverified {
+            return;
+        }
+        let anchor = post.anchor.clone();
+        let placement = match &post.command {
+            Some(SessionCommand::Conversation { .. }) => ComposerPlacement::ConversationMain,
+            Some(SessionCommand::ConversationReply { comment_id, .. }) => self
+                .active_comment_projection()
+                .and_then(|p| p.thread_for_inline(*comment_id))
+                .map(|t| ComposerPlacement::ConversationThread(t.id.clone()))
+                .unwrap_or(ComposerPlacement::Diff),
+            _ => ComposerPlacement::Diff,
+        };
+        let (path, side, line) = anchor
+            .as_ref()
+            .map(|a| (a.path.clone(), a.side, a.line))
+            .unwrap_or((String::new(), CommentSide::Right, 0));
+        if placement == ComposerPlacement::Diff {
+            if let Some(data) = self.active_data_mut() {
+                if let Some(ix) = data
+                    .diff
+                    .files
+                    .iter()
+                    .position(|f| f.display_path() == path)
+                {
+                    data.open_file(ix, None);
+                }
+            }
+        }
+        self.open_comment_composer(placement, post.reply_to, path, side, line, 0, window, cx);
+        if let Some(composer) = self.composer_mut() {
+            composer.pending = post.pending;
+            if let Some(anchor) = anchor {
+                composer.start_line = anchor.start_line;
+                composer.position = anchor.position;
+                composer.commit_id = anchor.commit_id;
+            }
+            composer
+                .input
+                .update(cx, |input, cx| input.set_value(post.body, window, cx));
+            if let Some(data) = self.active_data_mut() {
+                data.posts.failed.retain(|p| p.token != token);
+            }
+        }
+        cx.notify();
     }
 
     /// The minimap column: precomputed, coalesced quad runs plus one
@@ -5713,7 +6254,8 @@ impl ReviewApp {
                         cx.notify();
                     }))
                     .child(chrome::file_tree_loading_strip(
-                        self.active_item().and_then(ReviewItem::file_tree_loading_message),
+                        self.active_item()
+                            .and_then(ReviewItem::file_tree_loading_message),
                         cx,
                     ))
                     .child(
@@ -7156,6 +7698,19 @@ mod tests {
 
     include!("keyboard_selection_tests.rs");
     include!("selection_match_tests.rs");
+
+    mod comment_sync {
+        include!("comment_sync_tests.rs");
+    }
+    mod comment_creation {
+        include!("comment_creation_tests.rs");
+    }
+    mod comment_mutation {
+        include!("comment_mutation_tests.rs");
+    }
+    mod comment_layout {
+        include!("comment_layout_tests.rs");
+    }
 
     mod markdown_hosts {
         include!("markdown_tests.rs");
@@ -10832,7 +11387,7 @@ mod tests {
             _side: &str,
             _line: u64,
             _body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             unimplemented!("queue tests never post comments")
         }
 
@@ -10841,7 +11396,7 @@ mod tests {
             _loc: &github::PrLocator,
             _comment_id: u64,
             _body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             unimplemented!("queue tests never post replies")
         }
 
@@ -10909,9 +11464,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn file_tree_loading_tracks_fetch_stages_and_keeps_refresh_rows(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn file_tree_loading_tracks_fetch_stages_and_keeps_refresh_rows(cx: &mut gpui::TestAppContext) {
         let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
         let ready = || loop_pr_item(Vec::new()).state;
@@ -10955,11 +11508,22 @@ mod tests {
             if let Some(row) = vcx.debug_bounds("tree-row-0") {
                 // The item header can change height when metadata first arrives;
                 // refresh, in contrast, must keep both filter and rows stationary.
-                assert_eq!(*filter_bounds.get_or_insert(filter), filter, "refresh must not move filter");
-                assert_eq!(*row_bounds.get_or_insert(row), row, "refresh must not move tree rows");
+                assert_eq!(
+                    *filter_bounds.get_or_insert(filter),
+                    filter,
+                    "refresh must not move filter"
+                );
+                assert_eq!(
+                    *row_bounds.get_or_insert(row),
+                    row,
+                    "refresh must not move tree rows"
+                );
             }
             if let Some(status) = vcx.debug_bounds("file-tree-loading") {
-                assert_eq!(status, track, "animation must stay inside the reserved strip");
+                assert_eq!(
+                    status, track,
+                    "animation must stay inside the reserved strip"
+                );
             }
         }
     }
@@ -11803,7 +12367,7 @@ mod tests {
             _side: &str,
             _line: u64,
             _body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             unimplemented!("queue tests never post comments")
         }
 
@@ -11812,7 +12376,7 @@ mod tests {
             _loc: &github::PrLocator,
             _comment_id: u64,
             _body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             unimplemented!("queue tests never post replies")
         }
 
@@ -12065,6 +12629,7 @@ mod tests {
                             repo: "widgets".into(),
                             number: 1,
                         }),
+                        comment_sync: Default::default(),
                         state: ItemState::Failed("stale".into()),
                         reloading: false,
                         refresh_error: None,
@@ -12079,6 +12644,7 @@ mod tests {
                             repo: "widgets".into(),
                             number: 2,
                         }),
+                        comment_sync: Default::default(),
                         state: ItemState::Failed("stale".into()),
                         reloading: false,
                         refresh_error: None,
@@ -12248,6 +12814,7 @@ mod tests {
                 repo: "widgets".into(),
                 number: 7,
             }),
+            comment_sync: Default::default(),
             state: ItemState::Loading,
             reloading: false,
             refresh_error: None,
@@ -12290,6 +12857,7 @@ mod tests {
                 repo: "widgets".into(),
                 number: 8,
             }),
+            comment_sync: Default::default(),
             state: ItemState::Loading,
             reloading: false,
             refresh_error: None,
@@ -13007,6 +13575,7 @@ mod tests {
             review_draft: None,
             id: 1,
             source: Source::Pr(loc),
+            comment_sync: Default::default(),
             state: ItemState::Loading,
             reloading: false,
             refresh_error: None,
@@ -13477,7 +14046,7 @@ mod tests {
         );
 
         assert_eq!(review.comments[0].id, 1);
-        assert_eq!(review.comments[1].in_reply_to_id, Some(1));
+        assert_eq!(review.comments[1].in_reply_to_id, Some(1.into()));
         assert!(review.comments.iter().all(|c| c.time == CommentTime::Draft));
         assert!(review.comments.iter().all(|c| c.author == "you"));
         assert!(review.comments.iter().all(|c| c.start_line.is_none()));
@@ -13622,7 +14191,7 @@ mod tests {
                 .filter(|row| matches!(
                     row,
                     Row::CommentActions {
-                        root_id: 1,
+                        root_id: crate::comments::CommentKey::Inline(1),
                         side: CommentSide::Right,
                         line: 1,
                         ..
@@ -13691,6 +14260,26 @@ mod tests {
         }
     }
 
+    fn fake_receipt(
+        id: u64,
+        body: &str,
+        anchor: Option<github::CommentAnchor>,
+        in_reply_to_id: Option<u64>,
+    ) -> github::PublishedComment {
+        github::PublishedComment {
+            id,
+            node_id: format!("fake-created-{id}"),
+            body: Some(body.into()),
+            author: Some("tester".into()),
+            created_at: None,
+            anchor,
+            in_reply_to_id,
+            thread_id: None,
+            review_node_id: None,
+            review_id: None,
+        }
+    }
+
     /// A ready PR item over two_file_diff — the state a finished open
     /// leaves behind: file mode on a.rs, cursor revealed at its first
     /// change (the added line 1), carrying `comments` on the diff.
@@ -13712,6 +14301,7 @@ mod tests {
             review_draft: None,
             id: 0,
             source: Source::Pr(loop_loc()),
+            comment_sync: Default::default(),
             state: ItemState::Ready(Box::new({
                 let mut data = ItemData::new(
                     Some(loop_pr_meta()),
@@ -13788,6 +14378,14 @@ mod tests {
         fail: std::sync::atomic::AtomicBool,
         stale_discussion: std::sync::atomic::AtomicBool,
         fail_discussion: std::sync::atomic::AtomicBool,
+        fail_pending_create: std::sync::atomic::AtomicBool,
+        unknown_create: std::sync::atomic::AtomicBool,
+        unknown_mutation: std::sync::atomic::AtomicBool,
+        mutation_calls: std::sync::atomic::AtomicUsize,
+        thread_ids: std::sync::Mutex<HashMap<u64, String>>,
+        review_ids: std::sync::Mutex<HashMap<u64, String>>,
+        thread_metadata: std::sync::Mutex<HashMap<String, github::ReviewThread>>,
+        pending_create_calls: std::sync::atomic::AtomicUsize,
         /// The id the next posted comment gets.
         next_id: std::sync::atomic::AtomicU64,
         pending: std::sync::Mutex<Option<github::PendingReview>>,
@@ -13824,6 +14422,33 @@ mod tests {
 
         fn posts(&self) -> Vec<Post> {
             self.posted.lock().unwrap().clone()
+        }
+
+        fn before_mutation(&self, action: &str) -> Result<(), github::ClientError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.mutation_calls.fetch_add(1, SeqCst);
+            if self.fail.load(SeqCst) {
+                let message = format!("{action} rejected");
+                return Err(if self.unknown_mutation.load(SeqCst) {
+                    github::ClientError::Failed(message)
+                } else {
+                    github::ClientError::Rejected(message)
+                });
+            }
+            Ok(())
+        }
+
+        fn after_mutation(&self) -> Result<(), github::ClientError> {
+            if self
+                .unknown_mutation
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(github::ClientError::Failed(
+                    "response lost after committing".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
 
         fn patch_text(&self) -> String {
@@ -13893,9 +14518,7 @@ mod tests {
                 target: target.clone(),
                 body: body.into(),
             });
-            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(github::ClientError::Failed("edit rejected".into()));
-            }
+            self.before_mutation("edit")?;
             match target {
                 github::CommentTarget::ReviewComment(node_id) => {
                     let permissions = self.comment_permissions.lock().unwrap();
@@ -13922,7 +14545,7 @@ mod tests {
                         .body = body.into();
                 }
             }
-            Ok(())
+            self.after_mutation()
         }
 
         fn delete_comment(
@@ -13932,9 +14555,7 @@ mod tests {
             self.posted.lock().unwrap().push(Post::Delete {
                 target: target.clone(),
             });
-            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(github::ClientError::Failed("delete rejected".into()));
-            }
+            self.before_mutation("delete")?;
             match target {
                 github::CommentTarget::ReviewComment(node_id) => {
                     let permissions = self.comment_permissions.lock().unwrap();
@@ -13943,7 +14564,33 @@ mod tests {
                         .find(|(_, p)| &p.node_id == node_id)
                         .unwrap()
                         .0;
-                    self.comments.lock().unwrap().retain(|c| c.id != *id);
+                    let mut comments = self.comments.lock().unwrap();
+                    let removed = comments.iter().find(|c| c.id == *id).cloned().unwrap();
+                    let replacement = removed.in_reply_to_id.or_else(|| {
+                        comments
+                            .iter()
+                            .find(|c| c.in_reply_to_id == Some(*id))
+                            .map(|c| c.id)
+                    });
+                    comments.retain(|c| c.id != *id);
+                    for c in &mut *comments {
+                        if c.in_reply_to_id == Some(*id) {
+                            c.in_reply_to_id = replacement.filter(|id| *id != c.id);
+                            if c.in_reply_to_id.is_none() {
+                                c.path = removed.path.clone();
+                                c.line = removed.line;
+                                c.start_line = removed.start_line;
+                                c.side = removed.side.clone();
+                            }
+                        }
+                    }
+                    if removed.in_reply_to_id.is_none() {
+                        if let Some(new) = replacement {
+                            let mut ids = self.thread_ids.lock().unwrap();
+                            let thread = ids.get(id).cloned().unwrap_or_else(|| id.to_string());
+                            ids.insert(new, thread);
+                        }
+                    }
                 }
                 github::CommentTarget::Issue(node_id) | github::CommentTarget::Review(node_id) => {
                     self.conversation
@@ -13952,7 +14599,7 @@ mod tests {
                         .retain(|c| &c.permissions.node_id != node_id);
                 }
             }
-            Ok(())
+            self.after_mutation()
         }
 
         fn viewed_files(
@@ -14029,6 +14676,18 @@ mod tests {
                 github::PrDiscussion::from_review_comments(self.comments.lock().unwrap().clone());
             discussion.comments = self.conversation.lock().unwrap().clone();
             for thread in &mut discussion.threads {
+                if let Some(id) = thread
+                    .comments
+                    .first()
+                    .and_then(|c| self.thread_ids.lock().unwrap().get(&c.id).cloned())
+                {
+                    thread.id = id;
+                }
+                if let Some(metadata) = self.thread_metadata.lock().unwrap().get(&thread.id) {
+                    let comments = std::mem::take(&mut thread.comments);
+                    *thread = metadata.clone();
+                    thread.comments = comments;
+                }
                 if let Some(resolved) = self.resolutions.lock().unwrap().get(&thread.id) {
                     thread.is_resolved = *resolved;
                     thread.viewer_can_resolve = true;
@@ -14038,6 +14697,7 @@ mod tests {
             let permissions = self.comment_permissions.lock().unwrap();
             for comment in discussion.threads.iter_mut().flat_map(|t| &mut t.comments) {
                 comment.permissions = permissions.get(&comment.id).cloned().unwrap_or_default();
+                comment.review_id = self.review_ids.lock().unwrap().get(&comment.id).cloned();
             }
             let reactions = self.reactions.lock().unwrap();
             for comment in discussion
@@ -14061,56 +14721,31 @@ mod tests {
             Ok(discussion)
         }
 
-        fn post_conversation_comment_id(
-            &self,
-            loc: &github::PrLocator,
-            body: &str,
-        ) -> Result<Option<u64>, github::ClientError> {
-            self.post_conversation_comment(loc, body)?;
-            Ok(self
-                .conversation
-                .lock()
-                .unwrap()
-                .last()
-                .map(|comment| comment.id))
-        }
-
-        fn post_reply_id(
-            &self,
-            loc: &github::PrLocator,
-            comment_id: u64,
-            body: &str,
-        ) -> Result<Option<u64>, github::ClientError> {
-            self.post_reply(loc, comment_id, body)?;
-            Ok(self
-                .comments
-                .lock()
-                .unwrap()
-                .last()
-                .map(|comment| comment.id))
-        }
-
         fn post_conversation_comment(
             &self,
             _loc: &github::PrLocator,
             body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             self.posted
                 .lock()
                 .unwrap()
                 .push(Post::Conversation { body: body.into() });
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(github::ClientError::Failed("comment rejected".into()));
+                return Err(github::ClientError::Rejected("comment rejected".into()));
             }
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 100;
             self.conversation
                 .lock()
                 .unwrap()
                 .push(github::DiscussionComment {
-                    permissions: Default::default(),
-                    id: self
-                        .next_id
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                        + 100,
+                    permissions: github::CommentPermissions {
+                        node_id: format!("fake-created-{id}"),
+                        ..Default::default()
+                    },
+                    id,
                     author: "tester".into(),
                     body: body.into(),
                     created_at: "2026-10-25T00:00:00Z".into(),
@@ -14118,7 +14753,7 @@ mod tests {
                     review_state: None,
                     review_id: None,
                 });
-            Ok(())
+            Ok(fake_receipt(id, body, None, None))
         }
 
         fn update_pending_body(
@@ -14208,8 +14843,16 @@ mod tests {
             review: &github::PendingReview,
             anchor: &github::CommentAnchor,
             body: &str,
-        ) -> Result<github::PendingComment, github::ClientError> {
+        ) -> Result<github::PendingCommentReceipt, github::ClientError> {
+            self.pending_create_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(review.id, 91);
+            if self
+                .fail_pending_create
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(github::ClientError::Rejected("draft rejected".into()));
+            }
             let comment = github::PendingComment {
                 id: 12,
                 in_reply_to_id: None,
@@ -14227,7 +14870,10 @@ mod tests {
                 .unwrap()
                 .comments
                 .push(comment.clone());
-            Ok(comment)
+            Ok(github::PendingCommentReceipt {
+                comment,
+                thread_id: None,
+            })
         }
 
         fn add_pending_reply(
@@ -14236,7 +14882,9 @@ mod tests {
             review: &github::PendingReview,
             comment_id: u64,
             body: &str,
-        ) -> Result<github::PendingComment, github::ClientError> {
+        ) -> Result<github::PendingCommentReceipt, github::ClientError> {
+            self.pending_create_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(review.id, 91);
             let parent = self
                 .comments
@@ -14244,8 +14892,28 @@ mod tests {
                 .unwrap()
                 .iter()
                 .find(|comment| comment.id == comment_id)
-                .unwrap()
-                .clone();
+                .cloned()
+                .or_else(|| {
+                    review
+                        .comments
+                        .iter()
+                        .find(|c| c.id == comment_id)
+                        .map(|c| {
+                            let mut parent = rc(
+                                c.id,
+                                &c.path,
+                                Some(c.side.api_str()),
+                                c.line,
+                                &c.body,
+                                "you",
+                                "",
+                                c.in_reply_to_id,
+                            );
+                            parent.start_line = c.start_line;
+                            parent
+                        })
+                })
+                .expect("reply targets a surviving published or pending comment");
             let comment = github::PendingComment {
                 id: self
                     .next_id
@@ -14253,7 +14921,11 @@ mod tests {
                     + 100,
                 node_id: "draft_reply_node".into(),
                 path: parent.path,
-                side: CommentSide::Right,
+                side: if parent.side.as_deref() == Some("LEFT") {
+                    CommentSide::Left
+                } else {
+                    CommentSide::Right
+                },
                 line: parent.line,
                 start_line: parent.start_line,
                 body: body.into(),
@@ -14266,7 +14938,10 @@ mod tests {
                 .unwrap()
                 .comments
                 .push(comment.clone());
-            Ok(comment)
+            Ok(github::PendingCommentReceipt {
+                comment,
+                thread_id: None,
+            })
         }
 
         fn edit_pending_comment(
@@ -14275,6 +14950,7 @@ mod tests {
             comment: &github::PendingComment,
             body: &str,
         ) -> Result<(), github::ClientError> {
+            self.before_mutation("edit")?;
             self.pending
                 .lock()
                 .unwrap()
@@ -14285,7 +14961,7 @@ mod tests {
                 .find(|draft| draft.id == comment.id)
                 .unwrap()
                 .body = body.into();
-            Ok(())
+            self.after_mutation()
         }
 
         fn delete_pending_comment(
@@ -14293,6 +14969,7 @@ mod tests {
             _loc: &github::PrLocator,
             comment: &github::PendingComment,
         ) -> Result<(), github::ClientError> {
+            self.before_mutation("delete")?;
             self.pending
                 .lock()
                 .unwrap()
@@ -14300,7 +14977,7 @@ mod tests {
                 .unwrap()
                 .comments
                 .retain(|draft| draft.id != comment.id);
-            Ok(())
+            self.after_mutation()
         }
 
         fn submit_pending_review(
@@ -14409,6 +15086,41 @@ mod tests {
                 .cloned())
         }
 
+        fn post_anchored_comment(
+            &self,
+            loc: &github::PrLocator,
+            anchor: &github::CommentAnchor,
+            body: &str,
+        ) -> Result<github::PublishedComment, github::ClientError> {
+            let mut created = self.post_review_comment(
+                loc,
+                &anchor.commit_id,
+                &anchor.path,
+                anchor.side.api_str(),
+                anchor.line,
+                body,
+            )?;
+            created.anchor = Some(anchor.clone());
+            if let Some(comment) = self
+                .comments
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|c| c.id == created.id)
+            {
+                comment.start_line = anchor.start_line;
+            }
+            if self
+                .unknown_create
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(github::ClientError::Failed(
+                    "response lost after commit".into(),
+                ));
+            }
+            Ok(created)
+        }
+
         fn post_review_comment(
             &self,
             _loc: &github::PrLocator,
@@ -14417,7 +15129,7 @@ mod tests {
             side: &str,
             line: u64,
             body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             if self.pending.lock().unwrap().is_some() {
                 return Err(github::ClientError::Failed(
                     "pending review already exists".into(),
@@ -14431,7 +15143,9 @@ mod tests {
                 body: body.to_string(),
             });
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(github::ClientError::Failed("gh: the server said no".into()));
+                return Err(github::ClientError::Rejected(
+                    "gh: the server said no".into(),
+                ));
             }
             let id = self
                 .next_id
@@ -14447,7 +15161,30 @@ mod tests {
                 "2026-10-22T00:00:00Z",
                 None,
             ));
-            Ok(())
+            self.comment_permissions.lock().unwrap().insert(
+                id,
+                github::CommentPermissions {
+                    node_id: format!("fake-created-{id}"),
+                    ..Default::default()
+                },
+            );
+            Ok(fake_receipt(
+                id,
+                body,
+                Some(github::CommentAnchor {
+                    path: path.into(),
+                    commit_id: commit_id.into(),
+                    side: if side == "LEFT" {
+                        CommentSide::Left
+                    } else {
+                        CommentSide::Right
+                    },
+                    line,
+                    start_line: None,
+                    position: None,
+                }),
+                None,
+            ))
         }
 
         fn post_reply(
@@ -14455,7 +15192,7 @@ mod tests {
             _loc: &github::PrLocator,
             comment_id: u64,
             body: &str,
-        ) -> Result<(), github::ClientError> {
+        ) -> Result<github::PublishedComment, github::ClientError> {
             if self.pending.lock().unwrap().is_some() {
                 return Err(github::ClientError::Failed(
                     "pending review already exists".into(),
@@ -14466,7 +15203,7 @@ mod tests {
                 body: body.to_string(),
             });
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(github::ClientError::Failed("reply rejected".into()));
+                return Err(github::ClientError::Rejected("reply rejected".into()));
             }
             let id = self
                 .next_id
@@ -14482,7 +15219,14 @@ mod tests {
                 "2026-10-22T00:00:00Z",
                 Some(comment_id),
             ));
-            Ok(())
+            self.comment_permissions.lock().unwrap().insert(
+                id,
+                github::CommentPermissions {
+                    node_id: format!("fake-created-{id}"),
+                    ..Default::default()
+                },
+            );
+            Ok(fake_receipt(id, body, None, Some(comment_id)))
         }
 
         fn submit_review(
@@ -16002,7 +16746,7 @@ mod tests {
                     .filter(|row| matches!(
                         row,
                         Row::CommentHeader {
-                            comment_id: 11,
+                            comment_id: crate::comments::CommentKey::Inline(11),
                             collapsed: true,
                             ..
                         }
@@ -16012,13 +16756,22 @@ mod tests {
             );
             assert!(!data.rows.iter().any(|row| matches!(
                 row,
-                Row::CommentHeader { comment_id: 12, .. } | Row::CommentActions { root_id: 11, .. }
+                Row::CommentHeader {
+                    comment_id: crate::comments::CommentKey::Inline(12),
+                    ..
+                } | Row::CommentActions {
+                    root_id: crate::comments::CommentKey::Inline(11),
+                    ..
+                }
             )));
-            assert!(!data.rows.iter().any(|row| matches!(row, Row::CommentBody { text, .. } if matches!(text.comment_id, 11 | 12))));
-            assert!(data
-                .rows
-                .iter()
-                .any(|row| matches!(row, Row::CommentActions { root_id: 13, .. })));
+            assert!(!data.rows.iter().any(|row| matches!(row, Row::CommentBody { text, .. } if matches!(text.comment_id, comments::CommentKey::Inline(11 | 12)))));
+            assert!(data.rows.iter().any(|row| matches!(
+                row,
+                Row::CommentActions {
+                    root_id: crate::comments::CommentKey::Inline(13),
+                    ..
+                }
+            )));
             assert_eq!(data.comments.as_ref().unwrap().counts["a.rs"], (3, 0));
             assert!(data
                 .file_rows
@@ -16030,10 +16783,13 @@ mod tests {
                 .all(|&ix| matches!(data.rows[ix], Row::Line { .. } | Row::SplitLine { .. })));
             data.expanded_threads.insert("11".into());
             data.set_rows(data.row_build());
-            assert!(data
-                .rows
-                .iter()
-                .any(|row| matches!(row, Row::CommentHeader { comment_id: 12, .. })));
+            assert!(data.rows.iter().any(|row| matches!(
+                row,
+                Row::CommentHeader {
+                    comment_id: crate::comments::CommentKey::Inline(12),
+                    ..
+                }
+            )));
             assert!(data
                 .rows
                 .iter()
@@ -16083,10 +16839,13 @@ mod tests {
         cx.update(|cx| {
             let data = app.read(cx).active_data().unwrap();
             assert!(data.expanded_threads.contains("11"));
-            assert!(data
-                .rows
-                .iter()
-                .any(|row| matches!(row, Row::CommentActions { root_id: 11, .. })));
+            assert!(data.rows.iter().any(|row| matches!(
+                row,
+                Row::CommentActions {
+                    root_id: crate::comments::CommentKey::Inline(11),
+                    ..
+                }
+            )));
         });
         click_commenting(&mut vcx, "thread-expand-0-11");
         cx.update(|cx| {
@@ -16105,10 +16864,13 @@ mod tests {
         cx.update(|cx| {
             let data = app.read(cx).active_data().unwrap();
             assert!(!data.discussion.as_ref().unwrap().threads[0].is_resolved);
-            assert!(data
-                .rows
-                .iter()
-                .any(|row| matches!(row, Row::CommentActions { root_id: 11, .. })));
+            assert!(data.rows.iter().any(|row| matches!(
+                row,
+                Row::CommentActions {
+                    root_id: crate::comments::CommentKey::Inline(11),
+                    ..
+                }
+            )));
             assert!(
                 !data.expanded_threads.contains("11"),
                 "the resolve button must not also toggle the header"
@@ -16327,7 +17089,7 @@ mod tests {
             let app = app.read(cx);
             assert!(app.composer().is_none());
             let discussion = app.active_data().unwrap().discussion.as_ref().unwrap();
-            assert!(matches!(&conversation::timeline(discussion)[..], [conversation::Entry::Comment(c)] if c.body == "conversation feedbackcr"));
+            assert!(matches!(&conversation::timeline(discussion)[..], [comments::Entry::Comment(comments::Comment::Published(c))] if c.body == "conversation feedbackcr"));
             assert!(discussion.threads.is_empty());
             assert_eq!(app.store.snapshot("acme/widgets", 7).unwrap().discussion.unwrap()["comments"][0]["body"], "conversation feedbackcr");
         });
@@ -16602,6 +17364,21 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let (window, app) = queue_window(cx, fake.clone());
         install_item(&app, commenting_item(&fake), cx);
+        // Seed the same confirmed cache as a normal initial fetch. Rejected
+        // post-write stale reads must leave it unchanged, not write it anew.
+        cx.update(|cx| {
+            app.update(cx, |app, _| {
+                let data = app.active_data().unwrap();
+                let snapshot = review_target::discussion_snapshot(
+                    &loop_loc(),
+                    data.pr_meta.as_ref().unwrap(),
+                    data.discussion.as_ref().unwrap(),
+                    None,
+                )
+                .unwrap();
+                app.store.save_snapshot(&snapshot);
+            })
+        });
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
         click_commenting(
             &mut vcx,
@@ -16626,8 +17403,8 @@ mod tests {
                 let post = &data.posts.pending[0];
                 assert_eq!(post.token, 1);
                 assert_eq!(post.reply_to, reply.then_some(11));
-                assert_eq!(post.comment.body, "visible immediately");
-                assert_eq!(post.comment.created_at, "Posting…");
+                assert_eq!(post.body, "visible immediately");
+                assert_eq!(post.status.label(), "Posting…");
             })
         });
         cx.run_until_parked();
@@ -16640,10 +17417,7 @@ mod tests {
                 1,
                 "a successful POST plus a stale GET must not make the comment disappear"
             );
-            assert_eq!(
-                data.posts.pending[0].comment.created_at,
-                "Posted · syncing…"
-            );
+            assert_eq!(data.posts.pending[0].status.label(), "Posted · syncing…");
             assert!(data.discussion.as_ref().unwrap().comments.is_empty());
             assert_eq!(
                 app.store
@@ -16907,14 +17681,24 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             let app = app.read(cx);
-            let composer = app.composer().unwrap();
-            assert!(!composer.in_flight);
-            assert!(composer.error.is_some());
-            assert_eq!(composer.input.read(cx).value().as_str(), "keep this text");
+            assert!(app.composer().is_none());
+            let recovery = &app.active_data().unwrap().posts.failed[0];
+            assert!(recovery.error.is_some());
+            assert_eq!(recovery.body, "keep this text");
             assert!(
                 app.active_data().unwrap().posts.pending.is_empty(),
                 "a failed post does not leave a fake published comment"
             );
+        });
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                let token = this.active_data().unwrap().posts.failed[0].token;
+                this.restore_comment_draft(0, token, window, cx);
+                assert_eq!(
+                    this.composer().unwrap().input.read(cx).value(),
+                    "keep this text"
+                );
+            })
         });
         vcx.simulate_keystrokes("escape");
         cx.run_until_parked();
@@ -17095,8 +17879,8 @@ mod tests {
     ) {
         for fail in [false, true] {
             for reply in [false, true] {
-                // Replies exercise run_session; immediate comments have a
-                // separate completion handler. Test success and failure in both.
+                // Both replies and immediate comments use run_session. Keep
+                // success and failure coverage for each command variant.
                 let fake = FakePr::with_threads(vec![rc(
                     11,
                     "a.rs",
@@ -17127,7 +17911,7 @@ mod tests {
                             .input
                             .update(cx, |input, cx| input.set_value("posting a", window, cx));
                         app.submit_composer(window, cx);
-                        assert!(app.composer().unwrap().in_flight);
+                        assert!(app.composer().is_none(), "creation closes immediately");
                         // Navigate and compose before the asynchronous result is handled.
                         app.active_data_mut().unwrap().open_file(1, None);
                         app.open_composer_on_selection(window, cx);
@@ -17147,13 +17931,14 @@ mod tests {
                         assert!(second.error.is_none());
                         assert!(second.input.focus_handle(cx).is_focused(window));
                         app.active_data_mut().unwrap().open_file(0, None);
+                        assert!(
+                            app.composer().is_none(),
+                            "completion never reopens the submitted editor"
+                        );
                         if fail {
-                            let first = app.composer().unwrap();
-                            assert!(!first.in_flight);
-                            assert!(first.error.is_some());
-                            assert_eq!(first.input.read(cx).value(), "posting a");
-                        } else {
-                            assert!(app.composer().is_none());
+                            let recovery = &app.active_data().unwrap().posts.failed[0];
+                            assert!(recovery.error.is_some());
+                            assert_eq!(recovery.body, "posting a");
                         }
                     })
                 });
@@ -17188,9 +17973,15 @@ mod tests {
                     state.set_value("nit: s/teh/the/", window, cx)
                 });
                 this.submit_composer(window, cx);
-                assert!(
-                    this.composer().unwrap().in_flight,
-                    "posting is in flight until gh answers"
+                assert!(this.composer().is_none(), "editor closes before gh answers");
+                assert_eq!(
+                    this.active_data()
+                        .unwrap()
+                        .comments
+                        .as_ref()
+                        .unwrap()
+                        .counts["a.rs"],
+                    (1, 0)
                 );
             });
         });
@@ -17223,9 +18014,8 @@ mod tests {
         });
     }
 
-    /// A failed post surfaces inline in the composer (and doesn't stick
-    /// in flight), and Esc cancels without posting anything. (criterion:
-    /// errors surface inline; Esc never posts)
+    /// A rejected creation preserves text without automatically reopening an
+    /// editor. Explicit recovery restores a draft; Esc never posts it.
     #[gpui::test]
     fn a_failed_post_surfaces_inline_and_escape_cancels_cleanly(cx: &mut gpui::TestAppContext) {
         let fake = FakePr::with_threads(Vec::new());
@@ -17249,14 +18039,21 @@ mod tests {
 
         cx.update(|cx| {
             app.update(cx, |this, _cx| {
-                let composer = this.composer().expect("the composer stays open on failure");
-                assert!(!composer.in_flight, "a failed post is retryable");
-                assert!(composer.error.is_some(), "gh's failure shows inline");
+                assert!(this.composer().is_none(), "failure does not steal focus");
+                let recovery = &this.active_data().unwrap().posts.failed[0];
+                assert_eq!(recovery.body, "doomed");
+                assert!(recovery.error.is_some());
             });
         });
 
-        // Esc cancels: the composer goes away and nothing more posts (the
-        // failed attempt is the only thing gh ever saw).
+        vcx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                let token = this.active_data().unwrap().posts.failed[0].token;
+                this.restore_comment_draft(0, token, window, cx);
+                assert_eq!(this.composer().unwrap().input.read(cx).value(), "doomed");
+            })
+        });
+        // Esc cancels the recovered draft without a second write.
         vcx.dispatch_action(InputEscape);
         cx.run_until_parked();
         cx.update(|cx| {
@@ -17299,7 +18096,15 @@ mod tests {
                 let row_ix = data
                     .rows
                     .iter()
-                    .position(|row| matches!(row, Row::CommentActions { root_id: 11, .. }))
+                    .position(|row| {
+                        matches!(
+                            row,
+                            Row::CommentActions {
+                                root_id: crate::comments::CommentKey::Inline(11),
+                                ..
+                            }
+                        )
+                    })
                     .expect("the thread's reply affordance rides along in file mode");
                 let (path, side, line) = match &data.rows[row_ix] {
                     Row::CommentActions {
@@ -18168,7 +18973,7 @@ mod tests {
         cx.update(|cx| {
             app.update(cx, |this, cx| {
                 this.sessions.get_mut(&0).unwrap().comments_expanded = true;
-                this.finish_session(0, ReviewSession::default(), &Ok(()), cx);
+                this.finish_session(0, &loop_loc(), ReviewSession::default(), &Ok(()), cx);
                 assert!(!this.sessions[&0].comments_expanded);
             })
         });
@@ -18305,7 +19110,7 @@ mod tests {
             assert_eq!(composer.edit_target, Some(CommentTarget::Pending(12)));
             assert!(composer.row_ix > 0, "not the old top-of-diff editor");
             let data = this.active_data().unwrap();
-            assert!(matches!(&data.rows[composer.row_ix], Row::CommentHeader { comment_id: 12, .. }));
+            assert!(matches!(&data.rows[composer.row_ix], Row::CommentHeader { comment_id: crate::comments::CommentKey::Pending(12), .. }));
             assert!(matches!(&data.rows[composer.row_ix + 1], Row::CommentEditor { .. }));
             assert!(!data.rows.iter().any(|r| matches!(r, Row::CommentBody { line, .. } if line.as_ref() == "original draft")));
             this.close_composer(window, cx);
@@ -18467,9 +19272,9 @@ mod tests {
         vcx.update(|_, cx| app.update(cx, |this, _| {
             this.active_data_mut().unwrap().rebuild_rows_anchored();
             let rows = &this.active_data().unwrap().rows;
-            let footer = rows.iter().position(|r| matches!(r, Row::CommentReactions { comment_id: 11, .. })).unwrap();
+            let footer = rows.iter().position(|r| matches!(r, Row::CommentReactions { comment_id: crate::comments::CommentKey::Inline(11), .. })).unwrap();
             assert!(matches!(&rows[footer - 1], Row::CommentBody { text, .. } if text.comment_id == 11));
-            assert!(matches!(&rows[footer + 1], Row::CommentActions { root_id: 11, .. }));
+            assert!(matches!(&rows[footer + 1], Row::CommentActions { root_id: crate::comments::CommentKey::Inline(11), .. }));
         }));
         click_commenting(&mut vcx, "reaction-picker-review-comment-PRRC11");
         assert!(vcx.debug_bounds("reaction-options").is_some());

@@ -21,7 +21,6 @@
 
 mod jira;
 mod markdown;
-pub(crate) mod posting;
 pub(crate) use markdown::render as render_transient_markdown;
 pub(crate) use markdown::render_persistent as render_markdown;
 
@@ -70,71 +69,10 @@ pub fn preprocess(body: &str, repo_slug: &str) -> String {
     jira::link_references(out)
 }
 
-/// Submitted reviews occupy one slot, with their summary before their inline
-/// threads. Unassociated threads (including old cached data) stand alone.
-pub(crate) enum Entry<'a> {
-    Comment(&'a github::DiscussionComment),
-    Review(&'a github::DiscussionComment, Vec<&'a github::ReviewThread>),
-    Thread(&'a github::ReviewThread),
-}
-
-impl Entry<'_> {
-    fn key(&self) -> (&str, u8, u64, &str) {
-        match self {
-            Self::Comment(c) => (&c.created_at, u8::from(c.review_state.is_some()), c.id, ""),
-            Self::Review(c, _) => (&c.created_at, 1, c.id, ""),
-            Self::Thread(t) => (&t.comments[0].created_at, 2, 0, &t.id),
-        }
-    }
-}
-
-pub(crate) fn timeline(discussion: &github::PrDiscussion) -> Vec<Entry<'_>> {
-    let mut reviews = std::collections::HashMap::new();
-    let mut entries: Vec<_> = discussion
-        .comments
-        .iter()
-        .enumerate()
-        .map(|(ix, comment)| {
-            if comment.review_state.is_some() {
-                if let Some(id) = &comment.review_id {
-                    reviews.insert(id.as_str(), ix);
-                }
-                Entry::Review(comment, Vec::new())
-            } else {
-                Entry::Comment(comment)
-            }
-        })
-        .collect();
-    let mut threads: Vec<_> = discussion
-        .threads
-        .iter()
-        .filter(|t| !t.comments.is_empty())
-        .collect();
-    threads.sort_by(|a, b| Entry::Thread(a).key().cmp(&Entry::Thread(b).key()));
-    for thread in threads {
-        let review = thread.comments[0]
-            .review_id
-            .as_deref()
-            .and_then(|id| reviews.get(id));
-        if let Some(Entry::Review(_, threads)) = review.and_then(|&ix| entries.get_mut(ix)) {
-            threads.push(thread);
-        } else {
-            entries.push(Entry::Thread(thread));
-        }
-    }
-    entries.sort_by(|a, b| a.key().cmp(&b.key()));
-    // GitHub emits a bodyless COMMENTED review for inline comments, and can
-    // retain it after its threads disappear. It is not an empty comment card.
-    entries.retain(|entry| match entry {
-        Entry::Review(comment, threads) => {
-            !threads.is_empty()
-                || !matches!(comment.review_state.as_deref(), Some("COMMENTED"))
-                || markdown::has_content(&comment.body)
-        }
-        _ => true,
-    });
-    entries
-}
+use crate::comments::Comment;
+pub(crate) use crate::comments::Entry;
+#[cfg(test)]
+use crate::comments::Projection;
 
 #[derive(Debug, PartialEq, Eq)]
 struct CodeLine<'a> {
@@ -351,17 +289,16 @@ impl ReviewApp {
                 .child(self.render_composer_card(cx))
                 .into_any_element();
         }
-        let reply_to = thread
-            .and_then(|thread| thread.comments.first())
-            .map(|c| c.id);
+        let reply_to =
+            thread.and_then(|thread| self.active_comment_projection()?.reply_target(thread));
         let path = thread.map_or(String::new(), |thread| thread.path.clone());
         let side = if thread.is_some_and(|thread| thread.side == "LEFT") {
             CommentSide::Left
         } else {
             CommentSide::Right
         };
-        // A reply addresses the root identity, even for resolved/outdated
-        // threads whose file or line no longer exists in the current diff.
+        // A reply addresses a surviving remote comment, even for resolved /
+        // outdated threads whose root or current file/line no longer exists.
         let line = thread
             .and_then(|thread| thread.line.or(thread.original_line))
             .unwrap_or(0);
@@ -380,7 +317,11 @@ impl ReviewApp {
                     "Leave a comment"
                 })
                 .small()
-                .disabled(self.composer().is_some() || self.review.is_some())
+                .disabled(
+                    self.composer().is_some()
+                        || self.review.is_some()
+                        || (thread.is_some() && reply_to.is_none()),
+                )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.active_item().map(|item| item.id) != Some(item_id) {
                         return;
@@ -541,17 +482,14 @@ impl ReviewApp {
         let Source::Pr(loc) = &item.source else {
             return Vec::new();
         };
-        let empty = github::PrDiscussion::default();
-        let discussion = data.discussion.as_ref().unwrap_or(&empty);
+        let projection = data.comment_projection(
+            self.sessions
+                .get(&item.id)
+                .and_then(|ui| ui.state.pending.as_ref()),
+        );
         let slug = loc.repo_slug();
-        let entries = timeline(discussion);
-        if entries.is_empty()
-            && !data
-                .posts
-                .pending
-                .iter()
-                .any(|post| post.reply_to.is_none())
-        {
+        let entries = projection.conversation();
+        if entries.is_empty() {
             return vec![div()
                 .mt_6()
                 .text_color(theme::overlay0(cx))
@@ -566,8 +504,14 @@ impl ReviewApp {
                         .relative()
                         .child(
                             timeline_comment_card(cx)
-                                .debug_selector(|| {
-                                    format!("timeline-comment-{}-{}", item.id, comment.id)
+                                .debug_selector(|| match comment {
+                                    Comment::Published(c) => {
+                                        format!("timeline-comment-{}-{}", item.id, c.id)
+                                    }
+                                    Comment::Posting(post) => {
+                                        format!("timeline-post-{}-{}", item.id, post.token)
+                                    }
+                                    Comment::Pending(_) => unreachable!(),
                                 })
                                 .child(self.discussion_comment(
                                     item.id, "main", comment, &slug, window, cx,
@@ -577,9 +521,19 @@ impl ReviewApp {
                 ),
                 Entry::Review(comment, threads) => {
                     let (icon, color) = review_icon(comment.review_state.as_deref(), cx);
-                    let mut content = div().flex_1().min_w_0().pt_1().child(
-                        self.discussion_comment(item.id, "main", comment, &slug, window, cx),
-                    );
+                    let mut content =
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .pt_1()
+                            .child(self.discussion_comment(
+                                item.id,
+                                "main",
+                                Comment::Published(comment),
+                                &slug,
+                                window,
+                                cx,
+                            ));
                     if !threads.is_empty() {
                         content = content.child(
                             div()
@@ -625,6 +579,142 @@ impl ReviewApp {
                             .into_any_element(),
                     );
                 }
+                Entry::CreatedThread(post, comments) => {
+                    let anchor = post.anchor.as_ref().expect("inline root anchor");
+                    let key = format!("created-thread-{}-{}", item.id, post.token);
+                    let confirmed = data
+                        .discussion
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|d| &d.threads)
+                        .chain(data.posts.changes.threads.values())
+                        .find(|t| data.posts.is_thread_shell(post, t));
+                    let composing = self.composer().is_some_and(|c| {
+                        c.item_id == item.id
+                            && confirmed.is_some_and(|t| {
+                                c.placement == ComposerPlacement::ConversationThread(t.id.clone())
+                                    || comments.iter().any(|comment| match comment {
+                                        Comment::Published(comment) => {
+                                            c.placement
+                                                == ComposerPlacement::ConversationComment(
+                                                    crate::comment_actions::published_target(
+                                                        "review", comment,
+                                                    )
+                                                    .key(),
+                                                )
+                                        }
+                                        Comment::Pending(comment) => {
+                                            c.placement
+                                                == ComposerPlacement::ConversationComment(
+                                                    crate::CommentTarget::Pending(comment.id).key(),
+                                                )
+                                        }
+                                        _ => false,
+                                    })
+                            })
+                    });
+                    let expanded = composing
+                        || confirmed.is_none_or(|t| {
+                            !t.is_resolved || data.expanded_threads.contains(&t.id)
+                        });
+                    let location_label = confirmed
+                        .map(|thread| {
+                            format!(
+                                "{}{} · {}",
+                                thread.path,
+                                anchor_range(thread),
+                                if thread.side == "LEFT" { "old" } else { "new" }
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            format!(
+                                "{}:{}{} · {}",
+                                anchor.path,
+                                anchor
+                                    .start_line
+                                    .map(|n| format!("{n}–"))
+                                    .unwrap_or_default(),
+                                anchor.line,
+                                if anchor.side == CommentSide::Left {
+                                    "old"
+                                } else {
+                                    "new"
+                                }
+                            )
+                        });
+                    let mut location = div().h_6().flex().items_center().gap_2().child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_color(theme::subtext(cx))
+                            .child(location_label),
+                    );
+                    if let Some(thread) = confirmed {
+                        location = location.child(self.thread_controls(
+                            item.id,
+                            thread,
+                            true,
+                            &cx.entity(),
+                            cx,
+                        ));
+                    }
+                    let mut card = timeline_comment_card(cx)
+                        .id(SharedString::from(key.clone()))
+                        .debug_selector(move || key.clone())
+                        .child(location);
+                    if expanded {
+                        // Freeze the known revision's bounded context in the local
+                        // shell; acknowledgement must not move it to a review wrapper.
+                        card = card.child(
+                            div()
+                                .h(px(3. * crate::row_height()))
+                                .overflow_hidden()
+                                .font_family(crate::MONO)
+                                .text_size(px(text_size()))
+                                .children(post.context.iter().map(|line| {
+                                    div()
+                                        .h(px(crate::row_height()))
+                                        .whitespace_nowrap()
+                                        .child(line.clone())
+                                })),
+                        );
+                        for (ix, comment) in comments.into_iter().enumerate() {
+                            card = card.child(
+                                div()
+                                    .when(ix > 0, |row| {
+                                        row.pl(px(crate::threads::REPLY_INDENT)).mt_3()
+                                    })
+                                    .child(self.discussion_comment(
+                                        item.id, "review", comment, &slug, window, cx,
+                                    )),
+                            );
+                        }
+                        if let Some(thread) = confirmed {
+                            card =
+                                card.child(div().min_h(px(32.)).child(self.conversation_composer(
+                                    item.id,
+                                    Some(thread),
+                                    cx,
+                                )));
+                        } else {
+                            card = card.child(
+                                div()
+                                    .h_8()
+                                    .text_color(theme::overlay0(cx))
+                                    .child("↳ reply available after syncing"),
+                            );
+                        }
+                    }
+                    elements.push(
+                        div()
+                            .relative()
+                            .pl(px(TIMELINE_INDENT))
+                            .child(card)
+                            .into_any_element(),
+                    );
+                }
                 Entry::Thread(thread) => elements.push(
                     div()
                         .relative()
@@ -633,32 +723,6 @@ impl ReviewApp {
                         .into_any_element(),
                 ),
             }
-        }
-        for post in data
-            .posts
-            .pending
-            .iter()
-            .filter(|post| post.reply_to.is_none())
-        {
-            elements.push(
-                div()
-                    .relative()
-                    .child(
-                        timeline_comment_card(cx)
-                            .debug_selector(|| {
-                                format!("timeline-post-{}-{}", item.id, post.comment.id)
-                            })
-                            .child(self.discussion_comment(
-                                item.id,
-                                "optimistic",
-                                &post.comment,
-                                &slug,
-                                window,
-                                cx,
-                            )),
-                    )
-                    .into_any_element(),
-            );
         }
         // The spine is behind the entire stack, not a border on each card:
         // top-level comments mask it, while review events sit on it and their
@@ -692,11 +756,13 @@ impl ReviewApp {
         &self,
         item: &ReviewItem,
         data: &ItemData,
-        thread: &github::ReviewThread,
+        projected: crate::comments::Thread<'_>,
         slug: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let thread = projected.confirmed;
+        debug_assert_eq!(projected.key.0, thread.id);
         let composing = self.composer().is_some_and(|composer| {
             composer.item_id == item.id
                 && (composer.placement == ComposerPlacement::ConversationThread(thread.id.clone())
@@ -706,19 +772,15 @@ impl ReviewApp {
                                 crate::comment_actions::published_target("review", comment).key(),
                             )
                     })
-                    || self
-                        .sessions
-                        .get(&item.id)
-                        .and_then(|ui| ui.state.pending.as_ref())
-                        .is_some_and(|review| {
-                            review.comments.iter().any(|draft| {
-                                draft.in_reply_to_id == Some(thread.comments[0].id)
-                                    && composer.placement
-                                        == ComposerPlacement::ConversationComment(
-                                            crate::CommentTarget::Pending(draft.id).key(),
-                                        )
-                            })
-                        }))
+                    || projected.comments.iter().any(|comment| match comment {
+                        Comment::Pending(draft) => {
+                            composer.placement
+                                == ComposerPlacement::ConversationComment(
+                                    crate::CommentTarget::Pending(draft.id).key(),
+                                )
+                        }
+                        _ => false,
+                    }))
         });
         let expanded =
             composing || !thread.is_resolved || data.expanded_threads.contains(&thread.id);
@@ -908,96 +970,22 @@ impl ReviewApp {
                         .child("Code context unavailable for this thread."),
                 );
             }
-            for (ix, comment) in thread.comments.iter().enumerate() {
+            for (ix, comment) in projected.comments.iter().copied().enumerate() {
+                let pending_editor = matches!(comment, Comment::Pending(draft) if self.composer().is_some_and(|composer| {
+                    composer.item_id == item.id && composer.placement == ComposerPlacement::ConversationComment(
+                        crate::CommentTarget::Pending(draft.id).key())
+                }));
                 card = card.child(
                     div()
                         .p_4()
                         .when(ix > 0, |row| row.pl(px(16. + crate::threads::REPLY_INDENT)))
-                        .border_t_1()
-                        .border_color(theme::surface0(cx))
+                        .when(!pending_editor, |row| {
+                            row.border_t_1().border_color(theme::surface0(cx))
+                        })
                         .child(
                             self.discussion_comment(item.id, "review", comment, slug, window, cx),
                         ),
                 );
-            }
-            for post in data
-                .posts
-                .pending
-                .iter()
-                .filter(|post| post.reply_to == Some(thread.comments[0].id))
-            {
-                card = card.child(
-                    div()
-                        .p_4()
-                        .pl(px(16. + crate::threads::REPLY_INDENT))
-                        .border_t_1()
-                        .border_color(theme::surface0(cx))
-                        .child(self.discussion_comment(
-                            item.id,
-                            "optimistic",
-                            &post.comment,
-                            slug,
-                            window,
-                            cx,
-                        )),
-                );
-            }
-            if let Some(review) = self
-                .sessions
-                .get(&item.id)
-                .and_then(|ui| ui.state.pending.as_ref())
-            {
-                let root_id = thread.comments[0].id;
-                for draft in review
-                    .comments
-                    .iter()
-                    .filter(|draft| draft.in_reply_to_id == Some(root_id))
-                {
-                    let target = crate::CommentTarget::Pending(draft.id);
-                    let placement = ComposerPlacement::ConversationComment(target.key());
-                    if self.composer().is_some_and(|composer| {
-                        composer.item_id == item.id && composer.placement == placement
-                    }) {
-                        card = card.child(
-                            div()
-                                .p_4()
-                                .pl(px(16. + crate::threads::REPLY_INDENT))
-                                .child(self.render_composer_card(cx)),
-                        );
-                        continue;
-                    }
-                    card = card.child(
-                        div()
-                            .p_4()
-                            .pl(px(16. + crate::threads::REPLY_INDENT))
-                            .border_t_1()
-                            .border_color(theme::surface0(cx))
-                            .child(
-                                div()
-                                    .debug_selector(|| {
-                                        format!("conversation-draft-{}-{}", item.id, draft.id)
-                                    })
-                                    .mb_2()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_color(theme::yellow(cx))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .child("Pending reply · only you can see this"),
-                                    )
-                                    .child(self.comment_controls(target, placement, &cx.entity())),
-                            )
-                            .child(render_markdown(
-                                &format!("conversation-draft-{}-{}", item.id, draft.id),
-                                preprocess(&draft.body, slug),
-                                self,
-                                window,
-                                cx,
-                            )),
-                    );
-                }
             }
             card = card.child(
                 div()
@@ -1015,38 +1003,106 @@ impl ReviewApp {
         &self,
         item_id: u64,
         kind: &str,
-        comment: &github::DiscussionComment,
+        projected: Comment<'_>,
         slug: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let target = crate::comment_actions::published_target(kind, comment);
-        let placement = ComposerPlacement::ConversationComment(target.key());
-        if kind != "optimistic"
-            && self.composer().is_some_and(|composer| {
+        if let Comment::Pending(draft) = projected {
+            let target = crate::CommentTarget::Pending(draft.id);
+            let placement = ComposerPlacement::ConversationComment(target.key());
+            if self.composer().is_some_and(|composer| {
                 composer.item_id == item_id && composer.placement == placement
+            }) {
+                return self.render_composer_card(cx);
+            }
+        }
+        let pending_author = match &self.account {
+            crate::AccountStatus::SignedIn(viewer) => viewer.login.as_str(),
+            _ => "you",
+        };
+        let (author, body, timestamp, heading, target) = match projected {
+            Comment::Published(comment) => (
+                comment.author.as_str(),
+                comment.body.as_str(),
+                comment.created_at.clone(),
+                discussion_heading(comment, crate::rows::now_unix()),
+                Some(crate::comment_actions::published_target(kind, comment)),
+            ),
+            Comment::Posting(post) => (
+                post.author.as_str(),
+                post.body.as_str(),
+                post.status.label().to_owned(),
+                format!(
+                    "{} · {}{}",
+                    post.author,
+                    if post.pending { "Pending · " } else { "" },
+                    post.status.label()
+                ),
+                None,
+            ),
+            Comment::Pending(draft) => (
+                pending_author,
+                draft.body.as_str(),
+                "Pending reply · only you can see this".into(),
+                format!("{pending_author} · Pending reply · only you can see this"),
+                Some(crate::CommentTarget::Pending(draft.id)),
+            ),
+        };
+        let body = self
+            .items
+            .iter()
+            .find(|i| i.id == item_id)
+            .and_then(|i| match &i.state {
+                ItemState::Ready(data) => Some(
+                    data.comment_projection(None)
+                        .body(projected, kind == "review"),
+                ),
+                _ => None,
             })
-        {
+            .unwrap_or(body);
+        let controls = target.clone().map(|target| {
+            let placement = ComposerPlacement::ConversationComment(target.key());
+            (target, placement)
+        });
+        if controls.as_ref().is_some_and(|(_, placement)| {
+            self.composer().is_some_and(|composer| {
+                composer.item_id == item_id && &composer.placement == placement
+            })
+        }) {
             return self.render_composer_card(cx);
         }
-        let timestamp = comment.created_at.clone();
-        let key = self
+        let (key, reserve_reactions) = self
             .items
             .iter()
             .find(|item| item.id == item_id)
             .and_then(|item| {
                 if let ItemState::Ready(data) = &item.state {
-                    Some(data.posts.key(kind, comment))
+                    let key = data
+                        .comment_projection(None)
+                        .key(projected, kind == "review");
+                    Some((key.markdown_key(), data.posts.reserve_reactions(key)))
                 } else {
                     None
                 }
             })
-            .unwrap_or_else(|| format!("{kind}-{}", comment.id));
-        let controls = (kind != "optimistic")
-            .then(|| self.comment_controls(target.clone(), placement, &cx.entity()));
+            .expect("discussion cards belong to an open item");
+        let markdown_id = match projected {
+            Comment::Pending(draft) if key == format!("draft-{}", draft.id) => {
+                format!("conversation-draft-{item_id}-{}", draft.id)
+            }
+            _ => format!("discussion-{item_id}-{key}"),
+        };
+        let controls = controls
+            .map(|(target, placement)| self.comment_controls(target, placement, &cx.entity()));
         let mut card = div()
             .id(SharedString::from(format!("discussion-{item_id}-{key}")))
-            .debug_selector(|| format!("discussion-{item_id}-{key}"))
+            .debug_selector(|| match projected {
+                Comment::Pending(draft) if key == format!("draft-{}", draft.id) => {
+                    format!("conversation-draft-{item_id}-{}", draft.id)
+                }
+                _ => format!("discussion-{item_id}-{key}"),
+            })
             .w_full()
             .min_w_0()
             .child(
@@ -1055,57 +1111,68 @@ impl ReviewApp {
                     .flex()
                     .items_center()
                     .gap_2()
+                    // The final action chrome must fit from the first frame;
+                    // gaining edit/delete permission is metadata, not a resize.
+                    .when(key.starts_with("post-"), |header| {
+                        header.h(px(crate::row_height().max(24.))).min_w_0()
+                    })
                     .text_color(theme::subtext(cx))
                     .text_size(px(text_size() - 1.))
                     .child(
-                        crate::threads::author_avatar(&comment.author, &self.account)
+                        crate::threads::author_avatar(author, &self.account)
                             .debug_selector(|| format!("discussion-avatar-{item_id}-{key}")),
                     )
                     .child(
                         div()
                             .id("heading")
                             .flex_1()
-                            .child(
-                                StyledText::new(discussion_heading(
-                                    comment,
-                                    crate::rows::now_unix(),
-                                ))
-                                .with_highlights([(
-                                    0..comment.author.len(),
-                                    HighlightStyle {
-                                        font_weight: Some(FontWeight::BOLD),
-                                        color: Some(theme::text(cx).into()),
-                                        ..Default::default()
-                                    },
-                                )]),
-                            )
+                            .when(key.starts_with("post-"), |heading| {
+                                heading.min_w_0().whitespace_nowrap().overflow_hidden()
+                            })
+                            .child(StyledText::new(heading).with_highlights([(
+                                0..author.len(),
+                                HighlightStyle {
+                                    font_weight: Some(FontWeight::BOLD),
+                                    color: Some(theme::text(cx).into()),
+                                    ..Default::default()
+                                },
+                            )]))
                             .tooltip(move |window, cx| {
                                 Tooltip::new(timestamp.clone()).build(window, cx)
                             }),
                     )
                     .children(controls),
             );
-        if markdown::has_content(&comment.body) {
+        if markdown::has_content(body) {
             card = card.child(render_markdown(
-                &format!("discussion-{item_id}-{key}"),
-                preprocess(&comment.body, slug),
+                &markdown_id,
+                preprocess(body, slug),
                 self,
                 window,
                 cx,
             ));
         }
-        if kind != "optimistic"
-            && comment.review_state.is_none()
-            && (comment.reactions.iter().any(|r| r.count > 0)
-                || (comment.permissions.can_react && !comment.permissions.node_id.is_empty()))
-        {
-            if let crate::CommentTarget::Published(target) = target {
-                card = card.child(div().mt_3().child(self.comment_reactions(
-                    target,
-                    comment,
-                    &cx.entity(),
-                )));
+        let reaction_controls = match (projected, target) {
+            (Comment::Published(comment), Some(crate::CommentTarget::Published(target)))
+                if comment.review_state.is_none()
+                    && (comment.reactions.iter().any(|r| r.count > 0)
+                        || (comment.permissions.can_react
+                            && !comment.permissions.node_id.is_empty())) =>
+            {
+                Some(self.comment_reactions(target, comment, &cx.entity()))
             }
+            _ => None,
+        };
+        if reserve_reactions {
+            card = card.child(
+                div()
+                    .mt_3()
+                    .h_6()
+                    .overflow_hidden()
+                    .children(reaction_controls),
+            );
+        } else if let Some(controls) = reaction_controls {
+            card = card.child(div().mt_3().child(controls));
         }
         card.into_any_element()
     }
@@ -1305,6 +1372,13 @@ fn expand_text(text: &str, repo_slug: &str, out: &mut String) {
 }
 
 #[cfg(test)]
+pub(crate) fn timeline(discussion: &github::PrDiscussion) -> Vec<Entry<'_>> {
+    static POSTS: std::sync::LazyLock<crate::comments::posting::Posts> =
+        std::sync::LazyLock::new(Default::default);
+    Projection::new(Some(discussion), None, &POSTS).conversation()
+}
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
@@ -1456,11 +1530,11 @@ pub(crate) mod tests {
             3,
             "replies never become extra timeline entries"
         );
-        assert!(matches!(entries[0], Entry::Comment(c) if c.id == 2));
+        assert!(matches!(entries[0], Entry::Comment(Comment::Published(c)) if c.id == 2));
         assert!(
-            matches!(entries[1], Entry::Thread(t) if t.comments.len() == 2 && t.comments[1].id == 3)
+            matches!(&entries[1], Entry::Thread(t) if t.comments.len() == 2 && matches!(t.comments[1], Comment::Published(c) if c.id == 3))
         );
-        assert!(matches!(entries[2], Entry::Comment(c) if c.id == 1));
+        assert!(matches!(entries[2], Entry::Comment(Comment::Published(c)) if c.id == 1));
         assert_eq!(
             anchor(&discussion.threads[0]),
             "src/main.rs:10–12 · old · outdated"
@@ -1500,9 +1574,10 @@ pub(crate) mod tests {
             timeline(d)
                 .iter()
                 .map(|e| match e {
-                    Entry::Comment(c) => format!("comment-{}", c.id),
+                    Entry::Comment(Comment::Published(c)) => format!("comment-{}", c.id),
                     Entry::Review(c, _) => format!("review-{}", c.id),
-                    Entry::Thread(t) => t.id.clone(),
+                    Entry::Thread(t) => t.confirmed.id.clone(),
+                    _ => unreachable!("confirmed-only fixture"),
                 })
                 .collect::<Vec<_>>()
         };
@@ -1530,10 +1605,10 @@ pub(crate) mod tests {
         discussion.comments.push(review);
         let entries = timeline(&discussion);
         assert_eq!(entries.len(), 4, "no duplicate standalone inline threads");
-        assert!(matches!(&entries[0], Entry::Comment(c) if c.id == 2));
-        assert!(matches!(&entries[1], Entry::Comment(c) if c.id == 1));
+        assert!(matches!(&entries[0], Entry::Comment(Comment::Published(c)) if c.id == 2));
+        assert!(matches!(&entries[1], Entry::Comment(Comment::Published(c)) if c.id == 1));
         assert!(
-            matches!(&entries[2], Entry::Review(c, threads) if c.id == 10 && threads.iter().map(|t| t.id.as_str()).collect::<Vec<_>>() == ["T1", "T2"])
+            matches!(&entries[2], Entry::Review(c, threads) if c.id == 10 && threads.iter().map(|t| t.confirmed.id.as_str()).collect::<Vec<_>>() == ["T1", "T2"])
         );
         assert!(
             matches!(&entries[3], Entry::Review(c, threads) if c.id == 11 && threads.is_empty())

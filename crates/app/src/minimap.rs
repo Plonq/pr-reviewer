@@ -437,7 +437,7 @@ mod tests {
                     half: Some(CommentSide::Right),
                 },
                 Row::CommentHeader {
-                    comment_id: 99,
+                    comment_id: crate::comments::CommentKey::Inline(99),
                     author: "alice".into(),
                     when: "now".into(),
                     timestamp: None,

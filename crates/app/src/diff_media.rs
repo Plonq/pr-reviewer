@@ -20,14 +20,14 @@ use crate::{
 };
 
 pub(crate) struct CommentText {
-    pub comment_id: u64,
+    pub comment_id: crate::comments::CommentKey,
     pub is_reply: bool,
     pub part: usize,
     pub source: String,
 }
 
 impl CommentText {
-    fn key(&self) -> (u64, usize) {
+    fn key(&self) -> (crate::comments::CommentKey, usize) {
         (self.comment_id, self.part)
     }
 
@@ -44,7 +44,7 @@ pub(crate) struct TextLayout {
     rows: usize,
 }
 
-pub(crate) type TextLayouts = HashMap<(u64, usize), TextLayout>;
+pub(crate) type TextLayouts = HashMap<(crate::comments::CommentKey, usize), TextLayout>;
 
 fn reply_indent(is_reply: bool) -> Pixels {
     px(if is_reply { REPLY_INDENT } else { 0. })
@@ -384,7 +384,7 @@ mod tests {
     fn measured_reservations_remap_navigation_and_ignore_stale_sources() {
         for measured_rows in [1, 6] {
             let text = Arc::new(CommentText {
-                comment_id: 7,
+                comment_id: crate::comments::CommentKey::Inline(7),
                 is_reply: false,
                 part: 0,
                 source: "**unwrapped café**\n\n```rust\nlet x = 1;\n```".into(),

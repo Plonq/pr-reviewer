@@ -18,19 +18,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-/// Whitespace and HTML-only metadata do not warrant a review summary card.
-pub(super) fn has_content(mut body: &str) -> bool {
-    loop {
-        body = body.trim();
-        let Some(rest) = body.strip_prefix("<!--") else {
-            return !body.is_empty();
-        };
-        let Some(end) = rest.find("-->") else {
-            return false;
-        };
-        body = &rest[end + 3..];
-    }
-}
+pub(super) use crate::comments::has_content;
 
 #[derive(Clone)]
 struct ImagePlugin {

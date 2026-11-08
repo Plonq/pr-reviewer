@@ -1,6 +1,6 @@
 use super::*;
 
-fn image_client(cx: &mut gpui::TestAppContext) -> Arc<std::sync::Mutex<Vec<String>>> {
+pub(super) fn image_client(cx: &mut gpui::TestAppContext) -> Arc<std::sync::Mutex<Vec<String>>> {
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = requests.clone();
     let mut png = std::io::Cursor::new(Vec::new());
@@ -28,7 +28,7 @@ fn image_client(cx: &mut gpui::TestAppContext) -> Arc<std::sync::Mutex<Vec<Strin
     requests
 }
 
-fn draw_settled(cx: &mut gpui::VisualTestContext) {
+pub(super) fn draw_settled(cx: &mut gpui::VisualTestContext) {
     for _ in 0..8 {
         cx.update(|window, cx| { window.draw(cx).clear(cx); });
         cx.run_until_parked();

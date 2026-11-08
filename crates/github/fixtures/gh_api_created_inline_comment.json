@@ -1,0 +1,13 @@
+{
+  "id": 5000000000,
+  "node_id": "PRRC_created",
+  "body": "created comment",
+  "user": {"login": "octocat"},
+  "created_at": "2026-10-25T00:00:00Z",
+  "commit_id": "head",
+  "path": "a.rs",
+  "side": "RIGHT",
+  "line": 7,
+  "start_line": 5,
+  "pull_request_review_id": 91
+}

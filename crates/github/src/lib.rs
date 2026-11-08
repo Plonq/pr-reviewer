@@ -13,6 +13,10 @@
 //! Error kinds are stable vocabulary for callers to match on; the `Display`
 //! text is the user-facing message and moves with the backend (it carries
 //! v0.1's `gh`-CLI wording today, including the `gh auth login` fix).
+mod comment_mutation;
+pub use comment_mutation::{
+    MutationReceipt, MutationTarget, PendingCommentReceipt, PublishedComment,
+};
 pub mod commits;
 mod comparison;
 pub use commits::{ActionsRun, PrCommit, PrCommits};
@@ -542,6 +546,9 @@ pub enum ClientError {
     /// The operation failed for any other reason — network, API, or a
     /// response we couldn't digest. The string is a short human cause.
     Failed(String),
+    /// The server explicitly rejected a write; unlike transport/decoding
+    /// failures, retrying a recovered draft cannot duplicate a committed create.
+    Rejected(String),
 }
 
 impl std::fmt::Display for ClientError {
@@ -559,8 +566,17 @@ impl std::fmt::Display for ClientError {
                 )
             }
             Self::Invalid(cause) => write!(f, "{cause}"),
-            Self::Failed(cause) => write!(f, "GitHub operation failed: {cause}"),
+            Self::Failed(cause) | Self::Rejected(cause) => {
+                write!(f, "GitHub operation failed: {cause}")
+            }
         }
+    }
+}
+
+impl ClientError {
+    /// Generic failures are conservatively unknown outcomes for creation.
+    pub fn mutation_is_uncertain(&self) -> bool {
+        matches!(self, Self::Failed(_))
     }
 }
 
@@ -691,29 +707,16 @@ pub trait GitHubClient: Send + Sync {
         ))
     }
     /// Publish a main PR conversation comment, not an anchored review comment.
-    fn post_conversation_comment(&self, _loc: &PrLocator, _body: &str) -> Result<(), ClientError> {
+    /// Successful creates must return an exact database and node identity;
+    /// metadata can be absent, but lossy success/optional-ID fallbacks cannot.
+    fn post_conversation_comment(
+        &self,
+        _loc: &PrLocator,
+        _body: &str,
+    ) -> Result<PublishedComment, ClientError> {
         Err(ClientError::Failed(
             "conversation comments are not supported by this backend".into(),
         ))
-    }
-    /// As above, retaining the server identity for optimistic UI reconciliation.
-    /// Backends without a receipt may return None after a successful post.
-    fn post_conversation_comment_id(
-        &self,
-        loc: &PrLocator,
-        body: &str,
-    ) -> Result<Option<u64>, ClientError> {
-        self.post_conversation_comment(loc, body)?;
-        Ok(None)
-    }
-    fn post_reply_id(
-        &self,
-        loc: &PrLocator,
-        comment_id: u64,
-        body: &str,
-    ) -> Result<Option<u64>, ClientError> {
-        self.post_reply(loc, comment_id, body)?;
-        Ok(None)
     }
     fn add_pending_comment(
         &self,
@@ -721,7 +724,7 @@ pub trait GitHubClient: Send + Sync {
         _review: &PendingReview,
         _anchor: &CommentAnchor,
         _body: &str,
-    ) -> Result<PendingComment, ClientError> {
+    ) -> Result<PendingCommentReceipt, ClientError> {
         Err(ClientError::Failed(
             "pending reviews are not supported by this backend".into(),
         ))
@@ -733,7 +736,7 @@ pub trait GitHubClient: Send + Sync {
         _review: &PendingReview,
         _comment_id: u64,
         _body: &str,
-    ) -> Result<PendingComment, ClientError> {
+    ) -> Result<PendingCommentReceipt, ClientError> {
         Err(ClientError::Failed(
             "pending review replies are not supported by this backend".into(),
         ))
@@ -774,7 +777,7 @@ pub trait GitHubClient: Send + Sync {
         loc: &PrLocator,
         anchor: &CommentAnchor,
         body: &str,
-    ) -> Result<(), ClientError> {
+    ) -> Result<PublishedComment, ClientError> {
         if anchor.start_line.is_some() {
             return Err(ClientError::Invalid(
                 "range comments are not supported by this backend".into(),
@@ -788,6 +791,10 @@ pub trait GitHubClient: Send + Sync {
             anchor.line,
             body,
         )
+        .map(|mut created| {
+            created.anchor.get_or_insert_with(|| anchor.clone());
+            created
+        })
     }
 
     /// The signed-in viewer — also the app's auth check in one round trip:
@@ -849,11 +856,16 @@ pub trait GitHubClient: Send + Sync {
         side: &str,
         line: u64,
         body: &str,
-    ) -> Result<(), ClientError>;
+    ) -> Result<PublishedComment, ClientError>;
 
     /// Publish an immediate reply to the review thread rooted at `comment_id`.
     /// With a pending review, use `add_pending_reply` instead.
-    fn post_reply(&self, loc: &PrLocator, comment_id: u64, body: &str) -> Result<(), ClientError>;
+    fn post_reply(
+        &self,
+        loc: &PrLocator,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<PublishedComment, ClientError>;
 
     /// Submit a top-level review with `verdict`. GitHub requires a
     /// non-empty body for request-changes and comment reviews — the

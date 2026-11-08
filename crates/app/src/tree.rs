@@ -534,8 +534,8 @@ mod tests {
         use crate::threads::{group_comments, CommentSide, CommentTime, ReviewComment};
 
         let file = crate::test_util::sample_diff().files.remove(0);
-        let comment = |id, line, parent| ReviewComment {
-            id,
+        let comment = |id: u64, line, parent: Option<u64>| ReviewComment {
+            id: id.into(),
             path: file.display_path().into(),
             line,
             side: CommentSide::Right,
@@ -543,7 +543,7 @@ mod tests {
             body: "comment".into(),
             author: "alice".into(),
             time: CommentTime::Draft,
-            in_reply_to_id: parent,
+            in_reply_to_id: parent.map(Into::into),
         };
         // Two outdated roots with four replies, like permissions.py in PR #4805.
         let mut comments = vec![

@@ -3,7 +3,9 @@
 
 use crate::local_store;
 use crate::rows::{build_rows, BuiltRows, FileUpgrade, RowOptions, RowsView, ViewMode};
-use crate::threads::{group_comments, CommentIndex, ReviewComment, COMMENT_WRAP_CHARS};
+#[cfg(test)]
+use crate::threads::ReviewComment;
+use crate::threads::{CommentIndex, COMMENT_WRAP_CHARS};
 use crate::upgrade::{run_upgrade, UpgradeJob, UpgradeSource};
 use anyhow::anyhow;
 use diff_core::PrDiff;
@@ -159,7 +161,12 @@ pub(crate) fn fetch_item_with_conversation(
                 .map_err(|_| anyhow!("GitHub patch fetch panicked"))??;
             // Both the timeline and inline index derive from this discussion;
             // never fetch a second, potentially inconsistent comment collection.
-            let comments = discussion.review_comments();
+            let comments = crate::comments::Projection::new(
+                Some(&discussion),
+                None,
+                &crate::comments::posting::Posts::default(),
+            )
+            .diff_index();
             // Optional detail data must never make a usable diff fail to open.
             let commits = commits_thread.join().ok().and_then(Result::ok);
             let viewed = viewed_thread.join().unwrap_or_else(|_| {
@@ -200,9 +207,7 @@ pub(crate) fn fetch_item_with_conversation(
             (
                 LoadedMeta::Pr(meta),
                 patch,
-                Some(group_comments(
-                    comments.into_iter().map(ReviewComment::from).collect(),
-                )),
+                Some(comments),
                 Some(discussion),
                 commits,
                 Some(viewed),

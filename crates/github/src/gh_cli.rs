@@ -88,9 +88,28 @@ impl Default for GhCliClient<GhSubprocess> {
 
 impl<P: GhProcess> GhCliClient<P> {
     fn review_api(&self, args: &[String]) -> Result<serde_json::Value, ClientError> {
+        self.review_api_kind(args, false)
+    }
+
+    fn review_api_kind(
+        &self,
+        args: &[String],
+        comment_write: bool,
+    ) -> Result<serde_json::Value, ClientError> {
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = self.process.run(&argv).map_err(spawn_failure)?;
         if out.code != Some(0) {
+            if comment_write {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    if definite_graphql_rejection(&value) {
+                        return Err(ClientError::Rejected(format!(
+                            "GitHub rejected the comment operation: {}",
+                            value["errors"]
+                        )));
+                    }
+                }
+                return Err(create_api_error(classify_failure(&out)));
+            }
             return Err(classify_failure(&out));
         }
         if out.stdout.is_empty() {
@@ -98,9 +117,12 @@ impl<P: GhProcess> GhCliClient<P> {
         }
         let value: serde_json::Value = decode(out.text()?)?;
         if let Some(errors) = value.get("errors") {
-            return Err(ClientError::Failed(format!(
-                "GitHub rejected the review operation: {errors}"
-            )));
+            let message = format!("GitHub rejected the review operation: {errors}");
+            return Err(if comment_write && definite_graphql_rejection(&value) {
+                ClientError::Rejected(message)
+            } else {
+                ClientError::Failed(message)
+            });
         }
         Ok(value)
     }
@@ -114,6 +136,32 @@ impl<P: GhProcess> GhCliClient<P> {
             "-H".into(),
             "GraphQL-Features: graphql_pr_comment_positioning".into(),
         ])?;
+        if !value["data"].is_object() {
+            return Err(ClientError::Failed("GitHub returned no review data".into()));
+        }
+        Ok(value)
+    }
+
+    fn creation_api(&self, args: &[String]) -> Result<serde_json::Value, ClientError> {
+        self.review_api_kind(args, true)
+    }
+
+    fn creation_graphql(&self, query: String) -> Result<serde_json::Value, ClientError> {
+        self.comment_write_graphql(query)
+    }
+
+    fn comment_write_graphql(&self, query: String) -> Result<serde_json::Value, ClientError> {
+        let value = self.review_api_kind(
+            &[
+                "api".into(),
+                "graphql".into(),
+                "-f".into(),
+                format!("query={query}"),
+                "-H".into(),
+                "GraphQL-Features: graphql_pr_comment_positioning".into(),
+            ],
+            true,
+        )?;
         if !value["data"].is_object() {
             return Err(ClientError::Failed("GitHub returned no review data".into()));
         }
@@ -772,7 +820,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 "missing comment identity or body".into(),
             ));
         }
-        let value = self.review_graphql(format!(
+        let value = self.comment_write_graphql(format!(
             "mutation {{ {mutation}(input:{{{input}:{},body:{}}}) {{ {output} {{ id }} }} }}",
             json_string(id),
             json_string(body)
@@ -795,7 +843,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         if id.is_empty() {
             return Err(ClientError::Invalid("missing comment identity".into()));
         }
-        let value = self.review_graphql(format!(
+        let value = self.comment_write_graphql(format!(
             "mutation {{ {mutation}(input:{{{input}:{},clientMutationId:{}}}) {{ clientMutationId }} }}",
             json_string(id), json_string(id)
         ))?;
@@ -918,16 +966,12 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         Ok(())
     }
 
-    fn post_conversation_comment(&self, loc: &PrLocator, body: &str) -> Result<(), ClientError> {
-        self.post_conversation_comment_id(loc, body).map(|_| ())
-    }
-
-    fn post_conversation_comment_id(
+    fn post_conversation_comment(
         &self,
         loc: &PrLocator,
         body: &str,
-    ) -> Result<Option<u64>, ClientError> {
-        let value = self.review_api(&[
+    ) -> Result<crate::PublishedComment, ClientError> {
+        let value = self.creation_api(&[
             "api".into(),
             "-X".into(),
             "POST".into(),
@@ -935,16 +979,16 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             "-f".into(),
             format!("body={body}"),
         ])?;
-        Ok(value["id"].as_u64())
+        published_rest_receipt(&value, None)
     }
 
-    fn post_reply_id(
+    fn post_reply(
         &self,
         loc: &PrLocator,
         comment_id: u64,
         body: &str,
-    ) -> Result<Option<u64>, ClientError> {
-        let value = self.review_api(&[
+    ) -> Result<crate::PublishedComment, ClientError> {
+        let value = self.creation_api(&[
             "api".into(),
             "-X".into(),
             "POST".into(),
@@ -956,7 +1000,13 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             "-f".into(),
             format!("body={body}"),
         ])?;
-        Ok(value["id"].as_u64())
+        let receipt = published_rest_receipt(&value, None)?;
+        if receipt.in_reply_to_id != Some(comment_id) {
+            return Err(ClientError::Failed(
+                "GitHub returned no reply to the requested comment".into(),
+            ));
+        }
+        Ok(receipt)
     }
 
     fn add_pending_comment(
@@ -965,28 +1015,31 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         review: &PendingReview,
         anchor: &CommentAnchor,
         body: &str,
-    ) -> Result<PendingComment, ClientError> {
+    ) -> Result<crate::PendingCommentReceipt, ClientError> {
         anchor.validate()?;
         let range = anchor
             .start_line
             .map(|start| format!(",startLine:{start},startSide:{}", anchor.side.api_str()))
             .unwrap_or_default();
         let positioning = positioning_input(anchor);
-        let query = format!("mutation {{ addPullRequestReviewThread(input:{{pullRequestReviewId:{},path:{},side:{},line:{},body:{}{range}{positioning}}}) {{ thread {{ side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:1) {{ nodes {{ id:fullDatabaseId node_id:id path body }} }} }} }} }}",
+        let query = format!("mutation {{ addPullRequestReviewThread(input:{{pullRequestReviewId:{},path:{},side:{},line:{},body:{}{range}{positioning}}}) {{ thread {{ id side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:1) {{ nodes {{ id:fullDatabaseId node_id:id path body }} }} }} }} }}",
             json_string(&review.node_id), json_string(&anchor.path), anchor.side.api_str(), anchor.line, json_string(body));
         let value = self
-            .review_graphql(query)
+            .creation_graphql(query)
             .map_err(|error| positioning_error(anchor, error))?;
         let thread = &value["data"]["addPullRequestReviewThread"]["thread"];
-        pending_thread_comment(
-            thread,
-            thread["comments"]["nodes"][0].clone(),
-            Some(&anchor.commit_id),
-            anchor
-                .position
-                .as_ref()
-                .and_then(|position| position.base_commit_id.as_deref()),
-        )
+        Ok(crate::PendingCommentReceipt {
+            thread_id: thread["id"].as_str().map(str::to_owned),
+            comment: pending_thread_comment(
+                thread,
+                thread["comments"]["nodes"][0].clone(),
+                Some(&anchor.commit_id),
+                anchor
+                    .position
+                    .as_ref()
+                    .and_then(|position| position.base_commit_id.as_deref()),
+            )?,
+        })
     }
 
     fn add_pending_reply(
@@ -995,7 +1048,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         review: &PendingReview,
         comment_id: u64,
         body: &str,
-    ) -> Result<PendingComment, ClientError> {
+    ) -> Result<crate::PendingCommentReceipt, ClientError> {
         // Use the real node identity and authoritative thread anchor, including
         // preview-only/outdated positions. Never synthesize an opaque node id.
         let mut target = None;
@@ -1016,7 +1069,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 "this comment is no longer available; refresh and try again".into(),
             )
         })?;
-        let value = self.review_graphql(format!(
+        let value = self.creation_graphql(format!(
             "mutation {{ addPullRequestReviewComment(input:{{pullRequestReviewId:{},inReplyTo:{},body:{}}}) {{ comment {{ id:fullDatabaseId node_id:id path body replyTo {{ id:fullDatabaseId }} }} }} }}",
             json_string(&review.node_id), json_string(&node_id), json_string(body)
         ))?;
@@ -1031,7 +1084,10 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 "GitHub returned no reply to the requested comment".into(),
             ));
         }
-        Ok(comment)
+        Ok(crate::PendingCommentReceipt {
+            comment,
+            thread_id: thread["id"].as_str().map(str::to_owned),
+        })
     }
 
     fn edit_pending_comment(
@@ -1041,7 +1097,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         body: &str,
     ) -> Result<(), ClientError> {
         let id = pending_node_id(comment)?;
-        let value = self.review_graphql(format!("mutation {{ updatePullRequestReviewComment(input:{{pullRequestReviewCommentId:{},body:{}}}) {{ pullRequestReviewComment {{ id }} }} }}", json_string(id), json_string(body)))?;
+        let value = self.comment_write_graphql(format!("mutation {{ updatePullRequestReviewComment(input:{{pullRequestReviewCommentId:{},body:{}}}) {{ pullRequestReviewComment {{ id }} }} }}", json_string(id), json_string(body)))?;
         if value["data"]["updatePullRequestReviewComment"]["pullRequestReviewComment"]["id"]
             .as_str()
             != Some(id)
@@ -1059,7 +1115,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         comment: &PendingComment,
     ) -> Result<(), ClientError> {
         let id = pending_node_id(comment)?;
-        let value = self.review_graphql(format!("mutation {{ deletePullRequestReviewComment(input:{{id:{},clientMutationId:{}}}) {{ clientMutationId }} }}", json_string(id), json_string(id)))?;
+        let value = self.comment_write_graphql(format!("mutation {{ deletePullRequestReviewComment(input:{{id:{},clientMutationId:{}}}) {{ clientMutationId }} }}", json_string(id), json_string(id)))?;
         if value["data"]["deletePullRequestReviewComment"]["clientMutationId"].as_str() != Some(id)
         {
             return Err(ClientError::Failed(
@@ -1095,7 +1151,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         loc: &PrLocator,
         anchor: &CommentAnchor,
         body: &str,
-    ) -> Result<(), ClientError> {
+    ) -> Result<crate::PublishedComment, ClientError> {
         anchor.validate()?;
         if anchor.position.is_some() {
             // One atomic, already-submitted review: never add to or submit the
@@ -1107,8 +1163,8 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             ))?;
             let id: String =
                 decode_value(value["data"]["repository"]["pullRequest"]["id"].clone())?;
-            let value = self.review_graphql(format!(
-                "mutation {{ addPullRequestReview(input:{{pullRequestId:{},commitOID:{},event:COMMENT,threads:[{{path:{},side:{},body:{}{}}}]}}) {{ pullRequestReview {{ id state }} }} }}",
+            let value = self.creation_graphql(format!(
+                "mutation {{ addPullRequestReview(input:{{pullRequestId:{},commitOID:{},event:COMMENT,threads:[{{path:{},side:{},body:{}{}}}]}}) {{ pullRequestReview {{ id state comments(first:2) {{ nodes {{ id:fullDatabaseId node_id:id body createdAt author {{ login }} }} }} pullRequest {{ reviewThreads(last:1) {{ nodes {{ id comments(first:1) {{ nodes {{ id:fullDatabaseId }} }} }} }} }} }} }} }}",
                 json_string(&id), json_string(&anchor.commit_id), json_string(&anchor.path), anchor.side.api_str(), json_string(body), positioning_input(anchor)
             )).map_err(|error| positioning_error(anchor, error))?;
             let review = &value["data"]["addPullRequestReview"]["pullRequestReview"];
@@ -1117,7 +1173,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                     "GitHub returned no posted comment review".into(),
                 ));
             }
-            return Ok(());
+            return published_review_receipt(review, anchor);
         }
         if anchor.start_line.is_none() {
             return self.post_review_comment(
@@ -1129,7 +1185,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 body,
             );
         }
-        self.review_api(&[
+        let value = self.creation_api(&[
             "api".into(),
             "-X".into(),
             "POST".into(),
@@ -1149,7 +1205,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             "-f".into(),
             format!("start_side={}", anchor.side.api_str()),
         ])?;
-        Ok(())
+        published_rest_receipt(&value, Some(anchor.clone()))
     }
 
     fn viewer(&self) -> Result<Viewer, ClientError> {
@@ -1538,7 +1594,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         side: &str,
         line: u64,
         body: &str,
-    ) -> Result<(), ClientError> {
+    ) -> Result<crate::PublishedComment, ClientError> {
         let endpoint = format!(
             "repos/{}/{}/pulls/{}/comments",
             loc.owner, loc.repo, loc.number
@@ -1560,33 +1616,22 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             "-F".to_string(),
             format!("line={line}"),
         ];
-        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self.process.run(&argv).map_err(spawn_failure)?;
-        if out.code != Some(0) {
-            return Err(classify_failure(&out));
-        }
-        Ok(())
-    }
-
-    fn post_reply(&self, loc: &PrLocator, comment_id: u64, body: &str) -> Result<(), ClientError> {
-        let endpoint = format!(
-            "repos/{}/{}/pulls/{}/comments/{comment_id}/replies",
-            loc.owner, loc.repo, loc.number
-        );
-        let args = vec![
-            "api".to_string(),
-            "-X".to_string(),
-            "POST".to_string(),
-            endpoint,
-            "-f".to_string(),
-            format!("body={body}"),
-        ];
-        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self.process.run(&argv).map_err(spawn_failure)?;
-        if out.code != Some(0) {
-            return Err(classify_failure(&out));
-        }
-        Ok(())
+        let value = self.creation_api(&args)?;
+        published_rest_receipt(
+            &value,
+            Some(CommentAnchor {
+                path: path.into(),
+                commit_id: commit_id.into(),
+                side: if side == "LEFT" {
+                    crate::DiffSide::Left
+                } else {
+                    crate::DiffSide::Right
+                },
+                line,
+                start_line: None,
+                position: None,
+            }),
+        )
     }
 
     fn submit_review(
@@ -1631,6 +1676,70 @@ fn after_arg(cursor: Option<&str>) -> String {
 
 fn review_thread_fields(cursor: Option<&str>) -> String {
     format!("id path isResolved viewerCanResolve viewerCanUnresolve originalLine originalStartLine side:diffSide line start_line:startLine isOutdated {POSITIONING_FIELDS} comments(first:100{}) {{ nodes {{ id:fullDatabaseId node_id:id viewerCanUpdate viewerCanDelete viewerCanReact path body diffHunk createdAt author {{ login }} reactionGroups {{ content viewerHasReacted reactors {{ totalCount }} }} replyTo {{ id:fullDatabaseId }} pullRequestReview {{ id state }} }} pageInfo {{ hasNextPage endCursor }} }}", after_arg(cursor))
+}
+
+/// Creation endpoints must retain an exact identity. A malformed success is
+/// not a reason to POST again; callers surface the error and can refresh.
+fn published_rest_receipt(
+    value: &serde_json::Value,
+    anchor: Option<CommentAnchor>,
+) -> Result<crate::PublishedComment, ClientError> {
+    let node_id = value["node_id"].as_str().filter(|id| !id.is_empty()).ok_or_else(||
+        ClientError::Failed("GitHub returned no created comment node identity; refresh to verify before retrying".into()))?;
+    let returned_anchor = (|| {
+        Some(CommentAnchor {
+            path: value["path"].as_str()?.into(),
+            commit_id: value["commit_id"].as_str()?.into(),
+            side: if value["side"].as_str()? == "LEFT" {
+                crate::DiffSide::Left
+            } else {
+                crate::DiffSide::Right
+            },
+            line: value["line"].as_u64()?,
+            start_line: value["start_line"].as_u64(),
+            position: None,
+        })
+    })();
+    Ok(crate::PublishedComment {
+        id: database_id(&value["id"])?,
+        node_id: node_id.into(),
+        body: value["body"].as_str().map(str::to_owned),
+        author: value["user"]["login"].as_str().map(str::to_owned),
+        created_at: value["created_at"].as_str().map(str::to_owned),
+        anchor: returned_anchor.or(anchor),
+        in_reply_to_id: value["in_reply_to_id"].as_u64(),
+        thread_id: None,
+        review_node_id: None,
+        review_id: value["pull_request_review_id"].as_u64(),
+    })
+}
+
+fn published_review_receipt(
+    review: &serde_json::Value,
+    anchor: &CommentAnchor,
+) -> Result<crate::PublishedComment, ClientError> {
+    let comments = review["comments"]["nodes"].as_array().filter(|nodes| nodes.len() == 1)
+        .ok_or_else(|| ClientError::Failed("GitHub returned no exact created review comment; refresh to verify before retrying".into()))?;
+    let raw = &comments[0];
+    let mut receipt = published_rest_receipt(
+        &serde_json::json!({
+            "id": raw["id"], "node_id": raw["node_id"], "body": raw["body"],
+            "created_at": raw["createdAt"], "user": raw["author"],
+        }),
+        Some(anchor.clone()),
+    )?;
+    receipt.review_node_id = review["id"].as_str().map(str::to_owned);
+    // PullRequestReviewComment has no thread field in GitHub's schema. The
+    // mutation's bounded thread selection is useful only if its root matches
+    // the exact returned comment, never by ordering or body text.
+    receipt.thread_id = review["pullRequest"]["reviewThreads"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|thread| database_id(&thread["comments"]["nodes"][0]["id"]).ok() == Some(receipt.id))
+        .and_then(|thread| thread["id"].as_str())
+        .map(str::to_owned);
+    Ok(receipt)
 }
 
 fn database_id(value: &serde_json::Value) -> Result<u64, ClientError> {
@@ -1695,9 +1804,61 @@ fn positioning_input(anchor: &CommentAnchor) -> String {
     }
 }
 
+// A failure at the mutation field (not a nested response resolver) with an
+// explicit rejection type establishes that the write itself was rejected.
+// Partial data, nested field errors, and unknown types remain uncertain.
+fn definite_graphql_rejection(value: &serde_json::Value) -> bool {
+    value["errors"]
+        .as_array()
+        .filter(|errors| !errors.is_empty())
+        .is_some_and(|errors| {
+            errors.iter().all(|error| {
+                let kind = error["type"]
+                    .as_str()
+                    .or_else(|| error["extensions"]["code"].as_str())
+                    .unwrap_or("");
+                if kind == "GRAPHQL_VALIDATION_FAILED" && value["data"].is_null() {
+                    return true;
+                }
+                matches!(
+                    kind,
+                    "FORBIDDEN" | "NOT_FOUND" | "UNPROCESSABLE" | "RATE_LIMITED"
+                ) && error["path"].as_array().is_some_and(|path| {
+                    path.len() == 1
+                        && path[0]
+                            .as_str()
+                            .is_some_and(|field| value["data"][field].is_null())
+                })
+            })
+        })
+}
+
+/// Only explicit CLI HTTP rejections establish that a comment write did not commit.
+/// Parse/transport failures and GraphQL partial data remain unverified. This
+/// classification is intentionally confined to the comment write call itself.
+fn create_api_error(error: ClientError) -> ClientError {
+    match error {
+        ClientError::Failed(message)
+            if [400, 403, 404, 405, 409, 410, 422, 429]
+                .iter()
+                .any(|code| message.ends_with(&format!("(HTTP {code})"))) =>
+        {
+            ClientError::Rejected(message)
+        }
+        other => other,
+    }
+}
+
 fn positioning_error(anchor: &CommentAnchor, error: ClientError) -> ClientError {
-    if anchor.position.is_some() && matches!(error, ClientError::Failed(_)) {
-        ClientError::Failed(format!("outside-diff comments use GitHub's experimental positioning API, which may not be enabled for this repository: {error}"))
+    if anchor.position.is_some()
+        && matches!(error, ClientError::Failed(_) | ClientError::Rejected(_))
+    {
+        let message = format!("outside-diff comments use GitHub's experimental positioning API, which may not be enabled for this repository: {error}");
+        if matches!(error, ClientError::Rejected(_)) {
+            ClientError::Rejected(message)
+        } else {
+            ClientError::Failed(message)
+        }
     } else {
         error
     }
@@ -2393,6 +2554,123 @@ mod tests {
     use crate::{QueueFilter, QueueSort};
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    #[test]
+    fn edit_delete_classify_only_explicit_mutation_rejections_as_definite() {
+        use crate::CommentTarget;
+        for code in [0, 1] {
+            for (target, edit, delete) in [
+                (
+                    CommentTarget::Issue("node".into()),
+                    "updateIssueComment",
+                    "deleteIssueComment",
+                ),
+                (
+                    CommentTarget::Review("node".into()),
+                    "updatePullRequestReview",
+                    "deletePullRequestReview",
+                ),
+                (
+                    CommentTarget::ReviewComment("node".into()),
+                    "updatePullRequestReviewComment",
+                    "deletePullRequestReviewComment",
+                ),
+            ] {
+                for deleting in [false, true] {
+                    let mutation = if deleting { delete } else { edit };
+                    let value = serde_json::json!({"data":{mutation:null},"errors":[{"type":"FORBIDDEN","path":[mutation],"message":"permission denied"}]});
+                    let api = client(ok(Some(code), &value.to_string(), "gh: permission denied"));
+                    let error = if deleting {
+                        api.delete_comment(&target)
+                    } else {
+                        api.edit_comment(&target, "edit")
+                    }
+                    .unwrap_err();
+                    assert!(matches!(error, ClientError::Rejected(_)), "{error:?}");
+                }
+            }
+        }
+        let comment = PendingComment {
+            id: 1,
+            node_id: "node".into(),
+            path: "a.rs".into(),
+            side: crate::DiffSide::Right,
+            line: Some(1),
+            start_line: None,
+            body: "old".into(),
+            in_reply_to_id: None,
+        };
+        for deleting in [false, true] {
+            let mutation = if deleting {
+                "deletePullRequestReviewComment"
+            } else {
+                "updatePullRequestReviewComment"
+            };
+            let value = serde_json::json!({"data":{mutation:null},"errors":[{"type":"NOT_FOUND","path":[mutation],"message":"not found"}]});
+            let api = client(ok(Some(1), &value.to_string(), "gh: not found"));
+            let error = if deleting {
+                api.delete_pending_comment(&loc(), &comment)
+            } else {
+                api.edit_pending_comment(&loc(), &comment, "edit")
+            }
+            .unwrap_err();
+            assert!(matches!(error, ClientError::Rejected(_)));
+        }
+    }
+
+    #[test]
+    fn partial_graphql_responses_and_unrecognized_write_failures_remain_uncertain() {
+        let mutation = "updatePullRequestReviewComment";
+        for value in [
+            serde_json::json!({"data":{mutation:{"pullRequestReviewComment":null}},"errors":[{"type":"FORBIDDEN","path":[mutation,"pullRequestReviewComment"]}]}),
+            serde_json::json!({"data":{mutation:null},"errors":[{"type":"INTERNAL","path":[mutation]}]}),
+            serde_json::json!({"data":{mutation:{}}}),
+        ] {
+            for code in [0, 1] {
+                let error = client(ok(Some(code), &value.to_string(), "gh: response failed"))
+                    .edit_comment(&crate::CommentTarget::ReviewComment("node".into()), "edit")
+                    .unwrap_err();
+                assert!(error.mutation_is_uncertain(), "{error:?}");
+            }
+        }
+        for code in [408, 503] {
+            let error = client(ok(Some(1), "", &format!("gh: timeout (HTTP {code})")))
+                .delete_comment(&crate::CommentTarget::Issue("node".into()))
+                .unwrap_err();
+            assert!(error.mutation_is_uncertain());
+        }
+        assert!(definite_graphql_rejection(
+            &serde_json::json!({"data":null,"errors":[{"extensions":{"code":"GRAPHQL_VALIDATION_FAILED"}}]})
+        ));
+    }
+
+    #[test]
+    fn create_failures_distinguish_explicit_rejection_from_uncertain_outcomes() {
+        for code in [400, 403, 404, 405, 409, 410, 422, 429] {
+            let error = create_api_error(ClientError::Failed(format!(
+                "validation failed (HTTP {code})"
+            )));
+            assert!(matches!(error, ClientError::Rejected(_)));
+            assert!(!error.mutation_is_uncertain());
+        }
+        for message in [
+            "connection reset",
+            "timeout (HTTP 408)",
+            "upstream error (HTTP 503)",
+            "GitHub returned no created comment identity",
+            "invalid JSON containing (HTTP 422) inside a body",
+        ] {
+            let error = create_api_error(ClientError::Failed(message.into()));
+            assert!(error.mutation_is_uncertain(), "{message}");
+        }
+        for error in [
+            ClientError::Invalid("anchor".into()),
+            ClientError::Unauthenticated,
+            ClientError::NoCredentialSource,
+        ] {
+            assert!(!error.mutation_is_uncertain());
+        }
+    }
 
     #[test]
     fn complete_discussion_paginates_all_connections_and_keeps_published_metadata() {
@@ -3699,7 +3977,11 @@ mod tests {
     #[test]
     fn reply_after_external_review_submission_posts_immediately_instead_of_using_stale_draft() {
         use crate::review_session::{Command, ReviewSession};
-        let (client, calls) = session_script(&[SUCCESS, "[]", "{}"]);
+        let (client, calls) = session_script(&[
+            SUCCESS,
+            "[]",
+            r#"{"id":5000000000,"node_id":"PRRC_created","in_reply_to_id":11}"#,
+        ]);
         let mut session = ReviewSession {
             pending: Some(PendingReview {
                 id: 91,
@@ -3823,7 +4105,8 @@ mod tests {
                 };
                 let comment = client
                     .add_pending_comment(&loc(), &review, &anchor, "draft")
-                    .unwrap();
+                    .unwrap()
+                    .comment;
                 assert_eq!(
                     comment.line,
                     Some(7),
@@ -3980,7 +4263,7 @@ mod tests {
             for range in [false, true] {
                 for succeeds in [false, true] {
                     let response = if succeeds {
-                        r#"{"data":{"addPullRequestReview":{"pullRequestReview":{"id":"new-review","state":"COMMENTED"}}}}"#
+                        include_str!("../fixtures/gh_graphql_created_positioned_comment.json")
                     } else {
                         r#"{"errors":[{"message":"positioning not enabled"}],"data":null}"#
                     };
@@ -4315,7 +4598,8 @@ mod tests {
     #[test]
     fn immediate_comments_do_not_resume_start_or_submit_the_pending_review() {
         use crate::review_session::{Command, ReviewSession};
-        let (client, calls) = session_script(&[SUCCESS, PENDING, EMPTY_THREADS, "{}", "{}"]);
+        let created = include_str!("../fixtures/gh_api_created_inline_comment.json");
+        let (client, calls) = session_script(&[SUCCESS, PENDING, EMPTY_THREADS, created, created]);
         let mut session = ReviewSession::default();
         session.execute(&client, &loc(), Command::Resume).unwrap();
         let pending = session.pending.clone();
@@ -4509,14 +4793,16 @@ mod tests {
         anchor.start_line = None;
         let comment = client
             .add_pending_comment(&loc(), &review, &anchor, "quoted \"body\"")
-            .unwrap();
+            .unwrap()
+            .comment;
         assert_eq!(comment.id, 5_000_000_000);
         assert_eq!(comment.side, crate::DiffSide::Left);
         assert_eq!(comment.line, Some(7));
         assert_eq!(comment.start_line, None);
         let calls = calls.lock().unwrap();
-        assert!(calls[0][3]
-            .contains("thread { side:diffSide line start_line:startLine isOutdated positioning"));
+        assert!(calls[0][3].contains(
+            "thread { id side:diffSide line start_line:startLine isOutdated positioning"
+        ));
         assert!(calls[0][3].contains("comments(first:1) { nodes { id:fullDatabaseId"));
         assert!(!calls[0][3].contains("startSide"));
         assert!(calls[0][3].contains(r#"body:"quoted \"body\"""#));
@@ -4548,7 +4834,8 @@ mod tests {
             };
             let comment = client
                 .add_pending_comment(&loc(), &review, &anchor, "range")
-                .unwrap();
+                .unwrap()
+                .comment;
             assert_eq!(comment.side, side);
             assert_eq!(comment.line, expected);
             assert_eq!(comment.start_line, expected.map(|_| 5));
@@ -5692,9 +5979,379 @@ mod tests {
     // --- posting -------------------------------------------------------------
 
     #[test]
+    fn typed_receipts_cover_rest_single_range_and_both_reply_commands() {
+        use crate::review_session::{Command, ReviewSession};
+        for range in [false, true] {
+            let mut anchor = range_anchor();
+            if !range {
+                anchor.start_line = None;
+            }
+            let mut response: serde_json::Value = serde_json::from_str(include_str!(
+                "../fixtures/gh_api_created_inline_comment.json"
+            ))
+            .unwrap();
+            response["start_line"] = serde_json::json!(anchor.start_line);
+            let (client, calls) = session_script(&[&response.to_string()]);
+            let receipt = ReviewSession::default()
+                .execute_with_receipt(
+                    &client,
+                    &loc(),
+                    Command::Immediate {
+                        anchor: anchor.clone(),
+                        body: "created comment".into(),
+                    },
+                )
+                .unwrap();
+            let crate::MutationReceipt::PublishedCreated(created) = receipt else {
+                panic!("published create")
+            };
+            assert_eq!(created.id, 5_000_000_000);
+            assert_eq!(created.node_id, "PRRC_created");
+            assert_eq!(created.body.as_deref(), Some("created comment"));
+            assert_eq!(created.author.as_deref(), Some("octocat"));
+            assert_eq!(created.created_at.as_deref(), Some("2026-10-25T00:00:00Z"));
+            assert_eq!(created.anchor, Some(anchor));
+            assert_eq!(created.review_id, Some(91));
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
+        for conversation in [false, true] {
+            let response =
+                r#"{"id":5000000001,"node_id":"PRRC_reply","body":"reply","in_reply_to_id":11}"#;
+            let (client, calls) = session_script(&[SUCCESS, "[]", response]);
+            let command = if conversation {
+                Command::ConversationReply {
+                    comment_id: 11,
+                    commit_id: "head".into(),
+                    body: "reply".into(),
+                    pending: false,
+                }
+            } else {
+                Command::Reply {
+                    comment_id: 11,
+                    body: "reply".into(),
+                }
+            };
+            let receipt = ReviewSession::default()
+                .execute_with_receipt(&client, &loc(), command)
+                .unwrap();
+            let crate::MutationReceipt::PublishedCreated(created) = receipt else {
+                panic!("published reply")
+            };
+            assert_eq!(created.id, 5_000_000_001);
+            assert_eq!(created.in_reply_to_id, Some(11));
+            assert_eq!(calls.lock().unwrap().len(), 3);
+        }
+    }
+
+    #[test]
+    fn typed_reply_receipts_report_server_rerouting_to_pending_for_both_commands() {
+        use crate::review_session::{Command, ReviewSession};
+        let page = pending_threads(&[DRAFT]);
+        let response = r#"{"data":{"addPullRequestReviewComment":{"comment":{"id":"5000000001","node_id":"PRRC_reply","path":"a.rs","body":"reply","replyTo":{"id":"12"}}}}}"#;
+        for conversation in [false, true] {
+            let (client, calls) = session_script(&[SUCCESS, PENDING, &page, &page, response]);
+            let command = if conversation {
+                Command::ConversationReply {
+                    comment_id: 12,
+                    commit_id: "head".into(),
+                    body: "reply".into(),
+                    pending: false,
+                }
+            } else {
+                Command::Reply {
+                    comment_id: 12,
+                    body: "reply".into(),
+                }
+            };
+            let mut session = ReviewSession::default();
+            let receipt = session
+                .execute_with_receipt(&client, &loc(), command)
+                .unwrap();
+            let crate::MutationReceipt::PendingCreated {
+                review_id,
+                review_node_id,
+                created,
+            } = receipt
+            else {
+                panic!("server chose pending")
+            };
+            assert_eq!(review_id, 91);
+            assert_eq!(review_node_id, "PRR_pending");
+            assert_eq!(created.comment.id, 5_000_000_001);
+            assert_eq!(created.comment.in_reply_to_id, Some(12));
+            assert!(created.thread_id.is_some());
+            assert_eq!(
+                session.pending.as_ref().unwrap().comments.last(),
+                Some(&created.comment)
+            );
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                5,
+                "no publish or extra review lifecycle mutations"
+            );
+        }
+    }
+
+    #[test]
+    fn positioned_receipt_retains_exact_comment_review_and_only_a_matching_thread() {
+        use crate::review_session::{Command, ReviewSession};
+        for matching in [true, false] {
+            let mut response: serde_json::Value = serde_json::from_str(include_str!(
+                "../fixtures/gh_graphql_created_positioned_comment.json"
+            ))
+            .unwrap();
+            if !matching {
+                response["data"]["addPullRequestReview"]["pullRequestReview"]["pullRequest"]
+                    ["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]["id"] =
+                    serde_json::json!("999");
+            }
+            let (client, calls) = session_script(&[
+                r#"{"data":{"repository":{"pullRequest":{"id":"PR_id"}}}}"#,
+                &response.to_string(),
+            ]);
+            let anchor = positioned_anchor(crate::DiffSide::Left, true);
+            let receipt = ReviewSession::default()
+                .execute_with_receipt(
+                    &client,
+                    &loc(),
+                    Command::Immediate {
+                        anchor: anchor.clone(),
+                        body: "created comment".into(),
+                    },
+                )
+                .unwrap();
+            let crate::MutationReceipt::PublishedCreated(created) = receipt else {
+                panic!("published create")
+            };
+            assert_eq!(created.id, 5_000_000_000);
+            assert_eq!(created.node_id, "PRRC_created");
+            assert_eq!(created.anchor, Some(anchor));
+            assert_eq!(created.review_node_id.as_deref(), Some("new-review"));
+            assert_eq!(
+                created.thread_id.as_deref(),
+                matching.then_some("PRRT_created")
+            );
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert!(
+                calls[1][3].contains("comments(first:2) { nodes { id:fullDatabaseId node_id:id")
+            );
+            assert!(calls[1][3].contains("reviewThreads(last:1)"));
+        }
+    }
+
+    #[test]
+    fn malformed_successful_creates_never_get_optional_identity_fallbacks_or_retry() {
+        for response in ["{}", r#"{"node_id":"PRRC_created"}"#, r#"{"id":12}"#] {
+            let (client, calls) = session_script(&[response]);
+            assert!(client
+                .post_anchored_comment(&loc(), &range_anchor(), "body")
+                .is_err());
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                1,
+                "a malformed receipt must not POST again"
+            );
+        }
+        let (client, calls) = session_script(&[
+            r#"{"data":{"repository":{"pullRequest":{"id":"PR_id"}}}}"#,
+            r#"{"data":{"addPullRequestReview":{"pullRequestReview":{"id":"review","state":"COMMENTED","comments":{"nodes":[]}}}}}"#,
+        ]);
+        assert!(client
+            .post_anchored_comment(
+                &loc(),
+                &positioned_anchor(crate::DiffSide::Right, false),
+                "body"
+            )
+            .is_err());
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn typed_published_edit_delete_receipts_do_not_touch_pending_reviews() {
+        use crate::review_session::{Command, ReviewSession};
+        for (target, update, output, delete) in [
+            (
+                crate::CommentTarget::Issue("node".into()),
+                "updateIssueComment",
+                "issueComment",
+                "deleteIssueComment",
+            ),
+            (
+                crate::CommentTarget::Review("node".into()),
+                "updatePullRequestReview",
+                "pullRequestReview",
+                "deletePullRequestReview",
+            ),
+            (
+                crate::CommentTarget::ReviewComment("node".into()),
+                "updatePullRequestReviewComment",
+                "pullRequestReviewComment",
+                "deletePullRequestReviewComment",
+            ),
+        ] {
+            let edited = serde_json::json!({"data":{update:{output:{"id":"node"}}}}).to_string();
+            let deleted =
+                serde_json::json!({"data":{delete:{"clientMutationId":"node"}}}).to_string();
+            let (client, calls) = session_script(&[&edited, &deleted]);
+            let mut session = ReviewSession::default();
+            assert_eq!(
+                session
+                    .execute_with_receipt(
+                        &client,
+                        &loc(),
+                        Command::EditPublished {
+                            target: target.clone(),
+                            body: " accepted ".into()
+                        }
+                    )
+                    .unwrap(),
+                crate::MutationReceipt::Edited {
+                    target: crate::MutationTarget::Published(target.clone()),
+                    body: "accepted".into()
+                }
+            );
+            assert_eq!(
+                session
+                    .execute_with_receipt(
+                        &client,
+                        &loc(),
+                        Command::DeletePublished {
+                            target: target.clone()
+                        }
+                    )
+                    .unwrap(),
+                crate::MutationReceipt::Deleted {
+                    target: crate::MutationTarget::Published(target)
+                }
+            );
+            assert_eq!(calls.lock().unwrap().len(), 2);
+            assert!(session.pending.is_none());
+        }
+        let (client, _) = session_script(&[SUCCESS, "[]"]);
+        assert_eq!(
+            ReviewSession::default()
+                .execute_with_receipt(&client, &loc(), Command::Resume)
+                .unwrap(),
+            crate::MutationReceipt::NoCommentChange
+        );
+    }
+
+    #[test]
+    fn typed_pending_create_edit_delete_receipts_keep_confirmed_review_and_partial_failure() {
+        use crate::review_session::{Command, ReviewSession};
+        let added = format!(
+            r#"{{"data":{{"addPullRequestReviewThread":{{"thread":{{"id":"PRRT_draft","side":"RIGHT","line":7,"start_line":5,"isOutdated":false,"comments":{{"nodes":[{DRAFT}]}}}}}}}}}}"#
+        );
+        let (client, _) = session_script(&[
+            SUCCESS,
+            "[]",
+            r#"{"id":91,"node_id":"PRR_pending","body":""}"#,
+            &added,
+        ]);
+        let mut session = ReviewSession::default();
+        let receipt = session
+            .execute_with_receipt(
+                &client,
+                &loc(),
+                Command::Add {
+                    anchor: range_anchor(),
+                    body: "draft".into(),
+                },
+            )
+            .unwrap();
+        let crate::MutationReceipt::PendingCreated {
+            review_id,
+            review_node_id,
+            created,
+        } = receipt
+        else {
+            panic!("pending create")
+        };
+        assert_eq!(review_id, 91);
+        assert_eq!(review_node_id, "PRR_pending");
+        assert_eq!(created.thread_id.as_deref(), Some("PRRT_draft"));
+        assert_eq!(
+            &created.comment,
+            &session.pending.as_ref().unwrap().comments[0]
+        );
+        assert!(session.verified);
+        let page = pending_threads(&[DRAFT]);
+        let (client, _) = session_script(&[
+            SUCCESS,
+            PENDING,
+            &page,
+            r#"{"data":{"updatePullRequestReviewComment":{"pullRequestReviewComment":{"id":"PRRC_draft"}}}}"#,
+        ]);
+        let receipt = session
+            .execute_with_receipt(
+                &client,
+                &loc(),
+                Command::Edit {
+                    id: 12,
+                    body: "  accepted edit  ".into(),
+                },
+            )
+            .unwrap();
+        let target = crate::MutationTarget::Pending {
+            review_id: 91,
+            id: 12,
+            node_id: "PRRC_draft".into(),
+        };
+        assert_eq!(
+            receipt,
+            crate::MutationReceipt::Edited {
+                target: target.clone(),
+                body: "accepted edit".into()
+            }
+        );
+        assert_eq!(
+            session.pending.as_ref().unwrap().comments[0].body,
+            "accepted edit"
+        );
+        let (client, _) = session_script(&[
+            SUCCESS,
+            PENDING,
+            &page,
+            r#"{"data":{"deletePullRequestReviewComment":{"clientMutationId":"PRRC_draft"}}}"#,
+        ]);
+        assert_eq!(
+            session
+                .execute_with_receipt(&client, &loc(), Command::Delete { id: 12 })
+                .unwrap(),
+            crate::MutationReceipt::Deleted { target }
+        );
+        assert!(session.pending.as_ref().unwrap().comments.is_empty());
+        let (client, calls) = session_script(&[
+            SUCCESS,
+            "[]",
+            r#"{"id":91,"node_id":"PRR_pending","body":""}"#,
+            r#"{"errors":[{"message":"rejected"}]}"#,
+        ]);
+        let mut session = ReviewSession::default();
+        assert!(session
+            .execute_with_receipt(
+                &client,
+                &loc(),
+                Command::Add {
+                    anchor: range_anchor(),
+                    body: "draft".into()
+                }
+            )
+            .is_err());
+        assert_eq!(
+            session.pending.as_ref().unwrap().id,
+            91,
+            "partial start success is not lost"
+        );
+        assert!(session.verified);
+        assert_eq!(calls.lock().unwrap().len(), 4);
+    }
+
+    #[test]
     fn conversation_comment_uses_issue_comments_not_review_comments() {
         use crate::review_session::{Command, ReviewSession};
-        let (client, calls) = session_script(&[r#"{"id":123}"#]);
+        let (client, calls) = session_script(&[r#"{"id":123,"node_id":"IC_created"}"#]);
         let mut session = ReviewSession::default();
         let receipt = session
             .execute_with_receipt(
@@ -5705,7 +6362,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(receipt, Some(123));
+        assert_eq!(receipt.published_id(), Some(123));
         assert!(session.pending.is_none());
         let calls = calls.lock().unwrap();
         assert_eq!(
@@ -5729,7 +6386,11 @@ mod tests {
     #[test]
     fn conversation_reply_returns_the_actual_server_comment_identity() {
         use crate::review_session::{Command, ReviewSession};
-        let (client, calls) = session_script(&[SUCCESS, "[]", r#"{"id":5000000000}"#]);
+        let (client, calls) = session_script(&[
+            SUCCESS,
+            "[]",
+            r#"{"id":5000000000,"node_id":"PRRC_created","in_reply_to_id":11}"#,
+        ]);
         let receipt = ReviewSession::default()
             .execute_with_receipt(
                 &client,
@@ -5742,7 +6403,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(receipt, Some(5_000_000_000));
+        assert_eq!(receipt.published_id(), Some(5_000_000_000));
         assert_eq!(
             calls.lock().unwrap()[2],
             [
@@ -5890,7 +6551,11 @@ mod tests {
 
     #[test]
     fn post_review_comment_invokes_the_api_verbatim() {
-        let fake = FakeGh::one(ok(Some(0), "", ""));
+        let fake = FakeGh::one(ok(
+            Some(0),
+            include_str!("../fixtures/gh_api_created_inline_comment.json"),
+            "",
+        ));
         let calls = fake.calls_handle();
         GhCliClient::with_process(fake)
             .post_review_comment(&loc(), "a66406e", "src/main.rs", "RIGHT", 42, "nice")
@@ -5912,12 +6577,19 @@ mod tests {
         let err = client(ok(Some(1), "", "gh: Forbidden (HTTP 403)"))
             .post_review_comment(&loc(), "a66406e", "src/main.rs", "RIGHT", 42, "nice")
             .unwrap_err();
-        assert_eq!(err, ClientError::Failed("Forbidden (HTTP 403)".to_string()));
+        assert_eq!(
+            err,
+            ClientError::Rejected("Forbidden (HTTP 403)".to_string())
+        );
     }
 
     #[test]
     fn post_reply_invokes_the_api_verbatim() {
-        let fake = FakeGh::one(ok(Some(0), "", ""));
+        let fake = FakeGh::one(ok(
+            Some(0),
+            r#"{"id":5000000000,"node_id":"PRRC_created","in_reply_to_id":100}"#,
+            "",
+        ));
         let calls = fake.calls_handle();
         GhCliClient::with_process(fake)
             .post_reply(&loc(), 100, "+1")

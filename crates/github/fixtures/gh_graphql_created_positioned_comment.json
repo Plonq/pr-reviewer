@@ -1,0 +1,21 @@
+{
+  "data": {
+    "addPullRequestReview": {
+      "pullRequestReview": {
+        "id": "new-review",
+        "state": "COMMENTED",
+        "comments": {"nodes": [{
+          "id": "5000000000",
+          "node_id": "PRRC_created",
+          "body": "created comment",
+          "author": {"login": "octocat"},
+          "createdAt": "2026-10-25T00:00:00Z"
+        }]},
+        "pullRequest": {"reviewThreads": {"nodes": [{
+          "id": "PRRT_created",
+          "comments": {"nodes": [{"id": "5000000000"}]}
+        }]}}
+      }
+    }
+  }
+}
