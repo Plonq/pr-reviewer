@@ -150,7 +150,7 @@ fn conversation_keeps_deep_scroll_across_pane_switches(cx: &mut gpui::TestAppCon
     let mut item = loop_pr_item(Vec::new());
     item.pane = ItemPane::Conversation;
     let ItemState::Ready(data) = &mut item.state else { unreachable!() };
-    data.pr_meta.as_mut().unwrap().body = "Description paragraph.\n\n".repeat(300);
+    data.pr_meta.as_mut().unwrap().body = format!("```mermaid\nflowchart TD\nA[Review] --> B[Respond]\n```\n\n{}", "Description paragraph.\n\n".repeat(300));
     let mut discussion = conversation::tests::sample_discussion();
     discussion.threads.clear();
     let template = discussion.comments[0].clone();
@@ -211,4 +211,122 @@ fn stock_conversation_markdown_loads_html_linked_and_extensionless_images(cx: &m
         assert!(requests.iter().any(|url| url.ends_with(name)), "stock image loader requested {name}");
     }
     assert!(!requests.iter().any(|url| url.ends_with("reference-only")), "reference images are intentionally omitted by stock Markdown");
+}
+
+#[gpui::test]
+fn mermaid_inline_comments_resize_async_in_unified_split_and_partial_virtualization(cx: &mut gpui::TestAppContext) {
+    let requests = image_client(cx);
+    let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1500.), px(1800.)));
+    let source = "flowchart TD\nA[Understand] --> B[Review]\nB --> C[Respond]";
+    let fenced = format!("```mermaid\n{source}\n```");
+    let mut item = loop_pr_item(vec![
+        rc(11, "a.rs", Some("RIGHT"), Some(1), &fenced, "alice", "2026-01-01T00:00:00Z", None),
+        rc(13, "a.rs", Some("LEFT"), Some(1), &fenced, "bob", "2026-01-01T00:00:00Z", None),
+        rc(15, "a.rs", Some("RIGHT"), Some(1), "```mermaid\nflowchart LR\nA[unclosed\n```", "carol", "2026-01-01T00:00:00Z", None),
+    ]);
+    let ItemState::Ready(data) = &mut item.state else { unreachable!() };
+    data.diff = diff_core::parse_patch("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n tail\n");
+    data.set_rows(data.row_build());
+    install_item(&app, item, cx);
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        cx.update(|cx| app.update(cx, |app, cx| {
+            let data = app.active_data_mut().unwrap();
+            data.mode = mode;
+            data.rebuild_rows_anchored();
+            data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+            data.scroll.0.borrow().base_handle.set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        }));
+        draw_settled(&mut vcx);
+        for (card, content, diagram) in [
+            ("inline-text-0-11-0-card", "inline-text-0-11-0-content", "inline-text-0-11-0-mermaid-0-diagram"),
+            ("inline-text-0-13-0-card", "inline-text-0-13-0-content", "inline-text-0-13-0-mermaid-0-diagram"),
+        ] {
+            let card = vcx.debug_bounds(card).unwrap();
+            let content = vcx.debug_bounds(content).unwrap();
+            let diagram = vcx.debug_bounds(diagram).unwrap();
+            assert!(diagram.size.height > px(100.));
+            assert!(diagram.size.width > px(50.));
+            assert!(diagram.size.width <= content.size.width);
+            assert!(content.bottom() <= card.bottom(), "async diagram must fit reserved rows");
+        }
+        assert!(vcx.debug_bounds("inline-text-0-15-0-mermaid-0-diagram").is_none(), "invalid source must not produce a diagram");
+        let copy = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-copy").unwrap();
+        vcx.simulate_click(copy.center(), Default::default());
+        cx.update(|cx| assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), source));
+        let copy_markdown = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-copy-markdown").unwrap();
+        vcx.simulate_click(copy_markdown.center(), Default::default());
+        cx.update(|cx| assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), fenced));
+        let before = vcx.debug_bounds("inline-text-0-11-0-content").unwrap().size.height;
+        let toggle = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-source-toggle").unwrap();
+        vcx.simulate_click(toggle.center(), Default::default());
+        draw_settled(&mut vcx);
+        let expanded = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
+        assert!(expanded.size.height > before, "source disclosure grows reservation");
+        assert!(expanded.bottom() <= vcx.debug_bounds("inline-text-0-11-0-card").unwrap().bottom());
+        let original = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-diagram").unwrap();
+        vcx.simulate_resize(size(px(950.), px(1800.)));
+        draw_settled(&mut vcx);
+        let narrow = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-diagram").unwrap();
+        let content = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
+        assert!(narrow.right() <= content.right());
+        let original_ratio = f32::from(original.size.width) / f32::from(original.size.height);
+        let narrow_ratio = f32::from(narrow.size.width) / f32::from(narrow.size.height);
+        assert!((original_ratio - narrow_ratio).abs() < 0.02, "fit must preserve diagram aspect ratio");
+        vcx.simulate_resize(size(px(1500.), px(1800.)));
+        draw_settled(&mut vcx);
+        let first = cx.update(|cx| app.read(cx).active_data().unwrap().rows.iter().position(|row| matches!(row,
+            Row::CommentBody { text, slot: 0, .. } if text.comment_id == 11)).unwrap());
+        vcx.simulate_resize(size(px(1500.), px(200.)));
+        cx.update(|cx| app.update(cx, |app, cx| {
+            app.active_data_mut().unwrap().scroll.0.borrow().base_handle
+                .set_offset(point(px(0.), -px((first + 1) as f32 * row_height())));
+            cx.notify();
+        }));
+        draw_settled(&mut vcx);
+        assert!(vcx.debug_bounds("inline-text-0-11-0-content").is_some());
+        vcx.simulate_resize(size(px(1500.), px(1800.)));
+    }
+    let requests = requests.lock().unwrap();
+    assert!(requests.iter().all(|url| url.starts_with("https://avatars.githubusercontent.com/")), "Mermaid must not use HTTP: {requests:?}");
+}
+
+
+#[gpui::test]
+fn mermaid_persistent_description_ignores_old_results_after_edit_and_pr_switch(cx: &mut gpui::TestAppContext) {
+    let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+    let mut item = loop_pr_item(Vec::new());
+    item.pane = ItemPane::Conversation;
+    let ItemState::Ready(data) = &mut item.state else { unreachable!() };
+    data.pr_meta.as_mut().unwrap().body = "```mermaid\nflowchart LR\nA[Original]-->B\n```".into();
+    install_item(&app, item, cx);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    // Mount, but deliberately don't settle worker/parser completions.
+    vcx.update(|window, cx| { window.draw(cx).clear(cx); });
+    cx.update(|cx| app.update(cx, |app, cx| {
+        app.active_data_mut().unwrap().pr_meta.as_mut().unwrap().body = "```mermaid\nflowchart LR\nA[broken\n```".into();
+        let mut second = loop_pr_item(Vec::new());
+        second.id = 1;
+        second.pane = ItemPane::Conversation;
+        let ItemState::Ready(data) = &mut second.state else { unreachable!() };
+        data.pr_meta.as_mut().unwrap().body = "```mermaid\nflowchart TD\nC[Other PR]-->D\n```".into();
+        app.items.push(second);
+        app.active = 1;
+        cx.notify();
+    }));
+    draw_settled(&mut vcx);
+    assert!(vcx.debug_bounds("conversation-1-mermaid-0-diagram").is_some());
+    assert!(vcx.debug_bounds("conversation-0-mermaid-0-diagram").is_none());
+    cx.update(|cx| app.update(cx, |app, cx| { app.active = 0; cx.notify(); }));
+    draw_settled(&mut vcx);
+    assert!(vcx.debug_bounds("conversation-0-mermaid-0").is_some());
+    assert!(vcx.debug_bounds("conversation-0-mermaid-0-diagram").is_none(), "original source's completion cannot replace an edit");
+    cx.update(|cx| app.update(cx, |app, cx| {
+        app.active_data_mut().unwrap().pr_meta.as_mut().unwrap().body = "```mermaid\nsequenceDiagram\nAlice->>Bob: Edited\n```".into();
+        cx.notify();
+    }));
+    draw_settled(&mut vcx);
+    assert!(vcx.debug_bounds("conversation-0-mermaid-0-diagram").is_some());
 }

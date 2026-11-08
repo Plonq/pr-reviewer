@@ -2,6 +2,7 @@
 //! GitHub's image-only paste/drop HTML uses the same activation path; general
 //! HTML and reference-style images retain stock Kit behaviour.
 mod github_image;
+mod mermaid;
 mod video;
 use crate::{image_viewer::ImageTarget, ReviewApp};
 use gpui::component::text::{
@@ -436,6 +437,9 @@ fn render_view(
         host: id.to_owned().into(),
     };
     let extensions = MarkdownExtensions::default()
+        .plugin(mermaid::MermaidPlugin {
+            host: id.to_owned().into(),
+        })
         .plugin(video.clone())
         .plugin(video::VideoPlugin {
             block: false,
@@ -446,7 +450,7 @@ fn render_view(
             block: false,
             ..plugin
         })
-        .parser_revision(2);
+        .parser_revision(3);
     div()
         .w_full()
         .min_w_0()
