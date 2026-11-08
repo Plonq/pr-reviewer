@@ -219,7 +219,9 @@ fn mermaid_inline_comments_resize_async_in_unified_split_and_partial_virtualizat
     let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
     let mut vcx = gpui::VisualTestContext::from_window(window, cx);
     vcx.simulate_resize(size(px(1500.), px(1800.)));
-    let source = "flowchart TD\nA[Understand] --> B[Review]\nB --> C[Respond]";
+    // Wider than a split pane: exercise real downscaling, not just a small
+    // intrinsic diagram that fits unchanged in both modes.
+    let source = "flowchart TD\nA[Window<br/>backgrounded] -. pause timer .-> B[Timer paused]\nB -. regain focus .-> C[Focus refresh]\nD[Window<br/>frontmost] -->|timer elapsed| E[Background poll<br/>every 180 s]\nE -->|run queue search| F((GitHub<br/>GraphQL))\nF -->|new PRs| G[Merge into<br/>queue view]\nC --> G\nF -->|no change| H[Keep existing<br/>queue]\nG --> D\nH --> D";
     let fenced = format!("```mermaid\n{source}\n```");
     let mut item = loop_pr_item(vec![
         rc(11, "a.rs", Some("RIGHT"), Some(1), &fenced, "alice", "2026-01-01T00:00:00Z", None),
@@ -253,26 +255,54 @@ fn mermaid_inline_comments_resize_async_in_unified_split_and_partial_virtualizat
             assert!(content.bottom() <= card.bottom(), "async diagram must fit reserved rows");
         }
         assert!(vcx.debug_bounds("inline-text-0-15-0-mermaid-0-diagram").is_none(), "invalid source must not produce a diagram");
+        let before = vcx.debug_bounds("inline-text-0-11-0-content").unwrap().size.height;
+        let diagram = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-diagram").unwrap();
+        vcx.simulate_mouse_move(diagram.center(), None, Default::default());
+        draw_settled(&mut vcx);
+        assert_eq!(vcx.debug_bounds("inline-text-0-11-0-content").unwrap().size.height, before, "hover controls must not consume layout space");
+        let toolbar = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-toolbar").unwrap();
+        assert!((toolbar.right() - (diagram.right() - px(4.))).abs() <= px(1.), "toolbar floats at diagram's right edge");
+        assert!((toolbar.top() - (diagram.top() + px(4.))).abs() <= px(1.), "toolbar floats at diagram's top edge");
         let copy = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-copy").unwrap();
         vcx.simulate_click(copy.center(), Default::default());
         cx.update(|cx| assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), source));
         let copy_markdown = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-copy-markdown").unwrap();
         vcx.simulate_click(copy_markdown.center(), Default::default());
         cx.update(|cx| assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), fenced));
-        let before = vcx.debug_bounds("inline-text-0-11-0-content").unwrap().size.height;
         let toggle = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-source-toggle").unwrap();
         vcx.simulate_click(toggle.center(), Default::default());
         draw_settled(&mut vcx);
         let expanded = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
-        assert!(expanded.size.height > before, "source disclosure grows reservation");
+        assert_ne!(expanded.size.height, before, "source replacement updates reservation");
         assert!(expanded.bottom() <= vcx.debug_bounds("inline-text-0-11-0-card").unwrap().bottom());
+        assert!(vcx.debug_bounds("inline-text-0-11-0-mermaid-0-diagram").is_none(), "source replaces rather than accompanies the diagram");
+        assert!(vcx.debug_bounds("inline-text-0-11-0-mermaid-0-source-view").is_some());
+        vcx.simulate_resize(size(px(950.), px(1800.)));
+        draw_settled(&mut vcx);
+        let source_view = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-source-view").unwrap();
+        let content = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
+        assert!(source_view.right() <= content.right());
+        assert!(content.bottom() <= vcx.debug_bounds("inline-text-0-11-0-card").unwrap().bottom(), "source replacement must fit reserved rows after resize");
+        vcx.simulate_resize(size(px(1500.), px(1800.)));
+        draw_settled(&mut vcx);
+        let toggle = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-source-toggle").unwrap();
+        vcx.simulate_click(toggle.center(), Default::default());
+        draw_settled(&mut vcx);
+        assert!(vcx.debug_bounds("inline-text-0-11-0-mermaid-0-source-view").is_none());
+        assert_eq!(vcx.debug_bounds("inline-text-0-11-0-content").unwrap().size.height, before, "Diagram toggle restores original geometry");
         let original = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-diagram").unwrap();
         vcx.simulate_resize(size(px(950.), px(1800.)));
         draw_settled(&mut vcx);
         let narrow = vcx.debug_bounds("inline-text-0-11-0-mermaid-0-diagram").unwrap();
         let content = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
         assert!(narrow.right() <= content.right());
+        if mode == ViewMode::Split {
+            assert!(narrow.size.width < original.size.width - px(1.), "fixture must actually scale down in a narrower split pane");
+        }
         let original_ratio = f32::from(original.size.width) / f32::from(original.size.height);
+        assert!((content.size.height - narrow.size.height).abs() <= px(1.), "scaled diagram must not leave intrinsic-height whitespace in Markdown content");
+        let card = vcx.debug_bounds("inline-text-0-11-0-card").unwrap();
+        assert!(card.bottom() - content.bottom() < px(row_height()), "reserved rows may add rounding, not a large blank gap");
         let narrow_ratio = f32::from(narrow.size.width) / f32::from(narrow.size.height);
         assert!((original_ratio - narrow_ratio).abs() < 0.02, "fit must preserve diagram aspect ratio");
         vcx.simulate_resize(size(px(1500.), px(1800.)));

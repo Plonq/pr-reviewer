@@ -258,21 +258,47 @@ impl MarkdownPlugin for MermaidPlugin {
             });
         match result {
             Some(Ok(diagram)) => {
-                let expanded = window.use_keyed_state(id.clone(), cx, |_, _| false);
-                let open = *expanded.read(cx);
+                let source_mode = window.use_keyed_state(id.clone(), cx, |_, _| false);
+                let show_source = *source_mode.read(cx);
+                let toolbar_focus = window.use_keyed_state(
+                    SharedString::from(format!("{id}-toolbar-focus")),
+                    cx,
+                    |_, cx| cx.focus_handle(),
+                );
+                let toolbar_focus = toolbar_focus.read(cx).clone();
+                let toolbar_focused = toolbar_focus.contains_focused(window, cx);
                 let copy = node.as_text().to_owned();
                 let fenced = node.as_markdown().to_owned();
-                card = card
-                    .child(
+                card = card.group("mermaid").relative().when(!show_source, |card| {
+                    // Own the fitted aspect ratio at the container level.
+                    // An in-flow Img can shrink to max-width while its
+                    // parent's auto height retains the intrinsic height.
+                    card.w(px(diagram.width))
+                        .max_w_full()
+                        .aspect_ratio(diagram.width / diagram.height)
+                });
+                card = if show_source {
+                    card.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .debug_selector({
+                                let id = id.clone();
+                                move || format!("{id}-source-view")
+                            })
+                            .child(source_view()),
+                    )
+                } else {
+                    card.child(
                         img(diagram.image)
                             .id("diagram")
                             .debug_selector({
                                 let id = id.clone();
                                 move || format!("{id}-diagram")
                             })
-                            .w(px(diagram.width))
-                            .max_w_full()
-                            .aspect_ratio(diagram.width / diagram.height)
+                            .absolute()
+                            .inset_0()
+                            .size_full()
                             .object_fit(gpui::ObjectFit::Contain)
                             .with_fallback(|| {
                                 div()
@@ -280,77 +306,100 @@ impl MarkdownPlugin for MermaidPlugin {
                                     .into_any_element()
                             }),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_1()
-                            .text_xs()
-                            .child(
-                                Button::new("source")
-                                    .label(if open { "Hide source" } else { "Source" })
-                                    .small()
-                                    .ghost()
-                                    .debug_selector({
-                                        let id = id.clone();
-                                        move || format!("{id}-source-toggle")
-                                    })
-                                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                        window.prevent_default();
-                                        cx.stop_propagation();
-                                    })
-                                    .on_click(move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        expanded.update(cx, |open, cx| {
-                                            *open = !*open;
-                                            cx.notify();
-                                        });
-                                    }),
-                            )
-                            .child(
-                                Button::new("copy")
-                                    .label("Copy source")
-                                    .small()
-                                    .ghost()
-                                    .debug_selector({
-                                        let id = id.clone();
-                                        move || format!("{id}-copy")
-                                    })
-                                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                        window.prevent_default();
-                                        cx.stop_propagation();
-                                    })
-                                    .on_click(move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            copy.clone(),
-                                        ));
-                                    }),
-                            )
-                            .child(
-                                Button::new("copy-markdown")
-                                    .label("Copy Markdown")
-                                    .debug_selector({
-                                        let id = id.clone();
-                                        move || format!("{id}-copy-markdown")
-                                    })
-                                    .small()
-                                    .ghost()
-                                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                        window.prevent_default();
-                                        cx.stop_propagation();
-                                    })
-                                    .on_click(move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            fenced.clone(),
-                                        ));
-                                    }),
-                            ),
-                    );
-                if open {
-                    card = card.child(source_view());
-                }
+                };
+                card = card.child(
+                    div()
+                        .id("toolbar")
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("{id}-toolbar")
+                        })
+                        .absolute()
+                        .top_1()
+                        .left_1()
+                        .right_1()
+                        .flex()
+                        .justify_end()
+                        .track_focus(&toolbar_focus)
+                        .tab_stop(false)
+                        .opacity(if toolbar_focused { 1. } else { 0. })
+                        .group_hover("mermaid", |bar| bar.opacity(1.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .justify_end()
+                                .gap_1()
+                                .p_1()
+                                .rounded_md()
+                                .bg(cx.theme().background)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .shadow_sm()
+                                .text_xs()
+                                .child(
+                                    Button::new("source")
+                                        .label(if show_source { "Diagram" } else { "Source" })
+                                        .small()
+                                        .ghost()
+                                        .debug_selector({
+                                            let id = id.clone();
+                                            move || format!("{id}-source-toggle")
+                                        })
+                                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                            window.prevent_default();
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            source_mode.update(cx, |show_source, cx| {
+                                                *show_source = !*show_source;
+                                                cx.notify();
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("copy")
+                                        .label("Copy source")
+                                        .small()
+                                        .ghost()
+                                        .debug_selector({
+                                            let id = id.clone();
+                                            move || format!("{id}-copy")
+                                        })
+                                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                            window.prevent_default();
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy.clone(),
+                                            ));
+                                        }),
+                                )
+                                .child(
+                                    Button::new("copy-markdown")
+                                        .label("Copy Markdown")
+                                        .debug_selector({
+                                            let id = id.clone();
+                                            move || format!("{id}-copy-markdown")
+                                        })
+                                        .small()
+                                        .ghost()
+                                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                            window.prevent_default();
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                fenced.clone(),
+                                            ));
+                                        }),
+                                ),
+                        ),
+                );
             }
             result => {
                 let message: SharedString = result.map_or_else(

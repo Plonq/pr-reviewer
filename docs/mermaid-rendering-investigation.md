@@ -17,9 +17,11 @@ proposal-only statements describe the state before this implementation.
   Markdown/code remains stock. Blocks over the source limit are left entirely
   stock, without adding them to the diagram cache.
 - Plain node text, exact original fenced Markdown, source range and an accessible
-  source label are preserved. Success cards have keyboard-capable Kit buttons for
-  source disclosure, copying source and copying original Markdown. Pending/error
-  cards show stock Kit code. The standalone source view uses the de-indented
+  source label are preserved. Success cards have a floating top-right toolbar,
+  revealed on hover or keyboard focus, for toggling source/diagram and copying
+  source or original Markdown. Source replaces the diagram rather than expanding
+  below it; the toolbar is out of normal flow, so hover does not change geometry.
+  Pending/error cards show stock Kit code. The standalone source view uses the de-indented
   mdast value, so nested quote/list prefixes do not corrupt the displayed code;
   Markdown copy still uses the exact original source slice.
 - This is deliberately a subset, not GitHub Mermaid parity. Source configuration
@@ -50,11 +52,16 @@ replace the new diagram. Queue saturation is a transient readable-source state.
 Normal failures are cached as well as successes.
 
 Cached geometry is intrinsic logical size, fitted uniformly to available prose
-width. Display uses already-decoded `Arc<RenderImage>` pixels, not a URL or
+width. The card owns the fitted aspect ratio and its image fills it absolutely:
+putting an intrinsic-size image in normal flow let the Markdown parent retain
+its original height when a narrow split pane shrank the image, leaving a blank
+gap below it. The resize regression now uses a larger diagram and checks both
+the image ratio and tight Markdown/row reservations, not just image bounds.
+Display uses already-decoded `Arc<RenderImage>` pixels, not a URL or
 GPUI's default SVG loader, and does not create a new image per frame. Image
 objects and geometry are shared by measurement and display. The existing
 `on_children_prepainted` reservation updates and anchored rebuilds handle async
-changes and source disclosure without modifying source-line geometry. Persistent
+changes and source/diagram replacement without modifying source-line geometry. Persistent
 `TextViewState` ownership is unchanged.
 
 The cache has a 128-entry / 64 MiB accounting budget, including decoded CPU and
@@ -104,14 +111,15 @@ existing image decoder path. There is no source-upload path.
 
 - `cargo check -p gander`: passed.
 - `cargo test -p gander mermaid -- --nocapture`: 11 passed.
-- `cargo test --workspace`: **686 passed, 10 ignored**, no failures. Includes the
+- `cargo test --workspace`: **748 passed, 10 ignored**, no failures. Includes the
   persistent-conversation scroll test with a Mermaid description.
 - Tests cover exact matching/source preservation, tilde/backtick and nested
   fences, core families in light/dark, modern shapes, cycles/subgraphs/edge and
   HTML-style labels, supported Unicode, malformed/empty/unsupported input,
   missing glyph fallback, source/model/raster limits, cancellation/deadlines,
   hostile SVG/resources/configuration, cache failures/eviction, queue bounds,
-  async unified/split/narrow comments, partial virtualization, source disclosure
+  async unified/split/narrow comments, partial virtualization, floating toolbar
+  placement without hover reflow, source/diagram replacement (including resize)
   and clipboard contents, edits and PR switches.
 - `cargo clippy -p gander --tests` completes with existing warnings elsewhere;
   the new Mermaid module has no Clippy warnings.
