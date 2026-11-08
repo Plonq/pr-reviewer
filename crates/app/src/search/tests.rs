@@ -105,9 +105,23 @@ fn projections_are_unicode_safe_across_wraps_in_both_views() {
                     .collect();
                 assert_eq!(text, "é世界");
             }
+            // Minimap marks use character rather than byte coordinates, and
+            // each wrapped fragment stays in its own display row and lane.
+            assert_eq!(found.marks.len(), if wrap { 4 } else { 2 });
+            for (_, span) in found.by_row.iter().flatten() {
+                let text = row_side_text(&rows[span.row], span.side).unwrap();
+                let start = text[..span.range.start].chars().count() as f32 / 160.;
+                let end = text[..span.range.end].chars().count() as f32 / 160.;
+                assert!(found.marks.contains(&MinimapMatch {
+                    row: span.row,
+                    side: span.side,
+                    range: start..end,
+                }));
+            }
             // Reprojection to another file removes all stale highlights.
             found.project(&rows, 1);
             assert!(found.by_row.iter().all(Vec::is_empty));
+            assert!(found.marks.is_empty());
         }
     }
 }
@@ -163,6 +177,9 @@ fn full_file_gaps_and_split_context_are_indexed_once() {
     assert_eq!(found.occurrences.len(), 1);
     found.project(&rows(&diff, &upgrades, ViewMode::Split, false, 0), 0);
     assert_eq!(found.by_row.iter().flatten().count(), 2);
+    assert_eq!(found.marks.len(), 2);
+    assert!(found.marks.iter().any(|m| m.side == SelSide::Left));
+    assert!(found.marks.iter().any(|m| m.side == SelSide::Right));
     for query in ["line 1", "line 30"] {
         let found = Matches::find(
             &diff,
@@ -173,6 +190,37 @@ fn full_file_gaps_and_split_context_are_indexed_once() {
             query,
         );
         assert_eq!(found.occurrences.len(), usize::from(query == "line 1")); // removed line 12
+    }
+}
+
+#[test]
+fn minimap_marks_clip_to_the_visible_character_width() {
+    let diff = diff_core::parse_patch(&format!(
+        "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-{}needle\n+{}needle\n",
+        "é".repeat(158),
+        "é".repeat(160),
+    ));
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        let rows = rows(&diff, &HashMap::new(), mode, false, 0);
+        let mut found = find(&diff, SearchScope::CurrentFile, "needle");
+        found.project(&rows, 0);
+        assert_eq!(found.occurrences.len(), 2);
+        assert_eq!(found.marks.len(), 1);
+        let mark = &found.marks[0];
+        assert_eq!(mark.range, (158. / 160.)..1.);
+        assert_eq!(mark.row, 1);
+        assert_eq!(
+            mark.side,
+            if mode == ViewMode::Unified {
+                SelSide::Unified
+            } else {
+                SelSide::Left
+            }
+        );
+
+        let mut empty = find(&diff, SearchScope::CurrentFile, "absent");
+        empty.project(&rows, 0);
+        assert!(empty.marks.is_empty());
     }
 }
 

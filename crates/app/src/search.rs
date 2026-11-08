@@ -4,6 +4,7 @@
 mod tests;
 
 use crate::local_store::ReviewPosition;
+use crate::minimap::{text_range_frac, MinimapMatch};
 use crate::rows::{gap_span, source_row, FileUpgrade, LineKind, Row};
 use crate::selection::{row_side_text, selection_text, SelSide};
 use crate::{theme, ItemData, ItemPane, ReviewApp};
@@ -75,6 +76,8 @@ struct Matches {
     occurrences: Vec<Occurrence>,
     current: Option<usize>,
     by_row: Vec<Vec<(usize, Span)>>,
+    /// Cached minimap positions, rebuilt with the display-row projection.
+    marks: Vec<MinimapMatch>,
     skipped_large: usize,
     patch_only: usize,
 }
@@ -166,6 +169,7 @@ impl Matches {
             lines.entry((m.removed, m.line)).or_default().push((ix, m));
         }
         self.by_row = vec![Vec::new(); rows.len()];
+        self.marks.clear();
         for side in [SelSide::Unified, SelSide::Left, SelSide::Right] {
             let mut offset = 0;
             for (row_ix, row) in rows.iter().enumerate() {
@@ -216,6 +220,15 @@ impl Matches {
                         let start = m.range.start.max(offset);
                         let end = m.range.end.min(offset + text.len());
                         if start < end {
+                            if let Some(range) =
+                                text_range_frac(text, &(start - offset..end - offset))
+                            {
+                                self.marks.push(MinimapMatch {
+                                    row: row_ix,
+                                    side,
+                                    range,
+                                });
+                            }
                             self.by_row[row_ix].push((
                                 *ix,
                                 Span {
@@ -263,6 +276,10 @@ pub(crate) struct Search {
 }
 
 impl Search {
+    pub(crate) fn minimap_marks(&self) -> &[MinimapMatch] {
+        &self.matches.marks
+    }
+
     pub(crate) fn highlights(
         &self,
         row: usize,

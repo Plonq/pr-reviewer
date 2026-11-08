@@ -4,6 +4,7 @@
 mod tests;
 use std::ops::Range;
 
+use crate::minimap::MinimapMatch;
 use crate::rows::{source_row, LineKind, Row};
 use crate::selection::{row_side_text, selection_text, SelSide, Selection};
 
@@ -12,13 +13,6 @@ pub(crate) struct SelectionMatches {
     by_row: Vec<Vec<(SelSide, Range<usize>)>>,
     /// Cached horizontal positions on the minimap's character scale.
     pub(crate) marks: Vec<MinimapMatch>,
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) struct MinimapMatch {
-    pub(crate) row: usize,
-    pub(crate) side: SelSide,
-    pub(crate) range: Range<f32>,
 }
 
 impl SelectionMatches {

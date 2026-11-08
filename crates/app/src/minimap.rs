@@ -1,6 +1,7 @@
 //! The diff-pane minimap: display rows reduced to bars, downsampled into coalesced paint runs.
 
 use crate::rows::{Cell, LineKind, Row};
+use crate::selection::SelSide;
 use crate::threads::CommentSide;
 
 /// Width of the minimap column on the right edge of the diff pane.
@@ -49,6 +50,15 @@ pub(crate) enum MinimapKind {
 /// at the cap, so pathological lines cost nothing extra.
 fn line_frac(text: &str) -> f32 {
     text.chars().take(MAX_MINIMAP_CHARS).count() as f32 / MAX_MINIMAP_CHARS as f32
+}
+
+/// A match projected onto the minimap's character scale, shared by Find and
+/// passive selection matching.
+#[derive(Debug, PartialEq)]
+pub(crate) struct MinimapMatch {
+    pub(crate) row: usize,
+    pub(crate) side: SelSide,
+    pub(crate) range: std::ops::Range<f32>,
 }
 
 /// Project a source byte range onto the same character scale as the text bars.

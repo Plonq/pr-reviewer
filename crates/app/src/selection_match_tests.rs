@@ -55,13 +55,13 @@ fn selection_matches_paint_both_sides_clear_and_invalidate_with_rows(
             assert_eq!(matches.ranges(left_row, left_side), vec![4..10, 11..17]);
             assert_eq!(matches.ranges(right_row, right_side), vec![4..10]);
             assert_eq!(matches.marks, vec![
-                selection_matches::MinimapMatch {
+                minimap::MinimapMatch {
                     row: left_row, side: left_side, range: (4. / 160.)..(10. / 160.),
                 },
-                selection_matches::MinimapMatch {
+                minimap::MinimapMatch {
                     row: left_row, side: left_side, range: (11. / 160.)..(17. / 160.),
                 },
-                selection_matches::MinimapMatch {
+                minimap::MinimapMatch {
                     row: right_row, side: right_side, range: (4. / 160.)..(10. / 160.),
                 },
             ]);

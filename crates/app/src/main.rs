@@ -5755,7 +5755,25 @@ impl ReviewApp {
                         }
                         // Highlight just the matching characters within each lane.
                         // Quantize vertically like the base minimap when downsampled.
-                        for mark in &data.selection_matches().marks {
+                        // Find uses purple rather than selection's yellow, and
+                        // paints last so overlapping selections cannot hide it.
+                        let selection_matches = data.selection_matches();
+                        let search_marks = data
+                            .search
+                            .as_ref()
+                            .map_or(&[][..], |search| search.minimap_marks());
+                        // Tiny Find marks need a brighter, fully opaque tint
+                        // to stand out against the underlying diff bars.
+                        let mut search_color = Hsla::from(theme::mauve(cx)).opacity(1.);
+                        search_color.s = 1.;
+                        search_color.l = search_color.l.max(0.82);
+                        let selection_color = Hsla::from(theme::yellow(cx)).opacity(0.85);
+                        for (mark, color) in selection_matches
+                            .marks
+                            .iter()
+                            .map(|mark| (mark, selection_color))
+                            .chain(search_marks.iter().map(|mark| (mark, search_color)))
+                        {
                             let (lane_x, lane_w) = match mark.side {
                                 SelSide::Unified => (0., usable),
                                 SelSide::Left => (0., half),
@@ -5773,7 +5791,7 @@ impl ReviewApp {
                                     point(px(x0 + MINIMAP_PAD + x), px(y0 + y)),
                                     size(px(w), px(layout.slot_h.max(2.))),
                                 ),
-                                Hsla::from(theme::yellow(cx)).opacity(0.85),
+                                color,
                             ));
                         }
                         // Viewport indicator.
@@ -10233,6 +10251,12 @@ mod tests {
                 .collect();
             assert_eq!(data.file_ix, 0, "cmd-f stays in the current file");
             assert_eq!(highlights.len(), 2);
+            assert_eq!(search.minimap_marks().len(), 2);
+            for mark in search.minimap_marks() {
+                assert_eq!(mark.side, SelSide::Unified);
+                assert_eq!(mark.range, 0.0..(6. / 160.));
+                assert!(highlights.iter().any(|(row, _)| *row == mark.row));
+            }
             let active_color = theme::search_current_bg(cx);
             (
                 data.file_ix,
@@ -10244,6 +10268,31 @@ mod tests {
             )
         };
         let first = vcx.update(|_, cx| active_match(cx));
+        // A selection made while Find is open retains its independent minimap
+        // matches, even where the two sets overlap.
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let data = app.active_data_mut().unwrap();
+                data.selection = Some(Selection {
+                    side: SelSide::Unified,
+                    anchor: RowCol {
+                        row: first.1,
+                        col: 0,
+                    },
+                    head: RowCol {
+                        row: first.1,
+                        col: 6,
+                    },
+                    linewise: false,
+                });
+                assert_eq!(data.selection_matches().marks.len(), 2);
+                assert_eq!(data.search.as_ref().unwrap().minimap_marks().len(), 2);
+                assert_ne!(theme::yellow(cx), theme::mauve(cx));
+                cx.notify();
+            });
+            let _ = window.draw(cx);
+            app.update(cx, |app, _| app.active_data_mut().unwrap().selection = None);
+        });
         vcx.simulate_keystrokes("enter");
         let second = vcx.update(|_, cx| active_match(cx));
         assert!(second > first);
