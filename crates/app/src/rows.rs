@@ -2859,7 +2859,7 @@ mod tests {
                     Some(root_id),
                 ));
                 expected_anchors.push((
-                    root_id,
+                    crate::comments::CommentKey::Inline(root_id),
                     if side == "LEFT" {
                         CommentSide::Left
                     } else {
