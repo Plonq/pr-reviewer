@@ -536,7 +536,7 @@ fn push_gap_rows(
             CommentSide::Left,
             Some(old_no),
             now,
-            ViewMode::Split,
+            mode,
             wrap,
         );
         push_thread_rows(
@@ -546,7 +546,7 @@ fn push_gap_rows(
             CommentSide::Right,
             Some(new_no),
             now,
-            ViewMode::Split,
+            mode,
             wrap,
         );
     }
@@ -2811,6 +2811,120 @@ mod tests {
                 Some(Some(CommentSide::Right)), // actions
             ]
         );
+    }
+
+    #[test]
+    fn full_file_threads_use_the_view_mode_without_changing_their_anchors() {
+        let old: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let new = old
+            .replace("line 10\nline 11\n", "line ten\n")
+            .replace("line 30\n", "line thirty\n");
+        let mut diff =
+            diff_core::parse_patch("diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n");
+        diff.files[0].hunks = diff_texts(&old, &new, 3);
+        assert_eq!(diff.files[0].hunks.len(), 2);
+        let upgrades = HashMap::from([(
+            0,
+            FileUpgrade {
+                new_lines: new.lines().map(|line| line.to_owned().into()).collect(),
+                old_spans: vec![Vec::new(); 40],
+                new_spans: vec![Vec::new(); 39],
+            },
+        )]);
+        // Before, inside and between hunks, then after the final hunk. The
+        // deletion makes LEFT/RIGHT line numbers differ in the later context.
+        let mut comments = Vec::new();
+        let mut expected_anchors = Vec::new();
+        for (old_no, new_no) in [(2, 2), (10, 10), (13, 12), (20, 19), (38, 37)] {
+            for (side, line) in [("LEFT", old_no), ("RIGHT", new_no)] {
+                let root_id = comments.len() as u64 + 1;
+                comments.push(rc(
+                    root_id,
+                    "a.txt",
+                    Some(side),
+                    Some(line),
+                    "root",
+                    "alice",
+                    "",
+                    None,
+                ));
+                comments.push(rc(
+                    root_id + 1,
+                    "a.txt",
+                    Some(side),
+                    Some(line),
+                    "reply",
+                    "bob",
+                    "",
+                    Some(root_id),
+                ));
+                expected_anchors.push((
+                    root_id,
+                    if side == "LEFT" {
+                        CommentSide::Left
+                    } else {
+                        CommentSide::Right
+                    },
+                    line,
+                ));
+            }
+        }
+        let index = group_comments(comments);
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            for collapse in [false, true] {
+                let built = build_presented_rows(
+                    RowsView {
+                        diff: &diff,
+                        upgrades: &upgrades,
+                        comments: Some(&index),
+                        options: RowOptions {
+                            mode,
+                            file_ix: 0,
+                            comments_visible: true,
+                            comment_wrap: COMMENT_WRAP_CHARS,
+                        },
+                    },
+                    store::DiffPreferences {
+                        collapse_unchanged: Some(collapse),
+                        ..Default::default()
+                    },
+                    &Default::default(),
+                    80,
+                );
+                let mut source = None;
+                let mut actual_anchors = Vec::new();
+                let mut headers = Vec::new();
+                for row in &built.rows {
+                    if !is_comment_row(row) {
+                        source = Some(row);
+                    }
+                    if let Row::CommentHeader { comment_id, .. } = row {
+                        headers.push(*comment_id);
+                    }
+                    if let Some(half) = row_half(row) {
+                        let expected = if mode == ViewMode::Split {
+                            // Each thread emits root/body/reply/body/actions.
+                            Some(expected_anchors[actual_anchors.len()].1)
+                        } else {
+                            None
+                        };
+                        assert_eq!(half, expected, "comment placement must follow view mode");
+                    }
+                    if let Row::CommentActions {
+                        root_id,
+                        side,
+                        line,
+                        ..
+                    } = row
+                    {
+                        assert_eq!(comment_line(source.unwrap(), *side), Some(*line));
+                        actual_anchors.push((*root_id, *side, *line));
+                    }
+                }
+                assert_eq!(actual_anchors, expected_anchors);
+                assert_eq!(headers, (1..=20).collect::<Vec<_>>());
+            }
+        }
     }
 
     #[test]
