@@ -12,12 +12,13 @@ use gpui::{
 use markdown::mdast::Node;
 use merman::{OperationControl, RenderOutput, RenderRequest, Renderer, SvgRequest};
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
-const REVISION: u8 = 1;
+const REVISION: u8 = 3;
 const FONT: &str = "Arial";
 const MAX_SOURCE: usize = 16 * 1024;
 const MAX_SVG: usize = 512 * 1024;
@@ -758,9 +759,128 @@ fn native_fonts() -> Result<merman::svg::export::NativeFontContext, Arc<str>> {
         .clone()
 }
 
-fn rasterize(svg: &str, key: &Key, fonts: &merman::svg::export::NativeFontContext) -> Outcome {
-    audit_svg(svg)?;
-    use resvg::{tiny_skia, usvg};
+/// The pinned Merman SVG-text ER path emits tight relationship backgrounds
+/// without a padding setting. Pad only those admitted background rectangles;
+/// leave text, layout anchors, paths, entity cells and all other families alone.
+fn pad_er_relationship_labels<'a>(
+    svg: &'a str,
+    doc: &roxmltree::Document<'_>,
+    top_offsets: &[f64],
+) -> Result<Cow<'a, str>, Arc<str>> {
+    if doc.root_element().attribute("aria-roledescription") != Some("er") {
+        return Ok(Cow::Borrowed(svg));
+    }
+    let has_class = |node: roxmltree::Node<'_, '_>, class| {
+        node.attribute("class")
+            .is_some_and(|value| value.split_ascii_whitespace().any(|word| word == class))
+    };
+    let bad = || Arc::<str>::from("Mermaid ER label geometry outside host limits — source shown");
+    let mut edits = Vec::new();
+    for rect in doc.descendants().filter(|node| {
+        node.has_tag_name("rect")
+            && has_class(*node, "background")
+            && node
+                .ancestors()
+                .any(|parent| has_class(parent, "edgeLabel"))
+    }) {
+        let mut values = Vec::new();
+        for name in ["x", "y", "width", "height"] {
+            let attr = rect
+                .attributes()
+                .find(|attr| attr.name() == name)
+                .ok_or_else(bad)?;
+            let value = attr.value().parse::<f64>().map_err(|_| bad())?;
+            if !value.is_finite() || value.abs() > 16_777_216. {
+                return Err(bad());
+            }
+            values.push((attr.range_value(), value));
+        }
+        // Preserve Merman's zero-size whitespace labels, without painting a box.
+        if values[2].1 < 0. || values[3].1 < 0. {
+            return Err(bad());
+        }
+        if values[2].1 == 0. || values[3].1 == 0. {
+            continue;
+        }
+        let top = *top_offsets.get(edits.len() / 4).ok_or_else(bad)?;
+        // SVG text line boxes include extra ascent space. Place the top edge
+        // relative to the actual glyph outlines, while keeping the already-good
+        // bottom edge (original bottom + 2px) and horizontal padding unchanged.
+        for (index, ((range, value), delta)) in
+            values.into_iter().zip([-4., top, 8., 2. - top]).enumerate()
+        {
+            let padded = value + delta;
+            if !padded.is_finite() || padded.abs() > 16_777_216. || (index >= 2 && padded <= 0.) {
+                return Err(bad());
+            }
+            edits.push((range, padded.to_string()));
+        }
+        if edits.len() > 256 * 4 {
+            return Err(bad());
+        }
+    }
+    if edits.len() / 4 != top_offsets.len() {
+        return Err(bad());
+    }
+    if edits.is_empty() {
+        return Ok(Cow::Borrowed(svg));
+    }
+    edits.sort_unstable_by_key(|(range, _)| range.start);
+    let size = edits.iter().fold(svg.len(), |size, (range, value)| {
+        size + value.len() - range.len()
+    });
+    if size > MAX_SVG {
+        return Err(bad());
+    }
+    // Copy once, preserving every non-geometry byte (including escaped labels).
+    let mut padded = String::with_capacity(size);
+    let mut offset = 0;
+    for (range, value) in edits {
+        padded.push_str(&svg[offset..range.start]);
+        padded.push_str(&value);
+        offset = range.end;
+    }
+    padded.push_str(&svg[offset..]);
+    Ok(Cow::Owned(padded))
+}
+
+fn er_label_top_offsets(group: &resvg::usvg::Group, offsets: &mut Vec<f64>) {
+    use resvg::usvg::Node;
+    // The pinned ER SVG-text emitter groups each label's unstroked background
+    // with its text. Entity borders have strokes; markers have no text. Keep
+    // document order, and verify the count against admitted XML before editing.
+    if let [Node::Path(background), Node::Text(text)] = group.children() {
+        let transform = background.abs_transform();
+        if background.stroke().is_none()
+            && transform.sx == 1.
+            && transform.sy == 1.
+            && transform.kx == 0.
+            && transform.ky == 0.
+        {
+            // Flattened glyph outlines are text-local, unlike Text's ordinary
+            // absolute bounding box (which includes typographic line space).
+            let ink = text
+                .flattened()
+                .bounding_box()
+                .transform(text.abs_transform());
+            offsets.push(ink.map_or(f64::NAN, |ink| {
+                f64::from(ink.top() - background.abs_bounding_box().top() - 2.)
+            }));
+        }
+    }
+    for node in group.children() {
+        if let Node::Group(group) = node {
+            er_label_top_offsets(group, offsets);
+        }
+    }
+}
+
+fn decode_svg(
+    svg: &str,
+    fonts: &merman::svg::export::NativeFontContext,
+) -> Result<resvg::usvg::Tree, Arc<str>> {
+    let doc = audit_svg(svg)?;
+    use resvg::usvg;
     let mut options = usvg::Options {
         resources_dir: None,
         image_href_resolver: usvg::ImageHrefResolver {
@@ -770,11 +890,25 @@ fn rasterize(svg: &str, key: &Key, fonts: &merman::svg::export::NativeFontContex
         ..Default::default()
     };
     fonts.apply_to_usvg_options(&mut options);
-    let tree = usvg::Tree::from_str(svg, &options)
-        .map_err(|_| Arc::<str>::from("Mermaid SVG could not be decoded — source shown"))?;
+    let decode_error = || Arc::<str>::from("Mermaid SVG could not be decoded — source shown");
+    let mut tree = usvg::Tree::from_str(svg, &options).map_err(|_| decode_error())?;
+    if doc.root_element().attribute("aria-roledescription") == Some("er") {
+        let mut offsets = Vec::new();
+        er_label_top_offsets(tree.root(), &mut offsets);
+        let padded = pad_er_relationship_labels(svg, &doc, &offsets)?;
+        if let Cow::Owned(padded) = padded {
+            tree = usvg::Tree::from_str(&padded, &options).map_err(|_| decode_error())?;
+        }
+    }
     fonts.check().map_err(|_| {
         Arc::<str>::from("Mermaid glyph coverage or font limit exceeded — source shown")
     })?;
+    Ok(tree)
+}
+
+fn rasterize(svg: &str, key: &Key, fonts: &merman::svg::export::NativeFontContext) -> Outcome {
+    use resvg::{tiny_skia, usvg};
+    let tree = decode_svg(svg, fonts)?;
     let width = tree.size().width();
     let height = tree.size().height();
     fn text_is_complete(group: &usvg::Group, width: f32, height: f32) -> bool {
@@ -844,6 +978,24 @@ mod tests {
         editor_host::{parse_markdown, BlockNode},
         MarkdownExtensions,
     };
+
+    const ER_SHOWCASE: &str = r#"erDiagram
+    REVIEWER ||--o{ REVIEW : writes
+    PULL_REQUEST ||--o{ REVIEW : receives
+    REVIEWER {
+        int id
+        string name
+    }
+    PULL_REQUEST {
+        int number
+        string title
+    }
+    REVIEW {
+        int id
+        string verdict
+        string body
+    }
+"#;
 
     fn key(source: &str) -> Key {
         Key {
@@ -936,6 +1088,7 @@ mod tests {
             "classDiagram\nAnimal <|-- Duck\nAnimal : +int age\nAnimal : +run()",
             "stateDiagram-v2\n[*] --> Review\nReview --> Done\nDone --> [*]",
             "erDiagram\nUSER ||--o{ REVIEW : writes\nUSER { string name }",
+            ER_SHOWCASE,
         ] {
             for dark in [false, true] {
                 let mut key = key(source);
@@ -954,6 +1107,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mermaid_er_background_padding_is_targeted_and_bounded() {
+        let rect = r#"<rect class="background" x="-20" y="-1" width="40" height="16"/>"#;
+        let padded = r#"<rect class="background" x="-24" y="2" width="48" height="15"/>"#;
+        let svg = format!(
+            r#"<svg aria-roledescription="er"><g class="entity"><rect class="background" x="0" y="0" width="80" height="60"/></g><g class="edgeLabel"><g class="label" transform="translate(30,40)">{rect}<text>writes &amp; receives café Δ</text></g></g><g class="edgeLabel"><g class="label" transform="translate(60,90)">{rect}<text>reviews</text></g></g></svg>"#
+        );
+        let doc = audit_svg(&svg).unwrap();
+        let result = pad_er_relationship_labels(&svg, &doc, &[3., 3.]).unwrap();
+        assert_eq!(
+            result,
+            svg.replace(rect, padded),
+            "only expand the background, preserving the label anchor and all other bytes"
+        );
+        audit_svg(&result).unwrap();
+        for unchanged in [
+            svg.replace("\"er\"", "\"flowchart\""),
+            svg.replace("width=\"40\"", "width=\"0\""),
+            svg.replace("edgeLabel", "nodeLabel"),
+        ] {
+            let doc = audit_svg(&unchanged).unwrap();
+            assert!(matches!(
+                pad_er_relationship_labels(&unchanged, &doc, &[]).unwrap(),
+                Cow::Borrowed(_)
+            ));
+        }
+        for invalid in ["", "NaN", "inf", "-1", "16777216"] {
+            let svg = svg.replace("width=\"40\"", &format!("width=\"{invalid}\""));
+            let doc = audit_svg(&svg).unwrap();
+            assert!(pad_er_relationship_labels(&svg, &doc, &[3., 3.]).is_err());
+        }
+        let svg = svg.replace(
+            rect,
+            r#"<rect class="background" x="0" y="0" width="8" height="8"/>"#,
+        );
+        let svg = svg.replace(
+            "</svg>",
+            &format!("{}</svg>", " ".repeat(MAX_SVG - svg.len())),
+        );
+        assert_eq!(svg.len(), MAX_SVG);
+        let doc = audit_svg(&svg).unwrap();
+        assert!(
+            pad_er_relationship_labels(&svg, &doc, &[3., 3.]).is_err(),
+            "padding must not bypass the SVG byte budget"
+        );
+    }
+
+    #[test]
+    fn mermaid_er_top_padding_tracks_ink_not_the_font_line_box() {
+        let control = OperationControl::new();
+        let fonts = native_fonts().unwrap().for_operation(&control);
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" aria-roledescription="er" width="200" height="160" font-family="Arial" font-size="14">
+            <g class="edgeLabel" transform="translate(60,30)"><g><rect class="background" x="-35" y="-1" width="70" height="16"/><text y="14">receives</text></g></g>
+            <g class="edgeLabel" transform="translate(60,80)"><g><rect class="background" x="-35" y="-1" width="70" height="16"/><text y="14">ÉÉÉ</text></g></g>
+            <g class="edgeLabel" transform="translate(60,130)"><g><rect class="background" x="-35" y="-1" width="70" height="16"/><text y="14">gyp</text></g></g>
+        </svg>"#;
+        let tree = decode_svg(svg, &fonts).unwrap();
+        let mut offsets = Vec::new();
+        er_label_top_offsets(tree.root(), &mut offsets);
+        assert_eq!(offsets.len(), 3);
+        assert!(offsets.iter().all(|offset| offset.abs() < 0.001), "background top must sit 2px above actual outlines, including accents and descenders: {offsets:?}");
+        fn bottoms(group: &resvg::usvg::Group, result: &mut Vec<f32>) {
+            use resvg::usvg::Node;
+            if let [Node::Path(background), Node::Text(_)] = group.children() {
+                let bounds = background.abs_bounding_box();
+                assert!((bounds.width() - 78.).abs() < 0.001);
+                assert!((bounds.left() - 21.).abs() < 0.001);
+                if result.is_empty() {
+                    assert!(bounds.top() > 30. && bounds.top() < 35., "lowercase label top must follow glyph ink in canvas coordinates, not extend toward the origin");
+                }
+                result.push(bounds.bottom());
+            }
+            for node in group.children() {
+                if let Node::Group(group) = node {
+                    bottoms(group, result);
+                }
+            }
+        }
+        let mut bottom_edges = Vec::new();
+        bottoms(tree.root(), &mut bottom_edges);
+        assert_eq!(
+            bottom_edges,
+            [47., 97., 147.],
+            "original bottom + 2px must be preserved"
+        );
     }
 
     #[test]

@@ -86,6 +86,20 @@ The `usvg` data and string image resolvers both unconditionally return `None`.
 Only the closed, bounded host font set is supplied for measurement and painting.
 GPUI receives BGRA pixels, never diagram-provided SVG or resource locations.
 
+The pinned Merman SVG-text ER emitter has no relationship-background padding
+setting. After admission, a host-owned cosmetic pass adjusts only ER `edgeLabel`
+background rectangles: 4 logical pixels horizontally, the original bottom edge
+plus 2 pixels, and a top edge 2 pixels above the actual glyph outlines. Using the
+font line box instead left excessive space above lowercase labels. A bounded
+native shaping pass measures ink in canvas coordinates (including accents), then
+re-decodes the adjusted SVG using the same closed fonts and disabled resolvers.
+Text, anchors, relationship paths, entity cells, and other families remain
+byte-for-byte unchanged. Edits are numeric-only, coordinate/count bounded, and cannot exceed
+the existing SVG byte budget; zero-size whitespace labels stay zero-size. The
+renderer policy revision was bumped to invalidate cached presentation. The full
+reviewer/PR/review showcase is now a light/dark raster fixture, and corrected
+native PNGs were visually inspected for padding around `writes` and `receives`.
+
 | Resource | Host ceiling |
 | --- | --- |
 | Source / aggregate model label text | 16 KiB each |
@@ -110,8 +124,8 @@ existing image decoder path. There is no source-upload path.
 ### Validation and a concrete issue caught by visual inspection
 
 - `cargo check -p gander`: passed.
-- `cargo test -p gander mermaid -- --nocapture`: 11 passed.
-- `cargo test --workspace`: **748 passed, 10 ignored**, no failures. Includes the
+- `cargo test -p gander mermaid -- --nocapture`: 13 passed.
+- `cargo test --workspace`: **750 passed, 10 ignored**, no failures. Includes the
   persistent-conversation scroll test with a Mermaid description.
 - Tests cover exact matching/source preservation, tilde/backtick and nested
   fences, core families in light/dark, modern shapes, cycles/subgraphs/edge and
@@ -120,7 +134,11 @@ existing image decoder path. There is no source-upload path.
   hostile SVG/resources/configuration, cache failures/eviction, queue bounds,
   async unified/split/narrow comments, partial virtualization, floating toolbar
   placement without hover reflow, source/diagram replacement (including resize)
-  and clipboard contents, edits and PR switches.
+  and clipboard contents, edits and PR switches. ER padding tests verify targeted
+  geometry-only changes, unchanged anchors/entity cells/escaped text, no changes
+  to other families or zero-size labels, and numeric/output limits. Native-font
+  tests check the top gap against glyph ink for lowercase, accented capitals and
+  descenders, while keeping the bottom and horizontal edges unchanged.
 - `cargo clippy -p gander --tests` completes with existing warnings elsewhere;
   the new Mermaid module has no Clippy warnings.
 - Formatting passes on the changed renderer files and `git diff --check` passes.
