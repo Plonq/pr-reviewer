@@ -1418,12 +1418,17 @@ fn render_row_content(
                         div()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(theme::text(cx))
+                            .min_w_0()
+                            .truncate()
                             .child(author.clone()),
                     )
                     .child(
                         div()
                             .id(("comment-time", ix))
                             .debug_selector(|| format!("inline-comment-time-{comment_id}"))
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
                             .text_color(theme::overlay0(cx))
                             .text_size(px(11.))
                             .child(when.clone())

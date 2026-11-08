@@ -106,6 +106,33 @@ impl Changes {
         self.active.push(change);
     }
 
+    /// A pending creation receipt is already confirmed session data. Protect
+    /// it from stale Resume reads just like an accepted pending edit, without
+    /// keeping an optimistic draft or inventing a review/comment identity.
+    pub fn created_pending(
+        &mut self,
+        token: u64,
+        review_id: u64,
+        comment: &github::PendingComment,
+    ) {
+        let key = CommentKey::Pending(comment.id);
+        self.successful.retain(|c| c.key != key);
+        self.successful.push(Change {
+            token,
+            key,
+            target: MutationTarget::Pending {
+                review_id,
+                id: comment.id,
+                node_id: comment.node_id.clone(),
+            },
+            body: Some(comment.body.clone()),
+            recovery_body: String::new(),
+            placement: crate::ComposerPlacement::Diff,
+            uncertain: false,
+            error: None,
+        });
+    }
+
     pub fn finish(&mut self, token: u64, result: &Result<MutationReceipt, github::ClientError>) {
         let Some(ix) = self.active.iter().position(|c| c.token == token) else {
             return;

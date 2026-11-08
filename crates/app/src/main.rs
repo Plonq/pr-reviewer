@@ -811,22 +811,34 @@ impl ItemData {
     /// (every row rebuild goes through here).
     fn set_rows(&mut self, mut built_rows: BuiltRows) {
         let collapsed = self
-            .discussion
-            .iter()
-            .flat_map(|d| &d.threads)
-            .filter(|thread| {
-                thread.is_resolved
-                    && !self.expanded_threads.contains(&thread.id)
-                    && !thread
-                        .comments
-                        .iter()
-                        .any(|c| self.editing_comments.contains_key(&c.id))
-            })
+            .comment_projection(None)
+            .threads()
+            .into_iter()
+            .filter(|thread| thread.is_resolved && !self.expanded_threads.contains(&thread.id))
             .filter_map(|thread| {
-                thread
-                    .comments
-                    .first()
-                    .map(|c| self.posts.alias(comments::CommentKey::Inline(c.id)))
+                let index = self.comments.as_ref()?;
+                let root = index.thread_roots.get(&thread.id).copied().or_else(|| {
+                    // A plain imported index may not have projection metadata;
+                    // only its exact, still-visible original root is a fallback.
+                    let root = self
+                        .posts
+                        .alias(comments::CommentKey::Inline(thread.comments.first()?.id));
+                    index
+                        .all_threads()
+                        .any(|t| t.root.id == root)
+                        .then_some(root)
+                })?;
+                let editing = index
+                    .all_threads()
+                    .find(|t| t.root.id == root)
+                    .is_some_and(|t| {
+                        std::iter::once(&t.root).chain(&t.replies).any(|c| {
+                            self.posts
+                                .remote_id(c.id)
+                                .is_some_and(|id| self.editing_comments.contains_key(&id))
+                        })
+                    });
+                (!editing).then_some(root)
             })
             .collect();
         resolution::collapse_threads(&mut built_rows, &collapsed);
@@ -5286,6 +5298,8 @@ impl ReviewApp {
                         div()
                             .debug_selector(|| "pending-status".into())
                             .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .child(SharedString::from(label)),
                     )
                     .when(projection.has_pending(), |row| {
@@ -5359,46 +5373,56 @@ impl ReviewApp {
                 .flex_col()
                 .gap_1();
             for entry in projection.pending_entries() {
-                let comments::Comment::Pending(comment) = entry else {
-                    if let comments::Comment::Posting(post) = entry {
+                let (comment_id, path, line, start_line, side) = match entry {
+                    comments::Comment::Pending(comment) => (
+                        Some(comment.id),
+                        &comment.path,
+                        comment.line,
+                        comment.start_line,
+                        comment.side,
+                    ),
+                    comments::Comment::Posting(post) => {
                         let anchor = post.anchor.as_ref().expect("pending inline anchor");
-                        comments = comments.child(
-                            div()
-                                .debug_selector(|| format!("pending-post-{}", post.token))
-                                .child(format!(
-                                    "{}:{} · {} · {}",
-                                    anchor.path,
-                                    anchor.line,
-                                    post.body,
-                                    post.status.label()
-                                )),
-                        );
+                        (
+                            None,
+                            &anchor.path,
+                            Some(anchor.line),
+                            anchor.start_line,
+                            anchor.side,
+                        )
                     }
-                    continue;
+                    _ => unreachable!("pending entries only"),
                 };
-                let comment_id = comment.id;
+                let key = projection.key(entry, true);
                 if self.composer().is_some_and(|composer| {
                     composer.item_id == id
-                        && composer.placement == ComposerPlacement::PendingTray(comment_id)
+                        && comment_id.is_some_and(|id| {
+                            composer.placement == ComposerPlacement::PendingTray(id)
+                        })
                 }) {
                     comments = comments.child(self.render_composer_card(cx));
                     continue;
                 }
-                let location = match comment.line {
+                let location = match line {
                     Some(line) => format!(
-                        "{}:{}{} ({})",
-                        comment.path,
-                        comment
-                            .start_line
+                        "{path}:{}{line} ({})",
+                        start_line
                             .map(|start| format!("{start}–"))
                             .unwrap_or_default(),
-                        line,
-                        comment.side.api_str()
+                        side.api_str()
                     ),
-                    None => format!("{} (outdated)", comment.path),
+                    None => format!("{path} (outdated)"),
+                };
+                let status = match entry {
+                    comments::Comment::Posting(post) => format!(" · {}", post.status.label()),
+                    _ => String::new(),
                 };
                 comments = comments.child(
                     div()
+                        .id(SharedString::from(format!("pending-comment-{id}-{key}")))
+                        .debug_selector(move || format!("pending-comment-{id}-{key}"))
+                        .h_8()
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .gap_2()
@@ -5408,36 +5432,46 @@ impl ReviewApp {
                                 .min_w_0()
                                 .truncate()
                                 .child(SharedString::from(format!(
-                                    "{location} · {}",
-                                    projection.body(comments::Comment::Pending(comment), true)
+                                    "{location} · {}{status}",
+                                    projection.body(entry, true)
                                 ))),
                         )
                         .child(
-                            Button::new(("pending-edit", comment_id))
+                            Button::new(SharedString::from(format!("pending-edit-{key}")))
                                 .label("Edit")
                                 .ghost()
                                 .small()
                                 .disabled(
-                                    ui.busy || self.composer().is_some() || self.review.is_some(),
+                                    comment_id.is_none()
+                                        || ui.busy
+                                        || self.composer().is_some()
+                                        || self.review.is_some(),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.edit_pending(comment_id, window, cx)
+                                    if let Some(comment_id) = comment_id {
+                                        this.edit_pending(comment_id, window, cx);
+                                    }
                                 })),
                         )
                         .child(
-                            Button::new(("pending-delete", comment_id))
+                            Button::new(SharedString::from(format!("pending-delete-{key}")))
                                 .label("Delete")
                                 .ghost()
                                 .small()
                                 .disabled(
-                                    ui.busy || self.composer().is_some() || self.review.is_some(),
+                                    comment_id.is_none()
+                                        || ui.busy
+                                        || self.composer().is_some()
+                                        || self.review.is_some(),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.confirm_delete_comment(
-                                        CommentTarget::Pending(comment_id),
-                                        window,
-                                        cx,
-                                    )
+                                    if let Some(comment_id) = comment_id {
+                                        this.confirm_delete_comment(
+                                            CommentTarget::Pending(comment_id),
+                                            window,
+                                            cx,
+                                        );
+                                    }
                                 })),
                         ),
                 );
@@ -7650,6 +7684,9 @@ mod tests {
     }
     mod comment_mutation {
         include!("comment_mutation_tests.rs");
+    }
+    mod comment_layout {
+        include!("comment_layout_tests.rs");
     }
 
     mod markdown_hosts {
@@ -14323,6 +14360,9 @@ mod tests {
         unknown_mutation: std::sync::atomic::AtomicBool,
         mutation_calls: std::sync::atomic::AtomicUsize,
         thread_ids: std::sync::Mutex<HashMap<u64, String>>,
+        review_ids: std::sync::Mutex<HashMap<u64, String>>,
+        thread_metadata: std::sync::Mutex<HashMap<String, github::ReviewThread>>,
+        pending_create_calls: std::sync::atomic::AtomicUsize,
         /// The id the next posted comment gets.
         next_id: std::sync::atomic::AtomicU64,
         pending: std::sync::Mutex<Option<github::PendingReview>>,
@@ -14620,6 +14660,11 @@ mod tests {
                 {
                     thread.id = id;
                 }
+                if let Some(metadata) = self.thread_metadata.lock().unwrap().get(&thread.id) {
+                    let comments = std::mem::take(&mut thread.comments);
+                    *thread = metadata.clone();
+                    thread.comments = comments;
+                }
                 if let Some(resolved) = self.resolutions.lock().unwrap().get(&thread.id) {
                     thread.is_resolved = *resolved;
                     thread.viewer_can_resolve = true;
@@ -14629,6 +14674,7 @@ mod tests {
             let permissions = self.comment_permissions.lock().unwrap();
             for comment in discussion.threads.iter_mut().flat_map(|t| &mut t.comments) {
                 comment.permissions = permissions.get(&comment.id).cloned().unwrap_or_default();
+                comment.review_id = self.review_ids.lock().unwrap().get(&comment.id).cloned();
             }
             let reactions = self.reactions.lock().unwrap();
             for comment in discussion
@@ -14775,6 +14821,8 @@ mod tests {
             anchor: &github::CommentAnchor,
             body: &str,
         ) -> Result<github::PendingCommentReceipt, github::ClientError> {
+            self.pending_create_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(review.id, 91);
             if self
                 .fail_pending_create
@@ -14812,6 +14860,8 @@ mod tests {
             comment_id: u64,
             body: &str,
         ) -> Result<github::PendingCommentReceipt, github::ClientError> {
+            self.pending_create_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(review.id, 91);
             let parent = self
                 .comments
@@ -14819,8 +14869,28 @@ mod tests {
                 .unwrap()
                 .iter()
                 .find(|comment| comment.id == comment_id)
-                .unwrap()
-                .clone();
+                .cloned()
+                .or_else(|| {
+                    review
+                        .comments
+                        .iter()
+                        .find(|c| c.id == comment_id)
+                        .map(|c| {
+                            let mut parent = rc(
+                                c.id,
+                                &c.path,
+                                Some(c.side.api_str()),
+                                c.line,
+                                &c.body,
+                                "you",
+                                "",
+                                c.in_reply_to_id,
+                            );
+                            parent.start_line = c.start_line;
+                            parent
+                        })
+                })
+                .expect("reply targets a surviving published or pending comment");
             let comment = github::PendingComment {
                 id: self
                     .next_id
@@ -14828,7 +14898,11 @@ mod tests {
                     + 100,
                 node_id: "draft_reply_node".into(),
                 path: parent.path,
-                side: CommentSide::Right,
+                side: if parent.side.as_deref() == Some("LEFT") {
+                    CommentSide::Left
+                } else {
+                    CommentSide::Right
+                },
                 line: parent.line,
                 start_line: parent.start_line,
                 body: body.into(),

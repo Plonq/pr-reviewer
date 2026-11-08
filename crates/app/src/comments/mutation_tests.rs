@@ -186,6 +186,35 @@ fn published_root_deletion_retains_replies_thread_identity_and_historical_anchor
 }
 
 #[test]
+fn an_empty_confirmed_thread_node_keeps_pending_survivors_without_resurrecting_the_deleted_root() {
+    let mut d = discussion();
+    d.threads[0].comments.truncate(1);
+    d.threads[0].line = None;
+    d.threads[0].is_outdated = true;
+    d.threads[0].is_resolved = true;
+    d.threads[0].original_line = Some(7);
+    let p = review(vec![draft(10, Some(1))]);
+    let mut posts = posting::Posts::default();
+    let op = change(1, CommentKey::Inline(1), None);
+    posts.changes.begin(op.clone(), Some(&d), Some(&p));
+    posts.changes.finish(1, &Ok(receipt(&op)));
+    d.threads[0].comments.clear();
+    let projection = Projection::new(Some(&d), Some(&p), &posts);
+    let entries = projection.conversation();
+    let Entry::Thread(thread) = &entries[0] else {
+        panic!()
+    };
+    assert_eq!(thread.key, ThreadKey("1".into()));
+    assert_eq!(thread.comments.len(), 1);
+    assert!(matches!(thread.comments[0], Comment::Pending(c) if c.id == 10));
+    assert_eq!(projection.reply_target(thread.confirmed), Some(10));
+    assert_eq!(thread.confirmed.original_line, Some(7));
+    let index = projection.diff_index();
+    assert_eq!(index.counts["a.rs"], (0, 1));
+    assert_eq!(index.thread_roots["1"], CommentKey::Pending(10));
+}
+
+#[test]
 fn pending_root_deletion_promotes_survivors_even_after_a_flat_snapshot_loses_the_root() {
     let mut p = review(vec![
         draft(10, None),

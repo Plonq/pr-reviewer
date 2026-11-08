@@ -478,6 +478,124 @@ fn successful_creation_survives_failed_stale_and_full_reads_without_caching_the_
 }
 
 #[gpui::test]
+fn accepted_pending_creation_survives_stale_resume_until_exact_positive_acknowledgement(
+    cx: &mut gpui::TestAppContext,
+) {
+    for reply in [false, true] {
+        let fake = FakePr::with_threads(if reply {
+            vec![rc(
+                11,
+                "a.rs",
+                Some("RIGHT"),
+                Some(1),
+                "existing root",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            )]
+        } else {
+            vec![]
+        });
+        if reply {
+            *fake.pending.lock().unwrap() = Some(pending_review());
+        }
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, commenting_item(&fake), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                if reply {
+                    app.sessions.entry(0).or_default().state = ReviewSession {
+                        pending: Some(pending_review()),
+                        verified: true,
+                    };
+                }
+                app.open_composer(
+                    reply.then_some(11),
+                    "a.rs".into(),
+                    CommentSide::Right,
+                    1,
+                    0,
+                    window,
+                    cx,
+                );
+                app.composer_mut().unwrap().pending = true;
+                app.composer().unwrap().input.update(cx, |input, cx| {
+                    input.set_value("confirmed pending creation", window, cx)
+                });
+                app.submit_composer(window, cx);
+                assert!(app.composer().is_none());
+            })
+        });
+        vcx.run_until_parked();
+        let confirmed = fake.pending.lock().unwrap().clone().unwrap();
+        assert_eq!(confirmed.comments.len(), 1);
+        fake.pending
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .comments
+            .clear();
+        cx.update(|cx| app.update(cx, |app, cx| app.resume_session(0, cx)));
+        vcx.run_until_parked();
+        cx.update(|cx| {
+            let app = app.read(cx);
+            assert_eq!(
+                app.active_comment_projection().unwrap().pending_count(),
+                1,
+                "a stale session read must not undo a receipt"
+            );
+            assert_eq!(
+                indexed_keys(app.active_data().unwrap()),
+                if reply {
+                    vec![CommentKey::Inline(11), CommentKey::Post(1)]
+                } else {
+                    vec![CommentKey::Post(1)]
+                }
+            );
+            assert_eq!(
+                app.store
+                    .review_session(&loop_loc())
+                    .pending
+                    .unwrap()
+                    .comments,
+                confirmed.comments
+            );
+            assert!(app.composer().is_none());
+        });
+        *fake.pending.lock().unwrap() = Some(confirmed);
+        cx.update(|cx| app.update(cx, |app, cx| app.resume_session(0, cx)));
+        vcx.run_until_parked();
+        // Once the same owner/node/body is positively observed, a later actual
+        // deletion must be allowed through; protection is not a permanent overlay.
+        fake.pending
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .comments
+            .clear();
+        cx.update(|cx| app.update(cx, |app, cx| app.resume_session(0, cx)));
+        vcx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                app.read(cx)
+                    .active_comment_projection()
+                    .unwrap()
+                    .pending_count(),
+                0
+            )
+        });
+        assert_eq!(
+            fake.pending_create_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+}
+
+#[gpui::test]
 fn invalid_creation_anchor_keeps_the_editor_and_never_registers_an_operation(
     cx: &mut gpui::TestAppContext,
 ) {

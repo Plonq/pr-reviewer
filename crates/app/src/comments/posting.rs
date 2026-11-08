@@ -186,7 +186,11 @@ impl Posts {
                             super::CommentKey::Issue(c.id)
                         }
                     }
-                    github::MutationReceipt::PendingCreated { created, .. } => {
+                    github::MutationReceipt::PendingCreated {
+                        review_id, created, ..
+                    } => {
+                        self.changes
+                            .created_pending(token, *review_id, &created.comment);
                         post.pending = true;
                         self.public.remove(&super::CommentKey::Post(token));
                         self.loaded.insert(

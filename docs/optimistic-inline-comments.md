@@ -1,6 +1,11 @@
 # Optimistic inline comments: investigation and implementation plan
 
-Status: proposed architecture; no runtime behavior changes yet.
+Status: parts 1–5 implemented and validated. Optimism remains scoped to inline
+comments; issue comments and submitted-review summaries retain their existing
+editor timing. No concurrent-write queue or durable offline queue was added.
+
+The investigation and proposed sequence below are retained as historical context.
+See the **Part 5 validation record** at the end for current coverage and results.
 
 ## Scope and recommendation
 
@@ -241,3 +246,63 @@ cargo test -p gander --locked range_drafts_resume_edit_delete_and_submit_without
 These validate existing behavior, not the proposed architecture. The full suite
 was not run. The build emitted the existing unused `mark_thread_seen` warning
 and a dependency future-incompatibility warning for `block`.
+
+## Part 5 validation record
+
+Part 5 adds five GPUI regression tests in
+`crates/app/src/comment_layout_tests.rs` (66 parameterized scenarios), plus pure
+regressions in `comments/{creation_tests,mutation_tests}.rs` for empty fetched
+thread nodes and accepted replies whose receipt IDs are not present in a read yet.
+A further GPUI test in `comment_creation_tests.rs` checks stale pending-session
+reads after successful root/reply creation, including guard retirement after
+positive acknowledgement.
+
+The GPUI tests hold execution of the fake write while painting the optimistic
+result: the submitted editor is already closed, the operation is busy, and no
+backend write has run. They then exercise the receipt and subsequent eligible
+acknowledgement separately, rather than treating stable element keys as proof of
+stable layout.
+
+| Matrix area | Coverage |
+| --- | --- |
+| Card and following-card bounds | Published roots/replies and pending drafts, unified/split, narrow/wide panes, and applicable Changes/Conversation surfaces. Compares complete painted bounds, row counts, and both viewport offsets before the receipt and after authoritative permissions, reactions, and review ownership arrive. |
+| Pending tray | Long/multiline submitted text stays in a keyed, single-line card with action space reserved before real IDs exist. Sync metadata cannot wrap. Standalone pending roots retain their existing Changes/tray-only visibility. |
+| Scrolling and media | Partially visible Markdown in both diff modes and Conversation, with a loaded image through the fake HTTP client. Checks fractional scroll offsets, painted bounds, row reservations, measurement keys, and persistent Markdown/media-owner identity. Image arrival itself remains a legitimate geometry change. |
+| Completion ownership and focus | Successful/rejected create, edit, and delete completions for published/pending comments after switching PRs and opening a newer editor. Checks the active PR, draft text, focus, untouched discussion, explicit recovery safety, and exactly one write. Existing file-navigation and item-close tests remain covered. |
+| Root deletion | Resolved threads in both modes, expanded/collapsed and current/outdated, with published or pending survivors. Checks disclosure, original thread/anchor metadata, counts, and reply targeting; a pending survivor can receive a real follow-up reply instead of addressing the deleted root. Empty fetched thread nodes cannot hide pending survivors or resurrect a deleted body. |
+| Read races, recovery, and persistence | Existing pure projection/receipt/barrier tests and GPUI creation/mutation/sync tests cover identical bodies with independent receipts, failed/stale/pre-write/out-of-order reads, full refresh races, definite rejection, uncertain outcomes without retries, partial review-start success, and confirmed-only snapshots/session mirrors. |
+| Unchanged behavior | The full workspace suite retains review lifecycle, permissions, upload gating, comparison-scope filtering, local reviews, and the eight baseline checks. |
+
+Validation exposed and fixed:
+
+- Conversation action chrome changing header height at acknowledgement.
+- Unreserved pending-tray action chrome and unbounded sync/time text.
+- Resolved-thread disclosure referring to a deleted confirmed root instead of its
+  current projected survivor. The index now carries a derived thread-to-root
+  mapping, including pending membership; it is not persisted.
+- An empty fetched thread node preventing a retained thread shell from keeping
+  pending replies visible.
+- Successful pending creations lacking the stale-session protection already used
+  for pending edits/deletes. Creation receipts now enter that same confirmed-only
+  guard and retire on exact owner/node/body acknowledgement, allowing subsequent
+  real deletions through.
+
+Final checks:
+
+```sh
+cargo test -p gander --locked tests::comment_layout
+cargo test -p gander --locked comments::posting::tests
+cargo test -p gander --locked placeholder_
+cargo test -p gander --locked published_inline_edit_saves_in_both_views_without_touching_the_pending_review
+cargo test -p gander --locked range_drafts_resume_edit_delete_and_submit_without_posting_single_comments
+cargo test --workspace --locked
+cargo check -p gander --locked
+cargo fmt --all -- --check
+rustfmt --edition 2021 --check crates/app/src/comment_layout_tests.rs crates/app/src/comment_creation_tests.rs
+git diff --check
+```
+
+Workspace result: **733 passed, 10 ignored**. All eight baseline checks pass.
+Existing dead-code warnings and the `block v0.1.6` future-incompatibility warning
+remain. Validation uses fake GitHub/HTTP clients and fixtures, not live GitHub
+writes. No broader optimism or state-management rewrite is part of this stage.

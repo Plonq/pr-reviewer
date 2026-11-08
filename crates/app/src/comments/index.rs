@@ -86,12 +86,22 @@ pub(crate) struct CommentIndex {
     pub(crate) threads: HashMap<String, FileAnchors>,
     /// path → (anchored comment count, outdated comment count).
     pub(crate) counts: HashMap<String, (usize, usize)>,
+    /// Confirmed thread identity → current projected root. Deleting a root
+    /// changes the visible member, not the thread's disclosure identity.
+    pub(crate) thread_roots: HashMap<String, super::CommentKey>,
     /// Retained so replacing pending drafts can rebuild accurate counts
     /// without losing genuinely outdated published threads.
     unanchored: Vec<CommentThread>,
 }
 
 impl CommentIndex {
+    pub(crate) fn all_threads(&self) -> impl Iterator<Item = &CommentThread> {
+        self.threads
+            .values()
+            .flat_map(|anchors| anchors.values().flatten())
+            .chain(&self.unanchored)
+    }
+
     /// GitHub's current LEFT coordinates refer to the full PR's base, not a
     /// previous review commit. Retain counts/history, but never paint these at
     /// coincidentally matching incremental-diff line numbers.
@@ -108,7 +118,9 @@ impl CommentIndex {
                 thread.root.start_line = None;
             }
         }
+        let roots = std::mem::take(&mut self.thread_roots);
         *self = index_threads(all);
+        self.thread_roots = roots;
     }
 
     /// Compatibility adapter for the existing index parity tests. Runtime

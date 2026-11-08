@@ -125,6 +125,52 @@ fn deleting_a_locally_created_root_keeps_its_created_thread_shell_for_surviving_
 }
 
 #[test]
+fn accepted_unfetched_replies_keep_thread_membership_after_root_deletion() {
+    let mut confirmed = discussion(&[11]);
+    let thread_id = confirmed.threads[0].id.clone();
+    let mut posts = posting::Posts::default();
+    begin(&mut posts, 9, false, Some(11));
+    posts.finish_create(9, &Ok(published(12, Some(11))));
+    let change = super::mutations::Change {
+        token: 10,
+        key: CommentKey::Inline(11),
+        target: github::MutationTarget::Published(github::CommentTarget::ReviewComment(
+            "node-11".into(),
+        )),
+        body: None,
+        recovery_body: "identical".into(),
+        placement: crate::ComposerPlacement::Diff,
+        uncertain: false,
+        error: None,
+    };
+    posts.changes.begin(change.clone(), Some(&confirmed), None);
+    for saved in [false, true] {
+        if saved {
+            confirmed.threads[0].comments.clear();
+            posts.changes.finish(
+                10,
+                &Ok(MutationReceipt::Deleted {
+                    target: change.target.clone(),
+                }),
+            );
+            posts.reconcile(&confirmed);
+        }
+        let view = Projection::new(Some(&confirmed), None, &posts);
+        assert_eq!(view.remote_id(CommentKey::Post(9)), Some(12));
+        let index = view.diff_index();
+        assert_eq!(index.counts["a.rs"], (1, 0));
+        assert_eq!(
+            index.thread_roots[&thread_id],
+            CommentKey::Post(9),
+            "known receipt IDs are not necessarily present in a read yet"
+        );
+        assert!(
+            matches!(view.conversation().as_slice(), [Entry::Thread(thread)] if matches!(thread.comments.as_slice(), [Comment::Posting(post)] if post.token == 9))
+        );
+    }
+}
+
+#[test]
 fn public_roots_bind_in_place_without_moving_into_a_new_review_wrapper() {
     let mut posts = posting::Posts::default();
     let mut confirmed = discussion(&[]);

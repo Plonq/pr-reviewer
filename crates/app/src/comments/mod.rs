@@ -184,7 +184,7 @@ impl<'a> Projection<'a> {
         }
     }
 
-    fn threads(&self) -> Vec<&'a ReviewThread> {
+    pub(crate) fn threads(&self) -> Vec<&'a ReviewThread> {
         let mut threads: Vec<_> = self
             .discussion
             .into_iter()
@@ -192,9 +192,11 @@ impl<'a> Projection<'a> {
             .filter(|t| !t.comments.is_empty())
             .collect();
         threads.extend(self.posts.changes.threads.values().filter(|t| {
-            !self
-                .discussion
-                .is_some_and(|d| d.threads.iter().any(|current| current.id == t.id))
+            !self.discussion.is_some_and(|d| {
+                d.threads
+                    .iter()
+                    .any(|current| current.id == t.id && !current.comments.is_empty())
+            })
         }));
         threads
     }
@@ -227,9 +229,11 @@ impl<'a> Projection<'a> {
     }
 
     fn thread(&self, thread: &'a ReviewThread) -> Thread<'a> {
-        let actual = self
-            .discussion
-            .is_some_and(|d| d.threads.iter().any(|t| t.id == thread.id));
+        let actual = self.discussion.is_some_and(|d| {
+            d.threads
+                .iter()
+                .any(|t| t.id == thread.id && !t.comments.is_empty())
+        });
         let mut comments: Vec<_> = thread
             .comments
             .iter()
@@ -400,9 +404,11 @@ impl<'a> Projection<'a> {
         for thread in self.threads() {
             let placement = self.placement(thread);
             let root = &placement.comments[0];
-            let actual = self
-                .discussion
-                .is_some_and(|d| d.threads.iter().any(|t| t.id == thread.id));
+            let actual = self.discussion.is_some_and(|d| {
+                d.threads
+                    .iter()
+                    .any(|t| t.id == thread.id && !t.comments.is_empty())
+            });
             let mut members: Vec<_> = if actual {
                 thread.comments.iter().collect()
             } else {
@@ -487,7 +493,30 @@ impl<'a> Projection<'a> {
                     }
                 }),
         );
-        index::group_comments(index::retain_thread_members(comments, &hidden))
+        let mut index = index::group_comments(index::retain_thread_members(comments, &hidden));
+        // Resolve membership while this projection still has the pending
+        // snapshot. Thin renderers must not reconstruct it from a deleted
+        // confirmed root (or guess by shared coordinates).
+        for thread in self.threads() {
+            let root = index.all_threads().find_map(|t| {
+                let belongs = self
+                    .posts
+                    .remote_id(t.root.id)
+                    .is_some_and(|id| self.belongs(thread, id))
+                    || self
+                        .posts
+                        .pending
+                        .iter()
+                        .find(|p| CommentKey::Post(p.token) == t.root.id)
+                        .and_then(|p| p.reply_to)
+                        .is_some_and(|parent| self.belongs(thread, parent));
+                belongs.then_some(t.root.id)
+            });
+            if let Some(root) = root {
+                index.thread_roots.insert(thread.id.clone(), root);
+            }
+        }
+        index
     }
 }
 

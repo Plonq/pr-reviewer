@@ -297,8 +297,8 @@ impl ReviewApp {
         } else {
             CommentSide::Right
         };
-        // A reply addresses the root identity, even for resolved/outdated
-        // threads whose file or line no longer exists in the current diff.
+        // A reply addresses a surviving remote comment, even for resolved /
+        // outdated threads whose root or current file/line no longer exists.
         let line = thread
             .and_then(|thread| thread.line.or(thread.original_line))
             .unwrap_or(0);
@@ -1098,7 +1098,9 @@ impl ReviewApp {
         let mut card = div()
             .id(SharedString::from(format!("discussion-{item_id}-{key}")))
             .debug_selector(|| match projected {
-                Comment::Pending(draft) => format!("conversation-draft-{item_id}-{}", draft.id),
+                Comment::Pending(draft) if key == format!("draft-{}", draft.id) => {
+                    format!("conversation-draft-{item_id}-{}", draft.id)
+                }
                 _ => format!("discussion-{item_id}-{key}"),
             })
             .w_full()
@@ -1109,6 +1111,11 @@ impl ReviewApp {
                     .flex()
                     .items_center()
                     .gap_2()
+                    // The final action chrome must fit from the first frame;
+                    // gaining edit/delete permission is metadata, not a resize.
+                    .when(key.starts_with("post-"), |header| {
+                        header.h(px(crate::row_height().max(24.))).min_w_0()
+                    })
                     .text_color(theme::subtext(cx))
                     .text_size(px(text_size() - 1.))
                     .child(
