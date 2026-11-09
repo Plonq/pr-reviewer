@@ -109,6 +109,10 @@ pub(crate) enum Row {
         text: Arc<crate::diff_media::CommentText>,
         slot: usize,
     },
+    /// Breathing room before a reply header, inside the thread's outline.
+    CommentSpacer {
+        half: Option<CommentSide>,
+    },
     /// Published reaction controls below this comment's Markdown body.
     CommentReactions {
         comment_id: crate::comments::CommentKey,
@@ -138,6 +142,7 @@ pub(crate) fn is_comment_row(row: &Row) -> bool {
         Row::CommentHeader { .. }
             | Row::CommentBody { .. }
             | Row::CommentReactions { .. }
+            | Row::CommentSpacer { .. }
             | Row::CommentEditor { .. }
             | Row::CommentActions { .. }
     )
@@ -265,6 +270,9 @@ fn push_thread_rows(
             .chain(&thread.replies)
             .enumerate()
         {
+            if ix > 0 {
+                rows.push(Row::CommentSpacer { half });
+            }
             rows.push(Row::CommentHeader {
                 comment_id: comment.id,
                 author: comment.author.clone().into(),
@@ -1457,7 +1465,7 @@ fn render_row_content(
                 cx,
             )
         }
-        Row::CommentBody { half, .. } => {
+        Row::CommentBody { half, .. } | Row::CommentSpacer { half } => {
             comment_row(div().into_any_element(), *half, false, body_edge, cx)
         }
         Row::CommentReactions { comment_id, half } => comment_row(
@@ -1848,7 +1856,7 @@ mod tests {
     use syntax::Token;
 
     #[test]
-    fn pending_threads_close_on_their_last_body_without_extra_rows() {
+    fn pending_threads_close_on_their_last_body_without_footer_rows() {
         let mut comments = vec![
             rc(1, "a.rs", Some("RIGHT"), Some(2), "root", "you", "", None),
             rc(
@@ -1879,17 +1887,18 @@ mod tests {
                 mode,
                 COMMENT_WRAP_CHARS,
             );
-            assert_eq!(rows.len(), 6, "no spacer or reply-action rows");
+            assert_eq!(rows.len(), 7, "one reply spacer, but no reply-action rows");
+            assert!(matches!(rows[2], Row::CommentSpacer { .. }));
             assert!(
                 matches!(comment_body_edge(rows.get(2)), CardEdge::Middle),
                 "the root body stays joined to its reply"
             );
             assert!(
-                matches!(comment_body_edge(rows.get(4)), CardEdge::Bottom),
+                matches!(comment_body_edge(rows.get(5)), CardEdge::Bottom),
                 "the reply body closes before the next thread"
             );
             assert!(
-                matches!(comment_body_edge(rows.get(6)), CardEdge::Bottom),
+                matches!(comment_body_edge(rows.get(7)), CardEdge::Bottom),
                 "a single pending comment closes at EOF"
             );
             assert!(matches!(
@@ -2700,7 +2709,7 @@ mod tests {
         // old2, add new1 (new_no 2) + RIGHT thread, …
         let names: Vec<&str> = rows.iter().map(row_name).collect();
         assert_eq!(
-            &names[..12],
+            &names[..13],
             &[
                 "FileHeader",
                 "Line",          // ctx 1/1
@@ -2712,11 +2721,12 @@ mod tests {
                 "Line",          // add new1 (new 2)
                 "CommentHeader", // alice
                 "CommentBody",
+                "CommentSpacer",
                 "CommentHeader", // bob's reply
                 "CommentBody",
             ]
         );
-        assert_eq!(names[12], "CommentActions");
+        assert_eq!(names[13], "CommentActions");
         // The LEFT thread is carol's; the reply flag follows position.
         match &rows[3] {
             Row::CommentHeader {
@@ -2727,7 +2737,7 @@ mod tests {
             }
             other => panic!("expected comment header, got {}", row_name(other)),
         }
-        match &rows[10] {
+        match &rows[11] {
             Row::CommentHeader {
                 author, is_reply, ..
             } => {
@@ -2737,7 +2747,7 @@ mod tests {
             other => panic!("expected reply header, got {}", row_name(other)),
         }
         // Actions row targets the thread root and carries the anchor.
-        match &rows[12] {
+        match &rows[13] {
             Row::CommentActions {
                 root_id,
                 path,
@@ -2791,7 +2801,7 @@ mod tests {
         // thread directly beneath it.
         let names: Vec<&str> = rows.iter().map(row_name).collect();
         assert_eq!(
-            &names[1..10],
+            &names[1..11],
             &[
                 "SplitLine",     // ctx
                 "SplitLine",     // old1 | new1
@@ -2800,12 +2810,13 @@ mod tests {
                 "CommentActions",
                 "CommentHeader", // alice (RIGHT)
                 "CommentBody",
+                "CommentSpacer",
                 "CommentHeader", // bob reply
                 "CommentBody",
             ]
         );
-        assert_eq!(names[10], "CommentActions");
-        assert_eq!(names[11], "SplitLine"); // old2 | new2
+        assert_eq!(names[11], "CommentActions");
+        assert_eq!(names[12], "SplitLine"); // old2 | new2
     }
 
     /// The half a comment row renders in, or None for a full-width card.
@@ -2813,6 +2824,7 @@ mod tests {
         match row {
             Row::CommentHeader { half, .. }
             | Row::CommentBody { half, .. }
+            | Row::CommentSpacer { half }
             | Row::CommentActions { half, .. } => Some(*half),
             _ => None,
         }
@@ -2832,9 +2844,9 @@ mod tests {
                 comment_wrap: COMMENT_WRAP_CHARS,
             },
         });
-        // rows[3..6] are carol's LEFT thread, rows[6..11] the RIGHT one; each
-        // row of a thread carries the side it was anchored to.
-        let halves: Vec<Option<Option<CommentSide>>> = rows[3..11].iter().map(row_half).collect();
+        // rows[3..6] are carol's LEFT thread, rows[6..12] the RIGHT one; each
+        // row of a thread (including the spacer) carries its anchor side.
+        let halves: Vec<Option<Option<CommentSide>>> = rows[3..12].iter().map(row_half).collect();
         assert_eq!(
             halves,
             vec![
@@ -2843,6 +2855,7 @@ mod tests {
                 Some(Some(CommentSide::Left)),  // actions
                 Some(Some(CommentSide::Right)), // alice header
                 Some(Some(CommentSide::Right)), // body
+                Some(Some(CommentSide::Right)), // reply spacer
                 Some(Some(CommentSide::Right)), // bob reply header
                 Some(Some(CommentSide::Right)), // body
                 Some(Some(CommentSide::Right)), // actions

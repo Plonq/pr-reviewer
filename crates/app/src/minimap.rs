@@ -90,6 +90,7 @@ pub(crate) fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
             Row::CommentHeader { half, .. }
             | Row::CommentEditor { half, .. }
             | Row::CommentReactions { half, .. }
+            | Row::CommentSpacer { half }
             | Row::CommentBody { half, .. }
             | Row::CommentActions { half, .. } => MinimapRow {
                 kind: MinimapKind::Comment {

@@ -336,14 +336,15 @@ mod tests {
             rows: vec![
                 body(1, 0, Some(crate::CommentSide::Left)),
                 body(1, 1, Some(crate::CommentSide::Left)),
+                Row::CommentSpacer { half: Some(crate::CommentSide::Left) },
                 body(3, 0, Some(crate::CommentSide::Right)),
                 Row::Binary,
             ],
-            file_rows: vec![0, 3],
-            hunk_rows: vec![3],
+            file_rows: vec![0, 4],
+            hunk_rows: vec![4],
         };
         reserve_reaction_rows(&mut built, Some(&discussion), &Default::default());
-        assert_eq!(built.rows.len(), 6);
+        assert_eq!(built.rows.len(), 7);
         assert!(matches!(
             built.rows[2],
             Row::CommentReactions {
@@ -352,15 +353,19 @@ mod tests {
             }
         ));
         assert!(matches!(
-            built.rows[4],
+            built.rows[3],
+            Row::CommentSpacer { half: Some(crate::CommentSide::Left) }
+        ), "spacing belongs after the reactions, not between body and reactions");
+        assert!(matches!(
+            built.rows[5],
             Row::CommentReactions {
                 comment_id: crate::comments::CommentKey::Inline(3),
                 half: Some(crate::CommentSide::Right)
             }
         ));
-        assert!(matches!(built.rows[5], Row::Binary));
-        assert_eq!(built.file_rows, [0, 5]);
-        assert_eq!(built.hunk_rows, [5]);
+        assert!(matches!(built.rows[6], Row::Binary));
+        assert_eq!(built.file_rows, [0, 6]);
+        assert_eq!(built.hunk_rows, [6]);
 
         // No empty footer on read-only comments without reactions, or editors.
         let mut discussion = discussion;

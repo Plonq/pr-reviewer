@@ -7161,6 +7161,7 @@ impl ReviewApp {
                                                                 Row::CommentBody { .. }
                                                                     | Row::CommentHeader { .. }
                                                                     | Row::CommentEditor { .. }
+                                                                    | Row::CommentSpacer { .. }
                                                                     | Row::CommentReactions { .. }
                                                             ))
                                                             && !data
@@ -16262,7 +16263,7 @@ mod tests {
             "a reply affordance never anchors"
         );
         // old2|new2 still anchors beneath the threads.
-        assert_eq!(cursor_anchor(&rows, 11), Some((CommentSide::Right, 3)));
+        assert_eq!(cursor_anchor(&rows, 12), Some((CommentSide::Right, 3)));
 
         // Unified rows: the side is irrelevant, the kind decides — removed
         // lines anchor LEFT, everything else RIGHT.
@@ -16718,6 +16719,7 @@ mod tests {
                 }
                 let root_header = vcx.debug_bounds("inline-avatar-11").unwrap();
                 let root_body = vcx.debug_bounds("inline-text-0-11-0-card").unwrap();
+                let mut previous_body = root_body;
                 for (header_selector, body_selector) in [
                     ("inline-avatar-12", "inline-text-0-12-0-card"),
                     ("inline-avatar-13", "inline-text-0-13-0-card"),
@@ -16729,6 +16731,11 @@ mod tests {
                         px(threads::REPLY_INDENT)
                     );
                     assert_eq!(body.left() - root_body.left(), px(threads::REPLY_INDENT));
+                    assert!(
+                        header.top() >= previous_body.bottom() + px(row_height()),
+                        "each reply has breathing room after the preceding comment"
+                    );
+                    previous_body = body;
                     assert!(body.size.width <= root_body.size.width);
                     if mode == ViewMode::Split {
                         assert!(body.right() <= root_body.right());
