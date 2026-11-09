@@ -114,10 +114,12 @@ pub(crate) enum Row {
         comment_id: crate::comments::CommentKey,
         half: Option<CommentSide>,
     },
-    /// Space for the root-level editor: replacing a comment body when editing,
-    /// or extending the thread beneath its footer when replying.
+    /// Space for the root-level editor: a new card below source, a replacement
+    /// comment body, or an extension beneath a thread's footer.
     CommentEditor {
         half: Option<CommentSide>,
+        /// New comments start their own card; edits/replies continue one.
+        top: bool,
     },
     /// The "↳ reply" affordance closing a thread; clicking opens the
     /// composer targeting `post_reply` on the thread's root comment.
@@ -1149,7 +1151,8 @@ enum CardEdge {
 /// final body, editor or reaction row instead, without adding layout space.
 fn comment_body_edge(next_row: Option<&Row>) -> CardEdge {
     if next_row.is_none_or(|row| {
-        !is_comment_row(row) || matches!(row, Row::CommentHeader { top: true, .. })
+        !is_comment_row(row)
+            || matches!(row, Row::CommentHeader { top: true, .. } | Row::CommentEditor { top: true, .. })
     }) {
         CardEdge::Bottom
     } else {
@@ -1470,8 +1473,13 @@ fn render_row_content(
             body_edge,
             cx,
         ),
-        Row::CommentEditor { half } => {
-            comment_row(div().into_any_element(), *half, false, body_edge, cx)
+        Row::CommentEditor { half, top } => {
+            let edge = match (*top, body_edge) {
+                (true, CardEdge::Bottom) => CardEdge::Single,
+                (true, _) => CardEdge::Top,
+                (false, edge) => edge,
+            };
+            comment_row(div().into_any_element(), *half, false, edge, cx)
         }
         Row::CommentActions {
             root_id,
@@ -1889,7 +1897,7 @@ mod tests {
                 CardEdge::Bottom
             ));
             assert!(matches!(
-                comment_body_edge(Some(&Row::CommentEditor { half: None })),
+                comment_body_edge(Some(&Row::CommentEditor { half: None, top: false })),
                 CardEdge::Middle
             ));
             assert!(matches!(

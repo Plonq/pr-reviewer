@@ -85,9 +85,10 @@ pub(crate) fn reserve_editor_rows(
             *ix = *ix - (end - start) + count;
         }
     }
-    built
-        .rows
-        .splice(start..end, (0..count).map(|_| Row::CommentEditor { half }));
+    built.rows.splice(
+        start..end,
+        (0..count).map(|_| Row::CommentEditor { half, top: false }),
+    );
 }
 
 /// Keep a reply inside its thread, reserving space below the current actions
@@ -117,7 +118,37 @@ pub(crate) fn reserve_reply_rows(
     }
     built.rows.splice(
         start..start,
-        (0..count).map(|_| Row::CommentEditor { half }),
+        (0..count).map(|_| Row::CommentEditor { half, top: false }),
+    );
+}
+
+/// Reserve a new card immediately below its last visual source row. Resolve
+/// by line identity each time: stored display indices go stale after wrapping,
+/// comment measurement, folding, or a view-mode change.
+pub(crate) fn reserve_new_comment_rows(
+    built: &mut BuiltRows,
+    side: CommentSide,
+    line: u64,
+    half: Option<CommentSide>,
+    count: usize,
+) {
+    let Some(anchor) = built
+        .rows
+        .iter()
+        .rposition(|row| crate::rows::comment_line(row, side) == Some(line))
+    else {
+        return;
+    };
+    let start = anchor + 1;
+    let count = count.max(1);
+    for ix in built.file_rows.iter_mut().chain(&mut built.hunk_rows) {
+        if *ix >= start {
+            *ix += count;
+        }
+    }
+    built.rows.splice(
+        start..start,
+        (0..count).map(|ix| Row::CommentEditor { half, top: ix == 0 }),
     );
 }
 

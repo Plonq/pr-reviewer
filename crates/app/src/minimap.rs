@@ -88,7 +88,7 @@ pub(crate) fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
                 }
             }
             Row::CommentHeader { half, .. }
-            | Row::CommentEditor { half }
+            | Row::CommentEditor { half, .. }
             | Row::CommentReactions { half, .. }
             | Row::CommentBody { half, .. }
             | Row::CommentActions { half, .. } => MinimapRow {
@@ -439,12 +439,14 @@ mod tests {
             // Also cover in-place editors and collapsed headers, which can
             // occupy just one row and still need a visible marker.
             rows.extend([
-                Row::CommentEditor { half: None },
+                Row::CommentEditor { half: None, top: true },
                 Row::CommentEditor {
                     half: Some(CommentSide::Left),
+                    top: true,
                 },
                 Row::CommentEditor {
                     half: Some(CommentSide::Right),
+                    top: true,
                 },
                 Row::CommentHeader {
                     comment_id: crate::comments::CommentKey::Inline(99),
@@ -465,7 +467,7 @@ mod tests {
                     Row::CommentHeader { half, .. }
                     | Row::CommentBody { half, .. }
                     | Row::CommentActions { half, .. }
-                    | Row::CommentEditor { half } => half,
+                    | Row::CommentEditor { half, .. } => half,
                     _ => continue,
                 };
                 let lane = match half {

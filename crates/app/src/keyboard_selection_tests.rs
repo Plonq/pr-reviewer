@@ -215,6 +215,7 @@ fn keyboard_ranges_skip_comment_rows_and_keep_the_clicked_split_side(
         2,
         Row::CommentEditor {
             half: Some(CommentSide::Left),
+            top: false,
         },
     );
     data.cursor = 1;

@@ -678,6 +678,8 @@ pub(crate) struct ItemData {
     comments_visible: bool,
     editing_comments: HashMap<u64, Rc<Cell<Pixels>>>,
     replying_comments: HashMap<u64, Rc<Cell<Pixels>>>,
+    /// New diff drafts, keyed by file so reservations survive navigation.
+    new_comments: HashMap<String, NewCommentEditor>,
     /// Columns used for initial comment-height estimates, derived from the
     /// measured pane width (see `comment_wrap_cols`). Changing it re-wraps the
     /// estimates, which changes the row count, so render rebuilds the rows when
@@ -783,6 +785,7 @@ impl ItemData {
             comments_visible: true,
             editing_comments: HashMap::new(),
             replying_comments: HashMap::new(),
+            new_comments: HashMap::new(),
             comment_wrap: COMMENT_WRAP_CHARS,
             comment_text_layouts: HashMap::new(),
             preferences: Default::default(),
@@ -879,6 +882,20 @@ impl ItemData {
                     (f32::from(height.get()) / row_height()).ceil() as usize,
                 );
             }
+        }
+        if let Some(editor) = self
+            .diff
+            .files
+            .get(self.file_ix)
+            .and_then(|file| self.new_comments.get(file.display_path()))
+        {
+            comment_actions::reserve_new_comment_rows(
+                &mut built_rows,
+                editor.side,
+                editor.line,
+                (self.mode == ViewMode::Split).then_some(editor.side),
+                (f32::from(editor.height.get()) / row_height()).ceil() as usize,
+            );
         }
         let BuiltRows {
             rows,
@@ -1103,8 +1120,21 @@ impl ItemData {
             |rows: &[Row]| rows.iter().filter(|row| !is_comment_row(row)).count();
         let top_base = count_noncomment(&self.rows[..top_row]);
         let cursor_base = count_noncomment(&self.rows[..self.cursor.min(self.rows.len())]);
+        // Composer reservations are comment rows too. Keep a source selection
+        // intact when those rows appear or grow; display indices may shift.
+        let selection = self
+            .selection
+            .filter(|selection| {
+                [selection.anchor.row, selection.head.row]
+                    .into_iter()
+                    .all(|ix| self.rows.get(ix).is_some_and(|row| !is_comment_row(row)))
+            })
+            .map(|mut selection| {
+                selection.anchor.row = count_noncomment(&self.rows[..selection.anchor.row]);
+                selection.head.row = count_noncomment(&self.rows[..selection.head.row]);
+                selection
+            });
         self.set_rows(self.row_build());
-        self.selection = None;
         self.cursor = nth_noncomment_row(&self.rows, cursor_base);
         let new_top = top_text
             .and_then(|(text, slot)| {
@@ -1137,6 +1167,12 @@ impl ItemData {
             self.restore_review_position(position, true);
             self.cursor = nth_noncomment_row(&self.rows, cursor_base);
         }
+        // Position restoration clears selection too, so restore it last.
+        self.selection = selection.map(|mut selection| {
+            selection.anchor.row = nth_noncomment_row(&self.rows, selection.anchor.row);
+            selection.head.row = nth_noncomment_row(&self.rows, selection.head.row);
+            selection
+        });
     }
 
     /// The minimap quad runs for this pane height and blank tail, from the
@@ -1790,6 +1826,12 @@ enum ComposerPlacement {
     PendingTray(u64),
 }
 
+struct NewCommentEditor {
+    side: CommentSide,
+    line: u64,
+    height: Rc<Cell<Pixels>>,
+}
+
 /// A comment/reply draft. Diff composers belong to a specific item and file;
 /// switching files keeps their editor, uploads, and submission state intact.
 struct Composer {
@@ -1808,13 +1850,12 @@ struct Composer {
     pending: bool,
     edit_id: Option<u64>,
     edit_target: Option<CommentTarget>,
-    /// Initial display anchor for new comments. Edits and replies resolve their
-    /// current header/footer by identity on every render, never by this index.
+    /// Initial display anchor, retained for submission context. Rendering
+    /// resolves source lines or comment identities against the current rows.
     row_ix: usize,
     input: gpui::Entity<gpui::component::input::EditorState>,
     uploads: Option<gpui::Entity<comment_media::Uploads>>,
-    /// Measured composer height: reserved inside threads for edits/replies,
-    /// or below the diff's last row for a standalone new comment.
+    /// Measured composer height, reserved in the diff at its source/thread anchor.
     height: Rc<Cell<gpui::Pixels>>,
     /// Reveal a composer once, after its card is laid out.
     reveal: Rc<Cell<bool>>,
@@ -2102,20 +2143,6 @@ pub(crate) struct ReviewApp {
     /// Last normal size, cached during resize and saved on quit/close.
     window_size: Option<gpui::Size<Pixels>>,
     _subscriptions: Vec<Subscription>,
-}
-
-/// The comment composer card's x, window-absolute: in split view the card
-/// sits under the half its anchor is on (a right-side card starts at the
-/// right half's edge), otherwise near the pane's left — and always clamped
-/// so the 520px card fits inside the pane.
-fn composer_x(pane_left: f32, pane_width: f32, mode: ViewMode, side: CommentSide) -> f32 {
-    let half = (pane_width - SPLIT_DIVIDER) / 2.;
-    let x = match (mode, side) {
-        (ViewMode::Split, CommentSide::Right) => pane_left + half + SPLIT_DIVIDER,
-        _ => pane_left + 72.,
-    };
-    let pane_right = pane_left + pane_width;
-    x.min((pane_right - 528.).max(8.))
 }
 
 impl ReviewApp {
@@ -3539,6 +3566,9 @@ impl ReviewApp {
         } else {
             None
         };
+        // Reserve under the range's endpoint from the outset, not its first
+        // line (which is used above only to validate the selected side).
+        let line = range.as_ref().map_or(line, |anchor| anchor.line);
         self.open_composer(None, path, anchor_side, line, row_ix, window, cx);
         if let (Some(composer), Some(anchor)) = (self.composer_mut(), range) {
             composer.line = anchor.line;
@@ -4256,6 +4286,12 @@ impl ReviewApp {
             }
             self.ensure_mentions(item_id, loc, cx);
         }
+        // Match the empty inline card before it can paint: p_3 top/bottom
+        // (1.5rem), the gap_2 (0.5rem), and h_6 action buttons (1.5rem).
+        // Include the same 8px breathing room as the measured reservation.
+        let initial_height = comment_editor::minimum_height(cx)
+            + window.rem_size() * 3.5
+            + px(8.);
         self.composers.push(Composer {
             id: self.composer_gen,
             item_id,
@@ -4273,18 +4309,22 @@ impl ReviewApp {
             row_ix,
             input,
             uploads,
-            height: Rc::new(Cell::new(px(250.))),
+            height: Rc::new(Cell::new(initial_height)),
             reveal: Rc::new(Cell::new(true)),
             error: None,
             in_flight: false,
         });
         if placement == ComposerPlacement::Diff {
-            if let Some(id) = reply_to {
-                let height = self.composer().unwrap().height.clone();
-                if let Some(data) = self.active_data_mut() {
+            let composer = self.composer().unwrap();
+            let height = composer.height.clone();
+            let path = composer.path.clone();
+            if let Some(data) = self.active_data_mut() {
+                if let Some(id) = reply_to {
                     data.replying_comments.insert(id, height);
-                    data.rebuild_rows_anchored();
+                } else {
+                    data.new_comments.insert(path, NewCommentEditor { side, line, height });
                 }
+                data.rebuild_rows_anchored();
             }
         }
         cx.notify();
@@ -4388,7 +4428,11 @@ impl ReviewApp {
                         .reply_to
                         .and_then(|id| data.replying_comments.remove(&id))
                         .is_some();
-                if edited || replied {
+                let created = composer.placement == ComposerPlacement::Diff
+                    && composer.edit_id.is_none()
+                    && composer.reply_to.is_none()
+                    && data.new_comments.remove(&composer.path).is_some();
+                if edited || replied || created {
                     data.rebuild_rows_anchored();
                 }
             }
@@ -5007,8 +5051,8 @@ impl ReviewApp {
     }
 
     /// Diff composers live at root level so plain letters stay text rather
-    /// than triggering ReviewApp actions. New comments float below their
-    /// selection; edits/replies fill reserved rows inside their thread card.
+    /// than triggering ReviewApp actions. Every composer fills reserved rows
+    /// in a comment card, below its source selection or inside its thread.
     /// Reveal by scrolling, never by covering the selected source lines.
     fn render_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let empty = || div().into_any_element();
@@ -5053,20 +5097,19 @@ impl ReviewApp {
             };
             ix
         } else {
-            composer.row_ix
+            let Some(ix) = data
+                .rows
+                .iter()
+                .rposition(|row| rows::comment_line(row, composer.side) == Some(composer.line))
+            else {
+                return empty();
+            };
+            ix
         };
         let row_y = row_ix as f32 * row_height() + f32::from(offset.y);
-        let y = f32::from(bounds.top()) + (row_y + row_height()).max(8.);
-        let x = composer_x(
-            f32::from(bounds.left()),
-            f32::from(bounds.size.width),
-            data.mode,
-            composer.side,
-        );
         let scroll = data.scroll.clone();
         let entity = cx.entity();
         let item_id = composer.item_id;
-        let embedded = composer.edit_id.is_some() || composer.reply_to.is_some();
         let half_width = (bounds.size.width - px(SPLIT_DIVIDER)) / 2.;
         let inline_left = px(72.)
             + if data.mode == ViewMode::Split && composer.side == CommentSide::Right {
@@ -5080,30 +5123,17 @@ impl ReviewApp {
             .absolute()
             // Stay inside the thread's existing outline, including at the
             // bottom where the reserved rows draw its rounded cap.
-            .left(if embedded {
-                inline_left + px(2.)
+            .left(inline_left + px(2.))
+            .top(px(row_y + row_height()))
+            .w((if data.mode == ViewMode::Split {
+                half_width
             } else {
-                px(x)
-            })
-            .top(if embedded {
-                px(row_y + row_height())
-            } else {
-                px(y)
-            })
-            .w(if embedded {
-                (if data.mode == ViewMode::Split {
-                    half_width
-                } else {
-                    bounds.size.width
-                } - px(75.))
-                .max(px(1.))
-            } else {
-                px(520.)
-            })
+                bounds.size.width
+            } - px(75.))
+            .max(px(1.)))
             // Keep clicks/hover off the diff underneath, but let wheel events
             // reach its scroller when the composer's input cannot scroll.
             .block_mouse_except_scroll()
-            .when(!embedded, |card| card.shadow_lg())
             .on_children_prepainted(move |bounds, window, cx| {
                 let Some(card) = bounds.first() else {
                     return;
@@ -5122,14 +5152,14 @@ impl ReviewApp {
                 let delta = row_bottom.clamp(px(row_height()), latest_top) - row_bottom;
                 offset.y += delta;
                 if height_changed || delta != px(0.) {
-                    // The next layout reserves the measured tail space, so even
+                    // The next layout reserves the measured card height, so even
                     // a comment on the file's final line has room to scroll.
                     window.defer(cx, move |window, _| {
                         handle.set_offset(offset);
                         window.refresh();
                     });
                 }
-                if embedded && height_changed {
+                if height_changed {
                     let entity = entity.clone();
                     window.defer(cx, move |_, cx| {
                         entity.update(cx, |app, cx| {
@@ -5146,36 +5176,29 @@ impl ReviewApp {
                     });
                 }
             })
-            .child(if embedded {
+            .child(
                 div()
                     // Reserved list rows already paint the card background;
                     // repainting its translucent tint would make a dark panel.
                     .p_3()
-                    .child(self.render_composer_content(cx))
-                    .into_any_element()
-            } else {
-                self.render_composer_card(cx)
-            })
+                    .child(self.render_composer_content(cx)),
+            )
             .into_any_element();
-        if embedded {
-            // Match the list's clipping: the composer scrolls with its thread,
-            // never over the title bar, tray, or neighboring split pane.
-            div()
-                .absolute()
-                .left(bounds.left())
-                .top(bounds.top())
-                .w(bounds.size.width)
-                .h(bounds.size.height)
-                .overflow_hidden()
-                .child(card)
-                .into_any_element()
-        } else {
-            card
-        }
+        // Match the list's clipping: the composer scrolls with its card,
+        // never over the title bar, tray, or neighboring split pane.
+        div()
+            .absolute()
+            .left(bounds.left())
+            .top(bounds.top())
+            .w(bounds.size.width)
+            .h(bounds.size.height)
+            .overflow_hidden()
+            .child(card)
+            .into_any_element()
     }
 
-    /// Standalone shell only. Inline edits/replies use their existing comment
-    /// card; all editor features and actions live in render_composer_content.
+    /// Standalone shell for the pending tray. Diff and conversation composers
+    /// use ordinary comment cards; all editor features live in render_composer_content.
     fn render_composer_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let composer = self.composer().expect("an open composer");
         let pending = self.composer_uses_pending_review(composer);
@@ -6894,22 +6917,10 @@ impl ReviewApp {
         }
         footer
     }
-    /// Blank list slots shared by the diff's scroll range and minimap. Keep
-    /// composer space in addition to the half-viewport scroll-past-end area.
+    /// Blank list slots shared by the diff's scroll range and minimap.
+    /// Composers reserve their own rows at their anchors, not in this tail.
     fn diff_tail_rows(&self, pane_height: f32) -> usize {
-        let composer_rows = self
-            .composer()
-            .filter(|composer| {
-                self.active_item()
-                    .is_some_and(|item| item.id == composer.item_id)
-                    && composer.placement == ComposerPlacement::Diff
-                    && composer.edit_id.is_none()
-                    && composer.reply_to.is_none()
-            })
-            .map_or(0, |composer| {
-                (f32::from(composer.height.get()) / row_height()).ceil() as usize
-            });
-        diff_padding_rows(pane_height, row_height()) + composer_rows
+        diff_padding_rows(pane_height, row_height())
     }
 
     /// The pane for an open item — loading, failure message, the
@@ -16270,37 +16281,6 @@ mod tests {
         assert_eq!(cursor_anchor(&rows, 7), Some((CommentSide::Right, 2)));
     }
 
-    /// The composer card sits under the half its anchor is on in split view
-    /// (regression: it always used to sit on the left), stays left in
-    /// unified view, and clamps inside panes too narrow for the 520px card.
-    #[test]
-    fn composer_x_follows_the_anchored_half_in_split_view() {
-        let (left, width) = (100., 1200.);
-        // Split: a right-side card starts at the right half's edge; a
-        // left-side one stays near the pane's left.
-        let half = (width - SPLIT_DIVIDER) / 2.;
-        assert_eq!(
-            composer_x(left, width, ViewMode::Split, CommentSide::Right),
-            left + half + SPLIT_DIVIDER
-        );
-        assert_eq!(
-            composer_x(left, width, ViewMode::Split, CommentSide::Left),
-            left + 72.
-        );
-        // Unified is a single column: the card is always on the left.
-        assert_eq!(
-            composer_x(left, width, ViewMode::Unified, CommentSide::Right),
-            left + 72.
-        );
-        // A pane too narrow to hold the card: both sides clamp the same way
-        // so the card never starts past the pane's right edge.
-        assert_eq!(
-            composer_x(0., 480., ViewMode::Split, CommentSide::Right),
-            8.
-        );
-        assert_eq!(composer_x(0., 480., ViewMode::Split, CommentSide::Left), 8.);
-    }
-
     fn commenting_item(fake: &FakePr) -> ReviewItem {
         let comments = fake.comments.lock().unwrap().clone();
         let mut item = loop_pr_item(comments.clone());
@@ -17242,6 +17222,16 @@ mod tests {
             let _ = window.draw(cx);
         });
         let card = vcx.debug_bounds("composer-card").expect("open composer");
+        assert!(
+            vcx.debug_bounds("composer-shell").is_none(),
+            "conversation uses ordinary comment styling"
+        );
+        if !reply {
+            let shell = vcx
+                .debug_bounds("conversation-new-comment")
+                .expect("standard conversation card");
+            assert!(shell.top() <= card.top() && shell.bottom() >= card.bottom());
+        }
         let viewport = scroll.bounds();
         assert!(
             card.top() >= viewport.top(),
@@ -20312,7 +20302,7 @@ mod tests {
                 vcx.run_until_parked();
                 vcx.dispatch_action(NewComment);
                 vcx.run_until_parked();
-                let initial_height = vcx.debug_bounds("composer-shell").unwrap().size.height;
+                let initial_height = vcx.debug_bounds("composer-card").unwrap().size.height;
                 if anchor == eof {
                     // Growing the card must reserve more space and reveal it
                     // again, including when there are no source rows below it.
@@ -20324,7 +20314,7 @@ mod tests {
                     });
                     vcx.run_until_parked();
                 }
-                let card = vcx.debug_bounds("composer-shell").unwrap();
+                let card = vcx.debug_bounds("composer-card").unwrap();
                 if anchor.max(head) <= 3 {
                     let (highlight, code, opposite) = match side {
                         SelSide::Unified => ("comment-range-Unified-2", "diff-code-2", None),
@@ -20387,7 +20377,15 @@ mod tests {
                         let line_bottom = scroll.base_handle.bounds().top()
                             + scroll.base_handle.offset().y
                             + px((last + 1) as f32 * row_height());
-                        assert_eq!(card.top(), line_bottom, "the card must not cover the range");
+                        assert_eq!(
+                            card.top(),
+                            line_bottom + px(12.),
+                            "the editor sits inside the reserved card below the range"
+                        );
+                        assert!(matches!(
+                            data.rows[last + 1],
+                            Row::CommentEditor { top: true, .. }
+                        ));
                         assert!(
                             card.bottom() <= scroll.base_handle.bounds().bottom(),
                             "scroll the diff to leave room for the entire card"

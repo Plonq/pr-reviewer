@@ -368,7 +368,7 @@ mod tests {
             comment.reactions.clear();
         }
         let mut built = BuiltRows {
-            rows: vec![body(1, 0, None), Row::CommentEditor { half: None }],
+            rows: vec![body(1, 0, None), Row::CommentEditor { half: None, top: false }],
             file_rows: vec![0],
             hunk_rows: vec![],
         };
