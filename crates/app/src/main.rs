@@ -643,7 +643,7 @@ pub(crate) struct ItemData {
     conv_scroll: ScrollHandle,
     /// Parsed conversation bodies survive pane/tab unmounts, so their full
     /// height is available before the scroller clamps its retained offset.
-    conv_markdown: RefCell<HashMap<String, gpui::Entity<gpui::component::text::TextViewState>>>,
+    conv_markdown: RefCell<HashMap<String, conversation::PersistentMarkdown>>,
     discussion: Option<github::PrDiscussion>,
     posts: comments::posting::Posts,
     commits: Option<github::PrCommits>,
@@ -7306,11 +7306,8 @@ impl ReviewApp {
                 theme::overlay0(cx),
             );
         };
-        // The pipe runs on every paint; bodies are small, the output is
-        // what the retained TextView state diffs against (same text → no
-        // re-parse). A refreshed description updates that state on render.
-        let body = conversation::preprocess(&meta.body, &loc.repo_slug());
-        let content = if body.trim().is_empty() {
+        // The retained Markdown state preprocesses only changed bodies.
+        let content = if meta.body.trim().is_empty() {
             // GitHub's own empty state, verbatim.
             div()
                 .text_color(theme::overlay0(cx))
@@ -7319,7 +7316,8 @@ impl ReviewApp {
         } else {
             conversation::render_markdown(
                 &format!("conversation-{}", item.id),
-                body,
+                &meta.body,
+                &loc.repo_slug(),
                 self,
                 window,
                 cx,
@@ -7379,10 +7377,8 @@ impl ReviewApp {
                                             ))
                                             .child(conversation::render_markdown(
                                                 &format!("conversation-summary-{}", item.id),
-                                                conversation::preprocess(
-                                                    &review.body,
-                                                    &loc.repo_slug(),
-                                                ),
+                                                &review.body,
+                                                &loc.repo_slug(),
                                                 self,
                                                 window,
                                                 cx,
