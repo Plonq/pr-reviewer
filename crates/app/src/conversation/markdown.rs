@@ -1,6 +1,7 @@
-//! Stock Markdown prose/selection, with narrowly scoped media extension hooks.
-//! GitHub's image-only paste/drop HTML uses the same activation path; general
-//! HTML and reference-style images retain stock Kit behaviour.
+//! Stock GFM prose/selection with GitHub PR line breaks and media hooks.
+//! GitHub's image-only paste/drop HTML and reference-style Markdown images
+//! use the same activation path; general HTML retains stock Kit behaviour.
+mod breaks;
 mod github_image;
 mod mermaid;
 mod video;
@@ -20,6 +21,7 @@ use std::{
 };
 
 pub(super) use crate::comments::has_content;
+pub(super) use breaks::hard_breaks;
 
 #[derive(Clone)]
 struct ImagePlugin {
@@ -28,7 +30,7 @@ struct ImagePlugin {
     host: SharedString,
     // Parse only on Kit's parser thread, once per document, to recover the
     // parent link without claiming/replacing a mixed text-and-image link.
-    links: Arc<OnceLock<HashMap<usize, SharedString>>>,
+    images: Arc<OnceLock<ImageContext>>,
 }
 
 #[derive(Clone)]
@@ -45,25 +47,39 @@ struct CaptionedImage {
     targets: Vec<ImageTarget>,
 }
 
-fn image_nodes(node: &Node, links: &HashMap<usize, SharedString>) -> Option<Vec<EmbeddedImage>> {
+#[derive(Default)]
+struct ImageContext {
+    links: HashMap<usize, SharedString>,
+    definitions: HashMap<String, String>,
+}
+
+fn image_nodes(node: &Node, images: &ImageContext) -> Option<Vec<EmbeddedImage>> {
     let offset = node.position()?.start.offset;
-    match node {
-        Node::Image(image) => {
-            // Never turn document-provided paths into filesystem access.
-            if !image.url.starts_with("https://") && !image.url.starts_with("http://") {
-                return None;
-            }
-            Some(vec![EmbeddedImage {
-                offset,
-                target: ImageTarget {
-                    url: image.url.clone().into(),
-                    alt: image.alt.clone().into(),
-                    link: links.get(&offset).cloned(),
-                },
-                width: None,
-                height: None,
-            }])
+    let image = match node {
+        Node::Image(image) => Some((&image.url, &image.alt)),
+        Node::ImageReference(image) => {
+            Some((images.definitions.get(&image.identifier)?, &image.alt))
         }
+        _ => None,
+    };
+    if let Some((url, alt)) = image {
+        // Never turn document-provided paths into filesystem access, including
+        // URLs resolved through a reference definition.
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return None;
+        }
+        return Some(vec![EmbeddedImage {
+            offset,
+            target: ImageTarget {
+                url: url.clone().into(),
+                alt: alt.clone().into(),
+                link: images.links.get(&offset).cloned(),
+            },
+            width: None,
+            height: None,
+        }]);
+    }
+    match node {
         Node::Html(html) => Some(
             github_image::parse(&html.value)?
                 .into_iter()
@@ -74,7 +90,7 @@ fn image_nodes(node: &Node, links: &HashMap<usize, SharedString>) -> Option<Vec<
                         target: ImageTarget {
                             url: image.url.into(),
                             alt: image.alt.into(),
-                            link: links.get(&offset).cloned(),
+                            link: images.links.get(&offset).cloned(),
                         },
                         width: image.width,
                         height: image.height,
@@ -86,10 +102,12 @@ fn image_nodes(node: &Node, links: &HashMap<usize, SharedString>) -> Option<Vec<
     }
 }
 
-fn image_links(source: &str) -> HashMap<usize, SharedString> {
+fn image_context(source: &str) -> ImageContext {
     fn definitions(node: &Node, defs: &mut HashMap<String, String>) {
         if let Node::Definition(def) = node {
-            defs.insert(def.identifier.clone(), def.url.clone());
+            // CommonMark resolves duplicate definitions to the first one.
+            defs.entry(def.identifier.clone())
+                .or_insert_with(|| def.url.clone());
         }
         if let Some(children) = node.children() {
             for child in children {
@@ -108,8 +126,8 @@ fn image_links(source: &str) -> HashMap<usize, SharedString> {
             Node::LinkReference(link) => defs.get(&link.identifier).map(String::as_str),
             _ => inherited,
         };
-        if let (Node::Image(image), Some(link)) = (node, link) {
-            if let Some(pos) = &image.position {
+        if matches!(node, Node::Image(_) | Node::ImageReference(_)) {
+            if let (Some(pos), Some(link)) = (node.position(), link) {
                 links.insert(pos.start.offset, link.to_owned().into());
             }
         }
@@ -126,16 +144,15 @@ fn image_links(source: &str) -> HashMap<usize, SharedString> {
             }
         }
     }
-    let mut links = HashMap::new();
+    let mut images = ImageContext::default();
     let mut options = markdown::ParseOptions::gfm();
     options.constructs.math_text = true;
     options.constructs.math_flow = true;
     if let Ok(root) = markdown::to_mdast(source, &options) {
-        let mut defs = HashMap::new();
-        definitions(&root, &mut defs);
-        visit(&root, None, &defs, &mut links);
+        definitions(&root, &mut images.definitions);
+        visit(&root, None, &images.definitions, &mut images.links);
     }
-    links
+    images
 }
 
 impl ImagePlugin {
@@ -227,7 +244,7 @@ impl MarkdownPlugin for ImagePlugin {
             }
         }
         fn contains_image(node: &Node) -> bool {
-            matches!(node, Node::Image(_))
+            matches!(node, Node::Image(_) | Node::ImageReference(_))
                 || matches!(node, Node::Html(html) if github_image::parse(&html.value).is_some())
                 || node
                     .children()
@@ -237,10 +254,10 @@ impl MarkdownPlugin for ImagePlugin {
         match node {
             Node::Paragraph(_) if self.block && contains_image(node) => {}
             Node::Html(_) if self.block && contains_image(node) => {}
-            Node::Image(_) | Node::Html(_) if !self.block => {}
+            Node::Image(_) | Node::ImageReference(_) | Node::Html(_) if !self.block => {}
             _ => return None,
         }
-        let links = self.links.get_or_init(|| image_links(cx.source()));
+        let context = self.images.get_or_init(|| image_context(cx.source()));
         let images = if self.block && matches!(node, Node::Paragraph(_)) {
             let Node::Paragraph(paragraph) = node else {
                 unreachable!()
@@ -249,34 +266,34 @@ impl MarkdownPlugin for ImagePlugin {
             // Anything with text stays in Kit's normal paragraph/inline flow.
             fn collect(
                 node: &Node,
-                links: &HashMap<usize, SharedString>,
+                images: &ImageContext,
                 out: &mut Vec<EmbeddedImage>,
             ) -> Option<()> {
                 match node {
                     Node::Link(link) => {
                         for child in &link.children {
-                            collect(child, links, out)?;
+                            collect(child, images, out)?;
                         }
                     }
                     Node::LinkReference(link) => {
                         for child in &link.children {
-                            collect(child, links, out)?;
+                            collect(child, images, out)?;
                         }
                     }
-                    _ => out.extend(image_nodes(node, links)?),
+                    _ => out.extend(image_nodes(node, images)?),
                 }
                 Some(())
             }
             let mut images = Vec::new();
             for child in &paragraph.children {
-                collect(child, links, &mut images)?;
+                collect(child, context, &mut images)?;
             }
             if images.is_empty() {
                 return None;
             }
             images
         } else {
-            image_nodes(node, links)?
+            image_nodes(node, context)?
         };
         if !self.block && images.len() != 1 {
             return None;
@@ -390,27 +407,48 @@ pub(crate) fn render(
     )
 }
 
+pub(crate) struct PersistentMarkdown {
+    source: String,
+    repo_slug: String,
+    pub(crate) state: gpui::Entity<TextViewState>,
+}
+
 /// Conversation documents outlive their mounted elements. Otherwise returning
 /// from Changes reparses long bodies asynchronously, temporarily shortens the
 /// timeline, and irreversibly clamps the pane's retained scroll offset.
 pub(crate) fn render_persistent(
     id: &str,
-    source: String,
+    source: &str,
+    repo_slug: &str,
     app: &ReviewApp,
     _: &mut Window,
     cx: &mut Context<ReviewApp>,
 ) -> gpui::AnyElement {
-    let state = app
+    let mut documents = app
         .active_data()
         .expect("a ready conversation")
         .conv_markdown
-        .borrow_mut()
-        .entry(id.to_owned())
-        .or_insert_with(|| cx.new(|cx| TextViewState::markdown(&source, cx)))
-        .clone();
-    // Edits and refreshes still replace the source; unchanged bodies keep both
-    // their parsed document and layout when their element is mounted again.
-    state.update(cx, |state, cx| state.set_text(&source, cx));
+        .borrow_mut();
+    let document = documents.entry(id.to_owned()).or_insert_with(|| {
+        let prepared = super::preprocess(source, repo_slug);
+        PersistentMarkdown {
+            source: source.to_owned(),
+            repo_slug: repo_slug.to_owned(),
+            state: cx.new(|cx| TextViewState::markdown(&prepared, cx)),
+        }
+    });
+    // Preprocessing now includes an AST pass for GitHub's hard breaks. Only
+    // repeat it after an edit/refresh, not on every frame of a long timeline.
+    if document.source != source || document.repo_slug != repo_slug {
+        let prepared = super::preprocess(source, repo_slug);
+        document
+            .state
+            .update(cx, |state, cx| state.set_text(&prepared, cx));
+        document.source = source.to_owned();
+        document.repo_slug = repo_slug.to_owned();
+    }
+    let state = document.state.clone();
+    drop(documents);
     render_view(id, TextView::new(&state), app, cx)
 }
 
@@ -424,7 +462,7 @@ fn render_view(
         block: true,
         owner: cx.entity().downgrade(),
         host: id.to_owned().into(),
-        links: Arc::new(OnceLock::new()),
+        images: Arc::new(OnceLock::new()),
     };
     let video = video::VideoPlugin {
         block: true,
@@ -450,7 +488,7 @@ fn render_view(
             block: false,
             ..plugin
         })
-        .parser_revision(3);
+        .parser_revision(4);
     div()
         .w_full()
         .min_w_0()
@@ -493,9 +531,67 @@ mod tests {
     }
 
     #[test]
+    fn reference_images_resolve_full_collapsed_shortcut_and_parent_links() {
+        let source = "[![full][asset]][dest]\n\nBefore ![asset][] and ![asset] after.\n\n[asset]: https://example.com/first \"Title\"\n[ASSET]: https://example.com/ignored\n[dest]: https://example.com/full";
+        let context = image_context(source);
+        let root = ::markdown::to_mdast(source, &::markdown::ParseOptions::gfm()).unwrap();
+        fn references<'a>(node: &'a Node, out: &mut Vec<&'a Node>) {
+            if matches!(node, Node::ImageReference(_)) {
+                out.push(node);
+            }
+            if let Some(children) = node.children() {
+                for child in children {
+                    references(child, out);
+                }
+            }
+        }
+        let mut nodes = Vec::new();
+        references(&root, &mut nodes);
+        assert_eq!(nodes.len(), 3);
+        for (index, node) in nodes.into_iter().enumerate() {
+            let images = image_nodes(node, &context).unwrap();
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].target.url.as_ref(), "https://example.com/first");
+            assert_eq!(
+                images[0].target.alt.as_ref(),
+                if index == 0 { "full" } else { "asset" }
+            );
+            assert_eq!(
+                images[0].target.link.as_deref(),
+                (index == 0).then_some("https://example.com/full")
+            );
+        }
+    }
+
+    #[test]
+    fn reference_images_never_resolve_to_local_or_script_resources() {
+        for url in [
+            "file:///etc/passwd",
+            "/tmp/image.png",
+            "javascript:alert(1)",
+            "data:image/png;base64,abc",
+        ] {
+            let source = format!("![image][ref]\n\n[ref]: {url}");
+            let context = image_context(&source);
+            let Node::Root(root) =
+                ::markdown::to_mdast(&source, &::markdown::ParseOptions::gfm()).unwrap()
+            else {
+                panic!()
+            };
+            let Node::Paragraph(paragraph) = &root.children[0] else {
+                panic!()
+            };
+            assert!(
+                image_nodes(&paragraph.children[0], &context).is_none(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
     fn image_parent_links_do_not_claim_surrounding_text_or_code() {
         let source = "[before ![a](https://github.com/a) after](https://example.com/one)\n\n[![b](https://github.com/b)][dest]\n\n[dest]: https://example.com/two\n\n`![code](https://github.com/code)`\n\n<img src='https://github.com/html'>";
-        let links = image_links(source);
+        let links = image_context(source).links;
         assert_eq!(links.len(), 2);
         assert_eq!(
             links[&source.find("![a]").unwrap()].as_ref(),

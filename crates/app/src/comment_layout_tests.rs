@@ -435,7 +435,7 @@ fn metadata_acknowledgement_preserves_painted_cards_followers_and_viewports(
                                 .conv_markdown
                                 .borrow()
                                 .get(&format!("discussion-0-post-{token}"))
-                                .map(|state| state.entity_id());
+                                .map(|document| document.state.entity_id());
                             (
                                 data.rows.len(),
                                 data.scroll.0.borrow().base_handle.offset(),
@@ -574,7 +574,7 @@ fn metadata_acknowledgement_preserves_painted_cards_followers_and_viewports(
                                 data.conv_markdown
                                     .borrow()
                                     .get(&format!("discussion-0-post-{token}"))
-                                    .map(|state| state.entity_id()),
+                                    .map(|document| document.state.entity_id()),
                                 before_state.4,
                                 "Markdown/media owner: {case}"
                             );
@@ -751,7 +751,7 @@ fn metadata_acknowledgement_keeps_partially_visible_markdown_and_loaded_media_an
                         data.conv_markdown
                             .borrow()
                             .get("discussion-0-post-1")
-                            .map(|s| s.entity_id()),
+                            .map(|document| document.state.entity_id()),
                     )
                 });
                 assert!(fake.posts().is_empty());
@@ -800,7 +800,7 @@ fn metadata_acknowledgement_keeps_partially_visible_markdown_and_loaded_media_an
                         data.conv_markdown
                             .borrow()
                             .get("discussion-0-post-1")
-                            .map(|s| s.entity_id()),
+                            .map(|document| document.state.entity_id()),
                         state.3
                     );
                     assert!(data.posts.pending.is_empty());

@@ -17,12 +17,13 @@
 //! text, so a pathological description can still be rewritten a little too
 //! eagerly. Task 12 reuses this pipe for comment bodies, where the same
 //! tradeoff holds. Jira keys are then linked in parsed Markdown prose only,
-//! leaving code and existing links untouched.
+//! leaving code and existing links untouched. Finally, paragraph soft breaks
+//! become hard breaks to match GitHub's PR/comment rendering (not `.md` files).
 
 mod jira;
 mod markdown;
 pub(crate) use markdown::render as render_transient_markdown;
-pub(crate) use markdown::render_persistent as render_markdown;
+pub(crate) use markdown::{render_persistent as render_markdown, PersistentMarkdown};
 
 /// Expand GitHub-isms and Jira references in a description or comment body
 /// into plain GFM:
@@ -31,7 +32,8 @@ pub(crate) use markdown::render_persistent as render_markdown;
 /// - `@login` → a link to the GitHub profile,
 /// - `#123` → a link to the issue in `repo_slug` (GitHub redirects pulls
 ///   and issues to the same place; `issues/` is the canonical spelling),
-/// - `PYAPI-123`, `BOT-123`, `CS-123`, `HELP-123` → Jira ticket links.
+/// - `PYAPI-123`, `BOT-123`, `CS-123`, `HELP-123` → Jira ticket links,
+/// - single newlines in paragraph prose → hard line breaks.
 ///
 /// Code is never rewritten: fenced blocks pass through whole, and inline
 /// code spans are skipped within a line.
@@ -66,7 +68,7 @@ pub fn preprocess(body: &str, repo_slug: &str) -> String {
     // split('\n') on a trailing-newline body ends with an empty line, so
     // `foo\n` round-trips; a body without one (`foo`) gains a harmless
     // trailing newline that markdown ignores.
-    jira::link_references(out)
+    markdown::hard_breaks(jira::link_references(out))
 }
 
 use crate::comments::Comment;
@@ -1163,7 +1165,8 @@ impl ReviewApp {
         if markdown::has_content(body) {
             card = card.child(render_markdown(
                 &markdown_id,
-                preprocess(body, slug),
+                body,
+                slug,
                 self,
                 window,
                 cx,
@@ -1874,8 +1877,8 @@ pub(crate) mod tests {
     #[test]
     fn empty_and_crlf_bodies() {
         assert_eq!(preprocess("", "a/b"), "\n");
-        assert_eq!(preprocess("a\r\nb", "a/b"), "a\nb\n");
-        // A CR mid-line (not a line ending) survives as the character it is.
-        assert_eq!(preprocess("a\rb", "a/b"), "a\rb\n");
+        assert_eq!(preprocess("a\r\nb", "a/b"), "a\\\nb\n");
+        // CommonMark also recognizes a lone CR as a line ending.
+        assert_eq!(preprocess("a\rb", "a/b"), "a\\\rb\n");
     }
 }
