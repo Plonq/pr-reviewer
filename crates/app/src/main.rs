@@ -36,6 +36,7 @@ mod upgrade;
 mod video;
 mod video_player;
 mod viewed;
+mod window_size;
 
 #[cfg(test)]
 mod test_util;
@@ -521,12 +522,12 @@ fn main() {
             })
             .detach();
 
-            let bounds = Bounds::centered(None, size(px(1280.), px(860.)), cx);
             // The local store opens before the window: the queue paints
             // from it before anything else happens, so the store's own
             // cost (a few milliseconds for a SQLite open) is on the cold
             // start's critical path.
             let (store, store_error) = local_store::LocalStore::open_default();
+            let bounds = window_size::initial_bounds(&store, cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -2078,6 +2079,8 @@ pub(crate) struct ReviewApp {
     /// Bumped on every background poll; an older poll stops when it sees
     /// a newer generation, so there is never more than one running.
     poll_gen: u64,
+    /// Last normal size, cached during resize and saved on quit/close.
+    window_size: Option<gpui::Size<Pixels>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -2115,11 +2118,18 @@ impl ReviewApp {
             cx.on_app_quit(|this, cx| {
                 this.video_hub.update(cx, |hub, cx| hub.release(cx));
                 this.persist_positions();
+                window_size::persist(&this.store, this.window_size);
                 async {}
             }),
             cx.on_release(|this, cx| {
                 this.video_hub.update(cx, |hub, cx| hub.release(cx));
                 this.persist_positions();
+                window_size::persist(&this.store, this.window_size);
+            }),
+            cx.observe_window_bounds(window, |this, window, _| {
+                if let Some(size) = window_size::normal_size(window) {
+                    this.window_size = Some(size);
+                }
             }),
             // The window's key status: the app refreshes when it comes
             // back to the front, and the background poll only runs while
@@ -2194,6 +2204,7 @@ impl ReviewApp {
             store_error,
             frontmost: true,
             poll_gen: 0,
+            window_size: window_size::normal_size(window),
             _subscriptions,
         };
         for source in sources {
@@ -8669,6 +8680,32 @@ mod tests {
 
         let (_, restored) = queue_window_with_store(cx, Arc::new(FakePr::default()), store);
         cx.update(|cx| assert_eq!(restored.read(cx).sidebar_width, f32::from(width)));
+    }
+
+    #[gpui::test]
+    fn window_size_is_cached_on_resize_and_saved_on_close(cx: &mut gpui::TestAppContext) {
+        let store = local_store::LocalStore::in_memory();
+        let (window, app) = queue_window_with_store(cx, Arc::new(FakePr::default()), store.clone());
+        let expected = size(px(1130.), px(780.));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(expected);
+        vcx.run_until_parked();
+        vcx.update(|_, cx| assert_eq!(app.read(cx).window_size, Some(expected)));
+        assert_eq!(
+            store.setting("window_size"),
+            None,
+            "resizing does not write to disk"
+        );
+        vcx.update(|window, _| window.remove_window());
+        drop(vcx);
+        drop(app);
+        cx.update(|_| {});
+        cx.run_until_parked();
+        assert_eq!(
+            store.setting("window_size"),
+            Some(serde_json::json!({ "width": 1130., "height": 780. }))
+        );
+        cx.update(|cx| assert_eq!(window_size::initial_bounds(&store, cx).size, expected));
     }
 
     #[test]
