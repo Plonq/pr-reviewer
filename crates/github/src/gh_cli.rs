@@ -1309,9 +1309,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             ),
         ])?;
         let Some(review) = latest_review(pages, &viewer.login)? else {
-            return Ok(crate::ReviewChanges::Unavailable(
-                "Submit a GitHub review to use Changed since last review.".into(),
-            ));
+            return Ok(crate::ReviewChanges::NotReviewed);
         };
         if review.commit == head {
             return Ok(crate::ReviewChanges::Available(review));
@@ -3150,14 +3148,11 @@ mod tests {
                 ok(Some(0), r#"{"login":"me","avatar_url":""}"#, ""),
                 ok(Some(0), &reviews, ""),
             ]));
-            assert_eq!(
-                client
-                    .review_changes(&loc, &sha)
-                    .unwrap()
-                    .baseline()
-                    .is_some(),
-                reviewed
-            );
+            let changes = client.review_changes(&loc, &sha).unwrap();
+            assert_eq!(changes.baseline().is_some(), reviewed);
+            if !reviewed {
+                assert_eq!(changes, crate::ReviewChanges::NotReviewed);
+            }
             assert_eq!(
                 client
                     .comparison_patch(&loc, &sha, &sha, &sha)
