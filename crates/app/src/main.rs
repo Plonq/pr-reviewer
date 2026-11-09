@@ -267,12 +267,17 @@ actions!(
     ]
 );
 
-fn file_navigation_keybindings() -> [KeyBinding; 4] {
+fn file_navigation_keybindings() -> [KeyBinding; 2] {
     [
         KeyBinding::new("]", NextFile, Some("ReviewApp")),
         KeyBinding::new("[", PrevFile, Some("ReviewApp")),
-        KeyBinding::new("shift-n", NextFile, Some("ReviewApp")),
-        KeyBinding::new("shift-p", PrevFile, Some("ReviewApp")),
+    ]
+}
+
+fn hunk_navigation_keybindings() -> [KeyBinding; 2] {
+    [
+        KeyBinding::new("n", NextHunk, Some("ReviewApp")),
+        KeyBinding::new("shift-n", PrevHunk, Some("ReviewApp")),
     ]
 }
 
@@ -445,11 +450,10 @@ fn main() {
             cx.bind_keys(file_history::keybindings());
             cx.bind_keys(tree::keybindings());
             cx.bind_keys(file_navigation_keybindings());
+            cx.bind_keys(hunk_navigation_keybindings());
             cx.bind_keys(comment_composer_keybindings());
             cx.bind_keys(selection::keybindings());
             cx.bind_keys([
-                KeyBinding::new("n", NextHunk, Some("ReviewApp")),
-                KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
                 // Sideways through long lines in either diff mode. Inputs
@@ -3207,7 +3211,7 @@ impl ReviewApp {
         cx.notify();
     }
 
-    /// `n`/`p`: step to the next/previous hunk, wrapping past the ends —
+    /// `n`/`Shift+N`: step to the next/previous hunk, wrapping past the ends —
     /// into the next/previous file that has hunks, switching the display.
     fn step_hunk(&mut self, delta: i32, cx: &mut Context<Self>) {
         let nav = self.active_data().and_then(|data| data.step_hunk(delta));
@@ -6877,8 +6881,8 @@ impl ReviewApp {
                 .child(hint(&["cmd-o"], "open"));
         } else {
             footer = footer
-                .child(hint(&["shift-n", "shift-p"], "files"))
-                .child(hint(&["n", "p"], "hunks"))
+                .child(hint(&["]", "["], "files"))
+                .child(hint(&["n", "shift-n"], "hunks"))
                 // The conversation pane is one keystroke off the changes.
                 .child(hint(&["shift-cmd-left"], "conversation"))
                 .child(hint(&["u"], "queue"))
@@ -7011,7 +7015,7 @@ impl ReviewApp {
                                         })
                                     };
                                     // A plain click also moves the keyboard cursor:
-                                    // `C` and `n`/`p` follow the line the reviewer
+                                    // `C` and `n`/`Shift+N` follow the line the reviewer
                                     // last touched, mouse or keyboard alike.
                                     if let Some(data) = this.active_data_mut() {
                                         let previous = (data.cursor, data.cursor_side);
@@ -10813,9 +10817,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn shifted_hunk_keys_navigate_files_without_stealing_input(cx: &mut gpui::TestAppContext) {
+    fn navigation_keys_keep_files_on_brackets_without_stealing_input(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
-        cx.update(|cx| cx.bind_keys(file_navigation_keybindings()));
+        cx.update(|cx| {
+            cx.bind_keys(file_navigation_keybindings());
+            cx.bind_keys(hunk_navigation_keybindings());
+        });
         let mut item = loop_pr_item(Vec::new());
         item.state = ItemState::Ready(file_mode_data(two_file_diff()));
         install_item(&app, item, cx);
@@ -10825,14 +10834,23 @@ mod tests {
             let focus = app.read(cx).focus_handle.clone();
             window.focus(&focus, cx);
         });
-        for keys in [
-            "shift-n", "shift-n", "shift-p", "shift-p", "]", "]", "[", "[",
-        ] {
+        for keys in ["]", "]", "[", "["] {
             let before = cx.update(|cx| app.read(cx).active_data().unwrap().file_ix);
             vcx.simulate_keystrokes(keys);
             vcx.update(|window, cx| {
                 let _ = window.draw(cx);
                 assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1 - before);
+            });
+        }
+        for keys in ["shift-p", "p"] {
+            let before = vcx.update(|_, cx| {
+                let data = app.read(cx).active_data().unwrap();
+                (data.file_ix, data.cursor)
+            });
+            vcx.simulate_keystrokes(keys);
+            vcx.update(|_, cx| {
+                let data = app.read(cx).active_data().unwrap();
+                assert_eq!((data.file_ix, data.cursor), before);
             });
         }
         vcx.update(|window, cx| {
@@ -10854,11 +10872,8 @@ mod tests {
     ) {
         let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
         cx.update(|cx| {
-            cx.bind_keys([
-                KeyBinding::new("n", NextHunk, Some("ReviewApp")),
-                KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
-                KeyBinding::new("v", ToggleView, Some("ReviewApp")),
-            ]);
+            cx.bind_keys(hunk_navigation_keybindings());
+            cx.bind_keys([KeyBinding::new("v", ToggleView, Some("ReviewApp"))]);
         });
         let context = |range: std::ops::RangeInclusive<u32>| {
             range.map(|n| format!(" line {n}\n")).collect::<String>()
@@ -10880,7 +10895,7 @@ mod tests {
             window.focus(&focus, cx);
         });
         // Exercise both directions, after both next- and previous-hunk jumps.
-        for (navigation, hunk) in [("n", 1), ("p p", 0)] {
+        for (navigation, hunk) in [("n", 1), ("shift-n shift-n", 0)] {
             vcx.simulate_keystrokes(navigation);
             let bounds = vcx.update(|window, cx| {
                 let _ = window.draw(cx);
