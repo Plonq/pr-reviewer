@@ -39,7 +39,7 @@ The app is not notarised. If macOS blocks it, allow it in **System Settings → 
 
 1. Open Gander to see your pending review requests.
 2. Select a PR to read its conversation. Switch to **Changes** or click a file on the left to review the code.
-3. Use **`Shift+P` / `Shift+N`** to move between files and **`N` / `P`** between hunks. Select a line or range and press **Shift+C** to comment.
+3. Use **`[` / `]`** to move between files, **`n`** for the next hunk, and **`Shift+N`** for the previous hunk. Select a line or range and press **Shift+C** to comment.
 4. Add comments to a pending review, then choose **Finish review** to approve, request changes, or submit a comment-only review.
 
 **⌘O** opens a PR by URL or identifier, or a local repository by path. **`U`** returns to the queue without closing your open reviews.

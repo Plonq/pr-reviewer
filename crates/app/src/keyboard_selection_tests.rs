@@ -3,12 +3,11 @@
 fn bind_line_selection_keys(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
         cx.bind_keys(selection::keybindings());
+        cx.bind_keys(hunk_navigation_keybindings());
         cx.bind_keys([
             KeyBinding::new("shift-c", NewComment, Some("ReviewApp")),
             KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
             KeyBinding::new("cmd-c", CopySelection, Some("ReviewApp")),
-            KeyBinding::new("n", NextHunk, Some("ReviewApp")),
-            KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
         ]);
     });
 }
@@ -45,9 +44,9 @@ fn hunk_navigation_selects_and_comments_ranges_in_both_modes(cx: &mut gpui::Test
             ("n", 0, 1, CommentSide::Right, None, 10),
             ("n", 1, 0, CommentSide::Left, Some(1), 2),
             ("n", 0, 0, CommentSide::Right, Some(2), 3),
-            ("p", 1, 0, CommentSide::Left, Some(1), 2),
-            ("p", 0, 1, CommentSide::Right, None, 10),
-            ("p", 0, 0, CommentSide::Right, Some(2), 3),
+            ("shift-n", 1, 0, CommentSide::Left, Some(1), 2),
+            ("shift-n", 0, 1, CommentSide::Right, None, 10),
+            ("shift-n", 0, 0, CommentSide::Right, Some(2), 3),
         ] {
             vcx.simulate_keystrokes(key);
             vcx.update(|_, cx| {
