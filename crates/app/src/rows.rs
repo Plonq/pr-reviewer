@@ -114,7 +114,8 @@ pub(crate) enum Row {
         comment_id: crate::comments::CommentKey,
         half: Option<CommentSide>,
     },
-    /// Space for the root-level editor, replacing this comment's body in place.
+    /// Space for the root-level editor: replacing a comment body when editing,
+    /// or extending the thread beneath its footer when replying.
     CommentEditor {
         half: Option<CommentSide>,
     },
@@ -1482,46 +1483,74 @@ fn render_row_content(
             let (root_id, side, line) = (*root_id, *side, *line);
             let path = path.clone();
             let entity = entity.clone();
-            comment_row(
-                Button::new(SharedString::from(format!("reply-{root_id}")))
-                    .ghost()
-                    .xsmall()
-                    .h(row_height)
-                    .label("↳ reply")
-                    .disabled(
-                        entity
-                            .read(cx)
-                            .active_comment_projection()
-                            .and_then(|p| p.remote_id(root_id))
-                            .is_none()
-                            || entity
-                                .read(cx)
-                                .active_item()
-                                .is_some_and(|i| entity.read(cx).comment_write_blocked(i.id)),
-                    )
-                    .on_click(move |_, window, cx| {
-                        entity.update(cx, |this, cx| {
-                            let Some(remote_id) = this
-                                .active_comment_projection()
-                                .and_then(|p| p.remote_id(root_id))
-                            else {
-                                return;
-                            };
-                            this.open_composer(
-                                Some(remote_id),
-                                path.to_string(),
-                                side,
-                                line,
-                                ix,
-                                window,
-                                cx,
-                            );
-                        });
+            let app = entity.read(cx);
+            let replying = app
+                .active_comment_projection()
+                .and_then(|p| p.remote_id(root_id))
+                .is_some_and(|id| {
+                    app.composer().is_some_and(|c| {
+                        c.placement == crate::ComposerPlacement::Diff && c.reply_to == Some(id)
                     })
-                    .into_any_element(),
+                });
+            let editing = app.composer().is_some_and(|c| c.edit_id.is_some());
+            comment_row(
+                if replying {
+                    div()
+                        .text_color(theme::overlay0(cx))
+                        .child("Reply")
+                        .into_any_element()
+                } else {
+                    div()
+                        .debug_selector(|| format!("inline-reply-{root_id}"))
+                        .child(
+                            Button::new(SharedString::from(format!("reply-{root_id}")))
+                                .ghost()
+                                .xsmall()
+                                .h(row_height)
+                                .label("↳ reply")
+                                .when(editing, |button| {
+                                    button.tooltip("Save or cancel your edit first")
+                                })
+                                .disabled(
+                                    editing
+                                        || entity
+                                            .read(cx)
+                                            .active_comment_projection()
+                                            .and_then(|p| p.remote_id(root_id))
+                                            .is_none()
+                                        || entity.read(cx).active_item().is_some_and(|i| {
+                                            entity.read(cx).comment_write_blocked(i.id)
+                                        }),
+                                )
+                                .on_click(move |_, window, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        let Some(remote_id) = this
+                                            .active_comment_projection()
+                                            .and_then(|p| p.remote_id(root_id))
+                                        else {
+                                            return;
+                                        };
+                                        this.open_composer(
+                                            Some(remote_id),
+                                            path.to_string(),
+                                            side,
+                                            line,
+                                            ix,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        )
+                        .into_any_element()
+                },
                 *half,
                 false,
-                CardEdge::Bottom,
+                if replying {
+                    CardEdge::Middle
+                } else {
+                    CardEdge::Bottom
+                },
                 cx,
             )
         }
