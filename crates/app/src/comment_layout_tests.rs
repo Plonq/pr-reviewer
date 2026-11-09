@@ -95,6 +95,244 @@ fn layout_fake() -> Arc<FakePr> {
 }
 
 #[gpui::test]
+fn edits_share_composer_content_keep_authorship_and_cannot_be_replaced(
+    cx: &mut gpui::TestAppContext,
+) {
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        for conversation in [false, true] {
+            for reply in [false, true] {
+                let fake = layout_fake();
+                fake.comments.lock().unwrap().push(rc(
+                    12,
+                    "a.rs",
+                    Some("RIGHT"),
+                    Some(1),
+                    "A reply",
+                    "bob",
+                    "2026-01-01T00:01:00Z",
+                    Some(11),
+                ));
+                for id in [11, 12] {
+                    fake.comment_permissions
+                        .lock()
+                        .unwrap()
+                        .insert(id, permitted_comment(&format!("node-{id}"), true, true));
+                }
+                let (window, app) = queue_window(cx, fake.clone());
+                install_item(&app, layout_item(&fake, mode, conversation), cx);
+                let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+                let id = if reply { 12 } else { 11 };
+                let target = CommentTarget::Published(github::CommentTarget::ReviewComment(
+                    format!("node-{id}"),
+                ));
+                let token = vcx.update(|window, cx| {
+                    app.update(cx, |app, cx| {
+                        let placement = if conversation {
+                            ComposerPlacement::ConversationComment(target.key())
+                        } else {
+                            ComposerPlacement::Diff
+                        };
+                        app.edit_comment(target, placement, window, cx);
+                        let composer = app.composer().unwrap();
+                        let input = composer.input.read(cx);
+                        let end = input.text().len();
+                        assert_eq!(
+                            input.selected_range(),
+                            end..end,
+                            "editing starts ready to append"
+                        );
+                        composer
+                            .input
+                            .update(cx, |input, cx| input.set_value("unsaved edit", window, cx));
+                        composer.id
+                    })
+                });
+                paint(&mut vcx);
+                assert!(vcx.debug_bounds("composer-card").is_some());
+                assert!(vcx.debug_bounds("comment-editing").is_some());
+                assert!(
+                    vcx.debug_bounds("composer-shell").is_none(),
+                    "no nested standalone panel"
+                );
+                assert!(vcx
+                    .debug_bounds(if reply {
+                        "comment-edit-review-comment-node-12"
+                    } else {
+                        "comment-edit-review-comment-node-11"
+                    })
+                    .is_none());
+                let avatar = match (conversation, reply) {
+                    (true, true) => "discussion-avatar-0-review-false-12",
+                    (true, false) => "discussion-avatar-0-review-false-11",
+                    (false, true) => "inline-avatar-12",
+                    (false, false) => "inline-avatar-11",
+                };
+                assert!(
+                    vcx.debug_bounds(avatar).is_some(),
+                    "editing retains the author"
+                );
+                if !conversation && reply {
+                    assert!(
+                        vcx.debug_bounds("inline-reply-11").is_none(),
+                        "editor replaces the footer"
+                    );
+                }
+                // The other thread's Reply control must not cancel this edit.
+                if !conversation {
+                    if let Some(bounds) = vcx.debug_bounds("inline-reply-22") {
+                        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+                    }
+                }
+                vcx.update(|window, cx| {
+                    app.update(cx, |app, cx| {
+                        app.open_composer(
+                            Some(22),
+                            "a.rs".into(),
+                            CommentSide::Right,
+                            2,
+                            999,
+                            window,
+                            cx,
+                        );
+                        app.open_comment_composer(
+                            ComposerPlacement::ConversationMain,
+                            None,
+                            String::new(),
+                            CommentSide::Right,
+                            0,
+                            0,
+                            window,
+                            cx,
+                        );
+                        app.open_composer_on_selection(window, cx);
+                        assert_eq!(app.composer().unwrap().id, token);
+                        assert_eq!(
+                            app.composer().unwrap().input.read(cx).value(),
+                            "unsaved edit"
+                        );
+                    })
+                });
+                vcx.simulate_keystrokes("escape");
+                paint(&mut vcx);
+                cx.update(|cx| {
+                    let app = app.read(cx);
+                    assert!(app.composer().is_none());
+                    assert!(app.active_data().unwrap().editing_comments.is_empty());
+                    assert!(app.active_data().unwrap().replying_comments.is_empty());
+                });
+                assert!(vcx.debug_bounds("composer-card").is_none());
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn diff_reply_is_attached_to_the_current_thread_after_row_rebuilds(cx: &mut gpui::TestAppContext) {
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        let fake = layout_fake();
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, layout_item(&fake, mode, false), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                // A stale display index is deliberately not the thread's footer.
+                app.open_composer(
+                    Some(11),
+                    "a.rs".into(),
+                    CommentSide::Right,
+                    1,
+                    999,
+                    window,
+                    cx,
+                );
+            })
+        });
+        paint(&mut vcx);
+        let old_anchor = cx.update(|cx| {
+            app.read(cx)
+                .active_data()
+                .unwrap()
+                .rows
+                .iter()
+                .position(|row| {
+                    matches!(
+                        row,
+                        Row::CommentActions {
+                            root_id: CommentKey::Inline(11),
+                            ..
+                        }
+                    )
+                })
+                .unwrap()
+        });
+        vcx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                let data = app.active_data_mut().unwrap();
+                data.discussion
+                    .as_mut()
+                    .unwrap()
+                    .threads
+                    .iter_mut()
+                    .find(|t| t.id == "11")
+                    .unwrap()
+                    .comments[0]
+                    .body = "More context\n".repeat(12);
+                data.comment_text_layouts.clear();
+                data.project_comments(None);
+                data.rebuild_rows_anchored();
+                cx.notify();
+            })
+        });
+        paint(&mut vcx);
+        let content = vcx
+            .debug_bounds("composer-card")
+            .expect("the attached composer is visible");
+        let following = vcx
+            .debug_bounds("inline-avatar-22")
+            .expect("the next thread stays visible");
+        assert!(
+            content.bottom() < following.top(),
+            "reply reserves space instead of covering the next card"
+        );
+        assert!(vcx.debug_bounds("composer-shell").is_none());
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let data = app.active_data().unwrap();
+                let anchor = data
+                    .rows
+                    .iter()
+                    .position(|row| {
+                        matches!(
+                            row,
+                            Row::CommentActions {
+                                root_id: CommentKey::Inline(11),
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap();
+                assert_ne!(anchor, old_anchor);
+                let state = data.scroll.0.borrow();
+                let expected_top = state.base_handle.bounds().top()
+                    + state.base_handle.offset().y
+                    + px((anchor + 1) as f32 * row_height());
+                assert!((f32::from(content.top() - expected_top) - 12.).abs() < 2.);
+                drop(state);
+                assert!(matches!(data.rows[anchor + 1], Row::CommentEditor { .. }));
+                app.close_composer(window, cx);
+                assert!(app.active_data().unwrap().replying_comments.is_empty());
+                assert!(!app
+                    .active_data()
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .any(|r| matches!(r, Row::CommentEditor { .. })));
+            })
+        });
+    }
+}
+
+#[gpui::test]
 fn metadata_acknowledgement_preserves_painted_cards_followers_and_viewports(
     cx: &mut gpui::TestAppContext,
 ) {

@@ -245,7 +245,18 @@ impl ReviewApp {
                 }
             }
         }
-        if let Some(target) = self.diff_comment_target(key) {
+        if self
+            .composer()
+            .is_some_and(|c| c.placement == crate::ComposerPlacement::Diff && c.edit_id == Some(id))
+        {
+            controls = controls.child(
+                div()
+                    .debug_selector(|| "comment-editing".into())
+                    .text_color(crate::theme::overlay0(cx))
+                    .text_size(gpui::px(11.))
+                    .child("Editing"),
+            );
+        } else if let Some(target) = self.diff_comment_target(key) {
             controls = controls.child(self.comment_controls(
                 target,
                 crate::ComposerPlacement::Diff,

@@ -286,7 +286,11 @@ impl ReviewApp {
                         window.refresh();
                     });
                 })
-                .child(self.render_composer_card(cx))
+                .child(if thread.is_some() {
+                    self.render_composer_content(cx)
+                } else {
+                    self.render_composer_card(cx)
+                })
                 .into_any_element();
         }
         let reply_to =
@@ -317,6 +321,10 @@ impl ReviewApp {
                     "Leave a comment"
                 })
                 .small()
+                .when(
+                    self.composer().is_some_and(|c| c.edit_id.is_some()),
+                    |button| button.tooltip("Save or cancel your edit first"),
+                )
                 .disabled(
                     self.composer().is_some()
                         || self.review.is_some()
@@ -971,30 +979,36 @@ impl ReviewApp {
                 );
             }
             for (ix, comment) in projected.comments.iter().copied().enumerate() {
-                let pending_editor = matches!(comment, Comment::Pending(draft) if self.composer().is_some_and(|composer| {
-                    composer.item_id == item.id && composer.placement == ComposerPlacement::ConversationComment(
-                        crate::CommentTarget::Pending(draft.id).key())
-                }));
                 card = card.child(
                     div()
                         .p_4()
                         .when(ix > 0, |row| row.pl(px(16. + crate::threads::REPLY_INDENT)))
-                        .when(!pending_editor, |row| {
-                            row.border_t_1().border_color(theme::surface0(cx))
-                        })
+                        .border_t_1()
+                        .border_color(theme::surface0(cx))
                         .child(
                             self.discussion_comment(item.id, "review", comment, slug, window, cx),
                         ),
                 );
             }
-            card = card.child(
-                div()
-                    .p_4()
-                    .border_t_1()
-                    .border_color(theme::surface0(cx))
-                    .pl(px(16. + crate::threads::REPLY_INDENT))
-                    .child(self.conversation_composer(item.id, Some(thread), cx)),
-            );
+            let editing_thread = self.composer().is_some_and(|composer| {
+                composer.edit_id.is_some_and(|id| {
+                    projected.comments.iter().any(|comment| match comment {
+                        Comment::Published(c) => c.id == id,
+                        Comment::Pending(c) => c.id == id,
+                        Comment::Posting(_) => false,
+                    })
+                })
+            });
+            if !editing_thread {
+                card = card.child(
+                    div()
+                        .p_4()
+                        .border_t_1()
+                        .border_color(theme::surface0(cx))
+                        .pl(px(16. + crate::threads::REPLY_INDENT))
+                        .child(self.conversation_composer(item.id, Some(thread), cx)),
+                );
+            }
         }
         card.into_any_element()
     }
@@ -1008,15 +1022,6 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        if let Comment::Pending(draft) = projected {
-            let target = crate::CommentTarget::Pending(draft.id);
-            let placement = ComposerPlacement::ConversationComment(target.key());
-            if self.composer().is_some_and(|composer| {
-                composer.item_id == item_id && composer.placement == placement
-            }) {
-                return self.render_composer_card(cx);
-            }
-        }
         let pending_author = match &self.account {
             crate::AccountStatus::SignedIn(viewer) => viewer.login.as_str(),
             _ => "you",
@@ -1065,13 +1070,11 @@ impl ReviewApp {
             let placement = ComposerPlacement::ConversationComment(target.key());
             (target, placement)
         });
-        if controls.as_ref().is_some_and(|(_, placement)| {
+        let editing = controls.as_ref().is_some_and(|(_, placement)| {
             self.composer().is_some_and(|composer| {
                 composer.item_id == item_id && &composer.placement == placement
             })
-        }) {
-            return self.render_composer_card(cx);
-        }
+        });
         let (key, reserve_reactions) = self
             .items
             .iter()
@@ -1141,8 +1144,22 @@ impl ReviewApp {
                                 Tooltip::new(timestamp.clone()).build(window, cx)
                             }),
                     )
-                    .children(controls),
+                    .when(!editing, |header| header.children(controls))
+                    .when(editing, |header| {
+                        header.child(
+                            div()
+                                .debug_selector(|| "comment-editing".into())
+                                .text_color(theme::overlay0(cx))
+                                .text_sm()
+                                .child("Editing"),
+                        )
+                    }),
             );
+        if editing {
+            return card
+                .child(self.render_composer_content(cx))
+                .into_any_element();
+        }
         if markdown::has_content(body) {
             card = card.child(render_markdown(
                 &markdown_id,
