@@ -291,7 +291,10 @@ impl ReviewApp {
                 .child(if thread.is_some() {
                     self.render_composer_content(cx)
                 } else {
-                    self.render_composer_card(cx)
+                    timeline_comment_card(cx)
+                        .debug_selector(|| "conversation-new-comment".into())
+                        .child(self.render_composer_content(cx))
+                        .into_any_element()
                 })
                 .into_any_element();
         }

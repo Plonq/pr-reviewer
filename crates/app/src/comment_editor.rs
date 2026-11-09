@@ -149,6 +149,12 @@ fn height(rows: usize, line_height: gpui::Pixels) -> gpui::Pixels {
     line_height * rows.clamp(3, 8) + Size::Medium.input_py() * 2. + px(2.)
 }
 
+/// Height of a fresh prose field before its first layout. Keep the diff's
+/// initial composer reservation in sync with the field's actual minimum.
+pub(crate) fn minimum_height(cx: &App) -> gpui::Pixels {
+    height(3, cx.theme().font_size * 0.875 * 1.5)
+}
+
 #[cfg(test)]
 pub(crate) fn field<T: 'static>(state: &Entity<EditorState>, cx: &mut Context<T>) -> AnyElement {
     field_with_media(state, None, false, cx)

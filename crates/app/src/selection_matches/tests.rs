@@ -122,7 +122,7 @@ fn matches_project_across_unequal_soft_wraps_and_repeated_occurrences() {
 fn multiline_matches_follow_source_streams_but_not_folds_or_hunk_gaps() {
     let rows = vec![
         line(1, LineKind::Context, "foo"),
-        Row::CommentEditor { half: None },
+        Row::CommentEditor { half: None, top: false },
         line(2, LineKind::Context, "bar"),
         line(3, LineKind::Removed, "foo"),
         line(4, LineKind::Removed, "bar"),
