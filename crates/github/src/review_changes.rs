@@ -9,6 +9,8 @@ pub struct ReviewBaseline {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewChanges {
     Available(ReviewBaseline),
+    /// The viewer has not submitted a review yet; guidance, not a failure.
+    NotReviewed,
     Unavailable(String),
 }
 
@@ -22,7 +24,7 @@ impl ReviewChanges {
     pub fn baseline(&self) -> Option<&ReviewBaseline> {
         match self {
             Self::Available(review) => Some(review),
-            Self::Unavailable(_) => None,
+            Self::NotReviewed | Self::Unavailable(_) => None,
         }
     }
 }

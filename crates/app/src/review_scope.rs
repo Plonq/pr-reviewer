@@ -3,9 +3,38 @@
 use crate::{theme, ItemData, ItemState, ReviewApp, ReviewItem, Source};
 use gpui::component::{
     button::{Button, ButtonVariants as _},
-    Disableable as _, Sizable as _,
+    tooltip::Tooltip,
+    Disableable as _, Icon, Sizable as _,
 };
-use gpui::{div, prelude::*, Context, SharedString, Window};
+use gpui::{div, prelude::*, px, Context, Window};
+use gpui_kit_assets::IconName;
+
+fn scope_status(
+    changes: &github::ReviewChanges,
+    active: bool,
+    reloading: bool,
+) -> (IconName, String) {
+    let (icon, mut detail) = match changes {
+        github::ReviewChanges::NotReviewed => (
+            IconName::Info,
+            "Submit a GitHub review to use Changed since last review.".into(),
+        ),
+        github::ReviewChanges::Unavailable(reason) => (IconName::TriangleAlert, reason.clone()),
+        github::ReviewChanges::Available(review) => (
+            IconName::Info,
+            format!(
+                "Last review: {} · {}{}",
+                review.submitted_at,
+                review.commit.chars().take(7).collect::<String>(),
+                if reloading { " · loading…" } else { "" },
+            ),
+        ),
+    };
+    if active {
+        detail.push_str("\n\nComments on the full PR's old revision remain in Conversation; new comments use explicit revision positioning.");
+    }
+    (icon, detail)
+}
 
 impl ItemData {
     pub(crate) fn diff_base(&self) -> &str {
@@ -123,15 +152,7 @@ impl ReviewApp {
                 .iter()
                 .any(|composer| composer.item_id == item.id && composer.in_flight)
             || self.review.is_some();
-        let detail = match &data.review_changes {
-            github::ReviewChanges::Unavailable(reason) => reason.clone(),
-            github::ReviewChanges::Available(review) => format!(
-                "Last review: {} · {}{}",
-                review.submitted_at,
-                review.commit.chars().take(7).collect::<String>(),
-                if item.reloading { " · loading…" } else { "" },
-            ),
-        };
+        let (icon, detail) = scope_status(&data.review_changes, active, item.reloading);
         let mut bar = div()
             .debug_selector(|| "changes-header".into())
             .flex_shrink_0()
@@ -182,37 +203,92 @@ impl ReviewApp {
                                     } else {
                                         "Changed since last review"
                                     })
-                                    .tooltip(detail.clone())
                                     .disabled(busy || data.review_changes.baseline().is_none())
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.switch_review_scope(true, window, cx)
                                     })),
                             )
                             .child(
+                                // Keep this separate from the scope button so its tooltip
+                                // remains available even when switching scope is disabled.
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme::subtext(cx))
-                                    .child(SharedString::from(detail)),
+                                    .id("review-scope-status")
+                                    .debug_selector(|| "review-scope-status".into())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .flex_shrink_0()
+                                    .size(px(24.))
+                                    .text_color(if icon == IconName::TriangleAlert {
+                                        theme::yellow(cx)
+                                    } else {
+                                        theme::subtext(cx)
+                                    })
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(detail.clone())
+                                            .max_w(px(480.))
+                                            .build(window, cx)
+                                    })
+                                    .child(Icon::new(icon).small()),
                             )
                     }))
                     .when(!data.shows_file_media(), |row| {
                         row.child(self.render_presentation_controls(data, cx))
                     }),
             );
-        if is_pr && active {
-            bar = bar.child(div().text_color(theme::subtext(cx)).child(
-                "Comments on the full PR's old revision remain in Conversation; new comments use explicit revision positioning."
-            ));
-            if data.diff.files.is_empty() {
-                bar = bar.child(
-                    div()
-                        .text_color(theme::subtext(cx))
-                        .child("No changes since your last review."),
-                );
-            }
+        if is_pr && active && data.diff.files.is_empty() {
+            bar = bar.child(
+                div()
+                    .text_color(theme::subtext(cx))
+                    .child("No changes since your last review."),
+            );
         }
         bar.into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_status_distinguishes_guidance_from_warnings_and_preserves_details() {
+        let (icon, detail) = scope_status(&github::ReviewChanges::NotReviewed, false, false);
+        assert_eq!(icon, IconName::Info);
+        assert_eq!(
+            detail,
+            "Submit a GitHub review to use Changed since last review."
+        );
+        assert!(github::ReviewChanges::NotReviewed.baseline().is_none());
+
+        for reason in [
+            "History rewritten by a rebase or force-push",
+            "Couldn't verify changes: network unavailable",
+            "Couldn't load changes: diff unavailable",
+        ] {
+            let (icon, detail) = scope_status(
+                &github::ReviewChanges::Unavailable(reason.into()),
+                false,
+                false,
+            );
+            assert_eq!(icon, IconName::TriangleAlert);
+            assert_eq!(detail, reason);
+        }
+        assert_eq!(
+            scope_status(&github::ReviewChanges::default(), false, false).0,
+            IconName::TriangleAlert,
+        );
+
+        let review = github::ReviewChanges::Available(github::ReviewBaseline {
+            commit: "abcdef0123456789".into(),
+            submitted_at: "2026-03-03T00:00:00Z".into(),
+        });
+        let (icon, detail) = scope_status(&review, false, false);
+        assert_eq!(icon, IconName::Info);
+        assert_eq!(detail, "Last review: 2026-03-03T00:00:00Z · abcdef0");
+        let (_, detail) = scope_status(&review, true, true);
+        assert!(detail.contains(" · loading…"));
+        assert!(detail.contains("Comments on the full PR's old revision remain in Conversation"));
+        assert!(detail.contains("new comments use explicit revision positioning"));
     }
 }

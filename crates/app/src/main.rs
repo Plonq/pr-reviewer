@@ -9351,6 +9351,61 @@ mod tests {
     }
 
     #[gpui::test]
+    fn changes_header_status_tooltip_works_for_disabled_and_active_scopes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let tooltips = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = tooltips.clone();
+        let _subscription = cx.update(|cx| {
+            cx.observe_new::<gpui::component::tooltip::Tooltip>(move |_, _, _| {
+                observed.set(observed.get() + 1);
+            })
+        });
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for changes in [
+            github::ReviewChanges::NotReviewed,
+            github::ReviewChanges::Unavailable("History rewritten by a rebase or force-push".into()),
+            github::ReviewChanges::default(),
+            github::ReviewChanges::Available(github::ReviewBaseline {
+                commit: "abcdef0".into(),
+                submitted_at: "2026-03-03T00:00:00Z".into(),
+            }),
+        ] {
+            let mut item = loop_pr_item(Vec::new());
+            item.pane = ItemPane::Changes;
+            let ItemState::Ready(data) = &mut item.state else {
+                unreachable!()
+            };
+            data.review_base = changes.baseline().map(|review| review.commit.clone());
+            data.review_changes = changes;
+            install_item(&app, item, cx);
+            vcx.simulate_mouse_move(
+                gpui::point(px(0.), px(0.)),
+                None,
+                gpui::Modifiers::default(),
+            );
+            draw_window(&mut vcx);
+            let status = vcx
+                .debug_bounds("review-scope-status")
+                .expect("status icon is visible");
+            assert_eq!(status.size.width, px(24.));
+            assert!(vcx.debug_bounds("changes-header").unwrap().size.height < px(40.));
+            let before = tooltips.get();
+            vcx.simulate_mouse_move(status.center(), None, gpui::Modifiers::default());
+            vcx.run_until_parked();
+            vcx.executor()
+                .advance_clock(std::time::Duration::from_secs(1));
+            vcx.run_until_parked();
+            draw_window(&mut vcx);
+            assert!(
+                tooltips.get() > before,
+                "status tooltip must work even when the scope button is disabled"
+            );
+        }
+    }
+
+    #[gpui::test]
     fn titlebar_loading_spinner_follows_pr_link_and_errors_still_show(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -11974,6 +12029,8 @@ mod tests {
             IconName::SquareCheck,
             IconName::Pencil,
             IconName::Trash,
+            IconName::Info,
+            IconName::TriangleAlert,
         ] {
             let path = icon.path();
             let svg = AppAssets
