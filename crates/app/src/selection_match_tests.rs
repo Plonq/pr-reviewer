@@ -52,9 +52,16 @@ fn selection_matches_paint_both_sides_clear_and_invalidate_with_rows(
             } else {
                 (1, SelSide::Left, 1, SelSide::Right)
             };
-            assert_eq!(matches.ranges(left_row, left_side), vec![4..10, 11..17]);
-            assert_eq!(matches.ranges(right_row, right_side), vec![4..10]);
-            assert_eq!(matches.marks, vec![
+            let mut left_ranges = vec![4..10, 11..17];
+            let mut right_ranges = vec![4..10];
+            if side == SelSide::Right {
+                right_ranges.clear();
+            } else {
+                left_ranges.remove(0);
+            }
+            assert_eq!(matches.ranges(left_row, left_side), left_ranges);
+            assert_eq!(matches.ranges(right_row, right_side), right_ranges);
+            let mut expected_marks = vec![
                 minimap::MinimapMatch {
                     row: left_row, side: left_side, range: (4. / 160.)..(10. / 160.),
                 },
@@ -64,7 +71,9 @@ fn selection_matches_paint_both_sides_clear_and_invalidate_with_rows(
                 minimap::MinimapMatch {
                     row: right_row, side: right_side, range: (4. / 160.)..(10. / 160.),
                 },
-            ]);
+            ];
+            expected_marks.remove(if side == SelSide::Right { 2 } else { 0 });
+            assert_eq!(matches.marks, expected_marks);
             matches
         });
         // A rebuild with the same selection must not retain old row spans.

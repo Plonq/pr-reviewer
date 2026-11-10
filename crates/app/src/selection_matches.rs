@@ -93,6 +93,15 @@ impl SelectionMatches {
             stream.project(&query, side, &mut result);
         }
         for (ix, spans) in result.by_row.iter_mut().enumerate() {
+            // The active selection already paints these characters. Exclude it
+            // before building minimap marks so both views show only other matches.
+            if let Some(selected) = selection.text_range(ix, &rows[ix]) {
+                spans.retain(|(side, range)| {
+                    *side != selection.side
+                        || range.end <= selected.start
+                        || range.start >= selected.end
+                });
+            }
             spans.sort_by_key(|(side, range)| (side_order(*side), range.start, range.end));
             spans.dedup();
             for (side, range) in spans {
