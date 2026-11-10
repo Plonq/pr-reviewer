@@ -601,7 +601,29 @@ fn word_diff(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
     if changed(&old_ranges, old.trim_end().len()) || changed(&new_ranges, new.trim_end().len()) {
         return (Vec::new(), Vec::new());
     }
-    (old_ranges, new_ranges)
+    // Shared spaces between replaced words should not split a visual highlight.
+    // Do this after the rewrite cutoff: these spaces are not actual edits.
+    (
+        merge_whitespace_gaps(old, old_ranges),
+        merge_whitespace_gaps(new, new_ranges),
+    )
+}
+
+fn merge_whitespace_gaps(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut() {
+            if text[previous.end..range.start]
+                .chars()
+                .all(char::is_whitespace)
+            {
+                previous.end = range.end;
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -836,6 +858,45 @@ index 6666666..7777777 100644
                     .all(String::is_empty));
             }
         }
+    }
+
+    #[test]
+    fn consecutive_title_changes_form_one_highlight() {
+        let old_title = "Add deactivation filters to the users manage list";
+        let new_title = "Replace every loading spinner with a tiny migrating goose";
+        let old = format!("    \"title\": \"{old_title}\",");
+        let new = format!("    \"title\": \"{new_title}\",");
+        let hunks = diff_texts(&old, &new, 0);
+        for (row, title) in hunks[0].rows.iter().zip([old_title, new_title]) {
+            let (text, intra) = match row {
+                DiffRow::Removed { text, intra, .. } | DiffRow::Added { text, intra, .. } => {
+                    (text, intra)
+                }
+                _ => panic!("expected changed row"),
+            };
+            let start = text.find(title).unwrap();
+            assert_eq!(intra, &vec![start..start + title.len()]);
+        }
+    }
+
+    #[test]
+    fn whitespace_merging_preserves_shared_words_and_punctuation() {
+        for (old, new) in [
+            (
+                "prefix old shared value suffix",
+                "prefix new shared item suffix",
+            ),
+            ("prefix old, value suffix", "prefix new, item suffix"),
+        ] {
+            let (removed, added) = word_diff(old, new);
+            assert_eq!(removed.len(), 2);
+            assert_eq!(added.len(), 2);
+        }
+        let old = "prefix café\tα suffix";
+        let new = "prefix tea\tβ suffix";
+        let (removed, added) = word_diff(old, new);
+        assert_eq!(removed, vec![7.."prefix café\tα".len()]);
+        assert_eq!(added, vec![7.."prefix tea\tβ".len()]);
     }
 
     #[test]
