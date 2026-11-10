@@ -58,21 +58,22 @@ fn literal_unicode_substrings_match_both_split_sides_in_byte_coordinates() {
     ];
     // Backward character selection, not a word or a regular expression.
     let matches = SelectionMatches::find(&rows, Some(selection(SelSide::Left, (0, 6), (0, 2))));
-    assert_eq!(matches.ranges(0, SelSide::Left), vec![2..7, 8..13]);
+    assert_eq!(matches.ranges(0, SelSide::Left), vec![8..13]);
     assert_eq!(matches.ranges(0, SelSide::Right), vec![0..5]);
     assert_eq!(matches.ranges(1, SelSide::Right), vec![1..6]);
     assert!(matches.ranges(1, SelSide::Left).is_empty());
     assert_eq!(
         matches.marks,
         vec![
-            mark(0, SelSide::Left, 2..6),
             mark(0, SelSide::Left, 7..11),
             mark(0, SelSide::Right, 0..4),
             mark(1, SelSide::Right, 1..5),
         ]
     );
     let from_right = SelectionMatches::find(&rows, Some(selection(SelSide::Right, (0, 0), (0, 4))));
-    assert_eq!(from_right.by_row, matches.by_row);
+    assert_eq!(from_right.ranges(0, SelSide::Left), vec![2..7, 8..13]);
+    assert!(from_right.ranges(0, SelSide::Right).is_empty());
+    assert_eq!(from_right.ranges(1, SelSide::Right), vec![1..6]);
 }
 
 #[test]
@@ -83,10 +84,10 @@ fn unified_context_is_deduplicated_and_added_and_removed_text_both_match() {
         line(2, LineKind::Added, "Foo foo"),
     ];
     let matches = SelectionMatches::find(&rows, Some(selection(SelSide::Unified, (0, 0), (0, 3))));
-    assert_eq!(matches.ranges(0, SelSide::Unified), vec![0..3, 4..7]);
+    assert_eq!(matches.ranges(0, SelSide::Unified), vec![4..7]);
     assert_eq!(matches.ranges(1, SelSide::Unified), vec![0..3]);
     assert_eq!(matches.ranges(2, SelSide::Unified), vec![4..7]);
-    assert_eq!(matches.marks.len(), 4);
+    assert_eq!(matches.marks.len(), 3);
 }
 
 #[test]
@@ -98,8 +99,8 @@ fn matches_project_across_unequal_soft_wraps_and_repeated_occurrences() {
         split(2, Some("héllo héllo"), None),
     ];
     let matches = SelectionMatches::find(&rows, Some(selection(SelSide::Left, (0, 0), (1, 3))));
-    assert_eq!(matches.ranges(0, SelSide::Left), vec![0..3]);
-    assert_eq!(matches.ranges(1, SelSide::Left), vec![0..3]);
+    assert!(matches.ranges(0, SelSide::Left).is_empty());
+    assert!(matches.ranges(1, SelSide::Left).is_empty());
     assert_eq!(matches.ranges(0, SelSide::Right), vec![1..4]);
     assert_eq!(matches.ranges(1, SelSide::Right), vec![0..2]);
     assert_eq!(matches.ranges(2, SelSide::Right), vec![0..1]);
@@ -107,9 +108,7 @@ fn matches_project_across_unequal_soft_wraps_and_repeated_occurrences() {
     assert_eq!(
         matches.marks,
         vec![
-            mark(0, SelSide::Left, 0..2),
             mark(0, SelSide::Right, 1..3),
-            mark(1, SelSide::Left, 0..3),
             mark(1, SelSide::Right, 0..2),
             mark(2, SelSide::Right, 0..1),
             mark(3, SelSide::Left, 0..5),
@@ -141,9 +140,10 @@ fn multiline_matches_follow_source_streams_but_not_folds_or_hunk_gaps() {
             .iter()
             .map(|mark| mark.row)
             .collect::<Vec<_>>(),
-        vec![0, 2, 3, 4, 5, 6]
+        vec![3, 4, 5, 6]
     );
-    assert_eq!(matches.ranges(0, SelSide::Unified), vec![0..3]);
+    assert!(matches.ranges(0, SelSide::Unified).is_empty());
+    assert!(matches.ranges(2, SelSide::Unified).is_empty());
     assert!(matches.ranges(1, SelSide::Unified).is_empty());
     // Removed+added rows are adjacent visually, but not in either source.
     let mixed_rows = vec![
@@ -155,6 +155,17 @@ fn multiline_matches_follow_source_streams_but_not_folds_or_hunk_gaps() {
         Some(selection(SelSide::Unified, (0, 0), (1, 5))),
     );
     assert!(mixed.marks.is_empty());
+}
+
+#[test]
+fn selecting_the_only_occurrence_leaves_no_highlights_or_minimap_marks() {
+    let rows = vec![line(1, LineKind::Context, "unique")];
+    let matches = SelectionMatches::find(
+        &rows,
+        Some(selection(SelSide::Unified, (0, 6), (0, 0))),
+    );
+    assert!(matches.ranges(0, SelSide::Unified).is_empty());
+    assert!(matches.marks.is_empty());
 }
 
 #[test]

@@ -10474,7 +10474,7 @@ mod tests {
                     },
                     linewise: false,
                 });
-                assert_eq!(data.selection_matches().marks.len(), 2);
+                assert_eq!(data.selection_matches().marks.len(), 1);
                 assert_eq!(data.search.as_ref().unwrap().minimap_marks().len(), 2);
                 assert_ne!(theme::yellow(cx), theme::mauve(cx));
                 cx.notify();
