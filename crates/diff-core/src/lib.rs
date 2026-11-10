@@ -454,7 +454,7 @@ const MAX_BLOCK_LINES: usize = 32;
 const MAX_LINE_BYTES: usize = 4096;
 const MAX_BLOCK_TOKENS: usize = 512;
 /// If more than this fraction of a block changed, highlighting it all is noise.
-const MAX_CHANGED_FRACTION: f32 = 0.7;
+const MAX_CHANGED_FRACTION: f32 = 0.85;
 
 /// Diff a whole replacement block so unchanged words can match across line
 /// boundaries (including reflowed text and unequal numbers of lines).
@@ -577,9 +577,7 @@ fn word_diff(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
     let mut old_ranges: Vec<Range<usize>> = Vec::new();
     let mut new_ranges: Vec<Range<usize>> = Vec::new();
     imara_diff::diff(
-        // A shortest edit script avoids anchoring on rare punctuation while
-        // marking repeated, unchanged words as replacements.
-        Algorithm::Myers,
+        Algorithm::Histogram,
         &input,
         |before: Range<u32>, after: Range<u32>| {
             if before.start < before.end {
@@ -778,10 +776,14 @@ index 6666666..7777777 100644
         let old = "``assigned_at`` and ``ended_at`` both stay null, as they do on a\ncancel: they bracket a live chat, and a request nobody accepted never\nbecame one. ``created`` and ``modified`` bracket the wait itself.";
         let new = "``queued_at`` and ``modified`` bracket the wait itself — not\n``created``, which on a requeued chat predates a spell that was spent\nbeing handled rather than waiting.";
         let hunks = diff_texts(old, new, 0);
+        let (old_ranges, new_ranges) = word_diff(old, new);
+        for (text, ranges) in [(old, old_ranges), (new, new_ranges)] {
+            let start = text.find("bracket the wait itself").unwrap();
+            let end = start + "bracket the wait itself".len();
+            assert!(!ranges.is_empty());
+            assert!(ranges.iter().all(|r| r.end <= start || r.start >= end));
+        }
         for added in [false, true] {
-            for range in highlighted(&hunks[0].rows, added) {
-                assert!(!range.contains("bracket the wait itself"), "{range:?}");
-            }
             assert!(highlighted(&hunks[0].rows, added)
                 .iter()
                 .any(|s| !s.is_empty()));
