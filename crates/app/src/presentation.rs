@@ -255,12 +255,12 @@ impl ItemData {
         loc: Option<&github::PrLocator>,
     ) {
         self.preference_overrides = store.diff_preferences(loc);
-        // New PRs always start with the three decorations off. Legacy global
-        // preferences (also used by local diffs) must not leak into a new PR.
+        // New PRs hide whitespace changes, with collapse and wrap off. Legacy
+        // global preferences (also used by local diffs) must not leak into a new PR.
         let defaults = if loc.is_some() {
-            DiffPreferences::OFF
+            DiffPreferences::INITIAL
         } else {
-            store.diff_preferences(None).over(DiffPreferences::OFF)
+            store.diff_preferences(None).over(DiffPreferences::INITIAL)
         };
         self.preferences = self.preference_overrides.over(defaults);
         self.rebuild_presentation();
@@ -354,10 +354,10 @@ impl ReviewApp {
             .gap_2()
             .child(
                 toggle(
-                    "hide-whitespace",
-                    "Hide whitespace",
+                    "show-whitespace",
+                    "Show whitespace",
                     "W",
-                    data.preferences.hide_whitespace.unwrap_or(false),
+                    !data.preferences.hide_whitespace.unwrap_or(true),
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.toggle_presentation(Preference::Whitespace, cx)
@@ -441,6 +441,44 @@ mod tests {
             expanded,
             8,
         )
+    }
+
+    #[test]
+    fn initial_preferences_hide_whitespace_and_showing_it_restores_changes_in_both_modes() {
+        let diff = diff_core::parse_patch(
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a b\n+ab\n",
+        );
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let has_change = |built: &BuiltRows| {
+                built.rows.iter().any(|row| match row {
+                    Row::Line { kind, .. } => *kind != LineKind::Context,
+                    Row::SplitLine { left, right } => left
+                        .iter()
+                        .chain(right.iter())
+                        .any(|cell| cell.kind != LineKind::Context),
+                    _ => false,
+                })
+            };
+            let hidden = build(
+                &diff,
+                &HashMap::new(),
+                DiffPreferences::INITIAL,
+                &HashSet::new(),
+                mode,
+            );
+            assert!(!has_change(&hidden));
+            let shown = build(
+                &diff,
+                &HashMap::new(),
+                DiffPreferences {
+                    hide_whitespace: Some(false),
+                    ..DiffPreferences::INITIAL
+                },
+                &HashSet::new(),
+                mode,
+            );
+            assert!(has_change(&shown));
+        }
     }
 
     #[test]

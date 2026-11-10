@@ -16031,7 +16031,7 @@ mod tests {
         store.save_diff_preferences(
             None,
             store::DiffPreferences {
-                hide_whitespace: Some(true),
+                hide_whitespace: Some(false),
                 collapse_unchanged: Some(true),
                 soft_wrap: Some(true),
             },
@@ -16043,32 +16043,32 @@ mod tests {
         vcx.update(|window, cx| {
             let _ = window.draw(cx);
             let data = app.read(cx).active_data().unwrap();
-            assert_eq!(data.preferences, store::DiffPreferences::OFF);
+            assert_eq!(data.preferences, store::DiffPreferences::INITIAL);
             assert_eq!(data.preference_overrides.hide_whitespace, None);
         });
         // Presentation toggles use plain letters, not Shift+W / Shift+K.
         vcx.simulate_keystrokes("w");
         cx.update(|cx| {
             let prefs = app.read(cx).active_data().unwrap().preferences;
-            assert_eq!(prefs.hide_whitespace, Some(true));
+            assert_eq!(prefs.hide_whitespace, Some(false));
             assert_eq!(prefs.collapse_unchanged, Some(false));
         });
         vcx.simulate_keystrokes("k");
         cx.update(|cx| {
             let prefs = app.read(cx).active_data().unwrap().preferences;
-            assert_eq!(prefs.hide_whitespace, Some(true));
+            assert_eq!(prefs.hide_whitespace, Some(false));
             assert_eq!(prefs.collapse_unchanged, Some(true));
         });
         vcx.simulate_keystrokes("w k");
         cx.update(|cx| {
             assert_eq!(
                 app.read(cx).active_data().unwrap().preferences,
-                store::DiffPreferences::OFF
+                store::DiffPreferences::INITIAL
             );
         });
         vcx.simulate_keystrokes("w k alt-z");
         let wanted = store::DiffPreferences {
-            hide_whitespace: Some(true),
+            hide_whitespace: Some(false),
             collapse_unchanged: Some(true),
             soft_wrap: Some(true),
         };
@@ -16094,7 +16094,7 @@ mod tests {
             let data = second.read(cx).active_data().unwrap();
             assert_eq!(
                 data.preferences,
-                store::DiffPreferences::OFF,
+                store::DiffPreferences::INITIAL,
                 "new PRs must not inherit another PR's toggles or legacy global settings"
             );
             assert_eq!(
