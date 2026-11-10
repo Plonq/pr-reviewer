@@ -1144,7 +1144,7 @@ fn line_content(
 }
 
 /// Shared shape of every comment row: indented card with a mantle background
-/// and a blue left accent, spanning full width in both view modes.
+/// and a blue left accent, capped at the prose width in both view modes.
 /// Where a row sits in its thread's card, so the rows together draw one
 /// continuous outline instead of a box per row.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1173,6 +1173,7 @@ fn comment_row(
     half: Option<CommentSide>,
     header: bool,
     edge: CardEdge,
+    max_width: gpui::Pixels,
     cx: &gpui::App,
 ) -> gpui::AnyElement {
     // The card itself: indented past the gutter, blue-tinted and accented so a
@@ -1189,6 +1190,8 @@ fn comment_row(
                 // Sides on every row, caps only on the thread's first and last,
                 // so the rows stack into one unbroken outline.
                 let body = div()
+                    .debug_selector(|| "inline-comment-outline".into())
+                    .max_w(max_width)
                     .flex_1()
                     .min_w_0()
                     .h_full()
@@ -1352,6 +1355,9 @@ fn render_row_content(
 ) -> gpui::AnyElement {
     let row_height = px(row_height());
     let body_edge = comment_body_edge(next_row);
+    let max_comment_width = crate::diff_media::comment_card_max_width(
+        entity.read(cx).char_width.unwrap_or(px(crate::text_size() * 0.6)),
+    );
     match row {
         Row::Continuation(row) => render_row_content(
             ix,
@@ -1462,11 +1468,14 @@ fn render_row_content(
                 } else {
                     CardEdge::Middle
                 },
+                max_comment_width,
                 cx,
             )
         }
         Row::CommentBody { half, .. } | Row::CommentSpacer { half } => {
-            comment_row(div().into_any_element(), *half, false, body_edge, cx)
+            comment_row(
+                div().into_any_element(), *half, false, body_edge, max_comment_width, cx,
+            )
         }
         Row::CommentReactions { comment_id, half } => comment_row(
             div()
@@ -1479,6 +1488,7 @@ fn render_row_content(
             *half,
             false,
             body_edge,
+            max_comment_width,
             cx,
         ),
         Row::CommentEditor { half, top } => {
@@ -1487,7 +1497,9 @@ fn render_row_content(
                 (true, _) => CardEdge::Top,
                 (false, edge) => edge,
             };
-            comment_row(div().into_any_element(), *half, false, edge, cx)
+            comment_row(
+                div().into_any_element(), *half, false, edge, max_comment_width, cx,
+            )
         }
         Row::CommentActions {
             root_id,
@@ -1567,6 +1579,7 @@ fn render_row_content(
                 } else {
                     CardEdge::Bottom
                 },
+                max_comment_width,
                 cx,
             )
         }

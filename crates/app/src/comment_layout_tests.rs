@@ -1381,3 +1381,38 @@ fn inline_completion_after_switching_prs_cannot_replace_the_new_pr_editor_or_foc
         }
     }
 }
+
+#[gpui::test]
+fn diff_comment_cards_and_composers_share_the_prose_width_cap(cx: &mut gpui::TestAppContext) {
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        for width in [850., 2600.] {
+            let fake = layout_fake();
+            let (window, app) = queue_window(cx, fake.clone());
+            install_item(&app, layout_item(&fake, mode, false), cx);
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            vcx.simulate_resize(size(px(width), px(1200.)));
+            paint(&mut vcx);
+            let outline = vcx.debug_bounds("inline-comment-outline").unwrap();
+            let (cap, pane) = cx.update(|cx| {
+                let app = app.read(cx);
+                let data = app.active_data().unwrap();
+                let viewport = data.scroll.0.borrow().base_handle.bounds().size.width;
+                (diff_media::comment_card_max_width(app.char_width.unwrap()),
+                 if mode == ViewMode::Split { (viewport - px(SPLIT_DIVIDER)) / 2. } else { viewport })
+            });
+            let expected = cap.min(pane - px(72.));
+            let content = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
+            assert!((content.right() + px(13.) - outline.right()).abs() < px(1.));
+            assert!((outline.size.width - expected).abs() < px(1.));
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.open_composer(None, "a.rs".into(), CommentSide::Right, 2, 0, window, cx);
+                });
+            });
+            paint(&mut vcx);
+            let composer = vcx.debug_bounds("composer-card").unwrap();
+            // Content excludes the outline's borders and the overlay's p_3 padding.
+            assert!((composer.size.width - (expected - px(27.))).abs() < px(1.));
+        }
+    }
+}

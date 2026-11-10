@@ -5127,6 +5127,9 @@ impl ReviewApp {
             .absolute()
             // Stay inside the thread's existing outline, including at the
             // bottom where the reserved rows draw its rounded cap.
+            .max_w(diff_media::comment_card_max_width(
+                self.char_width.unwrap_or(px(text_size() * 0.6)),
+            ) - px(3.))
             .left(inline_left + px(2.))
             .top(px(row_y + row_height()))
             .w((if data.mode == ViewMode::Split {
