@@ -9478,6 +9478,7 @@ mod tests {
                 unreachable!()
             };
             data.review_base = changes.baseline().map(|review| review.commit.clone());
+            let active = data.review_base.is_some();
             data.review_changes = changes;
             install_item(&app, item, cx);
             vcx.simulate_mouse_move(
@@ -9502,6 +9503,13 @@ mod tests {
                 tooltips.get() > before,
                 "status tooltip must work even when the scope button is disabled"
             );
+            let text = vcx
+                .debug_bounds("review-scope-tooltip-text")
+                .expect("tooltip text is visible");
+            assert!(text.size.width <= px(440.), "tooltip text must stay bounded");
+            if active {
+                assert!(text.size.height > px(60.), "long guidance must wrap");
+            }
         }
     }
 
