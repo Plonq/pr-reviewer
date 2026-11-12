@@ -244,6 +244,31 @@ fn github_paste_html_in_quotes_lists_tables_mixed_links_and_adjacent_images(
 }
 
 #[gpui::test]
+fn consecutive_block_images_have_spacing(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    for body in [
+        "<img width='120' height='80' src='https://github.com/first'>\n<img width='120' height='80' src='https://github.com/second'>",
+        "<img width='120' height='80' src='https://github.com/first'>\n\n<img width='120' height='80' src='https://github.com/second'>",
+        "![first](https://github.com/first)![second](https://github.com/second)",
+        "![first](https://github.com/first)\n\n![second](https://github.com/second)",
+    ] {
+        let (window, _app) = viewer_conversation(cx, body);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        draw_settled(&mut vcx);
+        let offset = body.rfind("<img").or_else(|| body.rfind("![")).unwrap();
+        let second_selector =
+            Box::leak(format!("conversation-0-image-{offset}").into_boxed_str());
+        let first = vcx.debug_bounds("conversation-0-image-0").unwrap();
+        let second = vcx.debug_bounds(second_selector).unwrap();
+        assert!(
+            second.top() - first.bottom() >= px(8.),
+            "consecutive images need a visible gap: {first:?}, {second:?} for {body}"
+        );
+        assert_eq!(first.left(), second.left());
+    }
+}
+
+#[gpui::test]
 fn github_paste_image_with_a_following_caption_still_opens(cx: &mut gpui::TestAppContext) {
     image_client(cx);
     // No blank line: CommonMark delivers the image and caption as one HTML node.
