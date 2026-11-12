@@ -347,6 +347,9 @@ impl MarkdownPlugin for ImagePlugin {
         }
         div()
             .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
             .children(
                 node.data::<Vec<EmbeddedImage>>()
                     .unwrap()
