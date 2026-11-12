@@ -512,6 +512,46 @@ impl ReviewApp {
         let mut elements = Vec::new();
         for entry in entries {
             match entry {
+                Entry::Event(event) => elements.push(
+                    div()
+                        .debug_selector(|| format!("timeline-event-{}-{}", item.id, event.id))
+                        .relative()
+                        .flex()
+                        .items_start()
+                        .gap_3()
+                        .child(
+                            div()
+                                .size(px(TIMELINE_MARKER_SIZE))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(theme::base(cx))
+                                .border_1()
+                                .border_color(theme::surface0(cx))
+                                .child(
+                                    Icon::default()
+                                        .path("icons/gander/comment-16.svg")
+                                        .size(px(16.))
+                                        .text_color(theme::subtext(cx)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .pt_1()
+                                .child(format!("{} {}", event.actor, event.description))
+                                .child(div().text_color(theme::subtext(cx)).child(
+                                    crate::threads::short_age(
+                                        &event.created_at,
+                                        crate::rows::now_unix(),
+                                    ),
+                                )),
+                        )
+                        .into_any_element(),
+                ),
                 Entry::Comment(comment) => elements.push(
                     div()
                         .relative()
@@ -1482,6 +1522,7 @@ pub(crate) mod tests {
             }],
         };
         github::PrDiscussion {
+            events: Vec::new(),
             comments: vec![
                 comment(1, "2026-01-02T00:00:00Z"),
                 comment(2, "2026-01-01T00:00:00Z"),
@@ -1542,6 +1583,33 @@ pub(crate) mod tests {
         comment.review_state = None;
         comment.created_at = "unknown date".into();
         assert_eq!(discussion_heading(&comment, posted), "alice · unknown date");
+    }
+
+    #[test]
+    fn timeline_interleaves_activity_with_comments_and_threads_and_breaks_ties_by_id() {
+        let mut discussion = sample_discussion();
+        for id in ["E2", "E1"] {
+            discussion.events.push(github::DiscussionEvent {
+                id: id.into(),
+                actor: "alice".into(),
+                created_at: "2026-01-01T06:00:00Z".into(),
+                description: "requested a review from bob".into(),
+            });
+        }
+        let entries = timeline(&discussion);
+        assert_eq!(entries.len(), 5);
+        assert!(matches!(entries[0], Entry::Comment(Comment::Published(c)) if c.id == 2));
+        assert!(matches!(entries[1], Entry::Event(e) if e.id == "E1"));
+        assert!(matches!(entries[2], Entry::Event(e) if e.id == "E2"));
+        assert!(matches!(entries[3], Entry::Thread(_)));
+        assert!(matches!(entries[4], Entry::Comment(Comment::Published(c)) if c.id == 1));
+        discussion.comments.clear();
+        discussion.threads.clear();
+        assert_eq!(
+            timeline(&discussion).len(),
+            2,
+            "activity-only conversations remain visible"
+        );
     }
 
     #[test]

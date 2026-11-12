@@ -19,6 +19,7 @@ fn comment(id: u64, body: &str) -> DiscussionComment {
 
 fn discussion(ids: &[u64]) -> PrDiscussion {
     PrDiscussion {
+        events: vec![],
         comments: ids.iter().map(|id| comment(*id, "identical")).collect(),
         threads: vec![],
     }

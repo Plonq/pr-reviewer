@@ -303,6 +303,7 @@ mod tests {
         posts.begin(1, None, "tester".into(), "same text".into());
         let key = super::super::CommentKey::Post(posts.pending[0].token).markdown_key();
         let mut discussion = PrDiscussion {
+            events: vec![],
             comments: vec![comment(50)],
             threads: vec![],
         };
@@ -335,6 +336,7 @@ mod tests {
             posts.complete(token, Some(token + 100));
         }
         posts.reconcile(&PrDiscussion {
+            events: vec![],
             comments: vec![comment(102)],
             threads: vec![],
         });
@@ -348,6 +350,7 @@ mod tests {
         posts.begin(1, Some(11), "tester".into(), "same text".into());
         posts.complete(1, Some(100));
         let mut discussion = PrDiscussion {
+            events: vec![],
             comments: vec![comment(100)],
             threads: vec![],
         };

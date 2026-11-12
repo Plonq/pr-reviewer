@@ -86,6 +86,7 @@ pub(crate) struct Thread<'a> {
 /// Review wrappers, thread ordering and placement are retained, not reconstructed
 /// from a synthetic GitHub discussion containing transient comments.
 pub(crate) enum Entry<'a> {
+    Event(&'a github::DiscussionEvent),
     Comment(Comment<'a>),
     Review(&'a DiscussionComment, Vec<Thread<'a>>),
     Thread(Thread<'a>),
@@ -322,6 +323,12 @@ impl<'a> Projection<'a> {
                 entries.push(Entry::Thread(self.thread(thread)));
             }
         }
+        entries.extend(
+            self.discussion
+                .into_iter()
+                .flat_map(|d| &d.events)
+                .map(Entry::Event),
+        );
         entries.sort_by(|a, b| entry_order(a).cmp(&entry_order(b)));
         entries.retain(|entry| match entry {
             Entry::Review(comment, threads) => {
@@ -580,6 +587,7 @@ fn thread_order(thread: &ReviewThread) -> (&str, u8, u64, &str) {
 
 fn entry_order<'a>(entry: &'a Entry<'_>) -> (&'a str, u8, u64, &'a str) {
     match entry {
+        Entry::Event(event) => (&event.created_at, 3, 0, &event.id),
         Entry::Comment(Comment::Published(c)) => (&c.created_at, 0, c.id, ""),
         Entry::Review(c, _) => (&c.created_at, 1, c.id, ""),
         Entry::Thread(t) => thread_order(t.confirmed),

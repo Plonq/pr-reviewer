@@ -795,6 +795,24 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 .comments
                 .sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         }
+        let endpoint = format!(
+            "repos/{}/{}/issues/{}/timeline?per_page=100",
+            loc.owner, loc.repo, loc.number
+        );
+        let out = self
+            .process
+            .run(&["api", "--paginate", "--slurp", &endpoint])
+            .map_err(spawn_failure)?;
+        if out.code != Some(0) {
+            return Err(classify_failure(&out));
+        }
+        let pages: Vec<Vec<serde_json::Value>> = serde_json::from_str(out.text()?)
+            .map_err(|err| ClientError::Failed(format!("unexpected GitHub timeline: {err}")))?;
+        discussion.events = pages
+            .iter()
+            .flatten()
+            .filter_map(discussion_event)
+            .collect();
         Ok(discussion)
     }
 
@@ -1664,6 +1682,88 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         }
         Ok(())
     }
+}
+
+fn discussion_event(raw: &serde_json::Value) -> Option<crate::DiscussionEvent> {
+    let kind = raw["event"].as_str()?;
+    // Comments/reviews are loaded with richer metadata. Notification-only
+    // activity adds no useful review context.
+    if matches!(
+        kind,
+        "commented" | "reviewed" | "line-commented" | "mentioned" | "subscribed" | "unsubscribed"
+    ) {
+        return None;
+    }
+    let text = |pointer: &str| raw.pointer(pointer).and_then(|v| v.as_str()).unwrap_or("");
+    let reviewer = text("/requested_reviewer/login");
+    let team = text("/requested_team/name");
+    let reviewer = if reviewer.is_empty() { team } else { reviewer };
+    let description = match kind {
+        "review_requested" => format!("requested a review from {reviewer}"),
+        "review_request_removed" => format!("removed the review request for {reviewer}"),
+        "review_dismissed" => format!(
+            "dismissed a review: {}",
+            text("/dismissed_review/dismissal_message")
+        ),
+        "labeled" => format!("added the {} label", text("/label/name")),
+        "unlabeled" => format!("removed the {} label", text("/label/name")),
+        "assigned" => format!("assigned {}", text("/assignee/login")),
+        "unassigned" => format!("unassigned {}", text("/assignee/login")),
+        "milestoned" => format!("added to milestone {}", text("/milestone/title")),
+        "demilestoned" => format!("removed from milestone {}", text("/milestone/title")),
+        "renamed" => format!(
+            "changed the title from {} to {}",
+            text("/rename/from"),
+            text("/rename/to")
+        ),
+        "committed" => format!(
+            "committed {}: {}",
+            text("/sha").chars().take(7).collect::<String>(),
+            text("/message").lines().next().unwrap_or("")
+        ),
+        "head_ref_force_pushed" => format!(
+            "force-pushed the head branch to {}",
+            text("/commit_id").chars().take(7).collect::<String>()
+        ),
+        "head_ref_deleted" => "deleted the head branch".into(),
+        "head_ref_restored" => "restored the head branch".into(),
+        "base_ref_changed" => "changed the base branch".into(),
+        "ready_for_review" => "marked this ready for review".into(),
+        "convert_to_draft" => "converted this to a draft".into(),
+        "closed" => "closed this pull request".into(),
+        "reopened" => "reopened this pull request".into(),
+        "merged" => "merged this pull request".into(),
+        "cross-referenced" => format!(
+            "referenced this in #{}: {}",
+            raw["source"]["issue"]["number"],
+            text("/source/issue/title")
+        ),
+        // Preserve unfamiliar/new activity rather than silently hiding it.
+        _ => kind.replace(['_', '-'], " "),
+    };
+    let created_at = raw["created_at"]
+        .as_str()
+        .or_else(|| raw["committer"]["date"].as_str())
+        .or_else(|| raw["author"]["date"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let actor = raw["actor"]["login"]
+        .as_str()
+        .or_else(|| raw["author"]["name"].as_str())
+        .unwrap_or("ghost")
+        .to_owned();
+    let id = raw["node_id"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| raw["id"].as_u64().map(|id| id.to_string()))
+        .or_else(|| raw["sha"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{kind}-{created_at}-{actor}-{description}"));
+    Some(crate::DiscussionEvent {
+        id,
+        actor,
+        created_at,
+        description,
+    })
 }
 
 fn after_arg(cursor: Option<&str>) -> String {
@@ -2671,6 +2771,55 @@ mod tests {
     }
 
     #[test]
+    fn timeline_hides_notification_only_activity() {
+        for kind in ["mentioned", "subscribed", "unsubscribed"] {
+            assert!(discussion_event(&serde_json::json!({"event": kind})).is_none());
+        }
+    }
+
+    #[test]
+    fn timeline_activity_keeps_details_commits_and_unknown_event_types() {
+        use serde_json::json;
+        for (kind, details, expected) in [
+            (
+                "labeled",
+                json!({"label": {"name": "bug"}}),
+                "added the bug label",
+            ),
+            (
+                "assigned",
+                json!({"assignee": {"login": "bob"}}),
+                "assigned bob",
+            ),
+            (
+                "renamed",
+                json!({"rename": {"from": "old", "to": "new"}}),
+                "changed the title from old to new",
+            ),
+            ("merged", json!({}), "merged this pull request"),
+            ("future_event", json!({}), "future event"),
+        ] {
+            let mut raw = json!({"event": kind, "node_id": "E1", "actor": {"login": "alice"}, "created_at": "2026-01-01T00:00:00Z"});
+            raw.as_object_mut()
+                .unwrap()
+                .extend(details.as_object().unwrap().clone());
+            let event = discussion_event(&raw).unwrap();
+            assert_eq!(event.id, "E1");
+            assert_eq!(event.actor, "alice");
+            assert_eq!(event.created_at, "2026-01-01T00:00:00Z");
+            assert_eq!(event.description, expected);
+        }
+        let event = discussion_event(&json!({"event": "committed", "sha": "abcdef012345",
+            "author": {"name": "Alice", "date": "2026-01-01T00:00:00Z"},
+            "committer": {"date": "2026-01-02T00:00:00Z"}, "message": "Fix bug\n\nDetails"}))
+        .unwrap();
+        assert_eq!(event.id, "abcdef012345");
+        assert_eq!(event.actor, "Alice");
+        assert_eq!(event.created_at, "2026-01-02T00:00:00Z");
+        assert_eq!(event.description, "committed abcdef0: Fix bug");
+    }
+
+    #[test]
     fn complete_discussion_paginates_all_connections_and_keeps_published_metadata() {
         use serde_json::json;
         let connection = |nodes: Vec<serde_json::Value>, cursor: Option<&str>| {
@@ -2737,10 +2886,31 @@ mod tests {
                     None,
                 ),
             ),
+            json!([
+                [{"id": 101, "event": "review_requested", "created_at": "2026-01-02T00:00:00Z",
+                    "actor": {"login": "alice"}, "requested_reviewer": {"login": "bob"}},
+                 {"event": "commented"}, {"event": "reviewed"}, {"event": "line-commented"}],
+                [{"id": 102, "event": "review_request_removed", "created_at": "2026-01-03T00:00:00Z",
+                    "actor": null, "requested_team": {"name": "Maintainers"}}]
+            ]).to_string(),
         ];
         let refs: Vec<_> = responses.iter().map(String::as_str).collect();
         let (client, calls) = session_script(&refs);
         let discussion = client.pr_discussion(&loc()).unwrap();
+        assert_eq!(
+            discussion.events.len(),
+            2,
+            "all pages, without duplicate comments/reviews"
+        );
+        assert_eq!(
+            discussion.events[0].description,
+            "requested a review from bob"
+        );
+        assert_eq!(
+            discussion.events[1].description,
+            "removed the review request for Maintainers"
+        );
+        assert_eq!(discussion.events[1].actor, "ghost");
         assert_eq!(discussion.comments.len(), 3);
         assert_eq!(discussion.comments[0].id, u64::MAX);
         assert_eq!(discussion.comments[0].author, "ghost");
@@ -2793,6 +2963,19 @@ mod tests {
         );
         assert_eq!(flat[1].in_reply_to_id, Some(3));
         let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.last().unwrap(),
+            &vec![
+                "api".to_string(),
+                "--paginate".to_string(),
+                "--slurp".to_string(),
+                format!(
+                    "repos/{}/issues/{}/timeline?per_page=100",
+                    loc().repo_slug(),
+                    loc().number
+                )
+            ]
+        );
         assert!(calls[2].join(" ").contains("node_id:id"));
         assert!(calls[4].join(" ").contains("diffHunk"));
         assert!(calls[4]
@@ -2867,6 +3050,7 @@ mod tests {
                 "",
             ),
             ok(Some(1), "", "gh: Forbidden (HTTP 403)"),
+            ok(Some(0), "[[]]", ""),
         ]);
         let calls = fake.calls_handle();
         let discussion = GhCliClient::with_process(fake)
@@ -2900,7 +3084,7 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(
             calls.len(),
-            6,
+            7,
             "one request per captured blob, including failures"
         );
         assert!(calls[3].last().unwrap().ends_with("?ref=captured-left"));
@@ -3002,6 +3186,23 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("rate limited"));
+        let empty = r#"{"data":{"repository":{"pullRequest":{
+            "comments":{"nodes":[],"pageInfo":{"hasNextPage":false}},
+            "reviews":{"nodes":[],"pageInfo":{"hasNextPage":false}},
+            "reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}
+        }}}}"#;
+        for response in [
+            ok(Some(1), "", "network unavailable"),
+            ok(Some(0), "not JSON", ""),
+        ] {
+            let fake = FakeGh::many(vec![
+                ok(Some(0), empty, ""),
+                ok(Some(0), empty, ""),
+                ok(Some(0), empty, ""),
+                response,
+            ]);
+            assert!(GhCliClient::with_process(fake).pr_discussion(&loc()).is_err());
+        }
     }
 
     #[test]
@@ -4216,6 +4417,7 @@ mod tests {
                 &empty("reviews"),
                 &threads,
                 &comparison,
+                "[[]]",
                 SUCCESS,
                 PENDING,
                 &threads,
@@ -4233,10 +4435,10 @@ mod tests {
             let calls = calls.lock().unwrap();
             assert_eq!(
                 calls.len(),
-                8,
+                9,
                 "cache the lookup across threads, including failures"
             );
-            for ix in [3, 7] {
+            for ix in [3, 8] {
                 assert_eq!(
                     calls[ix],
                     vec![
