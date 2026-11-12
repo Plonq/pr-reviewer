@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const REVISION: u8 = 3;
+const REVISION: u8 = 4;
 const FONT: &str = "Arial";
 const MAX_SOURCE: usize = 16 * 1024;
 const MAX_SVG: usize = 512 * 1024;
@@ -451,7 +451,7 @@ fn admit(source: &str) -> Result<(), Arc<str>> {
         return Err("Mermaid configuration is not supported — source shown".into());
     }
     let lower = source.to_ascii_lowercase();
-    if lower
+    if without_quoted_labels(&lower)
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|word| {
             matches!(
@@ -481,6 +481,42 @@ fn admit(source: &str) -> Result<(), Arc<str>> {
         );
     }
     Ok(())
+}
+
+/// Ignore words inside quoted flowchart labels, not resource-bearing syntax.
+/// Keep this deliberately narrow: paired quotes within a single line, enclosed
+/// by a node shape or edge-label delimiter. HTML is still checked in the original
+/// source, and the generated SVG must independently pass the host audit.
+fn without_quoted_labels(source: &str) -> String {
+    let mut syntax = source.as_bytes().to_vec();
+    let bytes = source.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if bytes[offset] == b'"' && offset > 0 {
+            let close = match bytes[offset - 1] {
+                b'[' => b']',
+                b'{' => b'}',
+                b'(' => b')',
+                b'|' => b'|',
+                _ => {
+                    offset += 1;
+                    continue;
+                }
+            };
+            let end = bytes[offset + 1..]
+                .iter()
+                .position(|b| matches!(b, b'"' | b'\n' | b'\r'))
+                .map(|end| offset + 1 + end);
+            if let Some(end) = end.filter(|&end| {
+                bytes[end] == b'"' && bytes.get(end + 1) == Some(&close)
+            }) {
+                syntax[offset + 1..end].fill(b' ');
+                offset = end + 1;
+            }
+        }
+        offset += 1;
+    }
+    String::from_utf8(syntax).expect("only complete quoted label contents are replaced")
 }
 
 fn resource_policy() -> merman::svg::RenderResourcePolicy {
@@ -1081,6 +1117,8 @@ mod tests {
     #[test]
     fn mermaid_core_fixtures_produce_nonblank_native_rasters() {
         for source in [
+            // https://github.com/Plonq/pr-reviewer/issues/179: "link" is label text.
+            "flowchart LR\n  V[\"Cube: PageViewed<br/>5 pages for this page<br/>Views\"] --> M{\"Match by page id\"}\n  P[\"Postgres: pages with these ids<br/>category, link\"] --> M\n  M --> R[\"Table row<br/>no match = deleted page,<br/>no category or link\"]",
             "flowchart LR\nA[Start] -->|yes| B{Review}\nB --> C[Done]\nC --> A",
             "flowchart TD\nsubgraph Review\nA[café Δ] --> B[\"<b>Bold</b><br/>Next\"]\nend",
             "flowchart LR\nA@{ shape: rect, label: \"Start\" } --> B",
@@ -1256,10 +1294,24 @@ mod tests {
             "---\nconfig:\n  securityLevel: loose\n---\nflowchart LR\nA-->B",
             "flowchart LR\nA[\"<img src='https://example.com/a'>\"]",
             "flowchart LR\nA-->B\nclassDef default font-family:url(file:///tmp/a)",
+            "flowchart LR\nA[\"link\"] --> B\nclick A \"https://example.com\"",
+            "flowchart LR\nA[\"link\"]; click A callback",
+            "flowchart LR\nA[\"link\"]\nstyle A fill:red",
+            "flowchart LR\nA[\"<a href='https://example.com'>link</a>\"]",
+            "flowchart LR\nA[\"<style>rect {fill:red}</style>\"]",
+            "flowchart LR\nA[\"unfinished\nclick A callback\n\"]",
         ] {
             assert!(admit(source).is_err(), "{source}");
         }
         assert!(admit("flowchart LR\nA[\"https://example.com is plain text\"]").is_ok());
+        for source in [
+            "flowchart LR\nA[\"link image style café\"]",
+            "flowchart LR\nA{\"click or callback?\"}",
+            "flowchart LR\nA(\"href links icon\")",
+            "flowchart LR\nA -->|\"link\"| B",
+        ] {
+            assert!(admit(source).is_ok(), "{source}");
+        }
         let policy = resource_policy();
         assert!(merman::svg::ResourceLimitId::ALL
             .into_iter()
