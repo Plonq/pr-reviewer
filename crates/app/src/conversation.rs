@@ -23,6 +23,7 @@ mod jira;
 mod markdown;
 pub(crate) use markdown::render as render_transient_markdown;
 pub(crate) use markdown::render_persistent as render_markdown;
+pub(crate) use markdown::render_view as render_markdown_view;
 
 /// Expand GitHub-isms and Jira references in a description or comment body
 /// into plain GFM:

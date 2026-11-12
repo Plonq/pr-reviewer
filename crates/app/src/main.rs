@@ -276,15 +276,27 @@ fn file_navigation_keybindings() -> [KeyBinding; 4] {
     ]
 }
 
-fn comment_composer_keybindings() -> [KeyBinding; 1] {
-    [KeyBinding::new(
-        "shift-cmd-enter",
-        InputEnter {
-            secondary: true,
-            shift: true,
-        },
-        Some("CommentComposer"),
-    )]
+fn comment_composer_keybindings() -> [KeyBinding; 3] {
+    [
+        KeyBinding::new(
+            "shift-cmd-enter",
+            InputEnter {
+                secondary: true,
+                shift: true,
+            },
+            Some("CommentComposer"),
+        ),
+        // Preview has no Editor mounted to provide these bindings.
+        KeyBinding::new("escape", InputEscape, Some("CommentPreview")),
+        KeyBinding::new(
+            "cmd-enter",
+            InputEnter {
+                secondary: true,
+                shift: false,
+            },
+            Some("CommentPreview"),
+        ),
+    ]
 }
 
 /// Environment that makes every `git` we (or anything below us) run use the
@@ -1794,6 +1806,7 @@ struct Composer {
     row_ix: usize,
     input: gpui::Entity<gpui::component::input::EditorState>,
     uploads: Option<gpui::Entity<comment_media::Uploads>>,
+    preview: bool,
     /// Space below the diff's last row, measured from the floating card.
     height: Rc<Cell<gpui::Pixels>>,
     /// Reveal a composer once, after its card is laid out.
@@ -1838,6 +1851,7 @@ struct ReviewDialog {
     verdict: github::ReviewVerdict,
     input: gpui::Entity<gpui::component::input::EditorState>,
     uploads: Option<gpui::Entity<comment_media::Uploads>>,
+    preview: bool,
     error: Option<SharedString>,
     in_flight: bool,
 }
@@ -4246,6 +4260,7 @@ impl ReviewApp {
             row_ix,
             input,
             uploads,
+            preview: false,
             height: Rc::new(Cell::new(px(250.))),
             reveal: Rc::new(Cell::new(true)),
             error: None,
@@ -4761,6 +4776,7 @@ impl ReviewApp {
             verdict: github::ReviewVerdict::Approve,
             input,
             uploads,
+            preview: false,
             error: None,
             in_flight: false,
         });
@@ -5190,12 +5206,34 @@ impl ReviewApp {
                     .truncate()
                     .child(SharedString::from(target)),
             )
-            .child(comment_editor::field_with_media(
-                &composer.input,
-                composer.uploads.as_ref(),
+            .child(comment_editor::mode_tabs(
+                composer.preview,
                 composer.in_flight,
+                |app: &mut Self, preview, window, cx| {
+                    if let Some(composer) = app.composer_mut() {
+                        composer.preview = preview;
+                        composer.input.update(cx, |input, cx| input.focus(window, cx));
+                        cx.notify();
+                    }
+                },
                 cx,
             ))
+            .child(if composer.preview {
+                comment_editor::preview(
+                    &format!("composer-preview-{}", composer.id),
+                    &composer.input,
+                    composer.uploads.as_ref(),
+                    self,
+                    cx,
+                )
+            } else {
+                comment_editor::field_with_media(
+                    &composer.input,
+                    composer.uploads.as_ref(),
+                    composer.in_flight,
+                    cx,
+                )
+            })
             .when_some(composer.error.clone(), |card, err| {
                 card.child(div().text_color(theme::red(cx)).child(err))
             })
@@ -7743,6 +7781,7 @@ mod tests {
 
     mod markdown_hosts {
         include!("markdown_tests.rs");
+        include!("comment_preview_tests.rs");
         include!("image_viewer_tests.rs");
         include!("file_media_tests.rs");
         include!("svg_image_tests.rs");
