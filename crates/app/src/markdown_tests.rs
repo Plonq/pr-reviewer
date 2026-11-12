@@ -36,6 +36,74 @@ pub(super) fn draw_settled(cx: &mut gpui::VisualTestContext) {
 }
 
 #[gpui::test]
+fn github_single_newlines_match_explicit_breaks_in_inline_and_persistent_prose(cx: &mut gpui::TestAppContext) {
+    let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+    let multiline = "line1\nline2\nline3";
+    let single = "line1 line2 line3";
+    let mut item = loop_pr_item(vec![
+        rc(11, "a.rs", Some("RIGHT"), Some(1), multiline, "alice", "2026-01-01T00:00:00Z", None),
+        rc(13, "a.rs", Some("RIGHT"), Some(1), "line1  \nline2  \nline3", "bob", "2026-01-01T00:00:00Z", None),
+        rc(15, "a.rs", Some("RIGHT"), Some(1), single, "carol", "2026-01-01T00:00:00Z", None),
+    ]);
+    let ItemState::Ready(data) = &mut item.state else { unreachable!() };
+    data.pr_meta.as_mut().unwrap().body = multiline.into();
+    install_item(&app, item, cx);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1500.), px(1800.)));
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        cx.update(|cx| app.update(cx, |app, cx| {
+            let data = app.active_data_mut().unwrap();
+            data.mode = mode;
+            data.rebuild_rows_anchored();
+            data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+            data.scroll.0.borrow().base_handle.set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        }));
+        draw_settled(&mut vcx);
+        let body = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
+        let explicit = vcx.debug_bounds("inline-text-0-13-0-content").unwrap();
+        let one_line = vcx.debug_bounds("inline-text-0-15-0-content").unwrap();
+        assert_eq!(body.size.height, explicit.size.height);
+        assert!(body.size.height >= one_line.size.height * 2.9, "three visual lines, not one");
+        assert!(body.bottom() <= vcx.debug_bounds("inline-text-0-11-0-card").unwrap().bottom());
+        // Native prose selection must still copy real line endings, without
+        // the backslashes introduced only for the Markdown parser.
+        let start = body.origin + point(px(1.), px(8.));
+        let end = body.origin + point(px(90.), body.size.height - px(5.));
+        vcx.simulate_event(MouseDownEvent {
+            position: start, button: MouseButton::Left, click_count: 1,
+            ..Default::default()
+        });
+        vcx.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        vcx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        vcx.update(|window, cx| {
+            let selected = gpui::base::TextSelection::selected_text(window, cx);
+            assert!(selected.contains("line1\nline2\nline3"), "{selected:?}");
+        });
+    }
+    vcx.dispatch_action(ShowConversation);
+    draw_settled(&mut vcx);
+    let three_lines = vcx.debug_bounds("conversation-0-text").unwrap().size.height;
+    let owner = cx.update(|cx| app.read(cx).active_data().unwrap().conv_markdown.borrow()
+        .get("conversation-0").unwrap().state.entity_id());
+    for source in [single, multiline] {
+        cx.update(|cx| app.update(cx, |app, cx| {
+            app.active_data_mut().unwrap().pr_meta.as_mut().unwrap().body = source.into();
+            cx.notify();
+        }));
+        draw_settled(&mut vcx);
+        let height = vcx.debug_bounds("conversation-0-text").unwrap().size.height;
+        if source == single {
+            assert!(three_lines >= height * 2.9);
+        } else {
+            assert_eq!(height, three_lines);
+        }
+        cx.update(|cx| assert_eq!(app.read(cx).active_data().unwrap().conv_markdown.borrow()
+            .get("conversation-0").unwrap().state.entity_id(), owner, "edits reuse the document owner"));
+    }
+}
+
+#[gpui::test]
 fn stock_inline_markdown_measures_images_in_both_sides_and_partial_virtualization(cx: &mut gpui::TestAppContext) {
     let requests = image_client(cx);
     let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
@@ -190,6 +258,30 @@ fn conversation_keeps_deep_scroll_across_pane_switches(cx: &mut gpui::TestAppCon
 }
 
 #[gpui::test]
+fn reference_images_render_inline_and_block_and_open_the_viewer(cx: &mut gpui::TestAppContext) {
+    let requests = image_client(cx);
+    for (body, selector, linked) in [
+        ("[![asset][ref]][dest]", "conversation-0-image-1", true),
+        ("Before ![asset][] after", "conversation-0-image-7", false),
+        ("Before ![asset] after", "conversation-0-image-7", false),
+    ] {
+        let source = format!("{body}\n\n[ref]: https://example.com/screen\n[asset]: https://example.com/screen\n[dest]: https://example.com/original");
+        let (window, app) = viewer_conversation(cx, &source);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        draw_settled(&mut vcx);
+        click_selector(&mut vcx, selector);
+        cx.update(|cx| {
+            let viewer = app.read(cx).image_viewer.as_ref().unwrap();
+            assert_eq!(viewer.target.url.as_ref(), "https://example.com/screen");
+            assert_eq!(viewer.target.alt.as_ref(), "asset");
+            assert_eq!(viewer.target.link.as_deref(), linked.then_some("https://example.com/original"));
+        });
+        click_selector(&mut vcx, "viewer-close");
+    }
+    assert!(requests.lock().unwrap().iter().any(|url| url.ends_with("/screen")));
+}
+
+#[gpui::test]
 fn stock_conversation_markdown_loads_html_linked_and_extensionless_images(cx: &mut gpui::TestAppContext) {
     let requests = image_client(cx);
     let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
@@ -198,7 +290,7 @@ fn stock_conversation_markdown_loads_html_linked_and_extensionless_images(cx: &m
     let mut item = loop_pr_item(Vec::new());
     item.pane = ItemPane::Conversation;
     let ItemState::Ready(data) = &mut item.state else { unreachable!() };
-    data.pr_meta.as_mut().unwrap().body = "- first\n  - nested\n\n<img src='https://github.com/user-attachments/assets/html-screen'>\n\n[![diagram](https://github.com/user-attachments/assets/diagram)](https://example.com/full)\n\n| Before | After |\n| --- | --- |\n| a | b |\n\n![omitted][ref]\n\n[ref]: https://example.com/reference-only".into();
+    data.pr_meta.as_mut().unwrap().body = "- first\n  - nested\n\n<img src='https://github.com/user-attachments/assets/html-screen'>\n\n[![diagram](https://github.com/user-attachments/assets/diagram)](https://example.com/full)\n\n| Before | After |\n| --- | --- |\n| a | b |\n\n![reference][ref]\n\n[ref]: https://example.com/reference-only".into();
     let mut discussion = conversation::tests::sample_discussion();
     discussion.threads.clear();
     discussion.comments.truncate(1);
@@ -207,10 +299,9 @@ fn stock_conversation_markdown_loads_html_linked_and_extensionless_images(cx: &m
     install_item(&app, item, cx);
     draw_settled(&mut vcx);
     let requests = requests.lock().unwrap();
-    for name in ["html-screen", "diagram", "comment-screen"] {
+    for name in ["html-screen", "diagram", "comment-screen", "reference-only"] {
         assert!(requests.iter().any(|url| url.ends_with(name)), "stock image loader requested {name}");
     }
-    assert!(!requests.iter().any(|url| url.ends_with("reference-only")), "reference images are intentionally omitted by stock Markdown");
 }
 
 #[gpui::test]

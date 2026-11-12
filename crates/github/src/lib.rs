@@ -24,7 +24,7 @@ pub use comparison::{ComparisonBase, ReviewComparison};
 pub mod discussion;
 pub mod gh_cli;
 pub use discussion::{
-    CommentPermissions, CommentTarget, DiscussionComment, PrDiscussion, Reaction,
+    CommentPermissions, CommentTarget, DiscussionComment, DiscussionEvent, PrDiscussion, Reaction,
     ReviewCodeContext, ReviewThread,
 };
 pub mod review_changes;

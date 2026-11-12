@@ -17,6 +17,193 @@ fn paint(vcx: &mut gpui::VisualTestContext) {
     }
 }
 
+#[test]
+fn new_comment_reservations_follow_wrapped_source_and_shift_navigation() {
+    let line = |no| Row::Line {
+        old_no: Some(no),
+        new_no: Some(no),
+        kind: rows::LineKind::Context,
+        text: "source".into(),
+        intra: vec![],
+        syntax: vec![],
+    };
+    let mut built = BuiltRows {
+        rows: vec![line(1), Row::Continuation(Box::new(line(1))), line(2), Row::Binary],
+        file_rows: vec![0, 3],
+        hunk_rows: vec![0, 2],
+    };
+    comment_actions::reserve_new_comment_rows(
+        &mut built, CommentSide::Right, 1, Some(CommentSide::Right), 2,
+    );
+    assert!(matches!(built.rows[1], Row::Continuation(_)));
+    assert!(matches!(built.rows[2], Row::CommentEditor { top: true, half: Some(CommentSide::Right) }));
+    assert!(matches!(built.rows[3], Row::CommentEditor { top: false, .. }));
+    assert_eq!(rows::comment_line(&built.rows[4], CommentSide::Right), Some(2));
+    assert_eq!(built.file_rows, vec![0, 5]);
+    assert_eq!(built.hunk_rows, vec![0, 4]);
+    comment_actions::reserve_new_comment_rows(&mut built, CommentSide::Right, 99, None, 2);
+    assert_eq!(built.rows.len(), 6, "a missing source anchor never reserves at a stale index");
+}
+
+#[gpui::test]
+fn empty_diff_composer_reservation_is_stable_from_its_first_frame(
+    cx: &mut gpui::TestAppContext,
+) {
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        for (font_size, rem_size) in [(16., 16.), (24., 20.)] {
+            let fake = layout_fake();
+            let (window, app) = queue_window(cx, fake.clone());
+            install_item(&app, layout_item(&fake, mode, false), cx);
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            vcx.simulate_resize(size(px(1100.), px(1200.)));
+            vcx.update(|window, cx| {
+                gpui::component::Theme::global_mut(cx).font_size = px(font_size);
+                window.set_rem_size(px(rem_size));
+            });
+            paint(&mut vcx);
+            let initial_rows = vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.open_composer(None, "a.rs".into(), CommentSide::Right, 2, 0, window, cx);
+                    app.active_data().unwrap().rows.iter()
+                        .filter(|row| matches!(row, Row::CommentEditor { .. }))
+                        .count()
+                })
+            });
+            let reserved_rows = |cx: &mut gpui::App| {
+                app.read(cx).active_data().unwrap().rows.iter()
+                    .filter(|row| matches!(row, Row::CommentEditor { .. }))
+                    .count()
+            };
+            let mut first_card = None;
+            for _ in 0..4 {
+                vcx.update(|window, cx| {
+                    window.refresh();
+                    let _ = window.draw(cx);
+                });
+                let card = vcx.debug_bounds("composer-card").expect("empty composer");
+                assert_eq!(*first_card.get_or_insert(card), card);
+                vcx.update(|_, cx| {
+                    assert_eq!(
+                        reserved_rows(cx), initial_rows,
+                        "the empty card must not shrink its reservation after first paint"
+                    );
+                });
+                vcx.run_until_parked();
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn new_diff_comments_reserve_cards_at_source_anchors(cx: &mut gpui::TestAppContext) {
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        for side in [CommentSide::Left, CommentSide::Right] {
+            for width in [850., 1400.] {
+                let fake = layout_fake();
+                let (window, app) = queue_window(cx, fake.clone());
+                install_item(&app, layout_item(&fake, mode, false), cx);
+                let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+                vcx.simulate_resize(size(px(width), px(1200.)));
+                vcx.update(|window, cx| {
+                    app.update(cx, |app, cx| {
+                        // Rendering must not trust this stale display index.
+                        app.open_composer(None, "a.rs".into(), side, 2, 999, window, cx);
+                        app.composer_mut().unwrap().start_line = Some(1);
+                    });
+                });
+                for grow in [false, true] {
+                    if grow {
+                        vcx.update(|window, cx| {
+                            app.update(cx, |app, cx| {
+                                app.composer().unwrap().input.update(cx, |input, cx| {
+                                    input.set_value("A longer comment\n".repeat(10), window, cx);
+                                });
+                                // Hide other comments and rebuild, changing the
+                                // source anchor's display index under the editor.
+                                let data = app.active_data_mut().unwrap();
+                                data.comments_visible = false;
+                                data.rebuild_rows_anchored();
+                                cx.notify();
+                            });
+                        });
+                    }
+                    paint(&mut vcx);
+                    let card = vcx.debug_bounds("composer-card").expect("new comment card");
+                    assert!(vcx.debug_bounds("composer-shell").is_none());
+                    let (anchor, following, viewport, offset, half) = cx.update(|cx| {
+                        let data = app.read(cx).active_data().unwrap();
+                        let anchor = data.rows.iter()
+                            .rposition(|row| rows::comment_line(row, side) == Some(2))
+                            .unwrap();
+                        let following = data.rows.iter()
+                            .position(|row| rows::comment_line(row, side) == Some(3))
+                            .unwrap();
+                        let half = (mode == ViewMode::Split).then_some(side);
+                        assert!(matches!(data.rows[anchor + 1],
+                            Row::CommentEditor { half: actual, top: true } if actual == half
+                        ));
+                        let reserved = data.rows[anchor + 1..following].iter().filter(|row| {
+                            matches!(row, Row::CommentEditor { half: actual, .. } if *actual == half)
+                        }).count();
+                        assert!(reserved > 1);
+                        let state = data.scroll.0.borrow();
+                        (
+                            anchor, following, state.base_handle.bounds(),
+                            state.base_handle.offset(), half,
+                        )
+                    });
+                    let prefix = if mode == ViewMode::Unified {
+                        "diff-code"
+                    } else if side == CommentSide::Left {
+                        "diff-code-left"
+                    } else {
+                        "diff-code-right"
+                    };
+                    // GPUI's test selector API requires static strings.
+                    let source = vcx
+                        .debug_bounds(Box::leak(format!("{prefix}-{anchor}").into_boxed_str()))
+                        .expect("selected source remains visible");
+                    let next_code = vcx
+                        .debug_bounds(Box::leak(format!("{prefix}-{following}").into_boxed_str()))
+                        .expect("following code remains visible");
+                    assert!(card.top() >= source.bottom());
+                    assert!(
+                        card.bottom() <= next_code.top(),
+                        "new card must push following code down"
+                    );
+                    let pane_width = if half.is_some() {
+                        (viewport.size.width - px(SPLIT_DIVIDER)) / 2.
+                    } else {
+                        viewport.size.width
+                    };
+                    let pane_left = viewport.left()
+                        + if half == Some(CommentSide::Right) {
+                            pane_width + px(SPLIT_DIVIDER)
+                        } else {
+                            px(0.)
+                        };
+                    assert!(card.left() >= pane_left + px(72.));
+                    assert!(card.right() <= pane_left + pane_width);
+                    let expected_top = viewport.top()
+                        + offset.y
+                        + px((anchor + 1) as f32 * row_height())
+                        + px(12.);
+                    assert!((f32::from(card.top() - expected_top)).abs() < 2.);
+                }
+                vcx.simulate_keystrokes("escape");
+                paint(&mut vcx);
+                cx.update(|cx| {
+                    let data = app.read(cx).active_data().unwrap();
+                    assert!(data.new_comments.is_empty());
+                    assert!(!data.rows.iter().any(|row| {
+                        matches!(row, Row::CommentEditor { .. })
+                    }));
+                });
+            }
+        }
+    }
+}
+
 fn layout_item(fake: &FakePr, mode: ViewMode, conversation: bool) -> ReviewItem {
     let mut item = commenting_item(fake);
     item.pane = if conversation {
@@ -92,6 +279,244 @@ fn layout_fake() -> Arc<FakePr> {
             review_id: Some("original-review".into()),
         });
     fake
+}
+
+#[gpui::test]
+fn edits_share_composer_content_keep_authorship_and_cannot_be_replaced(
+    cx: &mut gpui::TestAppContext,
+) {
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        for conversation in [false, true] {
+            for reply in [false, true] {
+                let fake = layout_fake();
+                fake.comments.lock().unwrap().push(rc(
+                    12,
+                    "a.rs",
+                    Some("RIGHT"),
+                    Some(1),
+                    "A reply",
+                    "bob",
+                    "2026-01-01T00:01:00Z",
+                    Some(11),
+                ));
+                for id in [11, 12] {
+                    fake.comment_permissions
+                        .lock()
+                        .unwrap()
+                        .insert(id, permitted_comment(&format!("node-{id}"), true, true));
+                }
+                let (window, app) = queue_window(cx, fake.clone());
+                install_item(&app, layout_item(&fake, mode, conversation), cx);
+                let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+                let id = if reply { 12 } else { 11 };
+                let target = CommentTarget::Published(github::CommentTarget::ReviewComment(
+                    format!("node-{id}"),
+                ));
+                let token = vcx.update(|window, cx| {
+                    app.update(cx, |app, cx| {
+                        let placement = if conversation {
+                            ComposerPlacement::ConversationComment(target.key())
+                        } else {
+                            ComposerPlacement::Diff
+                        };
+                        app.edit_comment(target, placement, window, cx);
+                        let composer = app.composer().unwrap();
+                        let input = composer.input.read(cx);
+                        let end = input.text().len();
+                        assert_eq!(
+                            input.selected_range(),
+                            end..end,
+                            "editing starts ready to append"
+                        );
+                        composer
+                            .input
+                            .update(cx, |input, cx| input.set_value("unsaved edit", window, cx));
+                        composer.id
+                    })
+                });
+                paint(&mut vcx);
+                assert!(vcx.debug_bounds("composer-card").is_some());
+                assert!(vcx.debug_bounds("comment-editing").is_some());
+                assert!(
+                    vcx.debug_bounds("composer-shell").is_none(),
+                    "no nested standalone panel"
+                );
+                assert!(vcx
+                    .debug_bounds(if reply {
+                        "comment-edit-review-comment-node-12"
+                    } else {
+                        "comment-edit-review-comment-node-11"
+                    })
+                    .is_none());
+                let avatar = match (conversation, reply) {
+                    (true, true) => "discussion-avatar-0-review-false-12",
+                    (true, false) => "discussion-avatar-0-review-false-11",
+                    (false, true) => "inline-avatar-12",
+                    (false, false) => "inline-avatar-11",
+                };
+                assert!(
+                    vcx.debug_bounds(avatar).is_some(),
+                    "editing retains the author"
+                );
+                if !conversation && reply {
+                    assert!(
+                        vcx.debug_bounds("inline-reply-11").is_none(),
+                        "editor replaces the footer"
+                    );
+                }
+                // The other thread's Reply control must not cancel this edit.
+                if !conversation {
+                    if let Some(bounds) = vcx.debug_bounds("inline-reply-22") {
+                        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+                    }
+                }
+                vcx.update(|window, cx| {
+                    app.update(cx, |app, cx| {
+                        app.open_composer(
+                            Some(22),
+                            "a.rs".into(),
+                            CommentSide::Right,
+                            2,
+                            999,
+                            window,
+                            cx,
+                        );
+                        app.open_comment_composer(
+                            ComposerPlacement::ConversationMain,
+                            None,
+                            String::new(),
+                            CommentSide::Right,
+                            0,
+                            0,
+                            window,
+                            cx,
+                        );
+                        app.open_composer_on_selection(window, cx);
+                        assert_eq!(app.composer().unwrap().id, token);
+                        assert_eq!(
+                            app.composer().unwrap().input.read(cx).value(),
+                            "unsaved edit"
+                        );
+                    })
+                });
+                vcx.simulate_keystrokes("escape");
+                paint(&mut vcx);
+                cx.update(|cx| {
+                    let app = app.read(cx);
+                    assert!(app.composer().is_none());
+                    assert!(app.active_data().unwrap().editing_comments.is_empty());
+                    assert!(app.active_data().unwrap().replying_comments.is_empty());
+                });
+                assert!(vcx.debug_bounds("composer-card").is_none());
+            }
+        }
+    }
+}
+
+#[gpui::test]
+fn diff_reply_is_attached_to_the_current_thread_after_row_rebuilds(cx: &mut gpui::TestAppContext) {
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        let fake = layout_fake();
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, layout_item(&fake, mode, false), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                // A stale display index is deliberately not the thread's footer.
+                app.open_composer(
+                    Some(11),
+                    "a.rs".into(),
+                    CommentSide::Right,
+                    1,
+                    999,
+                    window,
+                    cx,
+                );
+            })
+        });
+        paint(&mut vcx);
+        let old_anchor = cx.update(|cx| {
+            app.read(cx)
+                .active_data()
+                .unwrap()
+                .rows
+                .iter()
+                .position(|row| {
+                    matches!(
+                        row,
+                        Row::CommentActions {
+                            root_id: CommentKey::Inline(11),
+                            ..
+                        }
+                    )
+                })
+                .unwrap()
+        });
+        vcx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                let data = app.active_data_mut().unwrap();
+                data.discussion
+                    .as_mut()
+                    .unwrap()
+                    .threads
+                    .iter_mut()
+                    .find(|t| t.id == "11")
+                    .unwrap()
+                    .comments[0]
+                    .body = "More context\n".repeat(12);
+                data.comment_text_layouts.clear();
+                data.project_comments(None);
+                data.rebuild_rows_anchored();
+                cx.notify();
+            })
+        });
+        paint(&mut vcx);
+        let content = vcx
+            .debug_bounds("composer-card")
+            .expect("the attached composer is visible");
+        let following = vcx
+            .debug_bounds("inline-avatar-22")
+            .expect("the next thread stays visible");
+        assert!(
+            content.bottom() < following.top(),
+            "reply reserves space instead of covering the next card"
+        );
+        assert!(vcx.debug_bounds("composer-shell").is_none());
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let data = app.active_data().unwrap();
+                let anchor = data
+                    .rows
+                    .iter()
+                    .position(|row| {
+                        matches!(
+                            row,
+                            Row::CommentActions {
+                                root_id: CommentKey::Inline(11),
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap();
+                assert_ne!(anchor, old_anchor);
+                let state = data.scroll.0.borrow();
+                let expected_top = state.base_handle.bounds().top()
+                    + state.base_handle.offset().y
+                    + px((anchor + 1) as f32 * row_height());
+                assert!((f32::from(content.top() - expected_top) - 12.).abs() < 2.);
+                drop(state);
+                assert!(matches!(data.rows[anchor + 1], Row::CommentEditor { .. }));
+                app.close_composer(window, cx);
+                assert!(app.active_data().unwrap().replying_comments.is_empty());
+                assert!(!app
+                    .active_data()
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .any(|r| matches!(r, Row::CommentEditor { .. })));
+            })
+        });
+    }
 }
 
 #[gpui::test]
@@ -197,7 +622,7 @@ fn metadata_acknowledgement_preserves_painted_cards_followers_and_viewports(
                                 .conv_markdown
                                 .borrow()
                                 .get(&format!("discussion-0-post-{token}"))
-                                .map(|state| state.entity_id());
+                                .map(|document| document.state.entity_id());
                             (
                                 data.rows.len(),
                                 data.scroll.0.borrow().base_handle.offset(),
@@ -336,7 +761,7 @@ fn metadata_acknowledgement_preserves_painted_cards_followers_and_viewports(
                                 data.conv_markdown
                                     .borrow()
                                     .get(&format!("discussion-0-post-{token}"))
-                                    .map(|state| state.entity_id()),
+                                    .map(|document| document.state.entity_id()),
                                 before_state.4,
                                 "Markdown/media owner: {case}"
                             );
@@ -513,7 +938,7 @@ fn metadata_acknowledgement_keeps_partially_visible_markdown_and_loaded_media_an
                         data.conv_markdown
                             .borrow()
                             .get("discussion-0-post-1")
-                            .map(|s| s.entity_id()),
+                            .map(|document| document.state.entity_id()),
                     )
                 });
                 assert!(fake.posts().is_empty());
@@ -562,7 +987,7 @@ fn metadata_acknowledgement_keeps_partially_visible_markdown_and_loaded_media_an
                         data.conv_markdown
                             .borrow()
                             .get("discussion-0-post-1")
-                            .map(|s| s.entity_id()),
+                            .map(|document| document.state.entity_id()),
                         state.3
                     );
                     assert!(data.posts.pending.is_empty());
@@ -953,6 +1378,41 @@ fn inline_completion_after_switching_prs_cannot_replace_the_new_pr_editor_or_foc
                     "one write: pending={pending}, operation={operation}, rejected={rejected}"
                 );
             }
+        }
+    }
+}
+
+#[gpui::test]
+fn diff_comment_cards_and_composers_share_the_prose_width_cap(cx: &mut gpui::TestAppContext) {
+    for mode in [ViewMode::Unified, ViewMode::Split] {
+        for width in [850., 2600.] {
+            let fake = layout_fake();
+            let (window, app) = queue_window(cx, fake.clone());
+            install_item(&app, layout_item(&fake, mode, false), cx);
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            vcx.simulate_resize(size(px(width), px(1200.)));
+            paint(&mut vcx);
+            let outline = vcx.debug_bounds("inline-comment-outline").unwrap();
+            let (cap, pane) = cx.update(|cx| {
+                let app = app.read(cx);
+                let data = app.active_data().unwrap();
+                let viewport = data.scroll.0.borrow().base_handle.bounds().size.width;
+                (diff_media::comment_card_max_width(app.char_width.unwrap()),
+                 if mode == ViewMode::Split { (viewport - px(SPLIT_DIVIDER)) / 2. } else { viewport })
+            });
+            let expected = cap.min(pane - px(72.));
+            let content = vcx.debug_bounds("inline-text-0-11-0-content").unwrap();
+            assert!((content.right() + px(13.) - outline.right()).abs() < px(1.));
+            assert!((outline.size.width - expected).abs() < px(1.));
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.open_composer(None, "a.rs".into(), CommentSide::Right, 2, 0, window, cx);
+                });
+            });
+            paint(&mut vcx);
+            let composer = vcx.debug_bounds("composer-card").unwrap();
+            // Content excludes the outline's borders and the overlay's p_3 padding.
+            assert!((composer.size.width - (expected - px(27.))).abs() < px(1.));
         }
     }
 }

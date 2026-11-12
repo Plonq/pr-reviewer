@@ -17,13 +17,14 @@
 //! text, so a pathological description can still be rewritten a little too
 //! eagerly. Task 12 reuses this pipe for comment bodies, where the same
 //! tradeoff holds. Jira keys are then linked in parsed Markdown prose only,
-//! leaving code and existing links untouched.
+//! leaving code and existing links untouched. Finally, paragraph soft breaks
+//! become hard breaks to match GitHub's PR/comment rendering (not `.md` files).
 
 mod jira;
 mod markdown;
 pub(crate) use markdown::render as render_transient_markdown;
-pub(crate) use markdown::render_persistent as render_markdown;
 pub(crate) use markdown::render_view as render_markdown_view;
+pub(crate) use markdown::{render_persistent as render_markdown, PersistentMarkdown};
 
 /// Expand GitHub-isms and Jira references in a description or comment body
 /// into plain GFM:
@@ -32,7 +33,8 @@ pub(crate) use markdown::render_view as render_markdown_view;
 /// - `@login` → a link to the GitHub profile,
 /// - `#123` → a link to the issue in `repo_slug` (GitHub redirects pulls
 ///   and issues to the same place; `issues/` is the canonical spelling),
-/// - `PYAPI-123`, `BOT-123`, `CS-123`, `HELP-123` → Jira ticket links.
+/// - `PYAPI-123`, `BOT-123`, `CS-123`, `HELP-123` → Jira ticket links,
+/// - single newlines in paragraph prose → hard line breaks.
 ///
 /// Code is never rewritten: fenced blocks pass through whole, and inline
 /// code spans are skipped within a line.
@@ -67,7 +69,7 @@ pub fn preprocess(body: &str, repo_slug: &str) -> String {
     // split('\n') on a trailing-newline body ends with an empty line, so
     // `foo\n` round-trips; a body without one (`foo`) gains a harmless
     // trailing newline that markdown ignores.
-    jira::link_references(out)
+    markdown::hard_breaks(jira::link_references(out))
 }
 
 use crate::comments::Comment;
@@ -287,7 +289,14 @@ impl ReviewApp {
                         window.refresh();
                     });
                 })
-                .child(self.render_composer_card(cx))
+                .child(if thread.is_some() {
+                    self.render_composer_content(cx)
+                } else {
+                    timeline_comment_card(cx)
+                        .debug_selector(|| "conversation-new-comment".into())
+                        .child(self.render_composer_content(cx))
+                        .into_any_element()
+                })
                 .into_any_element();
         }
         let reply_to =
@@ -318,6 +327,10 @@ impl ReviewApp {
                     "Leave a comment"
                 })
                 .small()
+                .when(
+                    self.composer().is_some_and(|c| c.edit_id.is_some()),
+                    |button| button.tooltip("Save or cancel your edit first"),
+                )
                 .disabled(
                     self.composer().is_some()
                         || self.review.is_some()
@@ -500,6 +513,46 @@ impl ReviewApp {
         let mut elements = Vec::new();
         for entry in entries {
             match entry {
+                Entry::Event(event) => elements.push(
+                    div()
+                        .debug_selector(|| format!("timeline-event-{}-{}", item.id, event.id))
+                        .relative()
+                        .flex()
+                        .items_start()
+                        .gap_3()
+                        .child(
+                            div()
+                                .size(px(TIMELINE_MARKER_SIZE))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(theme::base(cx))
+                                .border_1()
+                                .border_color(theme::surface0(cx))
+                                .child(
+                                    Icon::default()
+                                        .path("icons/gander/comment-16.svg")
+                                        .size(px(16.))
+                                        .text_color(theme::subtext(cx)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .pt_1()
+                                .child(format!("{} {}", event.actor, event.description))
+                                .child(div().text_color(theme::subtext(cx)).child(
+                                    crate::threads::short_age(
+                                        &event.created_at,
+                                        crate::rows::now_unix(),
+                                    ),
+                                )),
+                        )
+                        .into_any_element(),
+                ),
                 Entry::Comment(comment) => elements.push(
                     div()
                         .relative()
@@ -972,30 +1025,36 @@ impl ReviewApp {
                 );
             }
             for (ix, comment) in projected.comments.iter().copied().enumerate() {
-                let pending_editor = matches!(comment, Comment::Pending(draft) if self.composer().is_some_and(|composer| {
-                    composer.item_id == item.id && composer.placement == ComposerPlacement::ConversationComment(
-                        crate::CommentTarget::Pending(draft.id).key())
-                }));
                 card = card.child(
                     div()
                         .p_4()
                         .when(ix > 0, |row| row.pl(px(16. + crate::threads::REPLY_INDENT)))
-                        .when(!pending_editor, |row| {
-                            row.border_t_1().border_color(theme::surface0(cx))
-                        })
+                        .border_t_1()
+                        .border_color(theme::surface0(cx))
                         .child(
                             self.discussion_comment(item.id, "review", comment, slug, window, cx),
                         ),
                 );
             }
-            card = card.child(
-                div()
-                    .p_4()
-                    .border_t_1()
-                    .border_color(theme::surface0(cx))
-                    .pl(px(16. + crate::threads::REPLY_INDENT))
-                    .child(self.conversation_composer(item.id, Some(thread), cx)),
-            );
+            let editing_thread = self.composer().is_some_and(|composer| {
+                composer.edit_id.is_some_and(|id| {
+                    projected.comments.iter().any(|comment| match comment {
+                        Comment::Published(c) => c.id == id,
+                        Comment::Pending(c) => c.id == id,
+                        Comment::Posting(_) => false,
+                    })
+                })
+            });
+            if !editing_thread {
+                card = card.child(
+                    div()
+                        .p_4()
+                        .border_t_1()
+                        .border_color(theme::surface0(cx))
+                        .pl(px(16. + crate::threads::REPLY_INDENT))
+                        .child(self.conversation_composer(item.id, Some(thread), cx)),
+                );
+            }
         }
         card.into_any_element()
     }
@@ -1009,15 +1068,6 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        if let Comment::Pending(draft) = projected {
-            let target = crate::CommentTarget::Pending(draft.id);
-            let placement = ComposerPlacement::ConversationComment(target.key());
-            if self.composer().is_some_and(|composer| {
-                composer.item_id == item_id && composer.placement == placement
-            }) {
-                return self.render_composer_card(cx);
-            }
-        }
         let pending_author = match &self.account {
             crate::AccountStatus::SignedIn(viewer) => viewer.login.as_str(),
             _ => "you",
@@ -1066,13 +1116,11 @@ impl ReviewApp {
             let placement = ComposerPlacement::ConversationComment(target.key());
             (target, placement)
         });
-        if controls.as_ref().is_some_and(|(_, placement)| {
+        let editing = controls.as_ref().is_some_and(|(_, placement)| {
             self.composer().is_some_and(|composer| {
                 composer.item_id == item_id && &composer.placement == placement
             })
-        }) {
-            return self.render_composer_card(cx);
-        }
+        });
         let (key, reserve_reactions) = self
             .items
             .iter()
@@ -1142,12 +1190,27 @@ impl ReviewApp {
                                 Tooltip::new(timestamp.clone()).build(window, cx)
                             }),
                     )
-                    .children(controls),
+                    .when(!editing, |header| header.children(controls))
+                    .when(editing, |header| {
+                        header.child(
+                            div()
+                                .debug_selector(|| "comment-editing".into())
+                                .text_color(theme::overlay0(cx))
+                                .text_sm()
+                                .child("Editing"),
+                        )
+                    }),
             );
+        if editing {
+            return card
+                .child(self.render_composer_content(cx))
+                .into_any_element();
+        }
         if markdown::has_content(body) {
             card = card.child(render_markdown(
                 &markdown_id,
-                preprocess(body, slug),
+                body,
+                slug,
                 self,
                 window,
                 cx,
@@ -1460,6 +1523,7 @@ pub(crate) mod tests {
             }],
         };
         github::PrDiscussion {
+            events: Vec::new(),
             comments: vec![
                 comment(1, "2026-01-02T00:00:00Z"),
                 comment(2, "2026-01-01T00:00:00Z"),
@@ -1520,6 +1584,33 @@ pub(crate) mod tests {
         comment.review_state = None;
         comment.created_at = "unknown date".into();
         assert_eq!(discussion_heading(&comment, posted), "alice · unknown date");
+    }
+
+    #[test]
+    fn timeline_interleaves_activity_with_comments_and_threads_and_breaks_ties_by_id() {
+        let mut discussion = sample_discussion();
+        for id in ["E2", "E1"] {
+            discussion.events.push(github::DiscussionEvent {
+                id: id.into(),
+                actor: "alice".into(),
+                created_at: "2026-01-01T06:00:00Z".into(),
+                description: "requested a review from bob".into(),
+            });
+        }
+        let entries = timeline(&discussion);
+        assert_eq!(entries.len(), 5);
+        assert!(matches!(entries[0], Entry::Comment(Comment::Published(c)) if c.id == 2));
+        assert!(matches!(entries[1], Entry::Event(e) if e.id == "E1"));
+        assert!(matches!(entries[2], Entry::Event(e) if e.id == "E2"));
+        assert!(matches!(entries[3], Entry::Thread(_)));
+        assert!(matches!(entries[4], Entry::Comment(Comment::Published(c)) if c.id == 1));
+        discussion.comments.clear();
+        discussion.threads.clear();
+        assert_eq!(
+            timeline(&discussion).len(),
+            2,
+            "activity-only conversations remain visible"
+        );
     }
 
     #[test]
@@ -1858,8 +1949,8 @@ pub(crate) mod tests {
     #[test]
     fn empty_and_crlf_bodies() {
         assert_eq!(preprocess("", "a/b"), "\n");
-        assert_eq!(preprocess("a\r\nb", "a/b"), "a\nb\n");
-        // A CR mid-line (not a line ending) survives as the character it is.
-        assert_eq!(preprocess("a\rb", "a/b"), "a\rb\n");
+        assert_eq!(preprocess("a\r\nb", "a/b"), "a\\\nb\n");
+        // CommonMark also recognizes a lone CR as a line ending.
+        assert_eq!(preprocess("a\rb", "a/b"), "a\\\rb\n");
     }
 }

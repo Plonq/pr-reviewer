@@ -69,20 +69,87 @@ pub(crate) fn reserve_editor_rows(
         _ => unreachable!(),
     };
     let start = header + 1;
-    let end = start
+    let mut end = start
         + built.rows[start..]
             .iter()
             .take_while(|row| matches!(row, Row::CommentBody { .. }))
             .count();
+    // The last comment's editor owns its footer. Do not leave a Reply button
+    // sandwiched beneath its Save/Cancel actions. Earlier replies stay visible.
+    if matches!(built.rows.get(end), Some(Row::CommentActions { .. })) {
+        end += 1;
+    }
     let count = count.max(1);
     for ix in built.file_rows.iter_mut().chain(&mut built.hunk_rows) {
         if *ix >= end {
             *ix = *ix - (end - start) + count;
         }
     }
-    built
+    built.rows.splice(
+        start..end,
+        (0..count).map(|_| Row::CommentEditor { half, top: false }),
+    );
+}
+
+/// Keep a reply inside its thread, reserving space below the current actions
+/// row rather than retaining a display index captured before a row rebuild.
+pub(crate) fn reserve_reply_rows(
+    built: &mut BuiltRows,
+    id: crate::comments::CommentKey,
+    count: usize,
+) {
+    let Some(anchor) = built
         .rows
-        .splice(start..end, (0..count).map(|_| Row::CommentEditor { half }));
+        .iter()
+        .position(|row| matches!(row, Row::CommentActions { root_id, .. } if *root_id == id))
+    else {
+        return;
+    };
+    let half = match built.rows[anchor] {
+        Row::CommentActions { half, .. } => half,
+        _ => unreachable!(),
+    };
+    let start = anchor + 1;
+    let count = count.max(1);
+    for ix in built.file_rows.iter_mut().chain(&mut built.hunk_rows) {
+        if *ix >= start {
+            *ix += count;
+        }
+    }
+    built.rows.splice(
+        start..start,
+        (0..count).map(|_| Row::CommentEditor { half, top: false }),
+    );
+}
+
+/// Reserve a new card immediately below its last visual source row. Resolve
+/// by line identity each time: stored display indices go stale after wrapping,
+/// comment measurement, folding, or a view-mode change.
+pub(crate) fn reserve_new_comment_rows(
+    built: &mut BuiltRows,
+    side: CommentSide,
+    line: u64,
+    half: Option<CommentSide>,
+    count: usize,
+) {
+    let Some(anchor) = built
+        .rows
+        .iter()
+        .rposition(|row| crate::rows::comment_line(row, side) == Some(line))
+    else {
+        return;
+    };
+    let start = anchor + 1;
+    let count = count.max(1);
+    for ix in built.file_rows.iter_mut().chain(&mut built.hunk_rows) {
+        if *ix >= start {
+            *ix += count;
+        }
+    }
+    built.rows.splice(
+        start..start,
+        (0..count).map(|ix| Row::CommentEditor { half, top: ix == 0 }),
+    );
 }
 
 impl ReviewApp {
@@ -351,9 +418,9 @@ impl ReviewApp {
             composer.edit_id = Some(id);
             composer.edit_target = Some(target);
             composer.start_line = start_line;
-            composer
-                .input
-                .update(cx, |state, cx| state.set_value(body, window, cx));
+            composer.input.update(cx, |state, cx| {
+                crate::comment_editor::set_value_at_end(state, body, window, cx)
+            });
         }
         if let Some(composer) = self
             .composer()
@@ -361,6 +428,7 @@ impl ReviewApp {
         {
             let height = composer.height.clone();
             if let Some(data) = self.active_data_mut() {
+                data.replying_comments.remove(&id);
                 data.editing_comments.insert(id, height);
                 data.rebuild_rows_anchored();
             }
@@ -723,7 +791,7 @@ impl ReviewApp {
             .filter(|c| c.item_id == item_id && c.edit_target.as_ref() == Some(&target))
         {
             composer.input.update(cx, |input, cx| {
-                input.set_value(change.recovery_body, window, cx)
+                crate::comment_editor::set_value_at_end(input, change.recovery_body, window, cx)
             });
             self.active_data_mut()
                 .unwrap()

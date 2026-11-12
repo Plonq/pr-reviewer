@@ -267,12 +267,17 @@ actions!(
     ]
 );
 
-fn file_navigation_keybindings() -> [KeyBinding; 4] {
+fn file_navigation_keybindings() -> [KeyBinding; 2] {
     [
         KeyBinding::new("]", NextFile, Some("ReviewApp")),
         KeyBinding::new("[", PrevFile, Some("ReviewApp")),
-        KeyBinding::new("shift-n", NextFile, Some("ReviewApp")),
-        KeyBinding::new("shift-p", PrevFile, Some("ReviewApp")),
+    ]
+}
+
+fn hunk_navigation_keybindings() -> [KeyBinding; 2] {
+    [
+        KeyBinding::new("n", NextHunk, Some("ReviewApp")),
+        KeyBinding::new("shift-n", PrevHunk, Some("ReviewApp")),
     ]
 }
 
@@ -457,11 +462,10 @@ fn main() {
             cx.bind_keys(file_history::keybindings());
             cx.bind_keys(tree::keybindings());
             cx.bind_keys(file_navigation_keybindings());
+            cx.bind_keys(hunk_navigation_keybindings());
             cx.bind_keys(comment_composer_keybindings());
             cx.bind_keys(selection::keybindings());
             cx.bind_keys([
-                KeyBinding::new("n", NextHunk, Some("ReviewApp")),
-                KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
                 // Sideways through long lines in either diff mode. Inputs
@@ -655,7 +659,7 @@ pub(crate) struct ItemData {
     conv_scroll: ScrollHandle,
     /// Parsed conversation bodies survive pane/tab unmounts, so their full
     /// height is available before the scroller clamps its retained offset.
-    conv_markdown: RefCell<HashMap<String, gpui::Entity<gpui::component::text::TextViewState>>>,
+    conv_markdown: RefCell<HashMap<String, conversation::PersistentMarkdown>>,
     discussion: Option<github::PrDiscussion>,
     posts: comments::posting::Posts,
     commits: Option<github::PrCommits>,
@@ -689,6 +693,9 @@ pub(crate) struct ItemData {
     /// `c` toggles the comment rows; the file-header counts always show.
     comments_visible: bool,
     editing_comments: HashMap<u64, Rc<Cell<Pixels>>>,
+    replying_comments: HashMap<u64, Rc<Cell<Pixels>>>,
+    /// New diff drafts, keyed by file so reservations survive navigation.
+    new_comments: HashMap<String, NewCommentEditor>,
     /// Columns used for initial comment-height estimates, derived from the
     /// measured pane width (see `comment_wrap_cols`). Changing it re-wraps the
     /// estimates, which changes the row count, so render rebuilds the rows when
@@ -793,6 +800,8 @@ impl ItemData {
             local_review,
             comments_visible: true,
             editing_comments: HashMap::new(),
+            replying_comments: HashMap::new(),
+            new_comments: HashMap::new(),
             comment_wrap: COMMENT_WRAP_CHARS,
             comment_text_layouts: HashMap::new(),
             preferences: Default::default(),
@@ -873,6 +882,37 @@ impl ItemData {
             );
         }
         reactions::reserve_reaction_rows(&mut built_rows, self.discussion.as_ref(), &self.posts);
+        for (id, height) in &self.replying_comments {
+            let key = built_rows.rows.iter().find_map(|row| match row {
+                Row::CommentActions { root_id, .. }
+                    if self.posts.remote_id(*root_id) == Some(*id) =>
+                {
+                    Some(*root_id)
+                }
+                _ => None,
+            });
+            if let Some(key) = key {
+                comment_actions::reserve_reply_rows(
+                    &mut built_rows,
+                    key,
+                    (f32::from(height.get()) / row_height()).ceil() as usize,
+                );
+            }
+        }
+        if let Some(editor) = self
+            .diff
+            .files
+            .get(self.file_ix)
+            .and_then(|file| self.new_comments.get(file.display_path()))
+        {
+            comment_actions::reserve_new_comment_rows(
+                &mut built_rows,
+                editor.side,
+                editor.line,
+                (self.mode == ViewMode::Split).then_some(editor.side),
+                (f32::from(editor.height.get()) / row_height()).ceil() as usize,
+            );
+        }
         let BuiltRows {
             rows,
             file_rows,
@@ -1096,8 +1136,21 @@ impl ItemData {
             |rows: &[Row]| rows.iter().filter(|row| !is_comment_row(row)).count();
         let top_base = count_noncomment(&self.rows[..top_row]);
         let cursor_base = count_noncomment(&self.rows[..self.cursor.min(self.rows.len())]);
+        // Composer reservations are comment rows too. Keep a source selection
+        // intact when those rows appear or grow; display indices may shift.
+        let selection = self
+            .selection
+            .filter(|selection| {
+                [selection.anchor.row, selection.head.row]
+                    .into_iter()
+                    .all(|ix| self.rows.get(ix).is_some_and(|row| !is_comment_row(row)))
+            })
+            .map(|mut selection| {
+                selection.anchor.row = count_noncomment(&self.rows[..selection.anchor.row]);
+                selection.head.row = count_noncomment(&self.rows[..selection.head.row]);
+                selection
+            });
         self.set_rows(self.row_build());
-        self.selection = None;
         self.cursor = nth_noncomment_row(&self.rows, cursor_base);
         let new_top = top_text
             .and_then(|(text, slot)| {
@@ -1130,6 +1183,12 @@ impl ItemData {
             self.restore_review_position(position, true);
             self.cursor = nth_noncomment_row(&self.rows, cursor_base);
         }
+        // Position restoration clears selection too, so restore it last.
+        self.selection = selection.map(|mut selection| {
+            selection.anchor.row = nth_noncomment_row(&self.rows, selection.anchor.row);
+            selection.head.row = nth_noncomment_row(&self.rows, selection.head.row);
+            selection
+        });
     }
 
     /// The minimap quad runs for this pane height and blank tail, from the
@@ -1783,6 +1842,12 @@ enum ComposerPlacement {
     PendingTray(u64),
 }
 
+struct NewCommentEditor {
+    side: CommentSide,
+    line: u64,
+    height: Rc<Cell<Pixels>>,
+}
+
 /// A comment/reply draft. Diff composers belong to a specific item and file;
 /// switching files keeps their editor, uploads, and submission state intact.
 struct Composer {
@@ -1801,13 +1866,13 @@ struct Composer {
     pending: bool,
     edit_id: Option<u64>,
     edit_target: Option<CommentTarget>,
-    /// Display row the composer is anchored beneath (best effort; goes stale
-    /// harmlessly if rows rebuild while it is open).
+    /// Initial display anchor, retained for submission context. Rendering
+    /// resolves source lines or comment identities against the current rows.
     row_ix: usize,
     input: gpui::Entity<gpui::component::input::EditorState>,
     uploads: Option<gpui::Entity<comment_media::Uploads>>,
     preview: bool,
-    /// Space below the diff's last row, measured from the floating card.
+    /// Measured composer height, reserved in the diff at its source/thread anchor.
     height: Rc<Cell<gpui::Pixels>>,
     /// Reveal a composer once, after its card is laid out.
     reveal: Rc<Cell<bool>>,
@@ -2096,20 +2161,6 @@ pub(crate) struct ReviewApp {
     /// Last normal size, cached during resize and saved on quit/close.
     window_size: Option<gpui::Size<Pixels>>,
     _subscriptions: Vec<Subscription>,
-}
-
-/// The comment composer card's x, window-absolute: in split view the card
-/// sits under the half its anchor is on (a right-side card starts at the
-/// right half's edge), otherwise near the pane's left — and always clamped
-/// so the 520px card fits inside the pane.
-fn composer_x(pane_left: f32, pane_width: f32, mode: ViewMode, side: CommentSide) -> f32 {
-    let half = (pane_width - SPLIT_DIVIDER) / 2.;
-    let x = match (mode, side) {
-        (ViewMode::Split, CommentSide::Right) => pane_left + half + SPLIT_DIVIDER,
-        _ => pane_left + 72.,
-    };
-    let pane_right = pane_left + pane_width;
-    x.min((pane_right - 528.).max(8.))
 }
 
 impl ReviewApp {
@@ -3201,7 +3252,7 @@ impl ReviewApp {
         cx.notify();
     }
 
-    /// `n`/`p`: step to the next/previous hunk, wrapping past the ends —
+    /// `n`/`Shift+N`: step to the next/previous hunk, wrapping past the ends —
     /// into the next/previous file that has hunks, switching the display.
     fn step_hunk(&mut self, delta: i32, cx: &mut Context<Self>) {
         let nav = self.active_data().and_then(|data| data.step_hunk(delta));
@@ -3533,6 +3584,9 @@ impl ReviewApp {
         } else {
             None
         };
+        // Reserve under the range's endpoint from the outset, not its first
+        // line (which is used above only to validate the selected side).
+        let line = range.as_ref().map_or(line, |anchor| anchor.line);
         self.open_composer(None, path, anchor_side, line, row_ix, window, cx);
         if let (Some(composer), Some(anchor)) = (self.composer_mut(), range) {
             composer.line = anchor.line;
@@ -4176,7 +4230,14 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.image_viewer.is_some() {
+        // UI affordances and keyboard/programmatic entry points must agree:
+        // never silently discard an edit (or replace a write in flight).
+        if self.image_viewer.is_some()
+            || self
+                .composer()
+                .is_some_and(|c| c.edit_id.is_some() || c.in_flight)
+            || self.review.is_some()
+        {
             return;
         }
         let Some(item) = self.items.get(self.active) else {
@@ -4243,10 +4304,16 @@ impl ReviewApp {
             }
             self.ensure_mentions(item_id, loc, cx);
         }
+        // Match the empty inline card before it can paint: p_3 top/bottom
+        // (1.5rem), two gap_2 gaps (1rem), and h_6 mode/action buttons (3rem).
+        // Include the same 8px breathing room as the measured reservation.
+        let initial_height = comment_editor::minimum_height(cx)
+            + window.rem_size() * 5.5
+            + px(8.);
         self.composers.push(Composer {
             id: self.composer_gen,
             item_id,
-            placement,
+            placement: placement.clone(),
             reply_to,
             commit_id,
             path,
@@ -4261,11 +4328,24 @@ impl ReviewApp {
             input,
             uploads,
             preview: false,
-            height: Rc::new(Cell::new(px(250.))),
+            height: Rc::new(Cell::new(initial_height)),
             reveal: Rc::new(Cell::new(true)),
             error: None,
             in_flight: false,
         });
+        if placement == ComposerPlacement::Diff {
+            let composer = self.composer().unwrap();
+            let height = composer.height.clone();
+            let path = composer.path.clone();
+            if let Some(data) = self.active_data_mut() {
+                if let Some(id) = reply_to {
+                    data.replying_comments.insert(id, height);
+                } else {
+                    data.new_comments.insert(path, NewCommentEditor { side, line, height });
+                }
+                data.rebuild_rows_anchored();
+            }
+        }
         cx.notify();
     }
 
@@ -4358,11 +4438,20 @@ impl ReviewApp {
                 .find(|item| item.id == composer.item_id)
                 .map(|item| &mut item.state)
             {
-                if composer
+                let edited = composer
                     .edit_id
                     .and_then(|id| data.editing_comments.remove(&id))
-                    .is_some()
-                {
+                    .is_some();
+                let replied = composer.placement == ComposerPlacement::Diff
+                    && composer
+                        .reply_to
+                        .and_then(|id| data.replying_comments.remove(&id))
+                        .is_some();
+                let created = composer.placement == ComposerPlacement::Diff
+                    && composer.edit_id.is_none()
+                    && composer.reply_to.is_none()
+                    && data.new_comments.remove(&composer.path).is_some();
+                if edited || replied || created {
                     data.rebuild_rows_anchored();
                 }
             }
@@ -4742,7 +4831,7 @@ impl ReviewApp {
                 .and_then(|ui| ui.state.pending.as_ref())
             {
                 input.update(cx, |state, cx| {
-                    state.set_value(pending.body.clone(), window, cx)
+                    comment_editor::set_value_at_end(state, pending.body.clone(), window, cx)
                 });
             }
             input
@@ -4981,10 +5070,10 @@ impl ReviewApp {
         )
     }
 
-    /// The floating composer card: absolutely positioned at root level (so
-    /// its input sits outside the "ReviewApp" key context and plain letters
-    /// stay text), anchored below the target row. Reveal it by scrolling the
-    /// diff, never by moving the card upward over the selected source lines.
+    /// Diff composers live at root level so plain letters stay text rather
+    /// than triggering ReviewApp actions. Every composer fills reserved rows
+    /// in a comment card, below its source selection or inside its thread.
+    /// Reveal by scrolling, never by covering the selected source lines.
     fn render_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let empty = || div().into_any_element();
         let Some(composer) = self.composer() else {
@@ -5020,21 +5109,27 @@ impl ReviewApp {
                 return empty();
             };
             ix
+        } else if let Some(id) = composer.reply_to {
+            let Some(ix) = data.rows.iter().position(
+                |row| matches!(row, Row::CommentActions { root_id, .. } if data.posts.remote_id(*root_id) == Some(id)),
+            ) else {
+                return empty();
+            };
+            ix
         } else {
-            composer.row_ix
+            let Some(ix) = data
+                .rows
+                .iter()
+                .rposition(|row| rows::comment_line(row, composer.side) == Some(composer.line))
+            else {
+                return empty();
+            };
+            ix
         };
         let row_y = row_ix as f32 * row_height() + f32::from(offset.y);
-        let y = f32::from(bounds.top()) + (row_y + row_height()).max(8.);
-        let x = composer_x(
-            f32::from(bounds.left()),
-            f32::from(bounds.size.width),
-            data.mode,
-            composer.side,
-        );
         let scroll = data.scroll.clone();
         let entity = cx.entity();
         let item_id = composer.item_id;
-        let editing = composer.edit_id.is_some();
         let half_width = (bounds.size.width - px(SPLIT_DIVIDER)) / 2.;
         let inline_left = px(72.)
             + if data.mode == ViewMode::Split && composer.side == CommentSide::Right {
@@ -5046,26 +5141,22 @@ impl ReviewApp {
         let reveal = composer.reveal.clone();
         let card = div()
             .absolute()
-            .left(if editing { inline_left } else { px(x) })
-            .top(if editing {
-                px(row_y + row_height())
+            // Stay inside the thread's existing outline, including at the
+            // bottom where the reserved rows draw its rounded cap.
+            .max_w(diff_media::comment_card_max_width(
+                self.char_width.unwrap_or(px(text_size() * 0.6)),
+            ) - px(3.))
+            .left(inline_left + px(2.))
+            .top(px(row_y + row_height()))
+            .w((if data.mode == ViewMode::Split {
+                half_width
             } else {
-                px(y)
-            })
-            .w(if editing {
-                (if data.mode == ViewMode::Split {
-                    half_width
-                } else {
-                    bounds.size.width
-                } - px(72.))
-                .max(px(1.))
-            } else {
-                px(520.)
-            })
+                bounds.size.width
+            } - px(75.))
+            .max(px(1.)))
             // Keep clicks/hover off the diff underneath, but let wheel events
             // reach its scroller when the composer's input cannot scroll.
             .block_mouse_except_scroll()
-            .shadow_lg()
             .on_children_prepainted(move |bounds, window, cx| {
                 let Some(card) = bounds.first() else {
                     return;
@@ -5084,14 +5175,14 @@ impl ReviewApp {
                 let delta = row_bottom.clamp(px(row_height()), latest_top) - row_bottom;
                 offset.y += delta;
                 if height_changed || delta != px(0.) {
-                    // The next layout reserves the measured tail space, so even
+                    // The next layout reserves the measured card height, so even
                     // a comment on the file's final line has room to scroll.
                     window.defer(cx, move |window, _| {
                         handle.set_offset(offset);
                         window.refresh();
                     });
                 }
-                if editing && height_changed {
+                if height_changed {
                     let entity = entity.clone();
                     window.defer(cx, move |_, cx| {
                         entity.update(cx, |app, cx| {
@@ -5108,33 +5199,32 @@ impl ReviewApp {
                     });
                 }
             })
-            .child(self.render_composer_card(cx))
+            .child(
+                div()
+                    // Reserved list rows already paint the card background;
+                    // repainting its translucent tint would make a dark panel.
+                    .p_3()
+                    .child(self.render_composer_content(cx)),
+            )
             .into_any_element();
-        if editing {
-            // Match the list's clipping: an edited comment scrolls with its
-            // thread, never over the title bar, tray, or neighboring split pane.
-            div()
-                .absolute()
-                .left(bounds.left())
-                .top(bounds.top())
-                .w(bounds.size.width)
-                .h(bounds.size.height)
-                .overflow_hidden()
-                .child(card)
-                .into_any_element()
-        } else {
-            card
-        }
+        // Match the list's clipping: the composer scrolls with its card,
+        // never over the title bar, tray, or neighboring split pane.
+        div()
+            .absolute()
+            .left(bounds.left())
+            .top(bounds.top())
+            .w(bounds.size.width)
+            .h(bounds.size.height)
+            .overflow_hidden()
+            .child(card)
+            .into_any_element()
     }
 
+    /// Standalone shell for the pending tray. Diff and conversation composers
+    /// use ordinary comment cards; all editor features live in render_composer_content.
     fn render_composer_card(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let composer = self.composer().expect("an open composer");
         let pending = self.composer_uses_pending_review(composer);
-        let session_busy = self.comment_write_blocked(composer.item_id);
-        let submit_disabled = composer.in_flight
-            || session_busy
-            || comment_media::blocks_submission(composer.uploads.as_ref(), &composer.input, cx);
-        let action = self.composer_submit_label(composer);
         let target = if let Some(CommentTarget::Published(target)) = &composer.edit_target {
             match target {
                 github::CommentTarget::Issue(_) => "Edit PR conversation comment".to_owned(),
@@ -5168,6 +5258,37 @@ impl ReviewApp {
             )
         };
         div()
+            .debug_selector(|| "composer-shell".into())
+            .w_full()
+            .min_w_0()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::surface0(cx))
+            .bg(theme::mantle(cx))
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_size(px(12.))
+            .child(
+                div()
+                    .text_color(theme::overlay0(cx))
+                    .truncate()
+                    .child(SharedString::from(target)),
+            )
+            .child(self.render_composer_content(cx))
+            .into_any_element()
+    }
+
+    /// One editor/action implementation for standalone, edit, and reply shells.
+    /// Editor features, including Write/Preview, belong here, not in the shells.
+    fn render_composer_content(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let composer = self.composer().expect("an open composer");
+        let submit_disabled = composer.in_flight
+            || self.comment_write_blocked(composer.item_id)
+            || comment_media::blocks_submission(composer.uploads.as_ref(), &composer.input, cx);
+        let action = self.composer_submit_label(composer);
+        div()
             .debug_selector(|| "composer-card".into())
             .key_context("CommentComposer")
             .w_full()
@@ -5191,21 +5312,10 @@ impl ReviewApp {
             .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
                 this.close_composer(window, cx);
             }))
-            .rounded_lg()
-            .border_1()
-            .border_color(theme::surface0(cx))
-            .bg(theme::mantle(cx))
-            .p_2()
             .flex()
             .flex_col()
             .gap_2()
             .text_size(px(12.))
-            .child(
-                div()
-                    .text_color(theme::overlay0(cx))
-                    .truncate()
-                    .child(SharedString::from(target)),
-            )
             .child(comment_editor::mode_tabs(
                 composer.preview,
                 composer.in_flight,
@@ -5247,7 +5357,11 @@ impl ReviewApp {
                             .flex_1()
                             .text_size(px(11.))
                             .text_color(theme::overlay0(cx))
-                            .child(SharedString::from("⌘⏎ to submit")),
+                            .child(if composer.edit_id.is_some() {
+                                "⌘⏎ to save"
+                            } else {
+                                "⌘⏎ to submit"
+                            }),
                     )
                     .child(
                         Button::new("composer-cancel")
@@ -5720,9 +5834,9 @@ impl ReviewApp {
                 composer.position = anchor.position;
                 composer.commit_id = anchor.commit_id;
             }
-            composer
-                .input
-                .update(cx, |input, cx| input.set_value(post.body, window, cx));
+            composer.input.update(cx, |input, cx| {
+                comment_editor::set_value_at_end(input, post.body, window, cx)
+            });
             if let Some(data) = self.active_data_mut() {
                 data.posts.failed.retain(|p| p.token != token);
             }
@@ -6831,8 +6945,8 @@ impl ReviewApp {
                 .child(hint(&["cmd-o"], "open"));
         } else {
             footer = footer
-                .child(hint(&["shift-n", "shift-p"], "files"))
-                .child(hint(&["n", "p"], "hunks"))
+                .child(hint(&["]", "["], "files"))
+                .child(hint(&["n", "shift-n"], "hunks"))
                 // The conversation pane is one keystroke off the changes.
                 .child(hint(&["shift-cmd-left"], "conversation"))
                 .child(hint(&["u"], "queue"))
@@ -6848,21 +6962,10 @@ impl ReviewApp {
         }
         footer
     }
-    /// Blank list slots shared by the diff's scroll range and minimap. Keep
-    /// composer space in addition to the half-viewport scroll-past-end area.
+    /// Blank list slots shared by the diff's scroll range and minimap.
+    /// Composers reserve their own rows at their anchors, not in this tail.
     fn diff_tail_rows(&self, pane_height: f32) -> usize {
-        let composer_rows = self
-            .composer()
-            .filter(|composer| {
-                self.active_item()
-                    .is_some_and(|item| item.id == composer.item_id)
-                    && composer.placement == ComposerPlacement::Diff
-                    && composer.edit_id.is_none()
-            })
-            .map_or(0, |composer| {
-                (f32::from(composer.height.get()) / row_height()).ceil() as usize
-            });
-        diff_padding_rows(pane_height, row_height()) + composer_rows
+        diff_padding_rows(pane_height, row_height())
     }
 
     /// The pane for an open item — loading, failure message, the
@@ -6964,7 +7067,7 @@ impl ReviewApp {
                                         })
                                     };
                                     // A plain click also moves the keyboard cursor:
-                                    // `C` and `n`/`p` follow the line the reviewer
+                                    // `C` and `n`/`Shift+N` follow the line the reviewer
                                     // last touched, mouse or keyboard alike.
                                     if let Some(data) = this.active_data_mut() {
                                         let previous = (data.cursor, data.cursor_side);
@@ -7103,6 +7206,7 @@ impl ReviewApp {
                                                                 Row::CommentBody { .. }
                                                                     | Row::CommentHeader { .. }
                                                                     | Row::CommentEditor { .. }
+                                                                    | Row::CommentSpacer { .. }
                                                                     | Row::CommentReactions { .. }
                                                             ))
                                                             && !data
@@ -7259,11 +7363,8 @@ impl ReviewApp {
                 theme::overlay0(cx),
             );
         };
-        // The pipe runs on every paint; bodies are small, the output is
-        // what the retained TextView state diffs against (same text → no
-        // re-parse). A refreshed description updates that state on render.
-        let body = conversation::preprocess(&meta.body, &loc.repo_slug());
-        let content = if body.trim().is_empty() {
+        // The retained Markdown state preprocesses only changed bodies.
+        let content = if meta.body.trim().is_empty() {
             // GitHub's own empty state, verbatim.
             div()
                 .text_color(theme::overlay0(cx))
@@ -7272,7 +7373,8 @@ impl ReviewApp {
         } else {
             conversation::render_markdown(
                 &format!("conversation-{}", item.id),
-                body,
+                &meta.body,
+                &loc.repo_slug(),
                 self,
                 window,
                 cx,
@@ -7332,10 +7434,8 @@ impl ReviewApp {
                                             ))
                                             .child(conversation::render_markdown(
                                                 &format!("conversation-summary-{}", item.id),
-                                                conversation::preprocess(
-                                                    &review.body,
-                                                    &loc.repo_slug(),
-                                                ),
+                                                &review.body,
+                                                &loc.repo_slug(),
                                                 self,
                                                 window,
                                                 cx,
@@ -9390,6 +9490,69 @@ mod tests {
     }
 
     #[gpui::test]
+    fn changes_header_status_tooltip_works_for_disabled_and_active_scopes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let tooltips = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = tooltips.clone();
+        let _subscription = cx.update(|cx| {
+            cx.observe_new::<gpui::component::tooltip::Tooltip>(move |_, _, _| {
+                observed.set(observed.get() + 1);
+            })
+        });
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        for changes in [
+            github::ReviewChanges::NotReviewed,
+            github::ReviewChanges::Unavailable("History rewritten by a rebase or force-push".into()),
+            github::ReviewChanges::default(),
+            github::ReviewChanges::Available(github::ReviewBaseline {
+                commit: "abcdef0".into(),
+                submitted_at: "2026-03-03T00:00:00Z".into(),
+            }),
+        ] {
+            let mut item = loop_pr_item(Vec::new());
+            item.pane = ItemPane::Changes;
+            let ItemState::Ready(data) = &mut item.state else {
+                unreachable!()
+            };
+            data.review_base = changes.baseline().map(|review| review.commit.clone());
+            let active = data.review_base.is_some();
+            data.review_changes = changes;
+            install_item(&app, item, cx);
+            vcx.simulate_mouse_move(
+                gpui::point(px(0.), px(0.)),
+                None,
+                gpui::Modifiers::default(),
+            );
+            draw_window(&mut vcx);
+            let status = vcx
+                .debug_bounds("review-scope-status")
+                .expect("status icon is visible");
+            assert_eq!(status.size.width, px(24.));
+            assert!(vcx.debug_bounds("changes-header").unwrap().size.height < px(40.));
+            let before = tooltips.get();
+            vcx.simulate_mouse_move(status.center(), None, gpui::Modifiers::default());
+            vcx.run_until_parked();
+            vcx.executor()
+                .advance_clock(std::time::Duration::from_secs(1));
+            vcx.run_until_parked();
+            draw_window(&mut vcx);
+            assert!(
+                tooltips.get() > before,
+                "status tooltip must work even when the scope button is disabled"
+            );
+            let text = vcx
+                .debug_bounds("review-scope-tooltip-text")
+                .expect("tooltip text is visible");
+            assert!(text.size.width <= px(440.), "tooltip text must stay bounded");
+            if active {
+                assert!(text.size.height > px(60.), "long guidance must wrap");
+            }
+        }
+    }
+
+    #[gpui::test]
     fn titlebar_loading_spinner_follows_pr_link_and_errors_still_show(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -10361,7 +10524,7 @@ mod tests {
                     },
                     linewise: false,
                 });
-                assert_eq!(data.selection_matches().marks.len(), 2);
+                assert_eq!(data.selection_matches().marks.len(), 1);
                 assert_eq!(data.search.as_ref().unwrap().minimap_marks().len(), 2);
                 assert_ne!(theme::yellow(cx), theme::mauve(cx));
                 cx.notify();
@@ -10716,9 +10879,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn shifted_hunk_keys_navigate_files_without_stealing_input(cx: &mut gpui::TestAppContext) {
+    fn navigation_keys_keep_files_on_brackets_without_stealing_input(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
-        cx.update(|cx| cx.bind_keys(file_navigation_keybindings()));
+        cx.update(|cx| {
+            cx.bind_keys(file_navigation_keybindings());
+            cx.bind_keys(hunk_navigation_keybindings());
+        });
         let mut item = loop_pr_item(Vec::new());
         item.state = ItemState::Ready(file_mode_data(two_file_diff()));
         install_item(&app, item, cx);
@@ -10728,14 +10896,23 @@ mod tests {
             let focus = app.read(cx).focus_handle.clone();
             window.focus(&focus, cx);
         });
-        for keys in [
-            "shift-n", "shift-n", "shift-p", "shift-p", "]", "]", "[", "[",
-        ] {
+        for keys in ["]", "]", "[", "["] {
             let before = cx.update(|cx| app.read(cx).active_data().unwrap().file_ix);
             vcx.simulate_keystrokes(keys);
             vcx.update(|window, cx| {
                 let _ = window.draw(cx);
                 assert_eq!(app.read(cx).active_data().unwrap().file_ix, 1 - before);
+            });
+        }
+        for keys in ["shift-p", "p"] {
+            let before = vcx.update(|_, cx| {
+                let data = app.read(cx).active_data().unwrap();
+                (data.file_ix, data.cursor)
+            });
+            vcx.simulate_keystrokes(keys);
+            vcx.update(|_, cx| {
+                let data = app.read(cx).active_data().unwrap();
+                assert_eq!((data.file_ix, data.cursor), before);
             });
         }
         vcx.update(|window, cx| {
@@ -10757,11 +10934,8 @@ mod tests {
     ) {
         let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
         cx.update(|cx| {
-            cx.bind_keys([
-                KeyBinding::new("n", NextHunk, Some("ReviewApp")),
-                KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
-                KeyBinding::new("v", ToggleView, Some("ReviewApp")),
-            ]);
+            cx.bind_keys(hunk_navigation_keybindings());
+            cx.bind_keys([KeyBinding::new("v", ToggleView, Some("ReviewApp"))]);
         });
         let context = |range: std::ops::RangeInclusive<u32>| {
             range.map(|n| format!(" line {n}\n")).collect::<String>()
@@ -10783,7 +10957,7 @@ mod tests {
             window.focus(&focus, cx);
         });
         // Exercise both directions, after both next- and previous-hunk jumps.
-        for (navigation, hunk) in [("n", 1), ("p p", 0)] {
+        for (navigation, hunk) in [("n", 1), ("shift-n shift-n", 0)] {
             vcx.simulate_keystrokes(navigation);
             let bounds = vcx.update(|window, cx| {
                 let _ = window.draw(cx);
@@ -12013,6 +12187,8 @@ mod tests {
             IconName::SquareCheck,
             IconName::Pencil,
             IconName::Trash,
+            IconName::Info,
+            IconName::TriangleAlert,
         ] {
             let path = icon.path();
             let svg = AppAssets
@@ -15902,7 +16078,7 @@ mod tests {
         store.save_diff_preferences(
             None,
             store::DiffPreferences {
-                hide_whitespace: Some(true),
+                hide_whitespace: Some(false),
                 collapse_unchanged: Some(true),
                 soft_wrap: Some(true),
             },
@@ -15914,32 +16090,32 @@ mod tests {
         vcx.update(|window, cx| {
             let _ = window.draw(cx);
             let data = app.read(cx).active_data().unwrap();
-            assert_eq!(data.preferences, store::DiffPreferences::OFF);
+            assert_eq!(data.preferences, store::DiffPreferences::INITIAL);
             assert_eq!(data.preference_overrides.hide_whitespace, None);
         });
         // Presentation toggles use plain letters, not Shift+W / Shift+K.
         vcx.simulate_keystrokes("w");
         cx.update(|cx| {
             let prefs = app.read(cx).active_data().unwrap().preferences;
-            assert_eq!(prefs.hide_whitespace, Some(true));
+            assert_eq!(prefs.hide_whitespace, Some(false));
             assert_eq!(prefs.collapse_unchanged, Some(false));
         });
         vcx.simulate_keystrokes("k");
         cx.update(|cx| {
             let prefs = app.read(cx).active_data().unwrap().preferences;
-            assert_eq!(prefs.hide_whitespace, Some(true));
+            assert_eq!(prefs.hide_whitespace, Some(false));
             assert_eq!(prefs.collapse_unchanged, Some(true));
         });
         vcx.simulate_keystrokes("w k");
         cx.update(|cx| {
             assert_eq!(
                 app.read(cx).active_data().unwrap().preferences,
-                store::DiffPreferences::OFF
+                store::DiffPreferences::INITIAL
             );
         });
         vcx.simulate_keystrokes("w k alt-z");
         let wanted = store::DiffPreferences {
-            hide_whitespace: Some(true),
+            hide_whitespace: Some(false),
             collapse_unchanged: Some(true),
             soft_wrap: Some(true),
         };
@@ -15965,7 +16141,7 @@ mod tests {
             let data = second.read(cx).active_data().unwrap();
             assert_eq!(
                 data.preferences,
-                store::DiffPreferences::OFF,
+                store::DiffPreferences::INITIAL,
                 "new PRs must not inherit another PR's toggles or legacy global settings"
             );
             assert_eq!(
@@ -16152,7 +16328,7 @@ mod tests {
             "a reply affordance never anchors"
         );
         // old2|new2 still anchors beneath the threads.
-        assert_eq!(cursor_anchor(&rows, 11), Some((CommentSide::Right, 3)));
+        assert_eq!(cursor_anchor(&rows, 12), Some((CommentSide::Right, 3)));
 
         // Unified rows: the side is irrelevant, the kind decides — removed
         // lines anchor LEFT, everything else RIGHT.
@@ -16169,37 +16345,6 @@ mod tests {
         });
         assert_eq!(cursor_anchor(&rows, 2), Some((CommentSide::Left, 2)));
         assert_eq!(cursor_anchor(&rows, 7), Some((CommentSide::Right, 2)));
-    }
-
-    /// The composer card sits under the half its anchor is on in split view
-    /// (regression: it always used to sit on the left), stays left in
-    /// unified view, and clamps inside panes too narrow for the 520px card.
-    #[test]
-    fn composer_x_follows_the_anchored_half_in_split_view() {
-        let (left, width) = (100., 1200.);
-        // Split: a right-side card starts at the right half's edge; a
-        // left-side one stays near the pane's left.
-        let half = (width - SPLIT_DIVIDER) / 2.;
-        assert_eq!(
-            composer_x(left, width, ViewMode::Split, CommentSide::Right),
-            left + half + SPLIT_DIVIDER
-        );
-        assert_eq!(
-            composer_x(left, width, ViewMode::Split, CommentSide::Left),
-            left + 72.
-        );
-        // Unified is a single column: the card is always on the left.
-        assert_eq!(
-            composer_x(left, width, ViewMode::Unified, CommentSide::Right),
-            left + 72.
-        );
-        // A pane too narrow to hold the card: both sides clamp the same way
-        // so the card never starts past the pane's right edge.
-        assert_eq!(
-            composer_x(0., 480., ViewMode::Split, CommentSide::Right),
-            8.
-        );
-        assert_eq!(composer_x(0., 480., ViewMode::Split, CommentSide::Left), 8.);
     }
 
     fn commenting_item(fake: &FakePr) -> ReviewItem {
@@ -16396,6 +16541,12 @@ mod tests {
             unreachable!()
         };
         let mut discussion = conversation::tests::sample_discussion();
+        discussion.events.push(github::DiscussionEvent {
+            id: "E1".into(),
+            actor: "alice".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            description: "requested a review from bob".into(),
+        });
         let mut comment = discussion.comments[0].clone();
         comment.id = 21;
         comment.body = "Top-level comment".into();
@@ -16439,6 +16590,9 @@ mod tests {
                 vcx.run_until_parked();
             }
             let spine = vcx.debug_bounds("timeline-spine-0").unwrap();
+            let event = vcx.debug_bounds("timeline-event-0-E1").unwrap();
+            assert!(event.size.height > px(0.));
+            assert!(event.top() < vcx.debug_bounds("timeline-comment-0-21").unwrap().top());
             for selector in ["timeline-comment-0-21", "timeline-post-0-99"] {
                 let card = vcx.debug_bounds(selector).unwrap();
                 assert!(
@@ -16639,6 +16793,7 @@ mod tests {
                 }
                 let root_header = vcx.debug_bounds("inline-avatar-11").unwrap();
                 let root_body = vcx.debug_bounds("inline-text-0-11-0-card").unwrap();
+                let mut previous_body = root_body;
                 for (header_selector, body_selector) in [
                     ("inline-avatar-12", "inline-text-0-12-0-card"),
                     ("inline-avatar-13", "inline-text-0-13-0-card"),
@@ -16650,6 +16805,11 @@ mod tests {
                         px(threads::REPLY_INDENT)
                     );
                     assert_eq!(body.left() - root_body.left(), px(threads::REPLY_INDENT));
+                    assert!(
+                        header.top() >= previous_body.bottom() + px(row_height()),
+                        "each reply has breathing room after the preceding comment"
+                    );
+                    previous_body = body;
                     assert!(body.size.width <= root_body.size.width);
                     if mode == ViewMode::Split {
                         assert!(body.right() <= root_body.right());
@@ -17143,6 +17303,16 @@ mod tests {
             let _ = window.draw(cx);
         });
         let card = vcx.debug_bounds("composer-card").expect("open composer");
+        assert!(
+            vcx.debug_bounds("composer-shell").is_none(),
+            "conversation uses ordinary comment styling"
+        );
+        if !reply {
+            let shell = vcx
+                .debug_bounds("conversation-new-comment")
+                .expect("standard conversation card");
+            assert!(shell.top() <= card.top() && shell.bottom() >= card.bottom());
+        }
         let viewport = scroll.bounds();
         assert!(
             card.top() >= viewport.top(),
@@ -20288,7 +20458,15 @@ mod tests {
                         let line_bottom = scroll.base_handle.bounds().top()
                             + scroll.base_handle.offset().y
                             + px((last + 1) as f32 * row_height());
-                        assert_eq!(card.top(), line_bottom, "the card must not cover the range");
+                        assert_eq!(
+                            card.top(),
+                            line_bottom + px(12.),
+                            "the editor sits inside the reserved card below the range"
+                        );
+                        assert!(matches!(
+                            data.rows[last + 1],
+                            Row::CommentEditor { top: true, .. }
+                        ));
                         assert!(
                             card.bottom() <= scroll.base_handle.bounds().bottom(),
                             "scroll the diff to leave room for the entire card"

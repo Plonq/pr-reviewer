@@ -202,6 +202,7 @@ pub(crate) fn row_name(row: &Row) -> &'static str {
         Row::CommentActions { .. } => "CommentActions",
         Row::CommentEditor { .. } => "CommentEditor",
         Row::CommentReactions { .. } => "CommentReactions",
+        Row::CommentSpacer { .. } => "CommentSpacer",
     }
 }
 

@@ -50,11 +50,17 @@ fn reply_indent(is_reply: bool) -> Pixels {
     px(if is_reply { REPLY_INDENT } else { 0. })
 }
 
+/// Card borders and horizontal padding surround the same capped prose width.
+pub(crate) fn comment_card_max_width(char_width: Pixels) -> Pixels {
+    char_width * COMMENT_WRAP_CHARS + px(27.)
+}
+
 fn text_width(card_width: Pixels, char_width: Pixels, is_reply: bool) -> Pixels {
     // Gutter + borders + px_3 padding, with the existing prose width cap.
-    (card_width - px(99.) - reply_indent(is_reply))
+    ((card_width - px(72.)).min(comment_card_max_width(char_width))
+        - px(27.)
+        - reply_indent(is_reply))
         .max(px(1.))
-        .min(char_width * COMMENT_WRAP_CHARS)
 }
 
 /// Replace initial plain-text estimates with measured Markdown reservations,
@@ -372,11 +378,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reply_width_accounts_for_indent_before_applying_the_prose_cap() {
+    fn reply_width_accounts_for_indent_inside_the_capped_card() {
         let root = text_width(px(400.), px(8.), false);
         let reply = text_width(px(400.), px(8.), true);
         assert_eq!(root - reply, px(REPLY_INDENT));
-        assert_eq!(text_width(px(2000.), px(8.), true), px(640.));
+        assert_eq!(text_width(px(2000.), px(8.), true), px(640. - REPLY_INDENT));
         assert_eq!(text_width(px(80.), px(8.), true), px(1.));
     }
 

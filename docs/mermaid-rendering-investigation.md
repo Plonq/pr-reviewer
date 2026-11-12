@@ -26,9 +26,10 @@ proposal-only statements describe the state before this implementation.
   Markdown copy still uses the exact original source slice.
 - This is deliberately a subset, not GitHub Mermaid parity. Source configuration
   directives/frontmatter, custom styles, image/icon nodes and diagram navigation
-  fall back rather than being silently removed. Conservative token admission can
-  also reject ordinary labels/comments containing words such as `image` or
-  `link`; readable source is preferable to weakening this first policy.
+  fall back rather than being silently removed. Quoted flowchart node/edge labels
+  may contain words such as `image` or `link`; HTML checks still inspect their
+  contents. Conservative token admission can still reject these words in
+  unquoted labels/comments.
 - Diagram typography is host-fixed Arial, not the prose font. A closed set of
   macOS Arial regular/bold/italic/bold-italic files and optional Arial Unicode is
   loaded from fixed OS-owned paths. **No PR-supplied font path is opened.** Missing

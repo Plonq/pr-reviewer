@@ -109,14 +109,21 @@ pub(crate) enum Row {
         text: Arc<crate::diff_media::CommentText>,
         slot: usize,
     },
+    /// Breathing room before a reply header, inside the thread's outline.
+    CommentSpacer {
+        half: Option<CommentSide>,
+    },
     /// Published reaction controls below this comment's Markdown body.
     CommentReactions {
         comment_id: crate::comments::CommentKey,
         half: Option<CommentSide>,
     },
-    /// Space for the root-level editor, replacing this comment's body in place.
+    /// Space for the root-level editor: a new card below source, a replacement
+    /// comment body, or an extension beneath a thread's footer.
     CommentEditor {
         half: Option<CommentSide>,
+        /// New comments start their own card; edits/replies continue one.
+        top: bool,
     },
     /// The "↳ reply" affordance closing a thread; clicking opens the
     /// composer targeting `post_reply` on the thread's root comment.
@@ -135,6 +142,7 @@ pub(crate) fn is_comment_row(row: &Row) -> bool {
         Row::CommentHeader { .. }
             | Row::CommentBody { .. }
             | Row::CommentReactions { .. }
+            | Row::CommentSpacer { .. }
             | Row::CommentEditor { .. }
             | Row::CommentActions { .. }
     )
@@ -262,6 +270,9 @@ fn push_thread_rows(
             .chain(&thread.replies)
             .enumerate()
         {
+            if ix > 0 {
+                rows.push(Row::CommentSpacer { half });
+            }
             rows.push(Row::CommentHeader {
                 comment_id: comment.id,
                 author: comment.author.clone().into(),
@@ -1133,7 +1144,7 @@ fn line_content(
 }
 
 /// Shared shape of every comment row: indented card with a mantle background
-/// and a blue left accent, spanning full width in both view modes.
+/// and a blue left accent, capped at the prose width in both view modes.
 /// Where a row sits in its thread's card, so the rows together draw one
 /// continuous outline instead of a box per row.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1148,7 +1159,8 @@ enum CardEdge {
 /// final body, editor or reaction row instead, without adding layout space.
 fn comment_body_edge(next_row: Option<&Row>) -> CardEdge {
     if next_row.is_none_or(|row| {
-        !is_comment_row(row) || matches!(row, Row::CommentHeader { top: true, .. })
+        !is_comment_row(row)
+            || matches!(row, Row::CommentHeader { top: true, .. } | Row::CommentEditor { top: true, .. })
     }) {
         CardEdge::Bottom
     } else {
@@ -1161,6 +1173,7 @@ fn comment_row(
     half: Option<CommentSide>,
     header: bool,
     edge: CardEdge,
+    max_width: gpui::Pixels,
     cx: &gpui::App,
 ) -> gpui::AnyElement {
     // The card itself: indented past the gutter, blue-tinted and accented so a
@@ -1177,6 +1190,8 @@ fn comment_row(
                 // Sides on every row, caps only on the thread's first and last,
                 // so the rows stack into one unbroken outline.
                 let body = div()
+                    .debug_selector(|| "inline-comment-outline".into())
+                    .max_w(max_width)
                     .flex_1()
                     .min_w_0()
                     .h_full()
@@ -1340,6 +1355,9 @@ fn render_row_content(
 ) -> gpui::AnyElement {
     let row_height = px(row_height());
     let body_edge = comment_body_edge(next_row);
+    let max_comment_width = crate::diff_media::comment_card_max_width(
+        entity.read(cx).char_width.unwrap_or(px(crate::text_size() * 0.6)),
+    );
     match row {
         Row::Continuation(row) => render_row_content(
             ix,
@@ -1450,11 +1468,14 @@ fn render_row_content(
                 } else {
                     CardEdge::Middle
                 },
+                max_comment_width,
                 cx,
             )
         }
-        Row::CommentBody { half, .. } => {
-            comment_row(div().into_any_element(), *half, false, body_edge, cx)
+        Row::CommentBody { half, .. } | Row::CommentSpacer { half } => {
+            comment_row(
+                div().into_any_element(), *half, false, body_edge, max_comment_width, cx,
+            )
         }
         Row::CommentReactions { comment_id, half } => comment_row(
             div()
@@ -1467,10 +1488,18 @@ fn render_row_content(
             *half,
             false,
             body_edge,
+            max_comment_width,
             cx,
         ),
-        Row::CommentEditor { half } => {
-            comment_row(div().into_any_element(), *half, false, body_edge, cx)
+        Row::CommentEditor { half, top } => {
+            let edge = match (*top, body_edge) {
+                (true, CardEdge::Bottom) => CardEdge::Single,
+                (true, _) => CardEdge::Top,
+                (false, edge) => edge,
+            };
+            comment_row(
+                div().into_any_element(), *half, false, edge, max_comment_width, cx,
+            )
         }
         Row::CommentActions {
             root_id,
@@ -1482,46 +1511,75 @@ fn render_row_content(
             let (root_id, side, line) = (*root_id, *side, *line);
             let path = path.clone();
             let entity = entity.clone();
-            comment_row(
-                Button::new(SharedString::from(format!("reply-{root_id}")))
-                    .ghost()
-                    .xsmall()
-                    .h(row_height)
-                    .label("↳ reply")
-                    .disabled(
-                        entity
-                            .read(cx)
-                            .active_comment_projection()
-                            .and_then(|p| p.remote_id(root_id))
-                            .is_none()
-                            || entity
-                                .read(cx)
-                                .active_item()
-                                .is_some_and(|i| entity.read(cx).comment_write_blocked(i.id)),
-                    )
-                    .on_click(move |_, window, cx| {
-                        entity.update(cx, |this, cx| {
-                            let Some(remote_id) = this
-                                .active_comment_projection()
-                                .and_then(|p| p.remote_id(root_id))
-                            else {
-                                return;
-                            };
-                            this.open_composer(
-                                Some(remote_id),
-                                path.to_string(),
-                                side,
-                                line,
-                                ix,
-                                window,
-                                cx,
-                            );
-                        });
+            let app = entity.read(cx);
+            let replying = app
+                .active_comment_projection()
+                .and_then(|p| p.remote_id(root_id))
+                .is_some_and(|id| {
+                    app.composer().is_some_and(|c| {
+                        c.placement == crate::ComposerPlacement::Diff && c.reply_to == Some(id)
                     })
-                    .into_any_element(),
+                });
+            let editing = app.composer().is_some_and(|c| c.edit_id.is_some());
+            comment_row(
+                if replying {
+                    div()
+                        .text_color(theme::overlay0(cx))
+                        .child("Reply")
+                        .into_any_element()
+                } else {
+                    div()
+                        .debug_selector(|| format!("inline-reply-{root_id}"))
+                        .child(
+                            Button::new(SharedString::from(format!("reply-{root_id}")))
+                                .ghost()
+                                .xsmall()
+                                .h(row_height)
+                                .label("↳ reply")
+                                .when(editing, |button| {
+                                    button.tooltip("Save or cancel your edit first")
+                                })
+                                .disabled(
+                                    editing
+                                        || entity
+                                            .read(cx)
+                                            .active_comment_projection()
+                                            .and_then(|p| p.remote_id(root_id))
+                                            .is_none()
+                                        || entity.read(cx).active_item().is_some_and(|i| {
+                                            entity.read(cx).comment_write_blocked(i.id)
+                                        }),
+                                )
+                                .on_click(move |_, window, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        let Some(remote_id) = this
+                                            .active_comment_projection()
+                                            .and_then(|p| p.remote_id(root_id))
+                                        else {
+                                            return;
+                                        };
+                                        this.open_composer(
+                                            Some(remote_id),
+                                            path.to_string(),
+                                            side,
+                                            line,
+                                            ix,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        )
+                        .into_any_element()
+                },
                 *half,
                 false,
-                CardEdge::Bottom,
+                if replying {
+                    CardEdge::Middle
+                } else {
+                    CardEdge::Bottom
+                },
+                max_comment_width,
                 cx,
             )
         }
@@ -1811,7 +1869,7 @@ mod tests {
     use syntax::Token;
 
     #[test]
-    fn pending_threads_close_on_their_last_body_without_extra_rows() {
+    fn pending_threads_close_on_their_last_body_without_footer_rows() {
         let mut comments = vec![
             rc(1, "a.rs", Some("RIGHT"), Some(2), "root", "you", "", None),
             rc(
@@ -1842,17 +1900,18 @@ mod tests {
                 mode,
                 COMMENT_WRAP_CHARS,
             );
-            assert_eq!(rows.len(), 6, "no spacer or reply-action rows");
+            assert_eq!(rows.len(), 7, "one reply spacer, but no reply-action rows");
+            assert!(matches!(rows[2], Row::CommentSpacer { .. }));
             assert!(
                 matches!(comment_body_edge(rows.get(2)), CardEdge::Middle),
                 "the root body stays joined to its reply"
             );
             assert!(
-                matches!(comment_body_edge(rows.get(4)), CardEdge::Bottom),
+                matches!(comment_body_edge(rows.get(5)), CardEdge::Bottom),
                 "the reply body closes before the next thread"
             );
             assert!(
-                matches!(comment_body_edge(rows.get(6)), CardEdge::Bottom),
+                matches!(comment_body_edge(rows.get(7)), CardEdge::Bottom),
                 "a single pending comment closes at EOF"
             );
             assert!(matches!(
@@ -1860,7 +1919,7 @@ mod tests {
                 CardEdge::Bottom
             ));
             assert!(matches!(
-                comment_body_edge(Some(&Row::CommentEditor { half: None })),
+                comment_body_edge(Some(&Row::CommentEditor { half: None, top: false })),
                 CardEdge::Middle
             ));
             assert!(matches!(
@@ -2663,7 +2722,7 @@ mod tests {
         // old2, add new1 (new_no 2) + RIGHT thread, …
         let names: Vec<&str> = rows.iter().map(row_name).collect();
         assert_eq!(
-            &names[..12],
+            &names[..13],
             &[
                 "FileHeader",
                 "Line",          // ctx 1/1
@@ -2675,11 +2734,12 @@ mod tests {
                 "Line",          // add new1 (new 2)
                 "CommentHeader", // alice
                 "CommentBody",
+                "CommentSpacer",
                 "CommentHeader", // bob's reply
                 "CommentBody",
             ]
         );
-        assert_eq!(names[12], "CommentActions");
+        assert_eq!(names[13], "CommentActions");
         // The LEFT thread is carol's; the reply flag follows position.
         match &rows[3] {
             Row::CommentHeader {
@@ -2690,7 +2750,7 @@ mod tests {
             }
             other => panic!("expected comment header, got {}", row_name(other)),
         }
-        match &rows[10] {
+        match &rows[11] {
             Row::CommentHeader {
                 author, is_reply, ..
             } => {
@@ -2700,7 +2760,7 @@ mod tests {
             other => panic!("expected reply header, got {}", row_name(other)),
         }
         // Actions row targets the thread root and carries the anchor.
-        match &rows[12] {
+        match &rows[13] {
             Row::CommentActions {
                 root_id,
                 path,
@@ -2754,7 +2814,7 @@ mod tests {
         // thread directly beneath it.
         let names: Vec<&str> = rows.iter().map(row_name).collect();
         assert_eq!(
-            &names[1..10],
+            &names[1..11],
             &[
                 "SplitLine",     // ctx
                 "SplitLine",     // old1 | new1
@@ -2763,12 +2823,13 @@ mod tests {
                 "CommentActions",
                 "CommentHeader", // alice (RIGHT)
                 "CommentBody",
+                "CommentSpacer",
                 "CommentHeader", // bob reply
                 "CommentBody",
             ]
         );
-        assert_eq!(names[10], "CommentActions");
-        assert_eq!(names[11], "SplitLine"); // old2 | new2
+        assert_eq!(names[11], "CommentActions");
+        assert_eq!(names[12], "SplitLine"); // old2 | new2
     }
 
     /// The half a comment row renders in, or None for a full-width card.
@@ -2776,6 +2837,7 @@ mod tests {
         match row {
             Row::CommentHeader { half, .. }
             | Row::CommentBody { half, .. }
+            | Row::CommentSpacer { half }
             | Row::CommentActions { half, .. } => Some(*half),
             _ => None,
         }
@@ -2795,9 +2857,9 @@ mod tests {
                 comment_wrap: COMMENT_WRAP_CHARS,
             },
         });
-        // rows[3..6] are carol's LEFT thread, rows[6..11] the RIGHT one; each
-        // row of a thread carries the side it was anchored to.
-        let halves: Vec<Option<Option<CommentSide>>> = rows[3..11].iter().map(row_half).collect();
+        // rows[3..6] are carol's LEFT thread, rows[6..12] the RIGHT one; each
+        // row of a thread (including the spacer) carries its anchor side.
+        let halves: Vec<Option<Option<CommentSide>>> = rows[3..12].iter().map(row_half).collect();
         assert_eq!(
             halves,
             vec![
@@ -2806,6 +2868,7 @@ mod tests {
                 Some(Some(CommentSide::Left)),  // actions
                 Some(Some(CommentSide::Right)), // alice header
                 Some(Some(CommentSide::Right)), // body
+                Some(Some(CommentSide::Right)), // reply spacer
                 Some(Some(CommentSide::Right)), // bob reply header
                 Some(Some(CommentSide::Right)), // body
                 Some(Some(CommentSide::Right)), // actions

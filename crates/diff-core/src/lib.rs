@@ -450,16 +450,14 @@ fn parse_hunk_header(line: &str) -> Option<Hunk> {
 
 // --- Intra-line (word-level) diff -------------------------------------------
 
-const MAX_PAIR_RUN: usize = 32;
+const MAX_BLOCK_LINES: usize = 32;
 const MAX_LINE_BYTES: usize = 4096;
-const MAX_LINE_TOKENS: usize = 512;
-/// If more than this fraction of a line changed, highlighting it all is noise.
-const MAX_CHANGED_FRACTION: f32 = 0.7;
+const MAX_BLOCK_TOKENS: usize = 512;
+/// If more than this fraction of a block changed, highlighting it all is noise.
+const MAX_CHANGED_FRACTION: f32 = 0.85;
 
-/// For each run of removed lines immediately followed by an equal number of
-/// added lines, pair the lines positionally and compute word-level diffs.
-/// (Equal-count positional pairing is the cheap, high-confidence case;
-/// similarity-based pairing for unequal runs can come later.)
+/// Diff a whole replacement block so unchanged words can match across line
+/// boundaries (including reflowed text and unequal numbers of lines).
 fn compute_intra_line(rows: &mut [DiffRow]) {
     let mut i = 0;
     while i < rows.len() {
@@ -475,31 +473,52 @@ fn compute_intra_line(rows: &mut [DiffRow]) {
         while i < rows.len() && matches!(rows[i], DiffRow::Added { .. }) {
             i += 1;
         }
-        let removed = mid - start;
-        let added = i - mid;
-        if removed != added || removed > MAX_PAIR_RUN {
+        if mid == i || mid - start > MAX_BLOCK_LINES || i - mid > MAX_BLOCK_LINES {
             continue;
         }
-        for pair in 0..removed {
-            let old_text = match &rows[start + pair] {
-                DiffRow::Removed { text, .. } => text.clone(),
+        fn text(row: &DiffRow) -> &str {
+            match row {
+                DiffRow::Removed { text, .. } | DiffRow::Added { text, .. } => text.as_str(),
                 _ => unreachable!(),
-            };
-            let new_text = match &rows[mid + pair] {
-                DiffRow::Added { text, .. } => text.clone(),
-                _ => unreachable!(),
-            };
-            if old_text.len() > MAX_LINE_BYTES || new_text.len() > MAX_LINE_BYTES {
-                continue;
-            }
-            let (old_ranges, new_ranges) = word_diff(&old_text, &new_text);
-            if let DiffRow::Removed { intra, .. } = &mut rows[start + pair] {
-                *intra = old_ranges;
-            }
-            if let DiffRow::Added { intra, .. } = &mut rows[mid + pair] {
-                *intra = new_ranges;
             }
         }
+        if rows[start..i]
+            .iter()
+            .any(|row| text(row).len() > MAX_LINE_BYTES)
+        {
+            continue;
+        }
+        let old = rows[start..mid]
+            .iter()
+            .map(text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = rows[mid..i].iter().map(text).collect::<Vec<_>>().join("\n");
+        let (old_ranges, new_ranges) = word_diff(&old, &new);
+        set_intra_ranges(&mut rows[start..mid], &old_ranges);
+        set_intra_ranges(&mut rows[mid..i], &new_ranges);
+    }
+}
+
+/// Project block byte offsets onto row text, excluding the joining newlines.
+fn set_intra_ranges(rows: &mut [DiffRow], ranges: &[Range<usize>]) {
+    let mut offset = 0;
+    for row in rows {
+        let (text, intra) = match row {
+            DiffRow::Removed { text, intra, .. } | DiffRow::Added { text, intra, .. } => {
+                (text, intra)
+            }
+            _ => unreachable!(),
+        };
+        *intra = ranges
+            .iter()
+            .filter_map(|range| {
+                let start = range.start.max(offset);
+                let end = range.end.min(offset + text.len());
+                (start < end).then(|| start - offset..end - offset)
+            })
+            .collect();
+        offset += text.len() + 1;
     }
 }
 
@@ -542,12 +561,12 @@ fn char_class(ch: char) -> CharClass {
     }
 }
 
-/// Word-level diff of two lines → (changed byte ranges in old, in new).
-/// Returns empty ranges when the lines are too different for highlights to help.
+/// Word-level diff of two replacement blocks → (changed byte ranges in old, in new).
+/// Returns empty ranges when the blocks are too different for highlights to help.
 fn word_diff(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
     let old_tokens = token_ranges(old);
     let new_tokens = token_ranges(new);
-    if old_tokens.len() > MAX_LINE_TOKENS || new_tokens.len() > MAX_LINE_TOKENS {
+    if old_tokens.len() > MAX_BLOCK_TOKENS || new_tokens.len() > MAX_BLOCK_TOKENS {
         return (Vec::new(), Vec::new());
     }
 
@@ -582,7 +601,29 @@ fn word_diff(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
     if changed(&old_ranges, old.trim_end().len()) || changed(&new_ranges, new.trim_end().len()) {
         return (Vec::new(), Vec::new());
     }
-    (old_ranges, new_ranges)
+    // Shared spaces between replaced words should not split a visual highlight.
+    // Do this after the rewrite cutoff: these spaces are not actual edits.
+    (
+        merge_whitespace_gaps(old, old_ranges),
+        merge_whitespace_gaps(new, new_ranges),
+    )
+}
+
+fn merge_whitespace_gaps(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut() {
+            if text[previous.end..range.start]
+                .chars()
+                .all(char::is_whitespace)
+            {
+                previous.end = range.end;
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -728,6 +769,134 @@ index 6666666..7777777 100644
         assert_eq!(renamed.status, FileStatus::Renamed);
         assert_eq!(renamed.old_path.as_deref(), Some("old.rs"));
         assert_eq!(renamed.new_path.as_deref(), Some("renamed.rs"));
+    }
+
+    fn highlighted(rows: &[DiffRow], added: bool) -> Vec<String> {
+        rows.iter()
+            .filter_map(|row| match row {
+                DiffRow::Added { text, intra, .. } if added => Some((text, intra)),
+                DiffRow::Removed { text, intra, .. } if !added => Some((text, intra)),
+                _ => None,
+            })
+            .map(|(text, intra)| intra.iter().map(|r| &text[r.clone()]).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn block_diff_matches_words_across_reflowed_lines() {
+        let hunks = diff_texts(
+            "The old value brackets the wait itself.\nKeep this context.\n",
+            "The new value brackets\nthe wait itself.\nKeep this context.\n",
+            3,
+        );
+        assert_eq!(highlighted(&hunks[0].rows, false), vec!["old "]);
+        assert_eq!(highlighted(&hunks[0].rows, true), vec!["new", ""]);
+    }
+
+    #[test]
+    fn issue_51_keeps_the_shared_phrase_unhighlighted() {
+        let old = "``assigned_at`` and ``ended_at`` both stay null, as they do on a\ncancel: they bracket a live chat, and a request nobody accepted never\nbecame one. ``created`` and ``modified`` bracket the wait itself.";
+        let new = "``queued_at`` and ``modified`` bracket the wait itself — not\n``created``, which on a requeued chat predates a spell that was spent\nbeing handled rather than waiting.";
+        let hunks = diff_texts(old, new, 0);
+        let (old_ranges, new_ranges) = word_diff(old, new);
+        for (text, ranges) in [(old, old_ranges), (new, new_ranges)] {
+            let start = text.find("bracket the wait itself").unwrap();
+            let end = start + "bracket the wait itself".len();
+            assert!(!ranges.is_empty());
+            assert!(ranges.iter().all(|r| r.end <= start || r.start >= end));
+        }
+        for added in [false, true] {
+            assert!(highlighted(&hunks[0].rows, added)
+                .iter()
+                .any(|s| !s.is_empty()));
+        }
+    }
+
+    #[test]
+    fn block_diff_handles_unicode_and_one_sided_edits() {
+        let patch = "diff --git a/f b/f\n@@ -1,2 +1,3 @@\n-café α stays\n-tail stays\n+café β stays\n+inserted words\n+tail stays\n";
+        let diff = parse_patch(patch);
+        let rows = &diff.files[0].hunks[0].rows;
+        assert_eq!(highlighted(rows, false), vec!["α", ""]);
+        assert_eq!(highlighted(rows, true), vec!["β", "inserted words", ""]);
+        for (old, new) in [
+            ("let value = 1;", "let value = 1 + 2;"),
+            ("let value = 1 + 2;", "let value = 1;"),
+        ] {
+            let hunks = diff_texts(old, new, 0);
+            assert!(
+                highlighted(&hunks[0].rows, false)
+                    .iter()
+                    .any(|s| !s.is_empty())
+                    || highlighted(&hunks[0].rows, true)
+                        .iter()
+                        .any(|s| !s.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_blocks_skip_highlights() {
+        for (old, new) in [
+            (
+                "old value\n".repeat(MAX_BLOCK_LINES + 1),
+                "new value\n".repeat(MAX_BLOCK_LINES + 1),
+            ),
+            (
+                format!("{} old", "x".repeat(MAX_LINE_BYTES)),
+                format!("{} new", "x".repeat(MAX_LINE_BYTES)),
+            ),
+            (
+                format!("{}old", "x ".repeat(MAX_BLOCK_TOKENS)),
+                format!("{}new", "x ".repeat(MAX_BLOCK_TOKENS)),
+            ),
+        ] {
+            let hunks = diff_texts(&old, &new, 0);
+            for added in [false, true] {
+                assert!(highlighted(&hunks[0].rows, added)
+                    .iter()
+                    .all(String::is_empty));
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_title_changes_form_one_highlight() {
+        let old_title = "Add deactivation filters to the users manage list";
+        let new_title = "Replace every loading spinner with a tiny migrating goose";
+        let old = format!("    \"title\": \"{old_title}\",");
+        let new = format!("    \"title\": \"{new_title}\",");
+        let hunks = diff_texts(&old, &new, 0);
+        for (row, title) in hunks[0].rows.iter().zip([old_title, new_title]) {
+            let (text, intra) = match row {
+                DiffRow::Removed { text, intra, .. } | DiffRow::Added { text, intra, .. } => {
+                    (text, intra)
+                }
+                _ => panic!("expected changed row"),
+            };
+            let start = text.find(title).unwrap();
+            assert_eq!(intra, &vec![start..start + title.len()]);
+        }
+    }
+
+    #[test]
+    fn whitespace_merging_preserves_shared_words_and_punctuation() {
+        for (old, new) in [
+            (
+                "prefix old shared value suffix",
+                "prefix new shared item suffix",
+            ),
+            ("prefix old, value suffix", "prefix new, item suffix"),
+        ] {
+            let (removed, added) = word_diff(old, new);
+            assert_eq!(removed.len(), 2);
+            assert_eq!(added.len(), 2);
+        }
+        let old = "prefix café\tα suffix";
+        let new = "prefix tea\tβ suffix";
+        let (removed, added) = word_diff(old, new);
+        assert_eq!(removed, vec![7.."prefix café\tα".len()]);
+        assert_eq!(added, vec![7.."prefix tea\tβ".len()]);
     }
 
     #[test]

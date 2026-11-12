@@ -12,8 +12,8 @@ pub struct DiffPreferences {
 
 impl DiffPreferences {
     /// Initial presentation for a PR; saved per-PR choices override these.
-    pub const OFF: Self = Self {
-        hide_whitespace: Some(false),
+    pub const INITIAL: Self = Self {
+        hide_whitespace: Some(true),
         collapse_unchanged: Some(false),
         soft_wrap: Some(false),
     };

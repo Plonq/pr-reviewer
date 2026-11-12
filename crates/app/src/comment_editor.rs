@@ -4,7 +4,7 @@
 use crate::mentions::{mention_prefix, mention_rank};
 use gpui::component::{input::CompletionProvider, Rope, RopeExt};
 use gpui::component::{
-    input::{Editor, EditorState, WrappingIndent},
+    input::{Editor, EditorState, MoveDown, MoveUp, WrappingIndent},
     ActiveTheme, Size,
 };
 use gpui::{App, Focusable, Task};
@@ -82,10 +82,77 @@ pub(crate) fn new(window: &mut Window, cx: &mut Context<EditorState>) -> EditorS
         .scroll_bounce(false)
 }
 
+/// Multiline Kit inputs reset the caret to zero when assigning a value. Prose
+/// being opened for editing/restoration should instead be ready to append.
+pub(crate) fn set_value_at_end(
+    state: &mut EditorState,
+    value: impl Into<gpui::SharedString>,
+    window: &mut Window,
+    cx: &mut Context<EditorState>,
+) {
+    state.set_value(value.into(), window, cx);
+    let end = state.text().len();
+    state.set_selected_range(end..end, cx);
+    // A fresh editor has no layout yet, so the synchronous selection cannot
+    // reveal a long comment's tail. Retry after its first frame, but never
+    // override navigation/selection the user has made in the meantime.
+    let input = cx.entity().downgrade();
+    window.on_next_frame(move |_, cx| {
+        let _ = input.update(cx, |state, cx| {
+            if state.text().len() == end
+                && state.cursor() == end
+                && state.selected_range().is_empty()
+            {
+                state.set_selected_range(end..end, cx);
+            }
+        });
+    });
+}
+
+/// Let Kit perform normal visual-row movement first (including wrap affinity,
+/// column tracking, selection collapse and completion navigation). Only a plain
+/// arrow that could not move the caret gets the prose-style document-edge move.
+fn finish_vertical_movement(
+    input: &Entity<EditorState>,
+    down: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let state = input.read(cx);
+    if !state.selected_range().is_empty()
+        || state.line_height().is_none()
+        || state.completion_menu_state().open
+        || state.code_action_menu_state().open
+    {
+        return;
+    }
+    let before = state.cursor();
+    let target = if down { state.text().len() } else { 0 };
+    if before == target {
+        return;
+    }
+    let input = input.downgrade();
+    window.defer(cx, move |_, cx| {
+        if let Some(input) = input.upgrade() {
+            input.update(cx, |state, cx| {
+                if state.cursor() == before && state.selected_range().is_empty() {
+                    state.set_selected_range(target..target, cx);
+                }
+            });
+        }
+    });
+}
+
 fn height(rows: usize, line_height: gpui::Pixels) -> gpui::Pixels {
     // Stock medium Editor padding plus its two one-pixel borders. Reserve
     // complete text rows rather than introducing a tiny internal scroll range.
     line_height * rows.clamp(3, 8) + Size::Medium.input_py() * 2. + px(2.)
+}
+
+/// Height of a fresh prose field before its first layout. Keep the diff's
+/// initial composer reservation in sync with the field's actual minimum.
+pub(crate) fn minimum_height(cx: &App) -> gpui::Pixels {
+    height(3, cx.theme().font_size * 0.875 * 1.5)
 }
 
 #[cfg(test)]
@@ -108,6 +175,8 @@ pub(crate) fn field_with_media<T: 'static>(
     );
     let owner = cx.entity().entity_id();
     let editor = state.clone();
+    let up_input = state.clone();
+    let down_input = state.clone();
     let paste_input = state.downgrade();
     let drop_input = state.downgrade();
     let mut editor_element = Editor::new(state)
@@ -135,6 +204,15 @@ pub(crate) fn field_with_media<T: 'static>(
         .relative()
         .w_full()
         .h(h)
+        .when(!disabled, |field| {
+            field
+                .capture_action(move |_: &MoveUp, window, cx| {
+                    finish_vertical_movement(&up_input, false, window, cx);
+                })
+                .capture_action(move |_: &MoveDown, window, cx| {
+                    finish_vertical_movement(&down_input, true, window, cx);
+                })
+        })
         .when_some(uploads.filter(|_| !disabled).cloned(), |field, uploads| {
             field
                 .on_drop(move |paths: &gpui::ExternalPaths, window, cx| {
@@ -354,7 +432,10 @@ mod tests {
 
     fn settle(cx: &mut VisualTestContext) -> gpui::Pixels {
         for _ in 0..4 {
-            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_next_frame(cx);
+            });
             cx.run_until_parked();
         }
         cx.debug_bounds("comment-editor-field").unwrap().size.height
@@ -477,6 +558,179 @@ mod tests {
                 "Hello @alice Hello @alice "
             )
         });
+    }
+
+    #[gpui::test]
+    fn loaded_prose_is_ready_to_append_including_unicode_and_trailing_newlines(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut vcx, _, input) = fixture(cx);
+        let long = "many lines\n".repeat(40);
+        for text in [
+            long.as_str(),
+            "",
+            "a comment",
+            "é🙂\nmore",
+            "trailing newline\n",
+        ] {
+            vcx.update(|window, cx| {
+                input.update(cx, |state, cx| set_value_at_end(state, text, window, cx));
+                assert_eq!(input.read(cx).selected_range(), text.len()..text.len());
+            });
+            settle(&mut vcx);
+            vcx.update(|_, cx| {
+                let state = input.read(cx);
+                // Kit caches caret y in content space (x is already scrolled).
+                let (mut caret, _) = state.cursor_layout().unwrap();
+                caret.origin.y += state.scroll_offset().y;
+                assert!(
+                    state.input_bounds().intersects(&caret),
+                    "end caret must be visible: len={}, caret={caret:?}, viewport={:?}, scroll={:?}",
+                    text.len(), state.input_bounds(), state.scroll_offset()
+                );
+            });
+            vcx.simulate_input("!");
+            vcx.update(|_, cx| assert_eq!(input.read(cx).value().as_str(), format!("{text}!")));
+        }
+        vcx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                set_value_at_end(state, long, window, cx);
+                state.set_selected_range(2..5, cx);
+            })
+        });
+        settle(&mut vcx);
+        vcx.update(|_, cx| assert_eq!(input.read(cx).selected_range(), 2..5));
+    }
+
+    #[gpui::test]
+    fn vertical_arrows_reach_text_edges_without_changing_normal_movement_or_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut vcx, _, input) = fixture(cx);
+        let text = "first line\nfirst line\nlast é🙂";
+        vcx.update(|window, cx| {
+            input.update(cx, |state, cx| set_value_at_end(state, text, window, cx));
+        });
+        settle(&mut vcx);
+        // At the first visual row, Up reaches the start, and Shift+Up still
+        // selects to the start through Kit's normal selection implementation.
+        vcx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_cursor_position(lsp_types::Position::new(0, 4), window, cx)
+            })
+        });
+        vcx.simulate_keystrokes("shift-up");
+        vcx.update(|_, cx| assert_eq!(input.read(cx).selected_range(), 0..4));
+        vcx.simulate_keystrokes("right up");
+        vcx.update(|_, cx| assert_eq!(input.read(cx).cursor(), 0));
+        // A normal move still retains the visual column; it must not jump to
+        // an edge simply because the logical buffer row is first/last.
+        vcx.simulate_keystrokes("right right down");
+        vcx.update(|_, cx| {
+            assert_eq!(
+                input.read(cx).cursor_position(),
+                lsp_types::Position::new(1, 2)
+            )
+        });
+        vcx.simulate_keystrokes("up");
+        vcx.update(|_, cx| assert_eq!(input.read(cx).cursor(), 2));
+        vcx.simulate_keystrokes("up up");
+        vcx.update(|_, cx| assert_eq!(input.read(cx).cursor(), 0));
+        vcx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_cursor_position(lsp_types::Position::new(2, 3), window, cx)
+            })
+        });
+        vcx.simulate_keystrokes("shift-down");
+        vcx.update(|_, cx| assert_eq!(input.read(cx).selected_range(), 25..text.len()));
+        vcx.simulate_keystrokes("left down down");
+        vcx.update(|_, cx| assert_eq!(input.read(cx).selected_range(), text.len()..text.len()));
+        // The same behavior applies to a single visual row, including empty text.
+        for text in ["single é🙂 line", ""] {
+            vcx.update(|window, cx| {
+                input.update(cx, |state, cx| {
+                    set_value_at_end(state, text, window, cx);
+                    state.set_selected_range(3.min(text.len())..3.min(text.len()), cx);
+                })
+            });
+            settle(&mut vcx);
+            vcx.simulate_keystrokes("up");
+            vcx.update(|_, cx| assert_eq!(input.read(cx).cursor(), 0));
+            vcx.simulate_keystrokes("down");
+            vcx.update(|_, cx| assert_eq!(input.read(cx).cursor(), text.len()));
+        }
+    }
+
+    #[gpui::test]
+    fn vertical_edge_movement_respects_soft_wrapped_rows(cx: &mut TestAppContext) {
+        let (mut vcx, view, input) = fixture(cx);
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.width = px(180.);
+                cx.notify();
+            });
+            input.update(cx, |state, cx| {
+                set_value_at_end(state, "wrapped prose words ".repeat(8), window, cx)
+            });
+        });
+        settle(&mut vcx);
+        let end = vcx.update(|_, cx| {
+            assert!(input.read(cx).display_map().display_row_count() > 3);
+            input.read(cx).cursor()
+        });
+        vcx.simulate_keystrokes("up");
+        let previous = vcx.update(|_, cx| input.read(cx).cursor());
+        assert!(
+            previous > 0 && previous < end,
+            "Up moves one visual row, not to the buffer-line start"
+        );
+        vcx.simulate_keystrokes("down");
+        vcx.update(|_, cx| assert_eq!(input.read(cx).cursor(), end));
+        vcx.simulate_keystrokes("cmd-left");
+        for _ in 0..30 {
+            vcx.simulate_keystrokes("up");
+        }
+        vcx.update(|_, cx| assert_eq!(input.read(cx).cursor(), 0));
+        vcx.simulate_keystrokes("down");
+        let next = vcx.update(|_, cx| input.read(cx).cursor());
+        assert!(
+            next > 0 && next < end,
+            "Down traverses wraps before reaching the text end"
+        );
+        for _ in 0..30 {
+            vcx.simulate_keystrokes("down");
+        }
+        vcx.update(|_, cx| assert_eq!(input.read(cx).cursor(), end));
+    }
+
+    #[gpui::test]
+    fn vertical_arrows_navigate_mentions_instead_of_moving_the_caret(cx: &mut TestAppContext) {
+        let (mut vcx, _, input) = fixture(cx);
+        vcx.update(|_, cx| {
+            candidates(
+                &input,
+                Rc::new(RefCell::new(vec![
+                    github::Mention {
+                        login: "albert".into(),
+                        name: None,
+                    },
+                    github::Mention {
+                        login: "alice".into(),
+                        name: None,
+                    },
+                ])),
+                cx,
+            )
+        });
+        settle(&mut vcx);
+        vcx.simulate_input("Hello @al");
+        settle(&mut vcx);
+        vcx.update(|_, cx| assert!(input.read(cx).completion_menu_state().open));
+        vcx.simulate_keystrokes("down up down");
+        vcx.update(|_, cx| assert_eq!(input.read(cx).cursor(), "Hello @al".len()));
+        vcx.update(|window, cx| window.press("enter", cx));
+        settle(&mut vcx);
+        vcx.update(|_, cx| assert_eq!(input.read(cx).value().as_str(), "Hello @alice "));
     }
 
     #[test]
