@@ -225,7 +225,16 @@ impl ReviewApp {
                                         theme::subtext(cx)
                                     })
                                     .tooltip(move |window, cx| {
-                                        Tooltip::new(detail.clone())
+                                        // Constrain the content too: Tooltip's flex child
+                                        // can otherwise overflow the popup's max width.
+                                        let detail = detail.clone();
+                                        Tooltip::element(move |_, _| {
+                                            div()
+                                                .debug_selector(|| "review-scope-tooltip-text".into())
+                                                .max_w(px(440.))
+                                                .whitespace_normal()
+                                                .child(detail.clone())
+                                        })
                                             .max_w(px(480.))
                                             .build(window, cx)
                                     })
