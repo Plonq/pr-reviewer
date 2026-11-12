@@ -281,15 +281,27 @@ fn hunk_navigation_keybindings() -> [KeyBinding; 2] {
     ]
 }
 
-fn comment_composer_keybindings() -> [KeyBinding; 1] {
-    [KeyBinding::new(
-        "shift-cmd-enter",
-        InputEnter {
-            secondary: true,
-            shift: true,
-        },
-        Some("CommentComposer"),
-    )]
+fn comment_composer_keybindings() -> [KeyBinding; 3] {
+    [
+        KeyBinding::new(
+            "shift-cmd-enter",
+            InputEnter {
+                secondary: true,
+                shift: true,
+            },
+            Some("CommentComposer"),
+        ),
+        // Preview has no Editor mounted to provide these bindings.
+        KeyBinding::new("escape", InputEscape, Some("CommentPreview")),
+        KeyBinding::new(
+            "cmd-enter",
+            InputEnter {
+                secondary: true,
+                shift: false,
+            },
+            Some("CommentPreview"),
+        ),
+    ]
 }
 
 /// Environment that makes every `git` we (or anything below us) run use the
@@ -1859,6 +1871,7 @@ struct Composer {
     row_ix: usize,
     input: gpui::Entity<gpui::component::input::EditorState>,
     uploads: Option<gpui::Entity<comment_media::Uploads>>,
+    preview: bool,
     /// Measured composer height, reserved in the diff at its source/thread anchor.
     height: Rc<Cell<gpui::Pixels>>,
     /// Reveal a composer once, after its card is laid out.
@@ -1903,6 +1916,7 @@ struct ReviewDialog {
     verdict: github::ReviewVerdict,
     input: gpui::Entity<gpui::component::input::EditorState>,
     uploads: Option<gpui::Entity<comment_media::Uploads>>,
+    preview: bool,
     error: Option<SharedString>,
     in_flight: bool,
 }
@@ -4291,10 +4305,10 @@ impl ReviewApp {
             self.ensure_mentions(item_id, loc, cx);
         }
         // Match the empty inline card before it can paint: p_3 top/bottom
-        // (1.5rem), the gap_2 (0.5rem), and h_6 action buttons (1.5rem).
+        // (1.5rem), two gap_2 gaps (1rem), and h_6 mode/action buttons (3rem).
         // Include the same 8px breathing room as the measured reservation.
         let initial_height = comment_editor::minimum_height(cx)
-            + window.rem_size() * 3.5
+            + window.rem_size() * 5.5
             + px(8.);
         self.composers.push(Composer {
             id: self.composer_gen,
@@ -4313,6 +4327,7 @@ impl ReviewApp {
             row_ix,
             input,
             uploads,
+            preview: false,
             height: Rc::new(Cell::new(initial_height)),
             reveal: Rc::new(Cell::new(true)),
             error: None,
@@ -4850,6 +4865,7 @@ impl ReviewApp {
             verdict: github::ReviewVerdict::Approve,
             input,
             uploads,
+            preview: false,
             error: None,
             in_flight: false,
         });
@@ -5265,7 +5281,7 @@ impl ReviewApp {
     }
 
     /// One editor/action implementation for standalone, edit, and reply shells.
-    /// Future features (e.g. Write/Preview) belong here, not in the shells.
+    /// Editor features, including Write/Preview, belong here, not in the shells.
     fn render_composer_content(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let composer = self.composer().expect("an open composer");
         let submit_disabled = composer.in_flight
@@ -5300,12 +5316,34 @@ impl ReviewApp {
             .flex_col()
             .gap_2()
             .text_size(px(12.))
-            .child(comment_editor::field_with_media(
-                &composer.input,
-                composer.uploads.as_ref(),
+            .child(comment_editor::mode_tabs(
+                composer.preview,
                 composer.in_flight,
+                |app: &mut Self, preview, window, cx| {
+                    if let Some(composer) = app.composer_mut() {
+                        composer.preview = preview;
+                        composer.input.update(cx, |input, cx| input.focus(window, cx));
+                        cx.notify();
+                    }
+                },
                 cx,
             ))
+            .child(if composer.preview {
+                comment_editor::preview(
+                    &format!("composer-preview-{}", composer.id),
+                    &composer.input,
+                    composer.uploads.as_ref(),
+                    self,
+                    cx,
+                )
+            } else {
+                comment_editor::field_with_media(
+                    &composer.input,
+                    composer.uploads.as_ref(),
+                    composer.in_flight,
+                    cx,
+                )
+            })
             .when_some(composer.error.clone(), |card, err| {
                 card.child(div().text_color(theme::red(cx)).child(err))
             })
@@ -7843,6 +7881,7 @@ mod tests {
 
     mod markdown_hosts {
         include!("markdown_tests.rs");
+        include!("comment_preview_tests.rs");
         include!("image_viewer_tests.rs");
         include!("file_media_tests.rs");
         include!("svg_image_tests.rs");

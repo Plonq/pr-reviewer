@@ -7,7 +7,7 @@ use gpui::component::{
     input::{Editor, EditorState, MoveDown, MoveUp, WrappingIndent},
     ActiveTheme, Size,
 };
-use gpui::{App, Task};
+use gpui::{App, Focusable, Task};
 use std::{cell::RefCell, rc::Rc};
 
 struct MentionProvider {
@@ -253,32 +253,143 @@ pub(crate) fn field_with_media<T: 'static>(
         .flex_col()
         .gap_1()
         .child(field)
-        .when_some(uploads, |field, uploads| {
-            let blocked = crate::comment_media::blocks_submission(Some(uploads), state, cx);
-            let uploads = uploads.read(cx);
-            field
-                .when(blocked && uploads.pending() == 0, |field| {
-                    field.child(div().text_sm().text_color(crate::theme::red(cx)).child(
-                        "Remove the restored upload placeholder before submitting. Paste/drop the media again if needed.",
-                    ))
-                })
-                .when(uploads.pending() > 0, |field| {
-                    field.child(
-                        div()
-                            .text_sm()
-                            .text_color(crate::theme::subtext(cx))
-                            .child(format!("Uploading {} attachment(s)…", uploads.pending())),
-                    )
-                })
-                .when_some(uploads.error.clone(), |field, error| {
-                    field.child(
-                        div()
-                            .text_sm()
-                            .text_color(crate::theme::red(cx))
-                            .child(error),
-                    )
-                })
-        })
+        .children(media_feedback(state, uploads, cx))
+        .into_any_element()
+}
+
+fn media_feedback<T: 'static>(
+    state: &Entity<EditorState>,
+    uploads: Option<&Entity<crate::comment_media::Uploads>>,
+    cx: &mut Context<T>,
+) -> Option<AnyElement> {
+    let blocked = crate::comment_media::blocks_submission(uploads, state, cx);
+    let uploads = uploads?.read(cx);
+    if !blocked && uploads.error.is_none() {
+        return None;
+    }
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .when(blocked && uploads.pending() == 0, |field| {
+                field.child(div().text_sm().text_color(crate::theme::red(cx)).child(
+                    "Remove the restored upload placeholder before submitting. Paste/drop the media again if needed.",
+                ))
+            })
+            .when(uploads.pending() > 0, |field| {
+                field.child(
+                    div()
+                        .text_sm()
+                        .text_color(crate::theme::subtext(cx))
+                        .child(format!("Uploading {} attachment(s)…", uploads.pending())),
+                )
+            })
+            .when_some(uploads.error.clone(), |field, error| {
+                field.child(
+                    div()
+                        .text_sm()
+                        .text_color(crate::theme::red(cx))
+                        .child(error),
+                )
+            })
+            .into_any_element(),
+    )
+}
+
+/// Shared Write/Preview controls; changing mode never changes the draft.
+pub(crate) fn mode_tabs<T: 'static>(
+    preview: bool,
+    disabled: bool,
+    on_change: impl Fn(&mut T, bool, &mut Window, &mut Context<T>) + Clone + 'static,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    use gpui::component::{
+        button::{Button, ButtonVariants},
+        Disableable, Selectable, Sizable,
+    };
+    div()
+        .flex()
+        .gap_1()
+        .children(
+            [
+                ("comment-write", "Write", false),
+                ("comment-preview", "Preview", true),
+            ]
+            .map(|(id, label, mode)| {
+                let on_change = on_change.clone();
+                Button::new(id)
+                    .debug_selector(move || id.into())
+                    .label(label)
+                    .small()
+                    .ghost()
+                    .selected(preview == mode)
+                    .disabled(disabled)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        on_change(this, mode, window, cx);
+                    }))
+            }),
+        )
+        .into_any_element()
+}
+
+pub(crate) fn preview(
+    id: &str,
+    state: &Entity<EditorState>,
+    uploads: Option<&Entity<crate::comment_media::Uploads>>,
+    app: &crate::ReviewApp,
+    cx: &mut Context<crate::ReviewApp>,
+) -> AnyElement {
+    use gpui::component::text::TextView;
+    let source = state.read(cx).value().to_string();
+    let body = if source.trim().is_empty() {
+        div()
+            .text_sm()
+            .text_color(crate::theme::subtext(cx))
+            .child("Nothing to preview")
+            .into_any_element()
+    } else {
+        let slug = app.active_item().and_then(|item| match &item.source {
+            crate::Source::Pr(loc) => Some(loc.repo_slug()),
+            crate::Source::Local(_) => None,
+        });
+        let source = crate::conversation::preprocess(&source, slug.as_deref().unwrap_or(""));
+        crate::conversation::render_markdown_view(
+            id,
+            TextView::markdown(gpui::SharedString::from(id.to_owned()), source),
+            app,
+            cx,
+        )
+    };
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .id(gpui::SharedString::from(id.to_owned()))
+                // Keep composer actions (Escape / Cmd+Enter) routed through
+                // the card while the focused editor itself is unmounted.
+                .track_focus(&state.focus_handle(cx))
+                .key_context("CommentPreview")
+                .debug_selector(|| "comment-preview-body".into())
+                .w_full()
+                .min_w_0()
+                .min_h(px(80.))
+                .max_h(px(240.))
+                .overflow_y_scroll()
+                // Contain wheel gestures here, including at either end of the
+                // preview, rather than also scrolling the diff underneath.
+                .on_scroll(|_, _, cx| cx.stop_propagation())
+                .border_1()
+                .border_color(crate::theme::surface0(cx))
+                .rounded_md()
+                .p_2()
+                .text_sm()
+                .child(body),
+        )
+        .children(media_feedback(state, uploads, cx))
         .into_any_element()
 }
 

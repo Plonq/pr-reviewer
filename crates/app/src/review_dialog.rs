@@ -78,12 +78,34 @@ impl ReviewApp {
                         github::ReviewVerdict::Comment,
                     )),
             )
-            .child(comment_editor::field_with_media(
-                &review.input,
-                review.uploads.as_ref(),
+            .child(comment_editor::mode_tabs(
+                review.preview,
                 busy,
+                |app: &mut Self, preview, window, cx| {
+                    if let Some(review) = &mut app.review {
+                        review.preview = preview;
+                        review.input.update(cx, |input, cx| input.focus(window, cx));
+                        cx.notify();
+                    }
+                },
                 cx,
             ))
+            .child(if review.preview {
+                comment_editor::preview(
+                    "review-preview",
+                    &review.input,
+                    review.uploads.as_ref(),
+                    self,
+                    cx,
+                )
+            } else {
+                comment_editor::field_with_media(
+                    &review.input,
+                    review.uploads.as_ref(),
+                    busy,
+                    cx,
+                )
+            })
             .when_some(review.error.clone(), |body, error| {
                 body.child(div().text_color(theme::red(cx)).child(error))
             })

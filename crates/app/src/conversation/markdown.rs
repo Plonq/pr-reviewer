@@ -455,7 +455,7 @@ pub(crate) fn render_persistent(
     render_view(id, TextView::new(&state), app, cx)
 }
 
-fn render_view(
+pub(crate) fn render_view(
     id: &str,
     view: TextView,
     app: &ReviewApp,
