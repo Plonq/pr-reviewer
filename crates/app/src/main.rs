@@ -1730,7 +1730,7 @@ fn pr_titlebar_content(
                         Button::new("submit-review")
                             .label("Review")
                             .primary()
-                            .xsmall()
+                            .small()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_review(window, cx);
                             })),
