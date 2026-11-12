@@ -148,6 +148,18 @@ pub struct PrDiscussion {
     /// under their thread, so merging the timeline cannot duplicate them.
     pub comments: Vec<DiscussionComment>,
     pub threads: Vec<ReviewThread>,
+    #[serde(default)]
+    pub events: Vec<DiscussionEvent>,
+}
+
+/// Non-comment activity from GitHub's timeline. Kept separate from mutable
+/// comments so events never acquire comment actions or markdown interpretation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscussionEvent {
+    pub id: String,
+    pub actor: String,
+    pub created_at: String,
+    pub description: String,
 }
 
 impl PrDiscussion {
@@ -256,6 +268,7 @@ mod tests {
             }]
         });
         let discussion: PrDiscussion = serde_json::from_value(old).unwrap();
+        assert!(discussion.events.is_empty());
         assert!(discussion.threads[0].diff_hunk.is_empty());
         assert!(discussion.threads[0].code_context.is_none());
         assert!(discussion.threads[0].comments[0].review_id.is_none());

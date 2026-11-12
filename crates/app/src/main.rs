@@ -16502,6 +16502,12 @@ mod tests {
             unreachable!()
         };
         let mut discussion = conversation::tests::sample_discussion();
+        discussion.events.push(github::DiscussionEvent {
+            id: "E1".into(),
+            actor: "alice".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            description: "requested a review from bob".into(),
+        });
         let mut comment = discussion.comments[0].clone();
         comment.id = 21;
         comment.body = "Top-level comment".into();
@@ -16545,6 +16551,9 @@ mod tests {
                 vcx.run_until_parked();
             }
             let spine = vcx.debug_bounds("timeline-spine-0").unwrap();
+            let event = vcx.debug_bounds("timeline-event-0-E1").unwrap();
+            assert!(event.size.height > px(0.));
+            assert!(event.top() < vcx.debug_bounds("timeline-comment-0-21").unwrap().top());
             for selector in ["timeline-comment-0-21", "timeline-post-0-99"] {
                 let card = vcx.debug_bounds(selector).unwrap();
                 assert!(
