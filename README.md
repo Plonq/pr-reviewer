@@ -51,10 +51,7 @@ on normal quit. Publishing requires no paid Apple Developer account; see
 
 ### Session restoration
 
-Gander saves your session on every quit and restores it on launch, whether or
-not an update was installed. Open reviews, positions, view settings and
-unfinished comment/review text come back; nothing is automatically submitted.
-Changed sessions are also checkpointed every five seconds for crash recovery.
+Gander saves your session on every quit and restores it on launch. Open reviews, positions, view settings and unfinished comment/review text come back; nothing is automatically submitted. Changed sessions are also checkpointed every five seconds for crash recovery.
 
 For a fresh start, hold **Shift** while launching until the window appears.
 Explicit PR/path arguments also skip restoration for that launch. These fresh
