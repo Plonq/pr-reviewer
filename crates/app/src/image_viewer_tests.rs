@@ -171,6 +171,44 @@ fn image_viewer_zoom_drag_resize_fit_and_all_dismissals(cx: &mut gpui::TestAppCo
 }
 
 #[gpui::test]
+fn oversized_conversation_images_reserve_only_their_scaled_height(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    // The dimensions and adjacent image tags match ucroo/portal#4887.
+    let body = (0..7)
+        .map(|i| format!("<img width=\"3024\" height=\"1964\" alt=\"screenshot\" src=\"https://github.com/user-attachments/assets/large-{i}\" />"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (window, _) = viewer_conversation(cx, &body);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    for width in [1200., 800., 1600.] {
+        vcx.simulate_resize(size(px(width), px(5000.)));
+        draw_settled(&mut vcx);
+        let mut previous: Option<gpui::Bounds<gpui::Pixels>> = None;
+        for (offset, _) in body.match_indices("<img") {
+            let selector = Box::leak(format!("conversation-0-image-{offset}").into_boxed_str());
+            let bounds = vcx.debug_bounds(selector).unwrap();
+            assert!(bounds.size.width < px(3024.));
+            // The fake HTTP client returns 240x160 images. Use the decoded
+            // aspect ratio, not potentially stale HTML height attributes.
+            assert!(
+                (bounds.size.height - bounds.size.width / 1.5).abs() < px(1.),
+                "image must shrink in both dimensions: {bounds:?}"
+            );
+            if let Some(previous) = previous {
+                let gap = bounds.top() - previous.bottom();
+                assert!(gap >= px(0.) && gap <= px(16.), "image gap: {gap:?}");
+            }
+            previous = Some(bounds);
+        }
+        let text = vcx.debug_bounds("conversation-0-text").unwrap();
+        assert!(
+            text.bottom() - previous.unwrap().bottom() < px(32.),
+            "no trailing image reservation: text={text:?}, last={previous:?}"
+        );
+    }
+}
+
+#[gpui::test]
 fn github_paste_html_images_preserve_dimensions_and_open_the_viewer(cx: &mut gpui::TestAppContext) {
     image_client(cx);
     // This is the markup GitHub generates for ordinary pasted screenshots.
@@ -444,7 +482,12 @@ fn image_viewer_activates_markdown_and_github_paste_in_both_changes_views(
                 (data.scroll.0.borrow().base_handle.offset(), data.rows.len())
             });
             click_selector(&mut vcx, selector);
-            assert!(vcx.debug_bounds("image-viewer").is_some());
+            assert!(
+                vcx.debug_bounds("image-viewer").is_some(),
+                "{selector}: {:?}, split={}",
+                vcx.debug_bounds(selector),
+                mode == ViewMode::Split
+            );
             vcx.simulate_keystrokes("escape");
             draw_settled(&mut vcx);
             cx.update(|cx| {
