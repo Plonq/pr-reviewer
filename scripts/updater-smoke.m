@@ -6,7 +6,7 @@ extern void gander_updater_start(void);
 extern int gander_updater_state(void);
 extern const char *gander_updater_error(void);
 extern void gander_updater_install(void);
-extern void gander_updater_retry(void);
+extern void gander_updater_check(void);
 
 @interface SmokeHost : NSObject <NSApplicationDelegate>
 @end
@@ -19,12 +19,32 @@ extern void gander_updater_retry(void);
         [NSApp terminate:nil];
         return;
     }
+    BOOL manual = [[bundle objectForInfoDictionaryKey:@"SmokeManualCheck"] boolValue];
+    BOOL noUpdate = [[bundle objectForInfoDictionaryKey:@"SmokeNoUpdate"] boolValue];
+    // Make the regular scheduler NOT due. The automatic case must still check
+    // immediately; the manual case disables it entirely and uses the API below.
+    [NSUserDefaults.standardUserDefaults setBool:!manual forKey:@"SUEnableAutomaticChecks"];
+    [NSUserDefaults.standardUserDefaults setObject:NSDate.date forKey:@"SULastCheckTime"];
     gander_updater_start();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        gander_updater_retry();
-    });
+    if ([[bundle objectForInfoDictionaryKey:@"SmokeJoinCheck"] boolValue]) {
+        gander_updater_check();
+        gander_updater_check();
+    }
+    if (manual) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            gander_updater_check();
+            gander_updater_check(); // Duplicate requests must not start a second cycle.
+        });
+    }
+    __block BOOL showedUpToDate = NO;
     [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *timer) {
         int state = gander_updater_state();
+        if (state == 5) showedUpToDate = YES;
+        if (noUpdate && showedUpToDate && state == 0) {
+            [@"up to date then quiet" writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            [NSApp terminate:nil];
+            return;
+        }
         if (state == 1) {
             if ([[bundle objectForInfoDictionaryKey:@"SmokeQuitOnReady"] boolValue]) {
                 NSLog(@"Smoke: staged update ready; quitting normally");

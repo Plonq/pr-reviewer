@@ -14,11 +14,20 @@ On first launch, macOS may block it: attempt to open the installed app, then cho
 
 ## Automatic updates
 
-Release bundles embed Sparkle 2.10.1. While Gander is running, Sparkle checks
-roughly hourly and downloads/verifies updates in the background. A quiet
+Release bundles embed Sparkle 2.10.1. Gander checks quietly on every launch,
+even if the previous check was recent, then Sparkle checks roughly hourly while
+the app stays running. Updates download and verify in the background. A quiet
 **Restart to update** button appears in the title bar when an update is staged.
 There are no permission-to-check or update-available dialogs, and no profiling.
 Errors appear as a small retry button with details in its tooltip.
+
+**Gander → Check for Updates…** triggers a manual check without a dialog.
+The header briefly shows checking/preparation status, then **Up to date** for
+five seconds when no update is available, or **Restart to update** when ready.
+A manual check never installs/restarts an update by itself, and repeated checks
+join an existing background check/download instead of starting a second one.
+The error button retries via the same manual-check path. Updater-free local
+builds disable the menu item.
 
 Clicking the button flushes the current session, then lets Sparkle install and
 relaunch. In-flight writes/uploads and unresolved/unverified comment mutations
@@ -104,11 +113,17 @@ in the app or DMG.
 bash scripts/fetch-sparkle.sh
 python3 scripts/test-updater.py
 python3 scripts/test-updater.py --quit
+python3 scripts/test-updater.py --manual
+python3 scripts/test-updater.py --join
+python3 scripts/test-updater.py --manual --no-update
+python3 scripts/test-updater.py --manual --invalid-feed
 ```
 
 This uses a disposable native host in `target/`, an ephemeral Ed25519 key and
 local HTTP feed. It exercises the production bridge, signed feed and archive,
 tamper rejection, background download, ad-hoc-signed replacement, and relaunch.
+Launch checks are tested with a recent last-check date; manual checks are tested
+with automatic checking disabled, including no-update and invalid-feed results.
 It never accesses your Keychain, Gander database, or installed Gander app.
 Requires a logged-in macOS GUI session. Production feeds remain HTTPS-only.
 The publishing/test scripts use OpenSSL 3 to check/generate Ed25519 keys (already

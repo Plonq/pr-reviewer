@@ -557,6 +557,7 @@ fn main() {
                     let view = cx.new(|cx| {
                         ReviewApp::new(sources, errors, github, store, store_error, window, cx)
                     });
+                    updater::init_menu(&view, cx);
                     window.focus(&view.read(cx).focus_handle.clone(), cx);
                     cx.new(|cx| Root::new(view, window, cx))
                 },
@@ -7829,6 +7830,9 @@ impl Render for ReviewApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod updater_tests {
+        include!("updater_tests.rs");
+    }
     mod session_tests {
         include!("session_tests.rs");
     }

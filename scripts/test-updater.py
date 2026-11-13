@@ -32,6 +32,12 @@ def run(*args, **kwargs):
 
 def main():
     quit_on_ready = "--quit" in sys.argv
+    manual = "--manual" in sys.argv
+    join = "--join" in sys.argv
+    no_update = "--no-update" in sys.argv
+    invalid_feed = "--invalid-feed" in sys.argv
+    if no_update or invalid_feed:
+        assert manual and not quit_on_ready, 'Use --manual with --no-update or --invalid-feed'
     with tempfile.TemporaryDirectory(prefix="updater-smoke-", dir=ROOT / "target") as directory:
         work = Path(directory)
         marker = work / "relaunched"
@@ -39,7 +45,14 @@ def main():
         public_der = run(appcast.openssl(), "pkey", "-inform", "DER", "-pubout", "-outform", "DER", input=seed_der, capture_output=True).stdout
         os.environ["SPARKLE_PRIVATE_KEY"] = base64.b64encode(seed_der[-32:]).decode()
         os.environ["SPARKLE_PUBLIC_KEY"] = base64.b64encode(public_der[-32:]).decode()
-        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
+        requests = []
+
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                super().do_GET()
+
+        handler = functools.partial(Handler, directory=directory)
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         url = f"http://127.0.0.1:{server.server_port}"
@@ -67,6 +80,9 @@ def main():
                 "SURequireSignedFeed": True, "SUEnableSystemProfiling": False,
                 "SmokeMarker": str(marker),
                 "SmokeQuitOnReady": quit_on_ready,
+                "SmokeManualCheck": manual,
+                "SmokeJoinCheck": join,
+                "SmokeNoUpdate": no_update,
                 # Test host only: production always uses HTTPS.
                 "NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True},
                 "LSUIElement": True,
@@ -79,10 +95,13 @@ def main():
         installed = work / "installed/Updater Smoke.app"
         new = work / "payload/Updater Smoke.app"
         bundle(installed, "1.1")
-        bundle(new, "2.1")
+        bundle(new, "1.1" if no_update else "2.1")
         dmg = work / "update.dmg"
         run("hdiutil", "create", "-quiet", "-volname", "Updater Smoke", "-srcfolder", new.parent, "-format", "UDZO", dmg)
         appcast.create(dmg, f"{url}/update.dmg", new / "Contents/Info.plist", SPARKLE / "bin/sign_update", work / "appcast.xml")
+        if invalid_feed:
+            feed = work / "appcast.xml"
+            feed.write_bytes(feed.read_bytes().replace(b"Gander updates", b"Tampered updates"))
         # Verify tampering and key mismatch fail before trying the real update.
         signature = run(SPARKLE / "bin/sign_update", "--ed-key-file", "-", "-p", dmg,
                         input=os.environ["SPARKLE_PRIVATE_KEY"], capture_output=True, text=True).stdout.strip()
@@ -113,11 +132,20 @@ def main():
             while not marker.exists() and time.monotonic() < deadline:
                 time.sleep(0.2)
             assert marker.exists(), "new app did not relaunch"
-            assert marker.read_text() == "relaunched new version", "update failed"
+            expected = "failed" if invalid_feed else "up to date then quiet" if no_update else "relaunched new version"
+            assert marker.read_text() == expected, "unexpected update result"
             with (installed / "Contents/Info.plist").open("rb") as f:
-                assert plistlib.load(f)["CFBundleVersion"] == "2.1"
-            print("PASS: signed feed, tamper rejection, background DMG download, ad-hoc replacement and "
-                  + ("normal-quit installation" if quit_on_ready else "relaunch"))
+                assert plistlib.load(f)["CFBundleVersion"] == ("1.1" if no_update or invalid_feed else "2.1")
+            assert requests.count('/appcast.xml') == 1, 'Expected exactly one check, even with a recent last-check date or duplicate manual requests'
+            if no_update or invalid_feed:
+                assert '/update.dmg' not in requests, 'No update archive should be downloaded'
+            if invalid_feed:
+                print("PASS: manual check rejects a tampered feed without installing")
+            elif no_update:
+                print("PASS: manual no-update result appears briefly then returns to quiet idle")
+            else:
+                print("PASS: " + ("joined manual" if join else "manual" if manual else "immediate launch") + " check, signed feed, tamper rejection, DMG download, ad-hoc replacement and "
+                      + ("normal-quit installation" if quit_on_ready else "relaunch"))
         finally:
             if process.poll() is None:
                 process.terminate()

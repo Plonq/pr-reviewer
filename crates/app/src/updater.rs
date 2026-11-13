@@ -1,11 +1,30 @@
 //! Sparkle owns downloading, verification and installation. GPUI owns the only
 //! update UI. Development builds do not link or run Sparkle.
-use crate::{ItemState, ReviewApp};
+use crate::{ItemState, Quit, ReviewApp};
 use gpui::component::{
     button::{Button, ButtonVariants},
     Disableable, Sizable,
 };
-use gpui::{div, prelude::*, Context};
+use gpui::{div, prelude::*, App, Context, Entity, Menu, MenuItem};
+
+gpui::actions!(gander, [CheckForUpdates]);
+
+pub(crate) fn app_menu(updates_enabled: bool) -> Menu {
+    Menu::new("Gander").items([
+        MenuItem::action("Check for Updates…", CheckForUpdates).disabled(!updates_enabled),
+        MenuItem::separator(),
+        MenuItem::action("Quit Gander", Quit),
+    ])
+}
+
+/// A global action also works while an editor or a modal owns keyboard focus.
+pub(crate) fn init_menu(view: &Entity<ReviewApp>, cx: &mut App) {
+    let view = view.downgrade();
+    cx.on_action(move |_: &CheckForUpdates, cx| {
+        let _ = view.update(cx, |app, cx| app.check_for_updates(cx));
+    });
+    cx.set_menus([app_menu(cfg!(any(feature = "auto-updates", test)))]);
+}
 
 #[derive(Default)]
 pub(crate) struct Updater {
@@ -35,7 +54,7 @@ mod native {
         pub fn gander_updater_state() -> i32;
         pub fn gander_updater_error() -> *const std::ffi::c_char;
         pub fn gander_updater_install();
-        pub fn gander_updater_retry();
+        pub fn gander_updater_check();
     }
 }
 
@@ -58,11 +77,7 @@ impl ReviewApp {
                                 std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
                             })
                         };
-                        if app.updater.state != state || app.updater.error != error {
-                            app.updater.state = state;
-                            app.updater.error = error;
-                            cx.notify();
-                        }
+                        app.set_update_status(state, error, cx);
                     })
                     .is_err()
                 {
@@ -72,6 +87,34 @@ impl ReviewApp {
             .detach();
         }
         #[cfg(any(not(feature = "auto-updates"), test))]
+        let _ = cx;
+    }
+
+    #[cfg(any(feature = "auto-updates", test))]
+    pub(crate) fn set_update_status(
+        &mut self,
+        state: i32,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.updater.state != state || self.updater.error != error {
+            self.updater.state = state;
+            self.updater.error = error;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if self.updater.ready() || matches!(self.updater.state, 2 | 4 | 6) {
+            return;
+        }
+        #[cfg(all(feature = "auto-updates", not(test)))]
+        unsafe {
+            native::gander_updater_check();
+        }
+        #[cfg(any(feature = "auto-updates", test))]
+        self.set_update_status(4, None, cx);
+        #[cfg(not(any(feature = "auto-updates", test)))]
         let _ = cx;
     }
 
@@ -124,6 +167,19 @@ impl ReviewApp {
         if self.updater.state == 0 && self.updater.error.is_none() {
             return div().into_any_element();
         }
+        let notice = match self.updater.state {
+            4 => Some("Checking for updates…"),
+            5 => Some("Up to date"),
+            6 => Some("Preparing update…"),
+            _ => None,
+        };
+        if let Some(notice) = notice {
+            return div()
+                .debug_selector(|| "update-status".into())
+                .text_color(crate::theme::overlay0(cx))
+                .child(notice)
+                .into_any_element();
+        }
         let blocked = self.update_blocked(cx);
         let ready = self.updater.ready();
         let error = self
@@ -155,10 +211,7 @@ impl ReviewApp {
                 if app.updater.ready() {
                     app.install_update(cx);
                 } else {
-                    #[cfg(all(feature = "auto-updates", not(test)))]
-                    unsafe {
-                        native::gander_updater_retry()
-                    };
+                    app.check_for_updates(cx);
                 }
             }));
         div()
