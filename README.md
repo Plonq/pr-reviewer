@@ -33,7 +33,9 @@ Requires **Apple Silicon** and **macOS 15 or later**. GitHub reviews use your [G
    gh auth login
    ```
 
-The app is not notarised. If macOS blocks it, allow it in **System Settings → Privacy & Security** after attempting to open it.
+Builds are **not notarised**. If macOS blocks Gander, attempt to open the installed
+app, then choose **System Settings → Privacy & Security → Open Anyway**.
+Publishing requires no paid Apple Developer account; see [release workflow](docs/releases.md).
 
 ### Review your first PR
 
