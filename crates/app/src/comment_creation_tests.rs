@@ -35,7 +35,7 @@ fn creation_projects_all_surfaces_and_closes_before_the_response_in_both_modes(
                 for reply in [false, true] {
                     if conversation && !reply {
                         continue;
-                    } // Inline roots start in Changes; main comments/AddSummary are separate.
+                    } // Inline roots start in Changes; main comments are separate.
                     let fake = FakePr::with_threads(vec![rc(
                         11,
                         "a.rs",

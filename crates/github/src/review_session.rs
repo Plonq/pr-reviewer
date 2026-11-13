@@ -133,11 +133,6 @@ pub enum Command {
         comment_id: u64,
         body: String,
     },
-    /// Append a main-thread draft to the review summary, preserving web drafts.
-    AddSummary {
-        commit_id: String,
-        body: String,
-    },
     /// Reply immediately unless reconciliation finds an existing review.
     /// An explicit start-review choice also creates a draft when necessary.
     ConversationReply {
@@ -274,7 +269,6 @@ impl ReviewSession {
             }
             Command::Edit { body, .. }
             | Command::Reply { body, .. }
-            | Command::AddSummary { body, .. }
             | Command::ConversationReply { body, .. } => nonempty(body)?,
             _ => {}
         }
@@ -363,22 +357,6 @@ impl ReviewSession {
                         body.trim(),
                     )?);
                 }
-            }
-            Command::AddSummary { commit_id, body } => {
-                if self.pending.is_none() {
-                    if commit_id.is_empty() {
-                        return Err(ClientError::Invalid("missing head commit".into()));
-                    }
-                    self.pending = Some(client.start_review(loc, &commit_id)?);
-                }
-                let review = self.pending.as_mut().unwrap();
-                let summary = if review.body.trim().is_empty() {
-                    body.trim().to_owned()
-                } else {
-                    format!("{}\n\n{}", review.body, body.trim())
-                };
-                client.update_pending_body(loc, review, &summary)?;
-                review.body = summary;
             }
             Command::Delete { id } => {
                 let review_id = self.pending.as_ref().map(|r| r.id);
