@@ -6,7 +6,7 @@ use std::collections::HashMap;
 pub(crate) use github::DiffSide as CommentSide;
 
 /// The comment's display age and legacy lexical ordering key.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum CommentTime {
     Posted(String),
     Draft,
@@ -34,7 +34,7 @@ impl CommentTime {
 
 /// A card used by the app. Its identity is a stable UI key, not an API target;
 /// rendering adapters resolve confirmed remote identities through the projection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ReviewComment {
     pub(crate) id: super::CommentKey,
     pub(crate) path: String,

@@ -28,10 +28,12 @@ mod rows;
 mod search;
 mod selection;
 mod selection_matches;
+mod session;
 mod svg_image;
 mod theme;
 mod threads;
 mod tree;
+mod updater;
 mod upgrade;
 mod video;
 mod video_player;
@@ -426,10 +428,8 @@ fn main() {
     // same facade the app runs on, so launch errors speak the app's one
     // GitHub vocabulary.
     let github = github_client();
-    // Bare launch lands on the review queue — the home screen. The repo we
-    // stand in stays one explicit act away (`.` as an argument or in
-    // quick-open), so local review keeps working
-    // without hijacking the launch.
+    // Explicit arguments replace session restoration. The current directory
+    // stays opt-in (`.` as an argument or quick-open), never an implicit target.
     for arg in &args {
         let parsed = if Path::new(arg).is_dir() {
             git::resolve_local(Path::new(arg))
@@ -557,6 +557,7 @@ fn main() {
                     let view = cx.new(|cx| {
                         ReviewApp::new(sources, errors, github, store, store_error, window, cx)
                     });
+                    updater::init_menu(&view, cx);
                     window.focus(&view.read(cx).focus_handle.clone(), cx);
                     cx.new(|cx| Root::new(view, window, cx))
                 },
@@ -568,7 +569,7 @@ fn main() {
 
 // --- Review comments -------------------------------------------------------
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 struct LocalReview {
     comments: Vec<ReviewComment>,
     next_id: u64,
@@ -1223,7 +1224,7 @@ impl ItemData {
 /// — the PR description, rendered as GFM. PRs open onto conversation, local
 /// diffs onto changes; ⇧⌘←/→ flips between them. Per item, so ctrl-tab's
 /// other item keeps its own.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ItemPane {
     #[default]
     Changes,
@@ -1833,7 +1834,7 @@ fn seed_mentions(cell: &Rc<RefCell<Vec<github::Mention>>>, data: &ItemData) {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ComposerPlacement {
     Diff,
     ConversationMain,
@@ -2093,6 +2094,9 @@ impl CommentDrag {
 }
 
 pub(crate) struct ReviewApp {
+    updater: updater::Updater,
+    session_restore: HashMap<u64, session::SavedView>,
+    session_checkpoint: session::Checkpoint,
     items: Vec<ReviewItem>,
     active: usize,
     sidebar_width: f32,
@@ -2143,8 +2147,8 @@ pub(crate) struct ReviewApp {
     /// generation it captured is still current.
     queue_gen: u64,
     /// Whether the main pane shows the review queue (the home screen) or
-    /// the open items. Launching bare shows the queue; launching with PRs
-    /// or paths on the CLI shows those instead.
+    /// the open items. Bare launches restore the last session; a fresh launch
+    /// shows the queue, and explicit CLI targets show those items instead.
     show_queue: bool,
     /// The local store: the queue cache the app paints from on open, and
     /// the place fetched queues are written to.
@@ -2173,20 +2177,35 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Read once while opening the window. Holding Shift skips restoration
+        // for this launch only; it is never saved as a preference.
+        let restore_session = sources.is_empty() && errors.is_empty() && !window.modifiers().shift;
         let open_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
         let video_hub = cx.new(|_| video::VideoHub::default());
+        let window_closed = {
+            let app = cx.weak_entity();
+            let window_id = window.window_handle().window_id();
+            cx.on_window_closed(move |cx, closed_id| {
+                if closed_id == window_id {
+                    let _ = app.update(cx, |app, cx| app.finish_app_session(cx));
+                }
+            })
+        };
         let _subscriptions = vec![
+            window_closed,
             cx.observe(&video_hub, |_, _, cx| cx.notify()),
             cx.on_app_quit(|this, cx| {
+                this.finish_app_session(cx);
                 this.video_hub.update(cx, |hub, cx| hub.release(cx));
                 this.persist_positions();
                 window_size::persist(&this.store, this.window_size);
                 async {}
             }),
             cx.on_release(|this, cx| {
+                this.finish_app_session(cx);
                 this.video_hub.update(cx, |hub, cx| hub.release(cx));
                 this.persist_positions();
                 window_size::persist(&this.store, this.window_size);
@@ -2232,6 +2251,9 @@ impl ReviewApp {
             ),
         ];
         let mut this = Self {
+            updater: Default::default(),
+            session_restore: HashMap::new(),
+            session_checkpoint: session::Checkpoint::new(restore_session),
             items: Vec::new(),
             active: 0,
             sidebar_width: store
@@ -2272,6 +2294,11 @@ impl ReviewApp {
             window_size: window_size::normal_size(window),
             _subscriptions,
         };
+        let saved_session = if restore_session {
+            session::read(&this.store)
+        } else {
+            None
+        };
         for source in sources {
             this.open_item(source, cx);
         }
@@ -2285,9 +2312,14 @@ impl ReviewApp {
         // all: the first frame already shows the last queue, and the
         // fetch that follows hot-swaps the fresh one in.
         this.paint_queue_from_cache();
+        if let Some(saved_session) = saved_session {
+            this.restore_session(saved_session, window, cx);
+        }
         this.spawn_queue_refresh(cx);
         this.spawn_background_poll(cx);
         this.spawn_position_memory(cx);
+        this.spawn_session_checkpoint(cx);
+        this.spawn_updater(cx);
         if this.open_error.is_some() {
             // The modal shell needs the window's Root to be installed first.
             cx.defer_in(window, |app, window, cx| app.open_quick_open(window, cx));
@@ -2940,11 +2972,15 @@ impl ReviewApp {
             Some(ItemState::Ready(data)) => data.file_ix,
             _ => 0,
         };
+        let restart_base = self
+            .session_restore
+            .get(&id)
+            .and_then(|view| view.review_base.clone());
         cx.spawn(async move |this, cx| {
             let (conversation_tx, conversation_rx) = futures::channel::oneshot::channel();
             let fetch = cx.background_spawn(async move {
-                review_target::fetch_item_with_conversation(
-                    github, &source, mode, file_ix, since_review, Some(conversation_tx),
+                review_target::fetch_item_with_restart(
+                    github, &source, mode, file_ix, since_review, Some(conversation_tx), restart_base.as_deref(),
                 )
             });
             if let Ok(conversation) = conversation_rx.await {
@@ -3031,6 +3067,7 @@ impl ReviewApp {
                     }
                 }
                 app.sync_pending_comments(id);
+                app.restore_session_view(id);
                 cx.notify();
             })
             .ok();
@@ -6168,6 +6205,7 @@ impl ReviewApp {
                     .child(note),
             );
         }
+        right = right.child(self.render_update_button(cx));
         right = right.child(self.render_account(cx));
         TitleBar::new()
             .h(APP_HEADER_HEIGHT)
@@ -7792,6 +7830,12 @@ impl Render for ReviewApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod updater_tests {
+        include!("updater_tests.rs");
+    }
+    mod session_tests {
+        include!("session_tests.rs");
+    }
     use crate::mentions::{mention_prefix, mention_rank};
     use crate::rows::LineKind;
     use gpui::component::Rope;

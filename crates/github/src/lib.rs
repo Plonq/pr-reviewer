@@ -432,7 +432,7 @@ impl QueueSearch {
 
 /// A pull request's coordinates: which repository it lives in and which
 /// number it is — everything the review operations need to address one PR.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PrLocator {
     pub owner: String,
     pub repo: String,
@@ -447,7 +447,7 @@ impl PrLocator {
 }
 
 /// The verdict of a top-level PR review.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReviewVerdict {
     Approve,
     RequestChanges,

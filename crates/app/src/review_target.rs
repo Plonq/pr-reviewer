@@ -111,6 +111,7 @@ pub(crate) fn fetch_item_scoped(
 /// Publish conversation data independently of the patch, commits, viewed state,
 /// and review-baseline work. The final result still contains one consistent
 /// metadata/discussion pair; there is no duplicate API fetch.
+#[cfg(test)]
 pub(crate) fn fetch_item_with_conversation(
     github: Arc<dyn github::GitHubClient>,
     source: &Source,
@@ -118,6 +119,26 @@ pub(crate) fn fetch_item_with_conversation(
     file_ix: usize,
     since_review: bool,
     conversation: Option<futures::channel::oneshot::Sender<LoadedConversation>>,
+) -> anyhow::Result<Loaded> {
+    fetch_item_with_restart(
+        github,
+        source,
+        mode,
+        file_ix,
+        since_review,
+        conversation,
+        None,
+    )
+}
+
+pub(crate) fn fetch_item_with_restart(
+    github: Arc<dyn github::GitHubClient>,
+    source: &Source,
+    mode: ViewMode,
+    file_ix: usize,
+    since_review: bool,
+    conversation: Option<futures::channel::oneshot::Sender<LoadedConversation>>,
+    restart_base: Option<&str>,
 ) -> anyhow::Result<Loaded> {
     let mut review_changes = github::ReviewChanges::default();
     let mut pr_base = None;
@@ -180,11 +201,15 @@ pub(crate) fn fetch_item_with_conversation(
                 ))
             });
             let mut patch = patch;
-            if since_review {
-                if let Some(review) = review_changes.baseline() {
-                    match github.comparison_patch(loc, &review.commit, &meta.head_ref_oid, &meta.base_ref_oid) {
+            if since_review || restart_base.is_some() {
+                if let Some(base) = restart_base.or_else(|| {
+                    review_changes
+                        .baseline()
+                        .map(|review| review.commit.as_str())
+                }) {
+                    match github.comparison_patch(loc, base, &meta.head_ref_oid, &meta.base_ref_oid) {
                         Ok(comparison) => {
-                            review_base = Some(review.commit.clone());
+                            review_base = Some(base.to_owned());
                             patch = comparison.patch;
                             review_base_files = comparison.base_files.map(Arc::new);
                         }

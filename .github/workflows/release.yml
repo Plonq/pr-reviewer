@@ -24,10 +24,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fetch Sparkle
+        run: bash scripts/fetch-sparkle.sh
+
+      - name: Check update signing configuration
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          test -n "$SPARKLE_PUBLIC_KEY" || { echo 'Set the SPARKLE_PUBLIC_KEY repository variable (see docs/releases.md)'; exit 1; }
+          test -n "$SPARKLE_PRIVATE_KEY" || { echo 'Set the SPARKLE_PRIVATE_KEY repository secret (see docs/releases.md)'; exit 1; }
+
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --features auto-updates
 
       - name: Create app bundle
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
         run: bash scripts/bundle-macos.sh
 
       - name: Create unnotarised DMG
@@ -39,6 +52,24 @@ jobs:
           hdiutil create -volname Gander -srcfolder dist -ov -format UDZO Gander.dmg
           shasum -a 256 Gander.dmg > Gander.dmg.sha256
 
+      - name: Sign update and create feed
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          python3 scripts/create-appcast.py Gander.dmg \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/build-$GITHUB_RUN_NUMBER-$GITHUB_RUN_ATTEMPT/Gander.dmg" \
+            dist/Gander.app/Contents/Info.plist target/sparkle/bin/sign_update appcast.xml
+
+      - name: Publish immutable update archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-$GITHUB_RUN_NUMBER-$GITHUB_RUN_ATTEMPT" \
+            --target "$GITHUB_SHA" --prerelease --title "Build $GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT" \
+            --notes "Automatic update archive for Gander. Ad-hoc signed, not notarised." \
+            Gander.dmg Gander.dmg.sha256
+
       - name: Upload to latest release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -48,3 +79,5 @@ jobs:
             gh release create latest --prerelease --title "Latest build" --notes ""
           gh release edit latest --notes "Unnotarised Apple Silicon build from \`${GITHUB_SHA::7}\`. Requires macOS 15 or later. If macOS blocks the installed app, attempt to open it, then allow it in System Settings → Privacy & Security → Open Anyway."
           gh release upload latest Gander.dmg Gander.dmg.sha256 --clobber
+          # Publish the feed last: every URL in it is already downloadable.
+          gh release upload latest appcast.xml --clobber

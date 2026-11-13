@@ -226,6 +226,15 @@ impl LocalStore {
         let _ = store.settings().set(key, value);
     }
 
+    /// Restart must not proceed if the session could not be saved durably.
+    pub fn set_setting_checked(&self, key: &str, value: serde_json::Value) -> anyhow::Result<()> {
+        let store = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("store lock poisoned"))?;
+        store.settings().set(key, value)
+    }
+
     /// Store a PR's snapshot: what the app last saw of it, and when.
     ///
     /// The per-thread bookkeeping is written alongside it: the threads

@@ -12,7 +12,7 @@ The priorities are two features GitHub itself lacks: **fast diff navigation** an
 
 - **Your review queue.** See pending requests, filter by organisation or repository, and revisit recent reviews.
 - **Full files, not just hunks.** Unified or split diffs with syntax highlighting, word-level changes, image comparisons, and surrounding code for context.
-- **Fast navigation.** Keyboard shortcuts, a fuzzy file filter, diff-wide search, and a minimap. Pick up where you left off with remembered review positions.
+- **Fast navigation.** Keyboard shortcuts, a fuzzy file filter, diff-wide search, and a minimap. Pick up where you left off with restored reviews, positions and unfinished comments.
 - **Focus on what's new.** See changes since your last review, hide whitespace changes, fold unchanged code, and mark files as viewed on GitHub.
 - **The whole conversation.** Read the PR description, discussion, and review threads, including images and videos, alongside the code.
 - **Review without switching tools.** Write inline and multi-line comments, reply to and resolve threads, keep drafts, and submit approvals or change requests.
@@ -35,16 +35,29 @@ Requires **Apple Silicon** and **macOS 15 or later**. GitHub reviews use your [G
 
 Builds are **not notarised**. If macOS blocks Gander, attempt to open the installed
 app, then choose **System Settings → Privacy & Security → Open Anyway**.
-Publishing requires no paid Apple Developer account; see [release workflow](docs/releases.md).
+Installed builds check for updates on launch and hourly in the background;
+**Gander → Check for Updates…** checks manually. **Restart to update**
+installs a ready update and restores your review session. Updates can also install
+on normal quit. Publishing requires no paid Apple Developer account; see
+[release workflow and one-time update-key setup](docs/releases.md).
 
 ### Review your first PR
 
-1. Open Gander to see your pending review requests.
+1. On first launch, open Gander to see your pending review requests.
 2. Select a PR to read its conversation. Switch to **Changes** or click a file on the left to review the code.
 3. Use **`[` / `]`** to move between files, **`n`** for the next hunk, and **`Shift+N`** for the previous hunk. Select a line or range and press **Shift+C** to comment.
 4. Add comments to a pending review, then choose **Finish review** to approve, request changes, or submit a comment-only review.
 
 **⌘O** opens a PR by URL or identifier, or a local repository by path. **`U`** returns to the queue without closing your open reviews.
+
+### Session restoration
+
+Gander saves your session on every quit and restores it on launch. Open reviews, positions, view settings and unfinished comment/review text come back; nothing is automatically submitted. Changed sessions are also checkpointed every five seconds for crash recovery.
+
+For a fresh start, hold **Shift** while launching until the window appears.
+Explicit PR/path arguments also skip restoration for that launch. These fresh
+launches leave the previous snapshot untouched while running; quitting replaces
+it with the fresh session. Normal launches resume saving checkpoints.
 
 ### Build from source
 
