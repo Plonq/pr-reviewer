@@ -7414,6 +7414,14 @@ impl ReviewApp {
                             .px_8()
                             .py_6()
                             .child(content)
+                            .child(
+                                div()
+                                    .debug_selector(|| "conversation-description-divider".into())
+                                    .mt_6()
+                                    .h(px(1.))
+                                    .w_full()
+                                    .bg(theme::surface0(cx)),
+                            )
                             .child(self.render_commits(item, data, cx))
                             .children(self.render_discussion(item, data, window, cx))
                             .when_some(
@@ -16590,6 +16598,19 @@ mod tests {
                 vcx.run_until_parked();
             }
             let spine = vcx.debug_bounds("timeline-spine-0").unwrap();
+            let divider = vcx
+                .debug_bounds("conversation-description-divider")
+                .unwrap();
+            assert_eq!(divider.size.height, px(1.));
+            assert_eq!(
+                divider.left(),
+                vcx.debug_bounds("timeline-0").unwrap().left()
+            );
+            assert_eq!(
+                divider.right(),
+                vcx.debug_bounds("timeline-0").unwrap().right()
+            );
+            assert!(divider.bottom() < vcx.debug_bounds("commits-toggle-0").unwrap().top());
             let event = vcx.debug_bounds("timeline-event-0-E1").unwrap();
             assert!(event.size.height > px(0.));
             assert!(event.top() < vcx.debug_bounds("timeline-comment-0-21").unwrap().top());
