@@ -48,10 +48,17 @@ pub const SCHEMA_VERSION: i64 = 3;
 ///
 /// macOS: `~/Library/Application Support/Gander/store.db`.
 ///
+/// Set `GANDER_DB_PATH` to a nonempty file path to use a separate database,
+/// including its settings, sessions and drafts. Relative paths are resolved
+/// against the working directory.
+///
 /// The directory is created on demand; a home directory that can't be read
 /// yields `None`, and the app runs without a store (cache-first becomes
 /// network-first, but nothing breaks).
 pub fn default_database_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("GANDER_DB_PATH").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
     let home = std::env::var_os("HOME")?;
     let mut path = PathBuf::from(home);
     path.push("Library");

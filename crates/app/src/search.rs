@@ -4,7 +4,7 @@
 mod tests;
 
 use crate::local_store::ReviewPosition;
-use crate::minimap::{text_range_frac, MinimapMatch};
+use crate::minimap::{text_range_frac, MinimapMatch, MINIMAP_WIDTH};
 use crate::rows::{gap_span, source_row, FileUpgrade, LineKind, Row};
 use crate::selection::{row_side_text, selection_text, SelSide};
 use crate::{theme, ItemData, ItemPane, ReviewApp};
@@ -554,6 +554,7 @@ impl ReviewApp {
         let Some(search) = search else {
             return div().into_any_element();
         };
+        let right_inset = 20. + if self.minimap_visible { MINIMAP_WIDTH } else { 0. };
         let count = match search.matches.current {
             Some(ix) => format!("{} / {}", ix + 1, search.matches.occurrences.len()),
             None if search.query.is_empty() => "Enter: next · Esc: close".into(),
@@ -578,7 +579,7 @@ impl ReviewApp {
             .key_context("DiffSearch")
             .absolute()
             .top(px(80.))
-            .right(px(20.))
+            .right(px(right_inset))
             .w(px(460.))
             .p_2()
             .rounded_md()

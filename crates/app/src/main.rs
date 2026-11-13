@@ -5919,6 +5919,9 @@ impl ReviewApp {
                         let (x0, y0) = (f32::from(bounds.left()), f32::from(bounds.top()));
                         let usable = f32::from(bounds.size.width) - 2. * MINIMAP_PAD;
                         let half = (usable - MINIMAP_GAP) / 2.;
+                        // Find takes precedence over the diff overview. Keep the
+                        // dimming stable while typing, even with no matches.
+                        let diff_opacity = if data.search.is_some() { 0.35 } else { 0.8 };
                         for run in &layout.runs {
                             let (x, w) = match run.lane {
                                 MinimapLane::Full => (0., usable * run.frac),
@@ -5931,11 +5934,14 @@ impl ReviewApp {
                             } else {
                                 (run.end - run.start) as f32 * layout.slot_h
                             };
-                            // Full alpha-ish tints: these are 1-3px bars and
-                            // need punch, unlike the row backgrounds.
+                            // Thin diff bars need punch outside Find mode.
                             let color: Hsla = match run.color {
-                                MinimapColor::Added => Hsla::from(theme::green(cx)).opacity(0.8),
-                                MinimapColor::Removed => Hsla::from(theme::red(cx)).opacity(0.8),
+                                MinimapColor::Added => {
+                                    Hsla::from(theme::green(cx)).opacity(diff_opacity)
+                                }
+                                MinimapColor::Removed => {
+                                    Hsla::from(theme::red(cx)).opacity(diff_opacity)
+                                }
                                 MinimapColor::Context => {
                                     Hsla::from(theme::overlay0(cx)).opacity(0.35)
                                 }
@@ -5946,47 +5952,6 @@ impl ReviewApp {
                                 Bounds::new(
                                     point(px(x0 + MINIMAP_PAD + x), px(y0 + y)),
                                     size(px(w.max(1.)), px(h)),
-                                ),
-                                color,
-                            ));
-                        }
-                        // Highlight just the matching characters within each lane.
-                        // Quantize vertically like the base minimap when downsampled.
-                        // Find uses purple rather than selection's yellow, and
-                        // paints last so overlapping selections cannot hide it.
-                        let selection_matches = data.selection_matches();
-                        let search_marks = data
-                            .search
-                            .as_ref()
-                            .map_or(&[][..], |search| search.minimap_marks());
-                        // Tiny Find marks need a brighter, fully opaque tint
-                        // to stand out against the underlying diff bars.
-                        let mut search_color = Hsla::from(theme::mauve(cx)).opacity(1.);
-                        search_color.s = 1.;
-                        search_color.l = search_color.l.max(0.82);
-                        let selection_color = Hsla::from(theme::yellow(cx)).opacity(0.85);
-                        for (mark, color) in selection_matches
-                            .marks
-                            .iter()
-                            .map(|mark| (mark, selection_color))
-                            .chain(search_marks.iter().map(|mark| (mark, search_color)))
-                        {
-                            let (lane_x, lane_w) = match mark.side {
-                                SelSide::Unified => (0., usable),
-                                SelSide::Left => (0., half),
-                                SelSide::Right => (half + MINIMAP_GAP, half),
-                            };
-                            let x = lane_x + lane_w * mark.range.start;
-                            // Keep short matches visible, without spilling into
-                            // the divider or the neighboring lane.
-                            let w = (lane_w * (mark.range.end - mark.range.start))
-                                .max(1.)
-                                .min(lane_w * (1. - mark.range.start));
-                            let y = (mark.row / layout.group) as f32 * layout.slot_h;
-                            window.paint_quad(fill(
-                                Bounds::new(
-                                    point(px(x0 + MINIMAP_PAD + x), px(y0 + y)),
-                                    size(px(w), px(layout.slot_h.max(2.))),
                                 ),
                                 color,
                             ));
@@ -6009,6 +5974,65 @@ impl ReviewApp {
                             .border_widths(1.)
                             .border_color(Hsla::from(theme::overlay0(cx)).opacity(0.4)),
                         );
+                        // Highlight just the matching characters within each lane.
+                        // Quantize vertically like the base minimap when downsampled.
+                        // Find uses purple rather than selection's yellow, and
+                        // paints last so overlapping selections cannot hide it.
+                        let selection_matches = data.selection_matches();
+                        let search_marks = data
+                            .search
+                            .as_ref()
+                            .map_or(&[][..], |search| search.minimap_marks());
+                        // Tiny Find marks need a brighter, fully opaque tint
+                        // to stand out against the underlying diff bars.
+                        let mut search_color = Hsla::from(theme::mauve(cx)).opacity(1.);
+                        search_color.s = 1.;
+                        search_color.l = search_color.l.max(0.82);
+                        let selection_color = Hsla::from(theme::yellow(cx)).opacity(1.);
+                        let mark_bounds = |mark: &minimap::MinimapMatch, min_height: f32| {
+                            let (lane_x, lane_w) = match mark.side {
+                                SelSide::Unified => (0., usable),
+                                SelSide::Left => (0., half),
+                                SelSide::Right => (half + MINIMAP_GAP, half),
+                            };
+                            let x = lane_x + lane_w * mark.range.start;
+                            // Keep short matches visible, without spilling into
+                            // the divider or the neighboring lane.
+                            let w = (lane_w * (mark.range.end - mark.range.start))
+                                .max(1.)
+                                .min(lane_w * (1. - mark.range.start));
+                            let y = (mark.row / layout.group) as f32 * layout.slot_h;
+                            (
+                                Bounds::new(
+                                    point(px(x0 + MINIMAP_PAD + x), px(y0 + y)),
+                                    size(px(w), px(layout.slot_h.max(min_height))),
+                                ),
+                                Bounds::new(
+                                    point(px(x0 + MINIMAP_PAD + lane_x), bounds.top()),
+                                    size(px(lane_w), bounds.size.height),
+                                ),
+                            )
+                        };
+                        // Outline selections without changing their character-scaled
+                        // widths. Paint all surrounds first so nearby marks survive;
+                        // clip to the lane to preserve split-view separation.
+                        let outline_color = Hsla::from(theme::crust(cx)).opacity(1.);
+                        for mark in &selection_matches.marks {
+                            let (mark_bounds, lane_bounds) = mark_bounds(mark, 3.);
+                            window.paint_quad(fill(
+                                mark_bounds.dilate(px(1.)).intersect(&lane_bounds),
+                                outline_color,
+                            ));
+                        }
+                        for (mark, color, min_height) in selection_matches
+                            .marks
+                            .iter()
+                            .map(|mark| (mark, selection_color, 3.))
+                            .chain(search_marks.iter().map(|mark| (mark, search_color, 2.)))
+                        {
+                            let (mark_bounds, lane_bounds) = mark_bounds(mark, min_height);
+                            window.paint_quad(fill(mark_bounds.intersect(&lane_bounds), color));
+                        }
                     },
                 )
                 .size_full(),
