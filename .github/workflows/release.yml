@@ -3,6 +3,7 @@ name: Release DMG
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,6 +14,7 @@ concurrency:
 
 jobs:
   dmg:
+    if: github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -26,44 +28,16 @@ jobs:
         run: cargo build --release --locked
 
       - name: Create app bundle
-        run: |
-          APP=dist/Gander.app
-          mkdir -p "$APP/Contents/MacOS"
-          # The explicit aarch64-apple-darwin build target (see .cargo/config.toml)
-          # puts artifacts under target/<triple>/release/.
-          cp target/aarch64-apple-darwin/release/gander "$APP/Contents/MacOS/gander"
-          cat > "$APP/Contents/Info.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key>
-            <string>Gander</string>
-            <key>CFBundleDisplayName</key>
-            <string>Gander</string>
-            <key>CFBundleIdentifier</key>
-            <string>org.plonq.gander</string>
-            <key>CFBundleExecutable</key>
-            <string>gander</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>CFBundleShortVersionString</key>
-            <string>0.1.0</string>
-            <key>CFBundleVersion</key>
-            <string>${GITHUB_SHA::7}</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>15.0</string>
-            <key>NSHighResolutionCapable</key>
-            <true/>
-          </dict>
-          </plist>
-          EOF
-          codesign --force --deep --sign - "$APP"
+        run: bash scripts/bundle-macos.sh
 
-      - name: Create DMG
+      - name: Create unnotarised DMG
         run: |
-          ln -s /Applications dist/Applications
+          # Apple Silicon requires a signature, but ad-hoc signing is free
+          # and does not provide Developer ID trust or notarisation.
+          codesign --force --sign - dist/Gander.app
+          codesign --verify --deep --strict --verbose=2 dist/Gander.app
           hdiutil create -volname Gander -srcfolder dist -ov -format UDZO Gander.dmg
+          shasum -a 256 Gander.dmg > Gander.dmg.sha256
 
       - name: Upload to latest release
         env:
@@ -72,5 +46,5 @@ jobs:
           git push --force origin "HEAD:refs/tags/latest"
           gh release view latest >/dev/null 2>&1 || \
             gh release create latest --prerelease --title "Latest build" --notes ""
-          gh release edit latest --notes "Automated build from \`${GITHUB_SHA::7}\`"
-          gh release upload latest Gander.dmg --clobber
+          gh release edit latest --notes "Unnotarised Apple Silicon build from \`${GITHUB_SHA::7}\`. Requires macOS 15 or later. If macOS blocks the installed app, attempt to open it, then allow it in System Settings → Privacy & Security → Open Anyway."
+          gh release upload latest Gander.dmg Gander.dmg.sha256 --clobber
