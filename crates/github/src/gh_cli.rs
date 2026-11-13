@@ -957,33 +957,6 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         })
     }
 
-    fn update_pending_body(
-        &self,
-        loc: &PrLocator,
-        review: &PendingReview,
-        body: &str,
-    ) -> Result<(), ClientError> {
-        let value = self.review_api(&[
-            "api".into(),
-            "-X".into(),
-            "PUT".into(),
-            format!(
-                "repos/{}/pulls/{}/reviews/{}",
-                loc.repo_slug(),
-                loc.number,
-                review.id
-            ),
-            "-f".into(),
-            format!("body={body}"),
-        ])?;
-        if value["id"].as_u64() != Some(review.id) {
-            return Err(ClientError::Failed(
-                "GitHub returned no updated review summary".into(),
-            ));
-        }
-        Ok(())
-    }
-
     fn post_conversation_comment(
         &self,
         loc: &PrLocator,
@@ -6615,122 +6588,12 @@ mod tests {
     }
 
     #[test]
-    fn conversation_summary_starts_a_draft_without_publishing() {
-        use crate::review_session::{Command, ReviewSession};
-        let (client, calls) = session_script(&[
-            SUCCESS,
-            "[]",
-            r#"{"id":91,"node_id":"PRR_pending","body":""}"#,
-            r#"{"id":91,"body":"summary"}"#,
-        ]);
-        let mut session = ReviewSession::default();
-        session
-            .execute(
-                &client,
-                &loc(),
-                Command::AddSummary {
-                    commit_id: "head".into(),
-                    body: " summary ".into(),
-                },
-            )
-            .unwrap();
-        assert_eq!(session.pending.as_ref().unwrap().body, "summary");
-        assert_eq!(
-            session.count(),
-            0,
-            "summary text is not a fake inline comment"
-        );
-        let calls = calls.lock().unwrap();
-        assert_eq!(
-            calls[2],
-            [
-                "api",
-                "-X",
-                "POST",
-                "repos/octocat/Hello-World/pulls/4781/reviews",
-                "-f",
-                "commit_id=head"
-            ]
-        );
-        assert_eq!(
-            calls[3],
-            [
-                "api",
-                "-X",
-                "PUT",
-                "repos/octocat/Hello-World/pulls/4781/reviews/91",
-                "-f",
-                "body=summary"
-            ]
-        );
-        assert!(!calls
-            .iter()
-            .any(|call| call.join(" ").contains("submitPullRequestReview")));
-    }
-
-    #[test]
-    fn conversation_summary_reconciles_and_preserves_web_body_and_drafts() {
-        use crate::review_session::{Command, ReviewSession};
-        let mut pending: serde_json::Value = serde_json::from_str(PENDING).unwrap();
-        pending[0][0]["body"] = serde_json::json!("web summary");
-        let (client, calls) = session_script(&[
-            SUCCESS,
-            &pending.to_string(),
-            &pending_threads(&[DRAFT]),
-            r#"{"id":91}"#,
-        ]);
-        let mut session = ReviewSession::default();
-        session
-            .execute(
-                &client,
-                &loc(),
-                Command::AddSummary {
-                    commit_id: "head".into(),
-                    body: "extra".into(),
-                },
-            )
-            .unwrap();
-        let review = session.pending.as_ref().unwrap();
-        assert_eq!(review.body, "web summary\n\nextra");
-        assert_eq!(review.comments.len(), 1);
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 4);
-        assert_eq!(calls[3].last().unwrap(), "body=web summary\n\nextra");
-    }
-
-    #[test]
-    fn conversation_failed_summary_retains_reconciled_draft_without_fallback_post() {
-        use crate::review_session::{Command, ReviewSession};
-        let (client, calls) =
-            session_script(&[SUCCESS, PENDING, &pending_threads(&[DRAFT]), r#"{}"#]);
-        let mut session = ReviewSession::default();
-        assert!(session
-            .execute(
-                &client,
-                &loc(),
-                Command::AddSummary {
-                    commit_id: "head".into(),
-                    body: "extra".into()
-                }
-            )
-            .is_err());
-        let review = session.pending.as_ref().unwrap();
-        assert_eq!(review.body, "web summary");
-        assert_eq!(review.comments.len(), 1);
-        assert_eq!(calls.lock().unwrap().len(), 4);
-    }
-
-    #[test]
     fn empty_conversation_compositions_never_touch_github() {
         use crate::review_session::{Command, ReviewSession};
         let (client, calls) = session_script(&[]);
         for command in [
             Command::Conversation {
                 body: " \n ".into(),
-            },
-            Command::AddSummary {
-                commit_id: "head".into(),
-                body: " ".into(),
             },
             Command::ConversationReply {
                 comment_id: 11,

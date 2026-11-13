@@ -4463,6 +4463,9 @@ impl ReviewApp {
     }
 
     fn composer_uses_pending_review(&self, composer: &Composer) -> bool {
+        if composer.placement == ComposerPlacement::ConversationMain {
+            return false;
+        }
         if matches!(
             composer.edit_target,
             Some(CommentTarget::Published(_)) | Some(CommentTarget::Local(_))
@@ -4495,7 +4498,8 @@ impl ReviewApp {
     }
 
     fn composer_can_start_review(&self, composer: &Composer) -> bool {
-        (composer.reply_to.is_none() || composer.placement != ComposerPlacement::Diff)
+        composer.placement != ComposerPlacement::ConversationMain
+            && (composer.reply_to.is_none() || composer.placement != ComposerPlacement::Diff)
             && composer.edit_id.is_none()
             && !self.composer_uses_pending_review(composer)
             && matches!(
@@ -4599,19 +4603,12 @@ impl ReviewApp {
             }
         }
         if matches!(source, Source::Pr(_)) && composer.placement != ComposerPlacement::Diff {
-            let pending = self.composer_uses_pending_review(composer);
-
             let command = if let Some(comment_id) = composer.reply_to {
                 SessionCommand::ConversationReply {
                     comment_id,
                     commit_id: composer.commit_id.clone(),
                     body,
                     pending: composer.pending,
-                }
-            } else if pending {
-                SessionCommand::AddSummary {
-                    commit_id: composer.commit_id.clone(),
-                    body,
                 }
             } else {
                 SessionCommand::Conversation { body }
@@ -15057,19 +15054,6 @@ mod tests {
             Ok(fake_receipt(id, body, None, None))
         }
 
-        fn update_pending_body(
-            &self,
-            _loc: &github::PrLocator,
-            _review: &github::PendingReview,
-            body: &str,
-        ) -> Result<(), github::ClientError> {
-            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(github::ClientError::Failed("summary rejected".into()));
-            }
-            self.pending.lock().unwrap().as_mut().unwrap().body = body.into();
-            Ok(())
-        }
-
         fn pr_commits(
             &self,
             _loc: &github::PrLocator,
@@ -17484,7 +17468,8 @@ mod tests {
                     cx,
                 );
                 let composer = this.composer().unwrap();
-                assert_eq!(this.composer_submit_label(composer), "Add to review");
+                assert_eq!(this.composer_submit_label(composer), "Comment");
+                assert!(!this.composer_can_start_review(composer));
                 composer
                     .input
                     .update(cx, |state, cx| state.set_value("extra summary", window, cx));
@@ -17497,7 +17482,7 @@ mod tests {
                 assert!(this.composer().is_none());
                 assert_eq!(
                     this.sessions[&0].state.pending.as_ref().unwrap().body,
-                    "web summary\n\nextra summary"
+                    "web summary"
                 );
                 this.open_comment_composer(
                     ComposerPlacement::ConversationThread("11".into()),
@@ -17518,11 +17503,16 @@ mod tests {
             })
         });
         cx.run_until_parked();
-        assert!(fake.posts().is_empty());
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Conversation {
+                body: "extra summary".into()
+            }]
+        );
         cx.update(|cx| {
             let app = app.read(cx);
             let review = app.store.review_session(&loop_loc()).pending.unwrap();
-            assert_eq!(review.body, "web summary\n\nextra summary");
+            assert_eq!(review.body, "web summary");
             assert_eq!(review.comments[0].in_reply_to_id, Some(11));
             assert_eq!(review.comments[0].body, "draft reply");
             assert!(
@@ -17552,7 +17542,7 @@ mod tests {
                         .read(cx)
                         .value()
                         .as_str(),
-                    "web summary\n\nextra summary"
+                    "web summary"
                 );
                 this.submit_review(window, cx);
             })
@@ -17560,15 +17550,20 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             fake.posts(),
-            vec![Post::Review {
-                verdict: github::ReviewVerdict::Approve,
-                body: "web summary\n\nextra summary".into()
-            }]
+            vec![
+                Post::Conversation {
+                    body: "extra summary".into()
+                },
+                Post::Review {
+                    verdict: github::ReviewVerdict::Approve,
+                    body: "web summary".into()
+                }
+            ]
         );
     }
 
     #[gpui::test]
-    fn conversation_main_can_start_a_review(cx: &mut gpui::TestAppContext) {
+    fn conversation_main_cannot_start_a_review(cx: &mut gpui::TestAppContext) {
         conversation_start_review(cx, false);
     }
 
@@ -17611,20 +17606,38 @@ mod tests {
             );
         });
         vcx.simulate_input("draft feedback");
+        if !reply {
+            vcx.update(|window, cx| {
+                app.update(cx, |this, cx| {
+                    assert!(!this.composer_can_start_review(this.composer().unwrap()));
+                    this.submit_composer_to_review(window, cx);
+                    assert!(!this.composer().unwrap().in_flight);
+                });
+            });
+            assert!(vcx.debug_bounds("composer-start-review").is_none());
+            assert!(fake.posts().is_empty());
+            cx.update(|cx| {
+                assert!(app.read(cx).store.review_session(&loop_loc()).pending.is_none());
+            });
+            vcx.simulate_keystrokes("cmd-enter");
+            cx.run_until_parked();
+            assert_eq!(
+                fake.posts(),
+                vec![Post::Conversation {
+                    body: "draft feedback".into()
+                }]
+            );
+            return;
+        }
         click_commenting(&mut vcx, "composer-start-review");
         assert!(fake.posts().is_empty(), "Start review never publishes");
         cx.update(|cx| {
             let app = app.read(cx);
             assert!(app.composer().is_none(), "the draft was saved");
             let review = app.store.review_session(&loop_loc()).pending.unwrap();
-            if reply {
-                assert_eq!(review.comments.len(), 1);
-                assert_eq!(review.comments[0].in_reply_to_id, Some(11));
-                assert_eq!(review.comments[0].body, "draft feedback");
-            } else {
-                assert_eq!(review.body, "draft feedback");
-                assert!(review.comments.is_empty());
-            }
+            assert_eq!(review.comments.len(), 1);
+            assert_eq!(review.comments[0].in_reply_to_id, Some(11));
+            assert_eq!(review.comments[0].body, "draft feedback");
         });
     }
 
@@ -17798,7 +17811,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn shift_cmd_enter_starts_review_with_conversation_comment(cx: &mut gpui::TestAppContext) {
+    fn shift_cmd_enter_cannot_start_review_with_conversation_comment(cx: &mut gpui::TestAppContext) {
         composer_enter(
             cx,
             ComposerPlacement::ConversationMain,
@@ -17823,7 +17836,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn cmd_enter_adds_conversation_comment_to_existing_review(cx: &mut gpui::TestAppContext) {
+    fn cmd_enter_publishes_conversation_comment_without_changing_review(cx: &mut gpui::TestAppContext) {
         composer_enter(cx, ComposerPlacement::ConversationMain, "cmd-enter", true);
     }
 
@@ -17900,12 +17913,25 @@ mod tests {
         assert!(fake.posts().is_empty());
         vcx.simulate_keystrokes(keystroke);
         cx.run_until_parked();
+        if placement == ComposerPlacement::ConversationMain && keystroke == "shift-cmd-enter" {
+            cx.update(|cx| {
+                let app = app.read(cx);
+                assert!(app.composer().is_some());
+                assert!(app.review.is_none());
+                assert!(app.store.review_session(&loop_loc()).pending.is_none());
+                assert_eq!(input.read(cx).value().as_str(), "before\nafter");
+            });
+            assert!(fake.posts().is_empty());
+            return;
+        }
         cx.update(|cx| {
             assert_eq!(input.read(cx).value().as_str(), "before\nafter");
             assert!(app.read(cx).composer().is_none());
             assert!(app.read(cx).review.is_none());
         });
-        if existing_review || keystroke == "shift-cmd-enter" {
+        if placement != ComposerPlacement::ConversationMain
+            && (existing_review || keystroke == "shift-cmd-enter")
+        {
             assert!(fake.posts().is_empty(), "drafts are never published");
             cx.update(|cx| {
                 let review = app
@@ -17917,28 +17943,16 @@ mod tests {
                 if existing_review {
                     assert_eq!(review.id, 91, "reuse the existing review");
                 }
-                if placement == ComposerPlacement::ConversationMain {
-                    assert_eq!(
-                        review.body,
-                        if existing_review {
-                            "web summary\n\nbefore\nafter"
-                        } else {
-                            "before\nafter"
-                        }
-                    );
-                    assert!(review.comments.is_empty());
-                } else {
-                    assert_eq!(
-                        review.body,
-                        if existing_review { "web summary" } else { "" }
-                    );
-                    assert_eq!(review.comments.len(), 1);
-                    assert_eq!(review.comments[0].body, "before\nafter");
-                    assert_eq!(
-                        review.comments[0].in_reply_to_id,
-                        matches!(placement, ComposerPlacement::ConversationThread(_)).then_some(11)
-                    );
-                }
+                assert_eq!(
+                    review.body,
+                    if existing_review { "web summary" } else { "" }
+                );
+                assert_eq!(review.comments.len(), 1);
+                assert_eq!(review.comments[0].body, "before\nafter");
+                assert_eq!(
+                    review.comments[0].in_reply_to_id,
+                    matches!(placement, ComposerPlacement::ConversationThread(_)).then_some(11)
+                );
             });
             return;
         }
@@ -17961,6 +17975,14 @@ mod tests {
             }
         };
         assert_eq!(fake.posts(), vec![expected]);
+        if existing_review {
+            cx.update(|cx| {
+                let review = app.read(cx).store.review_session(&loop_loc()).pending.unwrap();
+                assert_eq!(review.id, 91);
+                assert_eq!(review.body, "web summary");
+                assert!(review.comments.is_empty());
+            });
+        }
     }
 
     #[gpui::test]

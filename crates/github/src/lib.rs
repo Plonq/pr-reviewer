@@ -695,17 +695,6 @@ pub trait GitHubClient: Send + Sync {
             "pending reviews are not supported by this backend".into(),
         ))
     }
-    /// Persist a pending review's summary without submitting the review.
-    fn update_pending_body(
-        &self,
-        _loc: &PrLocator,
-        _review: &PendingReview,
-        _body: &str,
-    ) -> Result<(), ClientError> {
-        Err(ClientError::Failed(
-            "pending review summaries are not supported by this backend".into(),
-        ))
-    }
     /// Publish a main PR conversation comment, not an anchored review comment.
     /// Successful creates must return an exact database and node identity;
     /// metadata can be absent, but lossy success/optional-ID fallbacks cannot.
