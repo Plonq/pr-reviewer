@@ -1,10 +1,30 @@
-//! A one-shot restart snapshot, separate from normal launch behaviour and the
-//! confirmed GitHub cache. Unsaved editors are restored, never auto-submitted.
+//! Persistent app sessions, independent of updates and the confirmed GitHub
+//! cache. Unsaved editors are restored, never auto-submitted.
 use crate::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-const KEY: &str = "update_restart_v1";
+pub(crate) const KEY: &str = "session_v1";
+const LEGACY_KEY: &str = "update_restart_v1";
+pub(crate) const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A fresh launch must leave the previous session untouched until it quits.
+/// Normal launches checkpoint changed state for crash recovery.
+pub(crate) struct Checkpoint {
+    enabled: bool,
+    last_saved: Option<serde_json::Value>,
+    finished: bool,
+}
+
+impl Checkpoint {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            last_saved: None,
+            finished: false,
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 enum SavedSource {
@@ -91,7 +111,7 @@ struct SavedComposer {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct RestartSession {
+pub(crate) struct SavedSession {
     items: Vec<SavedItem>,
     active: usize,
     show_queue: bool,
@@ -102,27 +122,25 @@ pub(crate) struct RestartSession {
     composers: Vec<SavedComposer>,
 }
 
-pub(crate) fn read(store: &local_store::LocalStore) -> Option<RestartSession> {
-    let value = store.setting(KEY)?;
+pub(crate) fn read(store: &local_store::LocalStore) -> Option<SavedSession> {
+    // Preserve sessions saved by the original update-only implementation. The
+    // next successful save writes the new key, which takes precedence here.
+    let value = store.setting(KEY).or_else(|| store.setting(LEGACY_KEY))?;
     if value.is_null() {
         return None;
     }
     match serde_json::from_value(value) {
         Ok(session) => Some(session),
         Err(error) => {
-            eprintln!("gander: couldn't restore update session: {error}");
+            eprintln!("gander: couldn't restore session: {error}");
             None
         }
     }
 }
 
 impl ReviewApp {
-    pub(crate) fn save_update_session(&mut self, cx: &App) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.store.path().is_some() || cfg!(test),
-            "no persistent store available"
-        );
-        let session = RestartSession {
+    fn session_snapshot(&self, cx: &App) -> anyhow::Result<serde_json::Value> {
+        let session = SavedSession {
             active: self.active,
             show_queue: self.show_queue,
             minimap: self.minimap_visible,
@@ -163,7 +181,7 @@ impl ReviewApp {
                             ),
                             review_base: data.review_base.clone(),
                         }),
-                        _ => self.update_restore.get(&item.id).cloned(),
+                        _ => self.session_restore.get(&item.id).cloned(),
                     },
                 })
                 .collect(),
@@ -190,16 +208,83 @@ impl ReviewApp {
                 })
                 .collect(),
         };
-        self.store
-            .set_setting_checked(KEY, serde_json::to_value(session)?)?;
+        Ok(serde_json::to_value(session)?)
+    }
+
+    fn write_session(&mut self, snapshot: serde_json::Value) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.store.path().is_some() || cfg!(test),
+            "no persistent store available"
+        );
+        self.store.set_setting_checked(KEY, snapshot.clone())?;
+        self.session_checkpoint.last_saved = Some(snapshot);
+        Ok(())
+    }
+
+    /// Always flush on quit/close and before an explicit update. A failed write
+    /// must leave the previous snapshot intact and prevent an update restart.
+    pub(crate) fn save_session(&mut self, cx: &App) -> anyhow::Result<()> {
+        self.write_session(self.session_snapshot(cx)?)?;
         self.persist_positions();
         window_size::persist(&self.store, self.window_size);
         Ok(())
     }
 
-    pub(crate) fn restore_update_session(
+    pub(crate) fn finish_app_session(&mut self, cx: &App) {
+        self.session_checkpoint.enabled = false;
+        // Window close, process quit and entity release can all fire. Save at
+        // the first boundary, not when the last asynchronous UI handle drops.
+        if !self.session_checkpoint.finished {
+            match self.save_session(cx) {
+                Ok(()) => self.session_checkpoint.finished = true,
+                Err(error) => eprintln!("gander: couldn't save session: {error:#}"),
+            }
+        }
+    }
+
+    pub(crate) fn checkpoint_session(&mut self, cx: &App) -> anyhow::Result<()> {
+        if !self.session_checkpoint.enabled {
+            return Ok(());
+        }
+        let snapshot = self.session_snapshot(cx)?;
+        if self.session_checkpoint.last_saved.as_ref() != Some(&snapshot) {
+            self.write_session(snapshot)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn spawn_session_checkpoint(&self, cx: &mut Context<Self>) {
+        if !self.session_checkpoint.enabled || self.store_error.is_some() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let mut last_error = None;
+            loop {
+                cx.background_executor().timer(CHECKPOINT_INTERVAL).await;
+                match this.update(cx, |app, cx| {
+                    app.session_checkpoint
+                        .enabled
+                        .then(|| app.checkpoint_session(cx))
+                }) {
+                    Err(_) => break,
+                    Ok(None) => break,
+                    Ok(Some(Ok(()))) => last_error = None,
+                    Ok(Some(Err(error))) => {
+                        let error = format!("{error:#}");
+                        if last_error.as_ref() != Some(&error) {
+                            eprintln!("gander: couldn't checkpoint session: {error}");
+                            last_error = Some(error);
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn restore_session(
         &mut self,
-        session: RestartSession,
+        session: SavedSession,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -223,7 +308,7 @@ impl ReviewApp {
             // open_item starts the asynchronous fetch, which must capture the
             // saved scope before any work is dispatched.
             if let Some(view) = saved.view {
-                self.update_restore.insert(self.next_id, view);
+                self.session_restore.insert(self.next_id, view);
             }
             self.open_item(saved.source.into(), cx);
             let item = &mut self.items[self.active];
@@ -284,14 +369,11 @@ impl ReviewApp {
                 in_flight: false,
             });
         }
-        // Consume only after reconstructing the editors. Normal launches still
-        // open the queue rather than resurrecting an old update session.
-        if let Err(error) = self.store.set_setting_checked(KEY, serde_json::Value::Null) {
-            eprintln!("gander: couldn't consume update session: {error:#}");
-        }
+        // Do not consume the snapshot. If startup fails or the process crashes
+        // before the next checkpoint, the last saved session is still usable.
     }
 
-    pub(crate) fn restore_update_view(&mut self, id: u64) {
+    pub(crate) fn restore_session_view(&mut self, id: u64) {
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
             return;
         };
@@ -301,7 +383,7 @@ impl ReviewApp {
         if !data.diff_loaded {
             return;
         }
-        let Some(view) = self.update_restore.remove(&id) else {
+        let Some(view) = self.session_restore.remove(&id) else {
             return;
         };
         data.comments_visible = view.comments_visible;

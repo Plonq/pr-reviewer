@@ -20,16 +20,29 @@ roughly hourly and downloads/verifies updates in the background. A quiet
 There are no permission-to-check or update-available dialogs, and no profiling.
 Errors appear as a small retry button with details in its tooltip.
 
-Clicking the button saves the open reviews, active pane, file/source-line
+Clicking the button flushes the current session, then lets Sparkle install and
+relaunch. In-flight writes/uploads and unresolved/unverified comment mutations
+disable the button. Session persistence is normal app behaviour, independent
+of updates: every quit saves the open reviews, active pane, file/source-line
 position, view mode, local review comments, unsent comment editors and review
-summary drafts, then lets Sparkle install and relaunch. In-flight writes/uploads
-and unresolved/unverified comment mutations disable the button. The restart
-snapshot is stored in the existing local SQLite database and consumed once;
-ordinary launches still open the queue. Review summaries reopen as drafts,
-not as a modal. Fresh data or a force push can change the exact scroll position.
+summary drafts. Every normal launch restores them. Review summaries reopen as
+drafts, not as a modal; nothing is automatically submitted. Fresh data or a force
+push can change the exact scroll position.
 
-Sparkle also installs a staged background update on a normal quit. Gander saves
-the same restart snapshot then, for the next launch. Installation permissions
+The snapshot is stored as the JSON setting `session_v1` in
+`~/Library/Application Support/Gander/store.db`. Restoring it does not consume
+it. Normal sessions checkpoint changed state every five seconds for crash
+recovery, then flush again on quit. Existing `update_restart_v1` snapshots are
+read as a fallback until the first general-session save.
+
+Hold **Shift** while launching until the window appears to skip restoration
+once and start at the queue. Explicit CLI PR/path arguments also skip restoration
+and open those targets instead. These fresh sessions leave the prior snapshot
+untouched (including during checkpoint intervals) until quit, when their state
+becomes the new saved session. There is no persistent opt-out preference.
+
+Sparkle also installs a staged background update on a normal quit. The next
+launch restores the saved session just like any other launch. Installation permissions
 can still require a macOS authorisation prompt. Run the app from Applications
 (or another writable folder), not from the mounted DMG. Ad-hoc signing and lack
 of notarisation are unchanged; the first manual installation may still need

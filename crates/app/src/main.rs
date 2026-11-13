@@ -28,11 +28,11 @@ mod rows;
 mod search;
 mod selection;
 mod selection_matches;
+mod session;
 mod svg_image;
 mod theme;
 mod threads;
 mod tree;
-mod update_session;
 mod updater;
 mod upgrade;
 mod video;
@@ -428,10 +428,8 @@ fn main() {
     // same facade the app runs on, so launch errors speak the app's one
     // GitHub vocabulary.
     let github = github_client();
-    // Bare launch lands on the review queue — the home screen. The repo we
-    // stand in stays one explicit act away (`.` as an argument or in
-    // quick-open), so local review keeps working
-    // without hijacking the launch.
+    // Explicit arguments replace session restoration. The current directory
+    // stays opt-in (`.` as an argument or quick-open), never an implicit target.
     for arg in &args {
         let parsed = if Path::new(arg).is_dir() {
             git::resolve_local(Path::new(arg))
@@ -2096,7 +2094,8 @@ impl CommentDrag {
 
 pub(crate) struct ReviewApp {
     updater: updater::Updater,
-    update_restore: HashMap<u64, update_session::SavedView>,
+    session_restore: HashMap<u64, session::SavedView>,
+    session_checkpoint: session::Checkpoint,
     items: Vec<ReviewItem>,
     active: usize,
     sidebar_width: f32,
@@ -2147,8 +2146,8 @@ pub(crate) struct ReviewApp {
     /// generation it captured is still current.
     queue_gen: u64,
     /// Whether the main pane shows the review queue (the home screen) or
-    /// the open items. Launching bare shows the queue; launching with PRs
-    /// or paths on the CLI shows those instead.
+    /// the open items. Bare launches restore the last session; a fresh launch
+    /// shows the queue, and explicit CLI targets show those items instead.
     show_queue: bool,
     /// The local store: the queue cache the app paints from on open, and
     /// the place fetched queues are written to.
@@ -2177,30 +2176,35 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Read once while opening the window. Holding Shift skips restoration
+        // for this launch only; it is never saved as a preference.
+        let restore_session = sources.is_empty() && errors.is_empty() && !window.modifiers().shift;
         let open_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
         let video_hub = cx.new(|_| video::VideoHub::default());
+        let window_closed = {
+            let app = cx.weak_entity();
+            let window_id = window.window_handle().window_id();
+            cx.on_window_closed(move |cx, closed_id| {
+                if closed_id == window_id {
+                    let _ = app.update(cx, |app, cx| app.finish_app_session(cx));
+                }
+            })
+        };
         let _subscriptions = vec![
+            window_closed,
             cx.observe(&video_hub, |_, _, cx| cx.notify()),
             cx.on_app_quit(|this, cx| {
-                if this.updater.ready() {
-                    if let Err(error) = this.save_update_session(cx) {
-                        eprintln!("gander: couldn't save update session: {error:#}");
-                    }
-                }
+                this.finish_app_session(cx);
                 this.video_hub.update(cx, |hub, cx| hub.release(cx));
                 this.persist_positions();
                 window_size::persist(&this.store, this.window_size);
                 async {}
             }),
             cx.on_release(|this, cx| {
-                if this.updater.ready() {
-                    if let Err(error) = this.save_update_session(cx) {
-                        eprintln!("gander: couldn't save update session: {error:#}");
-                    }
-                }
+                this.finish_app_session(cx);
                 this.video_hub.update(cx, |hub, cx| hub.release(cx));
                 this.persist_positions();
                 window_size::persist(&this.store, this.window_size);
@@ -2247,7 +2251,8 @@ impl ReviewApp {
         ];
         let mut this = Self {
             updater: Default::default(),
-            update_restore: HashMap::new(),
+            session_restore: HashMap::new(),
+            session_checkpoint: session::Checkpoint::new(restore_session),
             items: Vec::new(),
             active: 0,
             sidebar_width: store
@@ -2288,8 +2293,8 @@ impl ReviewApp {
             window_size: window_size::normal_size(window),
             _subscriptions,
         };
-        let restart = if sources.is_empty() && this.open_error.is_none() {
-            update_session::read(&this.store)
+        let saved_session = if restore_session {
+            session::read(&this.store)
         } else {
             None
         };
@@ -2306,12 +2311,13 @@ impl ReviewApp {
         // all: the first frame already shows the last queue, and the
         // fetch that follows hot-swaps the fresh one in.
         this.paint_queue_from_cache();
-        if let Some(restart) = restart {
-            this.restore_update_session(restart, window, cx);
+        if let Some(saved_session) = saved_session {
+            this.restore_session(saved_session, window, cx);
         }
         this.spawn_queue_refresh(cx);
         this.spawn_background_poll(cx);
         this.spawn_position_memory(cx);
+        this.spawn_session_checkpoint(cx);
         this.spawn_updater(cx);
         if this.open_error.is_some() {
             // The modal shell needs the window's Root to be installed first.
@@ -2966,7 +2972,7 @@ impl ReviewApp {
             _ => 0,
         };
         let restart_base = self
-            .update_restore
+            .session_restore
             .get(&id)
             .and_then(|view| view.review_base.clone());
         cx.spawn(async move |this, cx| {
@@ -3060,7 +3066,7 @@ impl ReviewApp {
                     }
                 }
                 app.sync_pending_comments(id);
-                app.restore_update_view(id);
+                app.restore_session_view(id);
                 cx.notify();
             })
             .ok();
@@ -7823,8 +7829,8 @@ impl Render for ReviewApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    mod update_tests {
-        include!("update_tests.rs");
+    mod session_tests {
+        include!("session_tests.rs");
     }
     use crate::mentions::{mention_prefix, mention_rank};
     use crate::rows::LineKind;

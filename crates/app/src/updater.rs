@@ -19,8 +19,8 @@ impl Updater {
         if self.state == 1 {
             return true;
         }
-        // Quit/release must not miss a staged update merely because the last
-        // UI poll ran just before Sparkle finished downloading it.
+        // Do not miss a staged update merely because the last UI poll ran just
+        // before Sparkle finished downloading it.
         #[cfg(all(feature = "auto-updates", not(test)))]
         return unsafe { native::gander_updater_state() == 1 };
         #[cfg(any(not(feature = "auto-updates"), test))]
@@ -106,7 +106,7 @@ impl ReviewApp {
         if !self.updater.ready() || self.update_blocked(cx) {
             return;
         }
-        if let Err(error) = self.save_update_session(cx) {
+        if let Err(error) = self.save_session(cx) {
             self.updater.save_error = Some(format!("Couldn't save your session: {error:#}"));
             cx.notify();
             return;
