@@ -41,6 +41,95 @@ struct EmbeddedImage {
     height: Option<f32>,
 }
 
+/// Measure against the prose width, including Kit's offscreen block pass.
+/// Percentage max-width alone is unresolved during that intrinsic pass.
+struct FittedImage {
+    width: f32,
+    ratio: f32,
+    image: Option<gpui::Stateful<gpui::Img>>,
+}
+
+impl IntoElement for FittedImage {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for FittedImage {
+    type RequestLayoutState = ();
+    type PrepaintState = gpui::AnyElement;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        _: &mut App,
+    ) -> (gpui::LayoutId, ()) {
+        let width = px(self.width);
+        let ratio = self.ratio;
+        (
+            window.request_measured_layout(Default::default(), move |known, available, _, _| {
+                let available = known.width.unwrap_or_else(|| match available.width {
+                    gpui::AvailableSpace::Definite(width) => width,
+                    _ => width,
+                });
+                let width = width.min(available);
+                gpui::size(width, width / ratio)
+            }),
+            (),
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        let width = bounds.size.width.min(px(self.width));
+        let size = gpui::size(width, width / self.ratio);
+        let mut image = self
+            .image
+            .take()
+            .unwrap()
+            .w(size.width)
+            .h(size.height)
+            .into_any_element();
+        image.prepaint_as_root(
+            bounds.origin,
+            size.map(gpui::AvailableSpace::Definite),
+            window,
+            cx,
+        );
+        image
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: gpui::Bounds<gpui::Pixels>,
+        _: &mut (),
+        image: &mut gpui::AnyElement,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        image.paint(window, cx);
+    }
+}
+
 #[derive(Clone)]
 struct CaptionedImage {
     html: SharedString,
@@ -156,6 +245,31 @@ fn image_context(source: &str) -> ImageContext {
 }
 
 impl ImagePlugin {
+    fn block_image(
+        &self,
+        image: &EmbeddedImage,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        let intrinsic = window
+            .use_asset::<ImgResourceLoader>(&Resource::Uri(image.target.url.clone()), cx)
+            .and_then(Result::ok)
+            .map(|image| image.size(0));
+        let Some(size) = intrinsic else {
+            return self.image(image).into_any_element();
+        };
+        // Img resolves its auto height from the requested pixel width before
+        // max-width is applied. That inflates the Markdown block's measured
+        // height even though the images paint smaller. Let a ratio-sized box
+        // own layout, and fit the image inside the resulting bounds.
+        FittedImage {
+            width: image.width.unwrap_or(size.width.0 as f32),
+            ratio: size.width.0 as f32 / (size.height.0 as f32).max(1.),
+            image: Some(self.image(image)),
+        }
+        .into_any_element()
+    }
+
     fn image(&self, image: &EmbeddedImage) -> gpui::Stateful<gpui::Img> {
         let offset = image.offset;
         let owner = self.owner.clone();
@@ -167,8 +281,7 @@ impl ImagePlugin {
             .object_fit(gpui::ObjectFit::Contain)
             .max_w(relative(1.))
             .when(self.block, |element| {
-                // Match Kit's block-image path: explicit width, intrinsic
-                // aspect ratio and a maximum of the available prose width.
+                // Keep placeholders bounded until intrinsic sizing is known.
                 element
                     .when_some(image.width, |element, width| element.w(px(width)))
                     .with_loading(|| {
@@ -310,7 +423,7 @@ impl MarkdownPlugin for ImagePlugin {
         )
     }
 
-    fn render(&self, node: &MarkdownNode, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
         if let Some(captioned) = node.data::<CaptionedImage>() {
             let offset = node.source_range().map_or(0, |range| range.start);
             let owner = self.owner.clone();
@@ -354,7 +467,7 @@ impl MarkdownPlugin for ImagePlugin {
                 node.data::<Vec<EmbeddedImage>>()
                     .unwrap()
                     .iter()
-                    .map(|image| self.image(image)),
+                    .map(|image| self.block_image(image, window, cx)),
             )
             .into_any_element()
     }
