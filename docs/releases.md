@@ -73,12 +73,22 @@ Add the printed public key as the repository **Actions variable**
 upload it directly with `gh`, then remove only that temporary file:
 
 ```sh
-keyfile=$(mktemp)
-chmod 600 "$keyfile"
-target/sparkle/bin/generate_keys --account gander -x "$keyfile"
-gh secret set SPARKLE_PRIVATE_KEY < "$keyfile"
-rm "$keyfile"
+(
+  set -eu
+  keydir=$(mktemp -d)
+  trap 'rm -f "$keydir/private-key"; rmdir "$keydir"' EXIT
+  keyfile="$keydir/private-key"
+  umask 077
+  target/sparkle/bin/generate_keys --account gander -x "$keyfile"
+  test -s "$keyfile"
+  gh secret set SPARKLE_PRIVATE_KEY --repo Plonq/pr-reviewer < "$keyfile"
+)
 ```
+
+Sparkle requires the export filename to be absent; do not use an existing empty
+file from `mktemp`. A secret can exist in GitHub with an empty value if an
+empty file was uploaded. Re-run the export/upload above to repair that case,
+then re-run the failed workflow.
 
 Back up this key securely. With ad-hoc signatures and verification-before-
 extraction enabled, losing it requires another manual installation to change
