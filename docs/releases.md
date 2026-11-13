@@ -1,9 +1,10 @@
 # macOS releases
 
-Every push to `main` builds the Apple Silicon app and publishes `Gander.dmg` on
-the rolling [`latest` release](https://github.com/Plonq/pr-reviewer/releases/tag/latest).
+Every push to `main` runs the tests, then builds the Apple Silicon app and publishes
+`Gander.dmg` on the rolling [`latest` release](https://github.com/Plonq/pr-reviewer/releases/tag/latest).
 The download URL stays the same. A SHA-256 checksum is published alongside it.
 The **Release DMG** workflow also has a **Run workflow** button for retries on `main`.
+Both automatic and manual releases require the tests to pass before building the DMG.
 
 No Apple Developer account or certificates are needed. Automatic updates use a
 free Sparkle signing key (a GitHub Actions secret), unrelated to Apple signing.
