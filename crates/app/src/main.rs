@@ -32,6 +32,8 @@ mod svg_image;
 mod theme;
 mod threads;
 mod tree;
+mod update_session;
+mod updater;
 mod upgrade;
 mod video;
 mod video_player;
@@ -568,7 +570,7 @@ fn main() {
 
 // --- Review comments -------------------------------------------------------
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 struct LocalReview {
     comments: Vec<ReviewComment>,
     next_id: u64,
@@ -1223,7 +1225,7 @@ impl ItemData {
 /// — the PR description, rendered as GFM. PRs open onto conversation, local
 /// diffs onto changes; ⇧⌘←/→ flips between them. Per item, so ctrl-tab's
 /// other item keeps its own.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ItemPane {
     #[default]
     Changes,
@@ -1833,7 +1835,7 @@ fn seed_mentions(cell: &Rc<RefCell<Vec<github::Mention>>>, data: &ItemData) {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ComposerPlacement {
     Diff,
     ConversationMain,
@@ -2093,6 +2095,8 @@ impl CommentDrag {
 }
 
 pub(crate) struct ReviewApp {
+    updater: updater::Updater,
+    update_restore: HashMap<u64, update_session::SavedView>,
     items: Vec<ReviewItem>,
     active: usize,
     sidebar_width: f32,
@@ -2181,12 +2185,22 @@ impl ReviewApp {
         let _subscriptions = vec![
             cx.observe(&video_hub, |_, _, cx| cx.notify()),
             cx.on_app_quit(|this, cx| {
+                if this.updater.ready() {
+                    if let Err(error) = this.save_update_session(cx) {
+                        eprintln!("gander: couldn't save update session: {error:#}");
+                    }
+                }
                 this.video_hub.update(cx, |hub, cx| hub.release(cx));
                 this.persist_positions();
                 window_size::persist(&this.store, this.window_size);
                 async {}
             }),
             cx.on_release(|this, cx| {
+                if this.updater.ready() {
+                    if let Err(error) = this.save_update_session(cx) {
+                        eprintln!("gander: couldn't save update session: {error:#}");
+                    }
+                }
                 this.video_hub.update(cx, |hub, cx| hub.release(cx));
                 this.persist_positions();
                 window_size::persist(&this.store, this.window_size);
@@ -2232,6 +2246,8 @@ impl ReviewApp {
             ),
         ];
         let mut this = Self {
+            updater: Default::default(),
+            update_restore: HashMap::new(),
             items: Vec::new(),
             active: 0,
             sidebar_width: store
@@ -2272,6 +2288,11 @@ impl ReviewApp {
             window_size: window_size::normal_size(window),
             _subscriptions,
         };
+        let restart = if sources.is_empty() && this.open_error.is_none() {
+            update_session::read(&this.store)
+        } else {
+            None
+        };
         for source in sources {
             this.open_item(source, cx);
         }
@@ -2285,9 +2306,13 @@ impl ReviewApp {
         // all: the first frame already shows the last queue, and the
         // fetch that follows hot-swaps the fresh one in.
         this.paint_queue_from_cache();
+        if let Some(restart) = restart {
+            this.restore_update_session(restart, window, cx);
+        }
         this.spawn_queue_refresh(cx);
         this.spawn_background_poll(cx);
         this.spawn_position_memory(cx);
+        this.spawn_updater(cx);
         if this.open_error.is_some() {
             // The modal shell needs the window's Root to be installed first.
             cx.defer_in(window, |app, window, cx| app.open_quick_open(window, cx));
@@ -2940,11 +2965,15 @@ impl ReviewApp {
             Some(ItemState::Ready(data)) => data.file_ix,
             _ => 0,
         };
+        let restart_base = self
+            .update_restore
+            .get(&id)
+            .and_then(|view| view.review_base.clone());
         cx.spawn(async move |this, cx| {
             let (conversation_tx, conversation_rx) = futures::channel::oneshot::channel();
             let fetch = cx.background_spawn(async move {
-                review_target::fetch_item_with_conversation(
-                    github, &source, mode, file_ix, since_review, Some(conversation_tx),
+                review_target::fetch_item_with_restart(
+                    github, &source, mode, file_ix, since_review, Some(conversation_tx), restart_base.as_deref(),
                 )
             });
             if let Ok(conversation) = conversation_rx.await {
@@ -3031,6 +3060,7 @@ impl ReviewApp {
                     }
                 }
                 app.sync_pending_comments(id);
+                app.restore_update_view(id);
                 cx.notify();
             })
             .ok();
@@ -6168,6 +6198,7 @@ impl ReviewApp {
                     .child(note),
             );
         }
+        right = right.child(self.render_update_button(cx));
         right = right.child(self.render_account(cx));
         TitleBar::new()
             .h(APP_HEADER_HEIGHT)
@@ -7792,6 +7823,9 @@ impl Render for ReviewApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod update_tests {
+        include!("update_tests.rs");
+    }
     use crate::mentions::{mention_prefix, mention_rank};
     use crate::rows::LineKind;
     use gpui::component::Rope;

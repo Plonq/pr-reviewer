@@ -22,7 +22,9 @@ use std::collections::{HashMap, HashSet};
 
 /// UI identity is not an API target. In particular local post tokens never
 /// occupy a reserved numeric range of GitHub comment IDs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) enum CommentKey {
     Issue(u64),
     Review(u64),

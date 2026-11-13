@@ -35,7 +35,10 @@ Requires **Apple Silicon** and **macOS 15 or later**. GitHub reviews use your [G
 
 Builds are **not notarised**. If macOS blocks Gander, attempt to open the installed
 app, then choose **System Settings → Privacy & Security → Open Anyway**.
-Publishing requires no paid Apple Developer account; see [release workflow](docs/releases.md).
+Installed builds check for updates in the background; **Restart to update**
+installs a ready update and restores your review session. Updates can also install
+on normal quit. Publishing requires no paid Apple Developer account; see
+[release workflow and one-time update-key setup](docs/releases.md).
 
 ### Review your first PR
 

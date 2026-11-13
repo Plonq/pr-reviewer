@@ -11,7 +11,7 @@ use gpui::component::{
 use gpui::{div, prelude::*, Context, MouseButton, SharedString, Window};
 use gpui_kit_assets::IconName;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum CommentTarget {
     Pending(u64),
     Local(u64),

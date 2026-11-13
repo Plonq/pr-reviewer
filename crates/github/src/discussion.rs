@@ -3,7 +3,7 @@
 use crate::{Author, ReviewComment};
 
 /// Opaque identity and API family for a published comment mutation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CommentTarget {
     Issue(String),
     Review(String),
