@@ -7,7 +7,7 @@ let assets = root.appendingPathComponent("assets")
 let iconset = assets.appendingPathComponent("Gander.iconset")
 try FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
 
-func drawIcon() {
+func drawIcon(pixelSize: Int) {
     let tile = NSBezierPath(roundedRect: NSRect(x: 64, y: 64, width: 896, height: 896), xRadius: 200, yRadius: 200)
     NSGradient(starting: NSColor(srgbRed: 0.12, green: 0.31, blue: 0.34, alpha: 1),
                ending: NSColor(srgbRed: 0.05, green: 0.15, blue: 0.20, alpha: 1))!
@@ -19,7 +19,12 @@ func drawIcon() {
     goose.curve(to: NSPoint(x: 563, y: 266), controlPoint1: NSPoint(x: 265, y: 235), controlPoint2: NSPoint(x: 453, y: 211))
     goose.curve(to: NSPoint(x: 682, y: 465), controlPoint1: NSPoint(x: 663, y: 311), controlPoint2: NSPoint(x: 682, y: 381))
     goose.line(to: NSPoint(x: 682, y: 654))
-    goose.curve(to: NSPoint(x: 744, y: 718), controlPoint1: NSPoint(x: 682, y: 689), controlPoint2: NSPoint(x: 710, y: 718))
+    // Carry the cheek all the way to the bill's lower root. The old curve
+    // stopped halfway up the bill, leaving its lower half floating off the face.
+    // The short edge beneath the bill also gives the two fills real overlap,
+    // rather than relying on antialiased edges touching without a seam.
+    goose.curve(to: NSPoint(x: 735, y: 684), controlPoint1: NSPoint(x: 682, y: 679), controlPoint2: NSPoint(x: 710, y: 684))
+    goose.line(to: NSPoint(x: 744, y: 718))
     goose.curve(to: NSPoint(x: 651, y: 801), controlPoint1: NSPoint(x: 746, y: 775), controlPoint2: NSPoint(x: 705, y: 810))
     goose.curve(to: NSPoint(x: 557, y: 683), controlPoint1: NSPoint(x: 592, y: 798), controlPoint2: NSPoint(x: 557, y: 747))
     goose.line(to: NSPoint(x: 557, y: 490))
@@ -32,7 +37,9 @@ func drawIcon() {
     let wing = NSBezierPath()
     wing.move(to: NSPoint(x: 299, y: 353))
     wing.curve(to: NSPoint(x: 528, y: 348), controlPoint1: NSPoint(x: 385, y: 315), controlPoint2: NSPoint(x: 471, y: 308))
-    wing.lineWidth = 22
+    // Keep these details legible in the 16/32px Finder representations without
+    // changing their proportions in the larger artwork.
+    wing.lineWidth = max(22, 512 / CGFloat(pixelSize))
     wing.lineCapStyle = .round
     NSColor(srgbRed: 0.69, green: 0.77, blue: 0.73, alpha: 1).setStroke()
     wing.stroke()
@@ -45,7 +52,9 @@ func drawIcon() {
     NSColor(srgbRed: 0.96, green: 0.64, blue: 0.27, alpha: 1).setFill()
     bill.fill()
     NSColor(srgbRed: 0.06, green: 0.17, blue: 0.20, alpha: 1).setFill()
-    NSBezierPath(ovalIn: NSRect(x: 687, y: 742, width: 18, height: 18)).fill()
+    let eyeDiameter = max(18, 768 / CGFloat(pixelSize))
+    NSBezierPath(ovalIn: NSRect(x: 696 - eyeDiameter / 2, y: 751 - eyeDiameter / 2,
+                              width: eyeDiameter, height: eyeDiameter)).fill()
 }
 
 func png(size: Int) -> Data {
@@ -56,7 +65,7 @@ func png(size: Int) -> Data {
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
     let transform = AffineTransform(scale: CGFloat(size) / 1024)
     (transform as NSAffineTransform).concat()
-    drawIcon()
+    drawIcon(pixelSize: size)
     NSGraphicsContext.restoreGraphicsState()
     return bitmap.representation(using: .png, properties: [:])!
 }
