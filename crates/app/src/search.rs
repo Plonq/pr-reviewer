@@ -554,7 +554,12 @@ impl ReviewApp {
         let Some(search) = search else {
             return div().into_any_element();
         };
-        let right_inset = 20. + if self.minimap_visible { MINIMAP_WIDTH } else { 0. };
+        let right_inset = 20.
+            + if self.minimap_visible {
+                MINIMAP_WIDTH
+            } else {
+                0.
+            };
         let count = match search.matches.current {
             Some(ix) => format!("{} / {}", ix + 1, search.matches.occurrences.len()),
             None if search.query.is_empty() => "Enter: next · Esc: close".into(),

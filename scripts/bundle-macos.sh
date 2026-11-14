@@ -7,7 +7,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/aarch64-apple-darwin/release/gander "$APP/Contents/MacOS/gander"
 cp assets/Gander.icns "$APP/Contents/Resources/Gander.icns"
 # Numeric, monotonically increasing CI build number (not a commit SHA).
-VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/app/Cargo.toml | head -1)
+# Published apps take their version from the release tag. Local bundles use Cargo.
+VERSION=${GANDER_VERSION:-$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/app/Cargo.toml | head -1)}
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

@@ -1160,7 +1160,10 @@ enum CardEdge {
 fn comment_body_edge(next_row: Option<&Row>) -> CardEdge {
     if next_row.is_none_or(|row| {
         !is_comment_row(row)
-            || matches!(row, Row::CommentHeader { top: true, .. } | Row::CommentEditor { top: true, .. })
+            || matches!(
+                row,
+                Row::CommentHeader { top: true, .. } | Row::CommentEditor { top: true, .. }
+            )
     }) {
         CardEdge::Bottom
     } else {
@@ -1356,7 +1359,10 @@ fn render_row_content(
     let row_height = px(row_height());
     let body_edge = comment_body_edge(next_row);
     let max_comment_width = crate::diff_media::comment_card_max_width(
-        entity.read(cx).char_width.unwrap_or(px(crate::text_size() * 0.6)),
+        entity
+            .read(cx)
+            .char_width
+            .unwrap_or(px(crate::text_size() * 0.6)),
     );
     match row {
         Row::Continuation(row) => render_row_content(
@@ -1472,11 +1478,14 @@ fn render_row_content(
                 cx,
             )
         }
-        Row::CommentBody { half, .. } | Row::CommentSpacer { half } => {
-            comment_row(
-                div().into_any_element(), *half, false, body_edge, max_comment_width, cx,
-            )
-        }
+        Row::CommentBody { half, .. } | Row::CommentSpacer { half } => comment_row(
+            div().into_any_element(),
+            *half,
+            false,
+            body_edge,
+            max_comment_width,
+            cx,
+        ),
         Row::CommentReactions { comment_id, half } => comment_row(
             div()
                 .debug_selector(|| format!("inline-reactions-{comment_id}"))
@@ -1498,7 +1507,12 @@ fn render_row_content(
                 (false, edge) => edge,
             };
             comment_row(
-                div().into_any_element(), *half, false, edge, max_comment_width, cx,
+                div().into_any_element(),
+                *half,
+                false,
+                edge,
+                max_comment_width,
+                cx,
             )
         }
         Row::CommentActions {
@@ -1919,7 +1933,10 @@ mod tests {
                 CardEdge::Bottom
             ));
             assert!(matches!(
-                comment_body_edge(Some(&Row::CommentEditor { half: None, top: false })),
+                comment_body_edge(Some(&Row::CommentEditor {
+                    half: None,
+                    top: false
+                })),
                 CardEdge::Middle
             ));
             assert!(matches!(

@@ -1,8 +1,15 @@
 name: Tests
 
 on:
+  push:
+    branches: [main]
   pull_request:
   workflow_call:
+
+# Only PR runs share a group; main pushes and release callers stay independent.
+concurrency:
+  group: tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -12,6 +19,9 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - run: python3 scripts/test-release.py
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
       - run: bash scripts/fetch-sparkle.sh

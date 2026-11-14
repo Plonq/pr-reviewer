@@ -60,7 +60,7 @@ fn text_width(card_width: Pixels, char_width: Pixels, is_reply: bool) -> Pixels 
     ((card_width - px(72.)).min(comment_card_max_width(char_width))
         - px(27.)
         - reply_indent(is_reply))
-        .max(px(1.))
+    .max(px(1.))
 }
 
 /// Replace initial plain-text estimates with measured Markdown reservations,

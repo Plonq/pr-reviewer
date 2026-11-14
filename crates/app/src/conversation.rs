@@ -1193,14 +1193,7 @@ impl ReviewApp {
                 .into_any_element();
         }
         if markdown::has_content(body) {
-            card = card.child(render_markdown(
-                &markdown_id,
-                body,
-                slug,
-                self,
-                window,
-                cx,
-            ));
+            card = card.child(render_markdown(&markdown_id, body, slug, self, window, cx));
         }
         let reaction_controls = match (projected, target) {
             (Comment::Published(comment), Some(crate::CommentTarget::Published(target)))

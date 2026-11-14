@@ -2,32 +2,39 @@ name: Release DMG
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
+    tags: ['v*']
 
 permissions:
   contents: write
 
 concurrency:
   group: release-dmg
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   test:
-    if: github.ref == 'refs/heads/main'
     uses: ./.github/workflows/test.yml
     permissions:
       contents: read
 
   dmg:
     needs: test
-    if: github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: 0
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Set release version
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo 'Release tags must use vMAJOR.MINOR.PATCH (for example v0.2.0).'
+            exit 1
+          fi
+          printf 'GANDER_VERSION=%s\n' "${RELEASE_TAG#v}" >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@v2
 
@@ -68,6 +75,30 @@ jobs:
             "https://github.com/$GITHUB_REPOSITORY/releases/download/build-$GITHUB_RUN_NUMBER-$GITHUB_RUN_ATTEMPT/Gander.dmg" \
             dist/Gander.app/Contents/Info.plist target/sparkle/bin/sign_update appcast.xml
 
+      - name: Publish versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" Gander.dmg Gander.dmg.sha256 --clobber
+          else
+            previous=$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 \
+              --json tagName --jq '.[0].tagName // empty')
+            if [[ -z "$previous" ]]; then
+              # The first named release follows the last rolling build. Never
+              # use the movable latest tag in release-note comparison links.
+              previous=$(gh release list --exclude-drafts --limit 100 --json tagName \
+                --jq 'map(select(.tagName | startswith("build-"))) | .[0].tagName // empty')
+            fi
+            notes=()
+            if [[ -n "$previous" ]]; then
+              notes=(--notes-start-tag "$previous")
+            fi
+            gh release create "$RELEASE_TAG" --verify-tag \
+              --title "Gander $GANDER_VERSION" --generate-notes "${notes[@]}" \
+              Gander.dmg Gander.dmg.sha256
+          fi
+
       - name: Publish immutable update archive
         env:
           GH_TOKEN: ${{ github.token }}
@@ -81,10 +112,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          newest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          if [[ "$newest" != "$RELEASE_TAG" ]]; then
+            echo "A newer release is published; leaving latest downloads and the update feed unchanged."
+            exit 0
+          fi
           git push --force origin "HEAD:refs/tags/latest"
           gh release view latest >/dev/null 2>&1 || \
-            gh release create latest --prerelease --title "Latest build" --notes ""
-          gh release edit latest --notes "Unnotarised Apple Silicon build from \`${GITHUB_SHA::7}\`. Requires macOS 15 or later. If macOS blocks the installed app, attempt to open it, then allow it in System Settings → Privacy & Security → Open Anyway."
+            gh release create latest --prerelease --title "Latest release downloads" --notes ""
+          gh release edit latest --title "Latest release downloads" --notes "Downloads for [$RELEASE_TAG](https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG). Requires Apple Silicon and macOS 15 or later. Unnotarised: if macOS blocks the installed app, attempt to open it, then allow it in System Settings → Privacy & Security → Open Anyway."
           gh release upload latest Gander.dmg Gander.dmg.sha256 --clobber
           # Publish the feed last: every URL in it is already downloadable.
           gh release upload latest appcast.xml --clobber

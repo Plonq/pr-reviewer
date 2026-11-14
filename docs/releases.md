@@ -1,10 +1,49 @@
 # macOS releases
 
-Every push to `main` runs the tests, then builds the Apple Silicon app and publishes
-`Gander.dmg` on the rolling [`latest` release](https://github.com/Plonq/gander/releases/tag/latest).
-The download URL stays the same. A SHA-256 checksum is published alongside it.
-The **Release DMG** workflow also has a **Run workflow** button for retries on `main`.
-Both automatic and manual releases require the tests to pass before building the DMG.
+Pushes to `main` and pull requests check Rust formatting, run tests, and check the
+updater-enabled build. New commits to a PR cancel its earlier CI run; checks on
+`main` and release tags run independently. Publishing a DMG and automatic update
+is an explicit release, triggered by a version tag such as `v0.2.0`.
+
+## Create a release
+
+After the changes you want to ship have merged to `main`, run:
+
+```sh
+./scripts/release.sh
+```
+
+The script suggests the next patch version; press Enter to accept it or type a
+different version, such as `0.2.0` for a feature release. For the first release it
+suggests the version in `crates/app/Cargo.toml`. You can also specify the version
+in the same command: `./scripts/release.sh 0.2.0`.
+
+That is the whole release step. The script fetches the remote `main` commit and
+pushes a version tag pointing to it. Your current branch, local changes and local
+tags are left alone. It uses the `origin` push repository and your existing Git
+authentication, plus the GitHub CLI login to check versions. It refuses existing
+tags and versions older than the highest release tag, including tags still building.
+
+The **Release DMG** workflow tests that tagged commit, builds the Apple Silicon
+app, signs it, and creates a GitHub release with `Gander.dmg`, its SHA-256 checksum,
+and notes generated from merged PRs since the previous release (the last rolling
+build for the first named release). Edit the release description on GitHub to
+curate those notes. The tag supplies the app version automatically; there is no
+separate Cargo version bump or commit to make. Tags use `vMAJOR.MINOR.PATCH`;
+beta/prerelease suffixes are not supported by this workflow.
+
+CI then updates the existing [`latest` downloads](https://github.com/Plonq/gander/releases/tag/latest)
+and Sparkle feed. The download and update URLs stay the same for existing installs.
+The versioned release and latest downloads appear only after CI succeeds; pushing
+the tag alone does not mean the DMG is ready. Follow the Actions link printed by
+the script. If a build fails, use **Actions → Release DMG → failed run → Re-run
+failed jobs**. Re-running all jobs also works. Reuse that run rather than moving
+the tag; once published, subsequent code changes need a new version.
+
+Keep this workflow in `.github/workflows/release.yml`: its existing run-number
+sequence is also the updater's build-number sequence. Release runs queue instead
+of cancelling a publication already in progress. Re-running an older release
+does not replace the latest downloads/feed when a newer release is already published.
 
 No Apple Developer account or certificates are needed. Automatic updates use a
 free Sparkle signing key (a GitHub Actions secret), unrelated to Apple signing.
@@ -95,9 +134,11 @@ extraction enabled, losing it requires another manual installation to change
 the embedded public key. Keep the same key across builds.
 
 The workflow fails early if either setting is missing. It signs both the DMG
-and feed, checks that the keypair matches the bundled public key, publishes an
-immutable `build-<run>-<attempt>` release, and only then replaces `appcast.xml`
-on `latest`. Download URLs in the feed never point at the overwritten DMG.
+and feed, checks that the keypair matches the bundled public key, publishes the
+versioned release and an immutable `build-<run>-<attempt>` updater archive, and
+only then replaces `appcast.xml` on `latest`. These build prereleases are internal
+download archives, created only when you explicitly release. Download URLs in the
+feed never point at the overwritten DMG on `latest` or on a retried versioned release.
 `CFBundleVersion` is `<run>.<attempt>` so workflow retries are distinct updates.
 Do not delete build releases while clients may still be downloading them.
 

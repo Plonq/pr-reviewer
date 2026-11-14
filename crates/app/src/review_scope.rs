@@ -230,13 +230,15 @@ impl ReviewApp {
                                         let detail = detail.clone();
                                         Tooltip::element(move |_, _| {
                                             div()
-                                                .debug_selector(|| "review-scope-tooltip-text".into())
+                                                .debug_selector(|| {
+                                                    "review-scope-tooltip-text".into()
+                                                })
                                                 .max_w(px(440.))
                                                 .whitespace_normal()
                                                 .child(detail.clone())
                                         })
-                                            .max_w(px(480.))
-                                            .build(window, cx)
+                                        .max_w(px(480.))
+                                        .build(window, cx)
                                     })
                                     .child(Icon::new(icon).small()),
                             )

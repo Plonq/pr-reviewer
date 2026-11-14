@@ -440,7 +440,10 @@ mod tests {
             // Also cover in-place editors and collapsed headers, which can
             // occupy just one row and still need a visible marker.
             rows.extend([
-                Row::CommentEditor { half: None, top: true },
+                Row::CommentEditor {
+                    half: None,
+                    top: true,
+                },
                 Row::CommentEditor {
                     half: Some(CommentSide::Left),
                     top: true,
