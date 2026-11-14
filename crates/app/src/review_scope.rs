@@ -245,6 +245,17 @@ impl ReviewApp {
                         row.child(self.render_presentation_controls(data, cx))
                     }),
             );
+        if data.omitted_untracked > 0 {
+            bar = bar.child(
+                div()
+                    .debug_selector(|| "untracked-limit-warning".into())
+                    .text_color(theme::yellow(cx))
+                    .child(format!(
+                        "Incomplete local changes: {} untracked files omitted (showing the first 200).",
+                        data.omitted_untracked
+                    )),
+            );
+        }
         if is_pr && active && data.diff.files.is_empty() {
             bar = bar.child(
                 div()

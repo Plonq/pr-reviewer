@@ -431,7 +431,7 @@ mod tests {
         std::fs::write(repo.path().join("a.svg"), "<svg>new</svg>").unwrap();
         std::fs::write(repo.path().join("movie.mp4"), [0, 254, 2]).unwrap();
         std::fs::remove_file(repo.path().join("binary")).unwrap();
-        let diff = diff_core::parse_patch(&git::diff_patch(&src).unwrap());
+        let diff = diff_core::parse_patch(&git::diff_patch(&src).unwrap().patch);
         let media = prepare(
             &diff,
             &Source::Local(src.clone()),

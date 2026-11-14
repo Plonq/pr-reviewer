@@ -623,6 +623,7 @@ enum ItemState {
 pub(crate) struct ItemData {
     pr_meta: Option<github::PrMeta>,
     pub(crate) diff: PrDiff,
+    omitted_untracked: usize,
     /// False for conversation-only data, not a genuinely empty diff.
     diff_loaded: bool,
     mode: ViewMode,
@@ -760,6 +761,7 @@ impl ItemData {
             pr_meta,
             anchor_hunks: diff.files.iter().map(|file| file.hunks.clone()).collect(),
             diff,
+            omitted_untracked: 0,
             diff_loaded: true,
             mode,
             file_ix,
@@ -1480,6 +1482,7 @@ impl ReviewItem {
         let Loaded {
             meta,
             diff,
+            omitted_untracked,
             anchor_hunks,
             upgrades,
             file_media,
@@ -1547,6 +1550,7 @@ impl ReviewItem {
                 }
                 data.anchor_hunks = anchor_hunks;
                 data.diff = diff;
+                data.omitted_untracked = omitted_untracked;
                 data.diff_loaded = true;
                 data.rebuild_tree();
                 let first_file = data.file_order().next().unwrap_or(0);
@@ -1614,6 +1618,7 @@ impl ReviewItem {
                 ));
                 data.anchor_hunks = anchor_hunks;
                 data.upgrades = upgrades;
+                data.omitted_untracked = omitted_untracked;
                 data.file_media = file_media;
                 data.discussion = discussion;
                 data.commits = commits;
@@ -7069,9 +7074,10 @@ impl ReviewApp {
                     .size_full()
                     .flex()
                     .flex_col()
-                    .when(matches!(item.source, Source::Pr(_)), |pane| {
-                        pane.child(self.render_changes_header(item, data, cx))
-                    })
+                    .when(
+                        matches!(item.source, Source::Pr(_)) || data.omitted_untracked > 0,
+                        |pane| pane.child(self.render_changes_header(item, data, cx)),
+                    )
                     .children(file_media::render_svg_controls(data, cx))
                     .child(file_media::render(
                         &data.diff.files[data.file_ix],
@@ -13320,6 +13326,90 @@ mod tests {
             1,
             "re-opening forwards the item, never a duplicate"
         );
+    }
+
+    #[gpui::test]
+    fn git_paths_cap_warning_survives_loading_media_and_refresh(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        for ix in 0..201 {
+            std::fs::write(dir.path().join(format!("{ix:03}.txt")), "").unwrap();
+        }
+        let source = Source::Local(git::resolve_local_with_base(dir.path(), Some("HEAD")).unwrap());
+        let fake = Arc::new(FakePr::default());
+        let loaded = fetch_item(fake.clone(), &source, ViewMode::Unified, 0).unwrap();
+        assert_eq!(loaded.omitted_untracked, 1);
+        assert_eq!(loaded.diff.files.len(), 200);
+        let mut item = loop_pr_item(Vec::new());
+        item.source = source.clone();
+        item.pane = ItemPane::Changes;
+        item.state = ItemState::Loading;
+        item.install(loaded);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("untracked-limit-warning").is_some());
+
+        // The warning must also be visible when the selected file is media.
+        vcx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                let file = &mut app.active_data_mut().unwrap().diff.files[0];
+                file.new_path = Some("image.png".into());
+                file.status = diff_core::FileStatus::Binary;
+                cx.notify();
+            });
+        });
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("untracked-limit-warning").is_some());
+
+        std::fs::remove_file(dir.path().join("200.txt")).unwrap();
+        let loaded = fetch_item(fake, &source, ViewMode::Unified, 0).unwrap();
+        assert_eq!(loaded.omitted_untracked, 0);
+        vcx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.items[0].install(loaded);
+                assert_eq!(app.active_data().unwrap().omitted_untracked, 0);
+                cx.notify();
+            });
+        });
+        draw_window(&mut vcx);
+        assert!(vcx.debug_bounds("untracked-limit-warning").is_none());
+    }
+
+    #[test]
+    fn git_paths_unsupported_patch_fails_loading_with_a_visible_error_message() {
+        let fake = Arc::new(FakePr {
+            patch: Some("diff --git \"a/\\377\" \"b/\\377\"\ndeleted file mode 100644\n".into()),
+            ..Default::default()
+        });
+        let error = fetch_item(fake, &Source::Pr(loop_loc()), ViewMode::Unified, 0)
+            .err()
+            .expect("unsupported paths must fail loading")
+            .to_string();
+        assert!(error.contains("Unsupported non-UTF-8 Git path"), "{error}");
     }
 
     #[gpui::test]

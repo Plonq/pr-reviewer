@@ -56,6 +56,7 @@ pub(crate) struct LoadedConversation {
 pub(crate) struct Loaded {
     pub(crate) meta: LoadedMeta,
     pub(crate) diff: PrDiff,
+    pub(crate) omitted_untracked: usize,
     /// Original patch coordinates, before re-diffing full file contents.
     pub(crate) anchor_hunks: Vec<Vec<diff_core::Hunk>>,
     pub(crate) upgrades: HashMap<usize, FileUpgrade>,
@@ -144,6 +145,7 @@ pub(crate) fn fetch_item_with_restart(
     let mut pr_base = None;
     let mut review_base = None;
     let mut review_base_files = None;
+    let mut omitted_untracked = 0;
     let (meta, patch, comments, discussion, commits, viewed, snapshot) = match source {
         Source::Pr(loc) => {
             let meta_client = github.clone();
@@ -242,7 +244,16 @@ pub(crate) fn fetch_item_with_restart(
         Source::Local(src) => {
             let src = git::resolve_local_with_base(&src.repo_root, src.base_ref.as_deref())?;
             let patch = git::diff_patch(&src)?;
-            (LoadedMeta::Local(src), patch, None, None, None, None, None)
+            omitted_untracked = patch.omitted_untracked;
+            (
+                LoadedMeta::Local(src),
+                patch.patch,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         }
     };
     let mut comments = comments;
@@ -251,7 +262,7 @@ pub(crate) fn fetch_item_with_restart(
             index.hide_left_anchors();
         }
     }
-    let mut diff = diff_core::parse_patch(&patch);
+    let mut diff = diff_core::try_parse_patch(&patch)?;
     let anchor_hunks = diff.files.iter().map(|file| file.hunks.clone()).collect();
     let jobs: Vec<_> = diff
         .files
@@ -316,6 +327,7 @@ pub(crate) fn fetch_item_with_restart(
     Ok(Loaded {
         meta,
         diff,
+        omitted_untracked,
         anchor_hunks,
         upgrades,
         file_media,

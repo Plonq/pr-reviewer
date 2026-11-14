@@ -5,7 +5,7 @@
 //! in the user's repository.
 
 use crate::{ClientError, PrLocator};
-use diff_core::{diff_texts, parse_patch, DiffRow};
+use diff_core::{diff_texts, try_parse_patch, DiffRow};
 use std::{collections::HashMap, path::Path, process::Command};
 
 #[derive(Debug, Clone)]
@@ -144,7 +144,7 @@ fn compare_trees(
         ],
     )?;
     let mut base_files = HashMap::new();
-    for file in parse_patch(&patch).files {
+    for file in try_parse_patch(&patch).map_err(failed)?.files {
         let Some(path) = file.old_path else { continue };
         let Some(text) = text_blob(repo, tree, &path)? else {
             continue;
@@ -288,6 +288,7 @@ fn failed(error: impl std::fmt::Display) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diff_core::parse_patch;
 
     fn commit(repo: &Path, files: &[(&str, &str)]) -> String {
         for (path, text) in files {
@@ -434,6 +435,44 @@ mod tests {
         assert_eq!(files["deleted"].text, "deleted reviewed\n");
         assert!(!files.contains_key("binary"));
         assert!(text_blob(repo, &head, "absent").unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unsupported_patch_path_returns_a_visible_comparison_error() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q"]).unwrap();
+        let base = commit(repo, &[("valid", "text\n")]);
+        let blob = git(repo, &["rev-parse", &format!("{base}:valid")]).unwrap();
+        // macOS cannot create this filename in the filesystem, but Git trees
+        // can contain it and an external comparison can therefore encounter it.
+        let output = command(repo)
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                blob.trim(),
+            ])
+            .arg(OsStr::from_bytes(b"invalid-\xff"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let head = git(repo, &["write-tree"]).unwrap();
+
+        let error = compare_trees(repo, &base, head.trim(), &base, &base).unwrap_err();
+        assert!(matches!(error, ClientError::Failed(_)), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("upstream-aware comparison"), "{message}");
+        assert!(
+            message.contains("Unsupported non-UTF-8 Git path"),
+            "{message}"
+        );
+        assert!(message.contains(r"invalid-\\377"), "{message}");
     }
 
     #[test]
