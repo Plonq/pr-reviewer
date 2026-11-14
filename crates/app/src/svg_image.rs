@@ -1,11 +1,12 @@
 //! PR images never enter GPUI's default SVG decoder (including raster-named
 //! resources). SVG file previews keep their parsed tree across resizes.
 use std::{
+    collections::HashMap,
     hash::{Hash, Hasher},
     io::{Cursor, Read as _},
     sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex, OnceLock,
     },
 };
 
@@ -19,6 +20,9 @@ use resvg::{tiny_skia, usvg};
 
 const MAX_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_RASTER: u32 = 8192;
+const MAX_SVG_DEPTH: usize = 4;
+const MAX_EMBEDDED_BYTES: usize = 1024 * 1024;
+const MAX_EMBEDDED_IMAGES: usize = 32;
 
 fn load_bytes(
     source: Resource,
@@ -193,15 +197,6 @@ fn animation_frames(frames: image::Frames<'_>) -> anyhow::Result<Vec<image::Fram
 }
 
 fn parse_svg(bytes: &[u8]) -> anyhow::Result<usvg::Tree> {
-    anyhow::ensure!(bytes.len() as u64 <= MAX_BYTES, "SVG exceeds 25 MiB");
-    // Deliberately accept plain XML only, avoiding unbounded SVGZ expansion.
-    let svg = std::str::from_utf8(bytes)?;
-    let xml = roxmltree::Document::parse(svg)?;
-    anyhow::ensure!(
-        !xml.descendants()
-            .any(|node| node.is_element() && matches!(node.tag_name().name(), "image" | "feImage")),
-        "SVG image references are unsupported"
-    );
     static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
     let fonts = FONTS.get_or_init(|| {
         let mut db = usvg::fontdb::Database::new();
@@ -222,17 +217,129 @@ fn parse_svg(bytes: &[u8]) -> anyhow::Result<usvg::Tree> {
         db.set_serif_family("Arial");
         Arc::new(db)
     });
+    parse_svg_document(bytes, 0, fonts, &mut SvgBudget::default())
+}
+
+#[derive(Default)]
+struct SvgWork {
+    bytes: usize,
+    images: usize,
+}
+
+impl SvgWork {
+    fn charge(&mut self, bytes: usize) -> anyhow::Result<()> {
+        self.bytes += bytes;
+        self.images += 1;
+        anyhow::ensure!(
+            self.bytes <= MAX_EMBEDDED_BYTES,
+            "SVG embedded bytes exceed 1 MiB"
+        );
+        anyhow::ensure!(
+            self.images <= MAX_EMBEDDED_IMAGES,
+            "SVG exceeds 32 embedded images"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SvgBudget {
+    embedded: SvgWork,
+    // Conversion can resolve one image repeatedly via <use>. Bound that work
+    // separately from validation, including across nested documents.
+    resolved: SvgWork,
+}
+
+fn parse_svg_document(
+    bytes: &[u8],
+    depth: usize,
+    fonts: &Arc<usvg::fontdb::Database>,
+    budget: &mut SvgBudget,
+) -> anyhow::Result<usvg::Tree> {
+    anyhow::ensure!(bytes.len() as u64 <= MAX_BYTES, "SVG exceeds 25 MiB");
+    anyhow::ensure!(depth <= MAX_SVG_DEPTH, "SVG nesting exceeds 4 levels");
+    if depth > 0 {
+        budget.embedded.charge(bytes.len())?;
+    }
+    // Plain XML only at every level: no SVGZ expansion or document entities.
+    let xml = roxmltree::Document::parse(std::str::from_utf8(bytes)?)?;
+    let mut embedded = HashMap::new();
+    // Validate even unused/hidden images: usvg otherwise silently drops an
+    // unsupported resource and reports a successful (but incomplete) badge.
+    for node in xml.descendants().filter(|node| node.is_element()) {
+        anyhow::ensure!(
+            node.tag_name().name() != "feImage",
+            "SVG feImage is unsupported"
+        );
+        if node.tag_name().name() != "image" {
+            continue;
+        }
+        let mut has_href = false;
+        for attr in node.attributes().filter(|attr| attr.name() == "href") {
+            has_href = true;
+            anyhow::ensure!(
+                matches!(
+                    attr.namespace(),
+                    None | Some("http://www.w3.org/1999/xlink")
+                ),
+                "Unsupported SVG image href namespace"
+            );
+            let url = data_url::DataUrl::process(attr.value())
+                .map_err(|_| anyhow::anyhow!("SVG images require a data:image/svg+xml URL"))?;
+            anyhow::ensure!(
+                url.mime_type().type_ == "image" && url.mime_type().subtype == "svg+xml",
+                "Only embedded SVG images are supported"
+            );
+            let mut data = Vec::new();
+            let fragment = url
+                .decode(|chunk| {
+                    anyhow::ensure!(
+                        budget.embedded.bytes + data.len() + chunk.len() <= MAX_EMBEDDED_BYTES,
+                        "SVG embedded bytes exceed 1 MiB"
+                    );
+                    data.extend_from_slice(chunk);
+                    Ok::<_, anyhow::Error>(())
+                })
+                .map_err(|_| anyhow::anyhow!("Invalid or oversized embedded SVG data URL"))?;
+            anyhow::ensure!(fragment.is_none(), "Embedded SVG fragments are unsupported");
+            let tree = parse_svg_document(&data, depth + 1, fonts, budget)?;
+            embedded.insert(data, tree);
+        }
+        anyhow::ensure!(has_href, "SVG image has no href");
+    }
+    let resolved = Mutex::new(&mut budget.resolved);
+    let failed = AtomicBool::new(false);
     let options = usvg::Options {
         resources_dir: None,
         image_href_resolver: usvg::ImageHrefResolver {
-            resolve_data: Box::new(|_, _, _| None),
-            resolve_string: Box::new(|_, _| None),
+            // Do not use usvg's default_data_resolver/from_data_nested: those
+            // rebuild options. Only return trees parsed above with our policy.
+            resolve_data: Box::new(|mime, data, _| {
+                if mime == "image/svg+xml" {
+                    if let Some(tree) = embedded.get(data.as_slice()) {
+                        if resolved.lock().unwrap().charge(data.len()).is_ok() {
+                            return Some(usvg::ImageKind::SVG(tree.clone()));
+                        }
+                    }
+                }
+                failed.store(true, Ordering::Relaxed);
+                None
+            }),
+            resolve_string: Box::new(|_, _| {
+                failed.store(true, Ordering::Relaxed);
+                None
+            }),
         },
         font_family: "Arial".into(),
         fontdb: fonts.clone(),
         ..Default::default()
     };
-    Ok(usvg::Tree::from_str(svg, &options)?)
+    let tree = usvg::Tree::from_xmltree(&xml, &options)?;
+    anyhow::ensure!(
+        !failed.load(Ordering::Relaxed),
+        "SVG image resolution failed or exceeded its budget"
+    );
+    Ok(tree)
 }
 
 fn render_svg(tree: &usvg::Tree, width: u32) -> anyhow::Result<Arc<RenderImage>> {
@@ -402,7 +509,166 @@ pub(crate) fn cached_raster(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use gpui::{px, size};
+
+    fn data_svg(bytes: &[u8]) -> String {
+        format!(
+            "data:image/svg+xml;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    }
+
+    fn with_image(href: &str) -> String {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><image href="{href}" width="20" height="20"/></svg>"#
+        )
+    }
+
+    #[test]
+    fn shields_style_badge_renders_embedded_logo_text_and_background() {
+        let image = decode_image(include_bytes!("testdata/embedded-svg-badge.svg")).unwrap();
+        assert_eq!(
+            image.size(0),
+            size(gpui::DevicePixels(95), gpui::DevicePixels(20))
+        );
+        let pixels = image.as_bytes(0).unwrap();
+        let pixel = |x: usize, y: usize| &pixels[(y * 95 + x) * 4..(y * 95 + x + 1) * 4];
+        // These colors occur only in the embedded SVG, not the badge itself.
+        assert_eq!(pixel(6, 4), [255, 200, 0, 255]);
+        assert_eq!(pixel(11, 9), [255, 255, 255, 255]);
+        assert_eq!(pixel(40, 18)[3], 255);
+        assert!(
+            pixel(90, 18)[2] > pixel(40, 18)[2],
+            "both background panels render"
+        );
+        assert!(
+            (22..90).any(|x| (5..15).any(|y| { pixel(x, y).iter().all(|channel| *channel > 240) })),
+            "badge text must produce white pixels outside the logo"
+        );
+    }
+
+    #[test]
+    fn nested_svg_keeps_the_host_font_policy_and_accepts_percent_encoded_data() {
+        let leaf = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><text x="1" y="15" font-size="14">Hi</text></svg>"#;
+        let expected = decode_image(leaf).unwrap();
+        assert!(expected
+            .as_bytes(0)
+            .unwrap()
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] > 0));
+        let mut nested = leaf.to_vec();
+        for _ in 0..MAX_SVG_DEPTH {
+            nested = with_image(&data_svg(&nested)).into_bytes();
+            let actual = decode_image(&nested).unwrap();
+            assert_eq!(
+                actual.as_bytes(0),
+                expected.as_bytes(0),
+                "nested text must keep Arial, including its default family"
+            );
+        }
+        let percent = br#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="2" height="2"><image width="2" height="2" xlink:href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='2'%20height='2'%3E%3Cpath%20fill='red'%20d='M0%200h2v2H0z'/%3E%3C/svg%3E"/></svg>"#;
+        assert_eq!(
+            &decode_image(percent).unwrap().as_bytes(0).unwrap()[..4],
+            [0, 0, 255, 255]
+        );
+    }
+
+    #[test]
+    fn svg_rejects_unsafe_resources_at_every_embedding_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("private.svg");
+        std::fs::write(
+            &file,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>"#,
+        )
+        .unwrap();
+        let mut invalid = Vec::new();
+        for href in [
+            file.to_str().unwrap().to_owned(),
+            http_client::Url::from_file_path(&file).unwrap().to_string(),
+            "relative.svg".into(),
+            "https://example.test/private.svg".into(),
+            "data:image/png;base64,iVBORw0KGgo=".into(),
+            "data:text/plain,%3Csvg/%3E".into(),
+            "data:image/svg+xml;base64,!!!!".into(),
+            data_svg(b"\x1f\x8b\x08\x00"),
+            data_svg(b"not SVG"),
+        ] {
+            invalid.push(with_image(&href).into_bytes());
+        }
+        invalid.push(br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><defs><filter id="f"><feImage href="#local"/></filter></defs></svg>"##.to_vec());
+        invalid.push(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><image/></svg>"#
+                .to_vec(),
+        );
+        invalid.push(
+            b"<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///tmp/private'>]><svg>&x;</svg>".to_vec(),
+        );
+        invalid.push(b"\x1f\x8b\x08\x00".to_vec());
+        for mut svg in invalid {
+            for depth in 0..=MAX_SVG_DEPTH {
+                assert!(
+                    decode_image(&svg).is_err(),
+                    "unsafe SVG accepted at depth {depth}"
+                );
+                svg = with_image(&data_svg(&svg)).into_bytes();
+            }
+        }
+    }
+
+    #[test]
+    fn svg_bounds_depth_aggregate_bytes_references_and_repeated_resolution() {
+        let leaf = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><path d="M0 0h20v20H0z"/></svg>"#;
+        let mut nested = leaf.to_vec();
+        for _ in 0..MAX_SVG_DEPTH {
+            nested = with_image(&data_svg(&nested)).into_bytes();
+        }
+        assert!(parse_svg(&nested).is_ok());
+        assert!(parse_svg(with_image(&data_svg(&nested)).as_bytes()).is_err());
+
+        let padded = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><!--{}--></svg>"#,
+            "x".repeat(MAX_EMBEDDED_BYTES / 2)
+        );
+        let image = format!(
+            r#"<image href="{}" width="20" height="20"/>"#,
+            data_svg(padded.as_bytes())
+        );
+        assert!(parse_svg(with_image(&data_svg(padded.as_bytes())).as_bytes()).is_ok());
+        let aggregate = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">{image}{image}</svg>"#
+        );
+        assert!(
+            parse_svg(aggregate.as_bytes()).is_err(),
+            "aggregate decoded bytes must be bounded"
+        );
+        let oversized = format!(r#"<svg><!--{}--></svg>"#, "x".repeat(MAX_EMBEDDED_BYTES));
+        assert!(parse_svg(with_image(&data_svg(oversized.as_bytes())).as_bytes()).is_err());
+
+        let image = format!(
+            r#"<image href="{}" width="20" height="20"/>"#,
+            data_svg(leaf)
+        );
+        for count in [MAX_EMBEDDED_IMAGES, MAX_EMBEDDED_IMAGES + 1] {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">{}</svg>"#,
+                image.repeat(count)
+            );
+            assert_eq!(
+                parse_svg(svg.as_bytes()).is_ok(),
+                count == MAX_EMBEDDED_IMAGES
+            );
+        }
+        let expanded = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><defs><g id="logo">{image}</g></defs>{}</svg>"##,
+            r##"<use href="#logo"/>"##.repeat(MAX_EMBEDDED_IMAGES + 1)
+        );
+        assert!(
+            parse_svg(expanded.as_bytes()).is_err(),
+            "repeated <use> resolution must also be bounded"
+        );
+    }
 
     #[test]
     fn raster_resolution_follows_contain_fit_and_display_density() {

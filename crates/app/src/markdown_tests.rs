@@ -19,6 +19,8 @@ pub(super) fn image_client(cx: &mut gpui::TestAppContext) -> Arc<std::sync::Mute
         seen.lock().unwrap().push(url.clone());
         let bytes = if url.ends_with("undecodable-badge.svg") {
             b"not an image".to_vec()
+        } else if url.ends_with("embedded-badge.svg") {
+            include_bytes!("testdata/embedded-svg-badge.svg").to_vec()
         } else if url.ends_with("diagram") {
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80"><rect width="200" height="80"/></svg>"#.to_vec()
         } else if url.ends_with("animation") { gif.clone() } else { png.clone() };
@@ -36,6 +38,162 @@ pub(super) fn draw_settled(cx: &mut gpui::VisualTestContext) {
         cx.update(|window, cx| { window.draw(cx).clear(cx); });
         cx.run_until_parked();
     }
+}
+
+#[gpui::test]
+fn embedded_svg_badges_render_in_shared_markdown_hosts_and_viewer(cx: &mut gpui::TestAppContext) {
+    let requests = image_client(cx);
+    let url = "https://example.test/embedded-badge.svg";
+    let source = format!(
+        "[![Lang]({url})](https://example.test/language) 🦀\n\n\
+         # Following heading\n\nProse after the badge.\n\n\
+         ![After](https://example.test/after)"
+    );
+    let following_offset = source.find("![After]").unwrap();
+    let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+    let mut item = loop_pr_item(vec![rc(
+        11,
+        "a.rs",
+        Some("RIGHT"),
+        Some(1),
+        &source,
+        "alice",
+        "2026-01-01T00:00:00Z",
+        None,
+    )]);
+    let ItemState::Ready(data) = &mut item.state else {
+        unreachable!()
+    };
+    data.pr_meta.as_mut().unwrap().body = source;
+    data.discussion = Some(github::PrDiscussion::default());
+    install_item(&app, item, cx);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1500.), px(1800.)));
+    for (mode, host, content_selector) in [
+        (
+            Some(ViewMode::Unified),
+            "inline-text-0-11-0",
+            "inline-text-0-11-0-content",
+        ),
+        (
+            Some(ViewMode::Split),
+            "inline-text-0-11-0",
+            "inline-text-0-11-0-content",
+        ),
+        (None, "conversation-0", "conversation-0-text"),
+    ] {
+        if let Some(mode) = mode {
+            cx.update(|cx| {
+                app.update(cx, |app, cx| {
+                    let data = app.active_data_mut().unwrap();
+                    data.mode = mode;
+                    data.rebuild_rows_anchored();
+                    data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+                    data.scroll
+                        .0
+                        .borrow()
+                        .base_handle
+                        .set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                })
+            });
+        } else {
+            vcx.dispatch_action(ShowConversation);
+        }
+        draw_settled(&mut vcx);
+        let selector = Box::leak(format!("{host}-image-1").into_boxed_str());
+        let fallback = Box::leak(format!("{host}-image-1-fallback").into_boxed_str());
+        let following = Box::leak(format!("{host}-image-{following_offset}").into_boxed_str());
+        let badge = vcx.debug_bounds(selector).unwrap();
+        let content = vcx.debug_bounds(content_selector).unwrap();
+        assert!(
+            vcx.debug_bounds(fallback).is_none(),
+            "valid badges must not show a fallback"
+        );
+        assert!(
+            (badge.size.width / badge.size.height - 4.75).abs() < 0.1,
+            "{host}: {badge:?}"
+        );
+        assert!(badge.top() >= content.top() && badge.bottom() <= content.bottom());
+        assert!(
+            vcx.debug_bounds(following).unwrap().top() >= badge.bottom() + px(32.),
+            "the following heading and prose must have their own space"
+        );
+        if mode.is_some() {
+            assert!(
+                content.bottom()
+                    <= vcx
+                        .debug_bounds("inline-text-0-11-0-card")
+                        .unwrap()
+                        .bottom()
+            );
+        }
+        let inline = vcx.update(|window, cx| {
+            let resource = gpui::Resource::Uri(url.into());
+            assert!(!cx.has_asset::<gpui::ImgResourceLoader>(&resource));
+            let image = window
+                .get_asset::<svg_image::ImageLoader>(&resource, cx)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                image.size(0),
+                size(gpui::DevicePixels(95), gpui::DevicePixels(20))
+            );
+            assert!(
+                image
+                    .as_bytes(0)
+                    .unwrap()
+                    .chunks_exact(4)
+                    .any(|pixel| pixel == [255, 200, 0, 255]),
+                "the embedded logo must actually render"
+            );
+            image
+        });
+        click_selector(&mut vcx, selector);
+        assert!(vcx.debug_bounds("viewer-image").is_some());
+        assert!(vcx.debug_bounds("viewer-error").is_none());
+        cx.update(|cx| {
+            let viewer = app.read(cx).image_viewer.as_ref().unwrap();
+            assert_eq!(viewer.target.url.as_ref(), url);
+            assert_eq!(
+                viewer.target.link.as_deref(),
+                Some("https://example.test/language")
+            );
+        });
+        assert!(
+            cx.opened_url().is_none(),
+            "badge activation opens the viewer"
+        );
+        vcx.update(|window, cx| {
+            let viewed = window
+                .get_asset::<svg_image::ImageLoader>(&gpui::Resource::Uri(url.into()), cx)
+                .unwrap()
+                .unwrap();
+            assert!(
+                Arc::ptr_eq(&inline, &viewed),
+                "the viewer shares the decoded badge"
+            );
+        });
+        if mode.is_none() {
+            click_selector(&mut vcx, "viewer-link");
+            assert_eq!(
+                cx.opened_url().as_deref(),
+                Some("https://example.test/language")
+            );
+        }
+        vcx.simulate_keystrokes("escape");
+        draw_settled(&mut vcx);
+    }
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.as_str() == url)
+            .count(),
+        1,
+        "hosts and viewer share the loaded bytes"
+    );
 }
 
 #[gpui::test]

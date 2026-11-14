@@ -19,6 +19,13 @@ line-break documentation](https://docs.github.com/en/get-started/writing-on-gith
   targets are loaded; resolving a reference must not grant filesystem access.
   Failed mixed-paragraph images show a small × inside their reserved inline
   bounds and remain clickable for inspection; block images retain error text.
+  SVG badges render through the app's SVG parser, including self-contained
+  `data:image/svg+xml` logos (base64 or percent encoded). Embedded SVGs retain
+  the fixed host font set and cannot load files or network resources. Nesting
+  is limited to four levels, with at most 32 embedded images and 1 MiB of
+  aggregate decoded data; repeated image resolution has the same work limits.
+  Embedded raster images, `feImage`, SVGZ and invalid embedded resources fail
+  visibly. Document-level data/file image URLs remain unsupported.
 - Mermaid and video attachments use the existing native extension hooks.
 - Conversation documents retain both their original input and their TextView
   state. Preprocessing runs again only when the body or repository context
