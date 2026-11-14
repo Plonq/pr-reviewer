@@ -1,7 +1,7 @@
 # macOS releases
 
 Every push to `main` runs the tests, then builds the Apple Silicon app and publishes
-`Gander.dmg` on the rolling [`latest` release](https://github.com/Plonq/pr-reviewer/releases/tag/latest).
+`Gander.dmg` on the rolling [`latest` release](https://github.com/Plonq/gander/releases/tag/latest).
 The download URL stays the same. A SHA-256 checksum is published alongside it.
 The **Release DMG** workflow also has a **Run workflow** button for retries on `main`.
 Both automatic and manual releases require the tests to pass before building the DMG.
@@ -81,7 +81,7 @@ upload it directly with `gh`, then remove only that temporary file:
   umask 077
   target/sparkle/bin/generate_keys --account gander -x "$keyfile"
   test -s "$keyfile"
-  gh secret set SPARKLE_PRIVATE_KEY --repo Plonq/pr-reviewer < "$keyfile"
+  gh secret set SPARKLE_PRIVATE_KEY --repo Plonq/gander < "$keyfile"
 )
 ```
 

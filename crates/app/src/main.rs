@@ -8258,7 +8258,7 @@ mod tests {
     }
 
     /// Opt-in end-to-end check for one file (e.g. main.rs in
-    /// Plonq/pr-reviewer#1). Pick a file without newline-only changes, which
+    /// Plonq/gander#1). Pick a file without newline-only changes, which
     /// our full-content diff deliberately normalizes away.
     #[test]
     #[ignore = "requires gh authentication, network, GANDER_DIFF_PR, and GANDER_DIFF_PATH"]

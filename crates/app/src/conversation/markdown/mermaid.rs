@@ -1117,7 +1117,7 @@ mod tests {
     #[test]
     fn mermaid_core_fixtures_produce_nonblank_native_rasters() {
         for source in [
-            // https://github.com/Plonq/pr-reviewer/issues/179: "link" is label text.
+            // https://github.com/Plonq/gander/issues/179: "link" is label text.
             "flowchart LR\n  V[\"Cube: PageViewed<br/>5 pages for this page<br/>Views\"] --> M{\"Match by page id\"}\n  P[\"Postgres: pages with these ids<br/>category, link\"] --> M\n  M --> R[\"Table row<br/>no match = deleted page,<br/>no category or link\"]",
             "flowchart LR\nA[Start] -->|yes| B{Review}\nB --> C[Done]\nC --> A",
             "flowchart TD\nsubgraph Review\nA[café Δ] --> B[\"<b>Bold</b><br/>Next\"]\nend",

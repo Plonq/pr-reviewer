@@ -24,7 +24,7 @@ Requires **Apple Silicon** and **macOS 15 or later**. GitHub reviews use your [G
 
 ### Install
 
-1. Download [Gander.dmg](https://github.com/Plonq/pr-reviewer/releases/download/latest/Gander.dmg) from the [latest build](https://github.com/Plonq/pr-reviewer/releases/tag/latest).
+1. Download [Gander.dmg](https://github.com/Plonq/gander/releases/download/latest/Gander.dmg) from the [latest build](https://github.com/Plonq/gander/releases/tag/latest).
 2. Open the disk image and drag **Gander** into **Applications**.
 3. Install the GitHub CLI if needed, then sign in:
 
@@ -64,8 +64,8 @@ it with the fresh session. Normal launches resume saving checkpoints.
 With [Rust](https://rustup.rs/) and Xcode installed:
 
 ```sh
-git clone https://github.com/Plonq/pr-reviewer.git
-cd pr-reviewer
+git clone https://github.com/Plonq/gander.git
+cd gander
 cargo run --release --locked
 ```
 

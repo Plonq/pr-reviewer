@@ -41,7 +41,7 @@ with open(sys.argv[1], 'rb') as f:
     info = plistlib.load(f)
 info.update({
     'SUPublicEDKey': key,
-    'SUFeedURL': f"https://github.com/{os.environ.get('GITHUB_REPOSITORY', 'Plonq/pr-reviewer')}/releases/download/latest/appcast.xml",
+    'SUFeedURL': f"https://github.com/{os.environ.get('GITHUB_REPOSITORY', 'Plonq/gander')}/releases/download/latest/appcast.xml",
     'SUEnableAutomaticChecks': True,
     'SUAutomaticallyUpdate': True,
     'SUScheduledCheckInterval': 3600,
