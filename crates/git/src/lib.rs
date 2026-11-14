@@ -7,6 +7,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod process;
+
 /// How many untracked files to inline into the patch before giving up.
 const MAX_UNTRACKED_FILES: usize = 200;
 
@@ -132,12 +134,14 @@ fn push_remote_head(repo_root: &Path, remote: &str, candidates: &mut Vec<String>
 /// caller keeps that file's patch-derived view.
 pub fn file_at_base(src: &LocalSource, path: &str) -> Option<String> {
     let oid = src.base_oid.as_deref()?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&src.repo_root)
-        .args(["show", &format!("{oid}:{path}")])
-        .output()
-        .ok()?;
+    let output = process::run(
+        Command::new("git")
+            .arg("-C")
+            .arg(&src.repo_root)
+            .args(["show", &format!("{oid}:{path}")]),
+        process::Limits::read(process::TEXT_BYTES),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -155,12 +159,14 @@ pub fn copy_file_at_base(
         .base_oid
         .as_deref()
         .ok_or_else(|| anyhow!("No base commit"))?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&src.repo_root)
-        .args(["show", &format!("{oid}:{path}")])
-        .stdout(destination.try_clone()?)
-        .output()?;
+    let output = process::run_to_file(
+        Command::new("git")
+            .arg("-C")
+            .arg(&src.repo_root)
+            .args(["show", &format!("{oid}:{path}")]),
+        process::Limits::read(process::BINARY_BYTES),
+        destination,
+    )?;
     if !output.status.success() {
         bail!(
             "Could not load base file: {}",
@@ -210,7 +216,14 @@ pub fn diff_patch(src: &LocalSource) -> Result<LocalPatch> {
     for path in paths.iter().take(MAX_UNTRACKED_FILES) {
         // Enumeration is raw NUL-delimited bytes, never Git-quoted text.
         // Validate before constructing the OS argument: our file model is UTF-8.
-        patch.push_str(&untracked_patch(&src.repo_root, untracked_path(path)?)?);
+        let added = untracked_patch(&src.repo_root, untracked_path(path)?)?;
+        if added.len() > process::PATCH_BYTES.saturating_sub(patch.len()) {
+            bail!(
+                "Local patch exceeded its {} byte limit",
+                process::PATCH_BYTES
+            );
+        }
+        patch.push_str(&added);
     }
     Ok(LocalPatch {
         patch,
@@ -227,25 +240,27 @@ fn untracked_path(path: &[u8]) -> Result<&OsStr> {
 fn untracked_patch(repo_root: &Path, file: &OsStr) -> Result<String> {
     // Different sides exit 1, including creation of an empty file (which has
     // a header but no hunks). Access errors can ALSO exit 1, with no patch.
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args([
-            "-c",
-            "core.quotePath=true",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            "--no-index",
-            "--",
-            "/dev/null",
-        ])
-        .arg(file)
-        .output()
-        .map_err(|err| anyhow!("failed to run git: {err}"))?;
+    let output = process::run(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args([
+                "-c",
+                "core.quotePath=true",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "--no-index",
+                "--",
+                "/dev/null",
+            ])
+            .arg(file),
+        process::Limits::read(process::PATCH_BYTES),
+    )
+    .map_err(|err| anyhow!("failed to run git: {err}"))?;
     if !matches!(output.status.code(), Some(0) | Some(1))
         || !output.stdout.starts_with(b"diff --git ")
     {
@@ -263,12 +278,16 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|err| anyhow!("failed to run git (is git installed?): {err}"))?;
+    let cap = if args.contains(&"diff") {
+        process::PATCH_BYTES
+    } else {
+        process::TEXT_BYTES
+    };
+    let output = process::run(
+        Command::new("git").arg("-C").arg(dir).args(args),
+        process::Limits::read(cap),
+    )
+    .map_err(|err| anyhow!("failed to run git (is git installed?): {err}"))?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",

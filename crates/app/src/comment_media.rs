@@ -2,6 +2,7 @@
 //! URLs in ordinary text are never fetched or uploaded.
 
 use anyhow::{bail, Context as _, Result};
+use github::gh_cli::{GhProcess as _, GhSubprocess};
 use gpui::component::input::EditorState;
 use gpui::{
     App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity, EntityInputHandler as _,
@@ -10,7 +11,6 @@ use gpui::{
 use http_client::Url;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -275,16 +275,9 @@ fn validate_size(size: u64, mime: &str) -> Result<()> {
 }
 
 fn gh(args: &[&str]) -> Result<String> {
-    let output = Command::new("gh")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .context("Could not run GitHub CLI")?;
-    if !output.status.success() {
-        bail!(
-            "GitHub CLI: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    let output = GhSubprocess.run(args).context("Could not run GitHub CLI")?;
+    if output.code != Some(0) {
+        bail!("GitHub CLI: {}", output.stderr.trim());
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }

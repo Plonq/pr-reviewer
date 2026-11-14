@@ -13,6 +13,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use git::process::{self, Limits, Operation};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -57,13 +58,71 @@ pub struct GhSubprocess;
 
 impl GhProcess for GhSubprocess {
     fn run(&self, args: &[&str]) -> io::Result<GhOutput> {
-        let out = Command::new("gh").args(args).output()?;
+        let out = process::run(&mut github_command(args), command_limits(args))?;
         Ok(GhOutput {
             code: out.status.code(),
             stdout: out.stdout,
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
+}
+
+/// This backend supports github.com only. Scope overrides to the child so
+/// credentials, proxies and the user's environment retain their normal behavior.
+fn github_command(args: &[&str]) -> Command {
+    let mut command = Command::new("gh");
+    command.env("GH_HOST", "github.com").env_remove("GH_REPO");
+    if args.first() == Some(&"api") && !args.contains(&"--hostname") {
+        command.args(["api", "--hostname", "github.com"]);
+        command.args(&args[1..]);
+    } else {
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 && args[i - 1] == "--repo" && !arg.starts_with("github.com/") {
+                command.arg(format!("github.com/{arg}"));
+            } else {
+                command.arg(arg);
+            }
+        }
+    }
+    command
+}
+
+fn command_limits(args: &[&str]) -> Limits {
+    let patch = args.starts_with(&["pr", "diff"])
+        || args
+            .iter()
+            .any(|arg| *arg == "Accept: application/vnd.github.diff");
+    let raw = args
+        .iter()
+        .any(|arg| *arg == "Accept: application/vnd.github.raw+json");
+    let mut limits = Limits::read(if patch {
+        process::PATCH_BYTES
+    } else if raw {
+        process::TEXT_BYTES
+    } else if args.starts_with(&["auth", "token"]) {
+        16 * 1024
+    } else {
+        process::JSON_BYTES
+    });
+    let graphql = args.first() == Some(&"api") && args.contains(&"graphql");
+    let mutation = if graphql {
+        args.iter().any(|arg| {
+            arg.strip_prefix("query=")
+                .is_some_and(|q| q.trim_start().starts_with("mutation"))
+        })
+    } else {
+        args.windows(2)
+            .any(|pair| matches!(pair[0], "-X" | "--method") && !matches!(pair[1], "GET" | "HEAD"))
+            || (args.first() == Some(&"api")
+                && !args.iter().any(|arg| matches!(*arg, "-X" | "--method"))
+                && args
+                    .iter()
+                    .any(|arg| matches!(*arg, "-f" | "-F" | "--field" | "--raw-field")))
+    };
+    if mutation {
+        limits.operation = Operation::Mutation;
+    }
+    limits
 }
 
 /// The v0.1 backend: each facade operation becomes one or more `gh`
@@ -520,14 +579,7 @@ impl<P: GhProcess> GhCliClient<P> {
     fn locator_in_cwd_repo(&self, number: u64) -> Result<PrLocator, ClientError> {
         let out = self
             .process
-            .run(&[
-                "repo",
-                "view",
-                "--json",
-                "nameWithOwner",
-                "--jq",
-                ".nameWithOwner",
-            ])
+            .run(&["repo", "view", "--json", "url", "--jq", ".url"])
             .map_err(spawn_failure)?;
         if out.code != Some(0) {
             let mut err = classify_failure(&out);
@@ -540,9 +592,15 @@ impl<P: GhProcess> GhCliClient<P> {
             return Err(err);
         }
         let stdout = out.text()?;
-        stdout
+        let slug = stdout
             .trim()
-            .split_once('/')
+            .strip_prefix("https://github.com/")
+            .ok_or_else(|| {
+                ClientError::Invalid(
+                    "Only github.com repositories are supported; use owner/repo#123".into(),
+                )
+            })?;
+        slug.split_once('/')
             .map(|(owner, repo)| PrLocator {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
@@ -1274,6 +1332,12 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             let (owner, repo) = repo_part.split_once('/').ok_or_else(|| {
                 ClientError::Invalid(format!("expected owner/repo before '#' in {arg}"))
             })?;
+            if owner.is_empty() || repo.is_empty() || repo.contains('/') || repo_part.contains(':')
+            {
+                return Err(ClientError::Invalid(
+                    "expected owner/repo#123 on github.com".into(),
+                ));
+            }
             return Ok(PrLocator {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
@@ -3236,7 +3300,9 @@ mod tests {
                 ok(Some(0), empty, ""),
                 response,
             ]);
-            assert!(GhCliClient::with_process(fake).pr_discussion(&loc()).is_err());
+            assert!(GhCliClient::with_process(fake)
+                .pr_discussion(&loc())
+                .is_err());
         }
     }
 
@@ -3553,6 +3619,138 @@ mod tests {
             repo: "Hello-World".into(),
             number: 4781,
         }
+    }
+
+    #[test]
+    fn subprocess_commands_pin_github_com_without_overriding_credentials_or_proxies() {
+        use std::ffi::OsStr;
+        for (args, expected) in [
+            (
+                vec!["api", "user"],
+                vec!["api", "--hostname", "github.com", "user"],
+            ),
+            (
+                vec!["api", "--hostname", "github.com", "repos/o/r"],
+                vec!["api", "--hostname", "github.com", "repos/o/r"],
+            ),
+            (
+                vec!["pr", "diff", "1", "--repo", "o/r"],
+                vec!["pr", "diff", "1", "--repo", "github.com/o/r"],
+            ),
+            (vec!["search", "prs"], vec!["search", "prs"]),
+            (
+                vec!["auth", "token", "--hostname", "github.com"],
+                vec!["auth", "token", "--hostname", "github.com"],
+            ),
+        ] {
+            let command = github_command(&args);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                expected.iter().map(OsStr::new).collect::<Vec<_>>()
+            );
+            let env: HashMap<_, _> = command.get_envs().collect();
+            assert_eq!(
+                env.get(OsStr::new("GH_HOST")),
+                Some(&Some(OsStr::new("github.com")))
+            );
+            assert_eq!(env.get(OsStr::new("GH_REPO")), Some(&None));
+            assert_eq!(
+                env.len(),
+                2,
+                "credential and proxy variables must remain inherited"
+            );
+        }
+    }
+
+    #[test]
+    fn command_classes_keep_blob_patch_and_write_limits_distinct() {
+        assert_eq!(
+            command_limits(&["pr", "diff", "1"]).stdout,
+            process::PATCH_BYTES
+        );
+        assert_eq!(
+            command_limits(&["auth", "token", "--hostname", "github.com"]).stdout,
+            16 * 1024
+        );
+        assert_eq!(
+            command_limits(&[
+                "api",
+                "compare",
+                "-H",
+                "Accept: application/vnd.github.diff"
+            ])
+            .stdout,
+            process::PATCH_BYTES
+        );
+        assert_eq!(
+            command_limits(&[
+                "api",
+                "contents",
+                "-H",
+                "Accept: application/vnd.github.raw+json"
+            ])
+            .stdout,
+            process::TEXT_BYTES
+        );
+        for args in [
+            vec![
+                "api",
+                "graphql",
+                "-f",
+                "query=mutation { submitPullRequestReview {} }",
+            ],
+            vec!["api", "-X", "POST", "comments"],
+            vec!["api", "--method", "DELETE", "comments/1"],
+            vec!["api", "comments", "-f", "body=comment"],
+        ] {
+            assert_eq!(command_limits(&args).operation, Operation::Mutation);
+        }
+        for args in [
+            vec!["api", "graphql", "-f", "query=query { viewer { login } }"],
+            vec!["api", "user"],
+            vec!["api", "--method", "GET", "comments", "-f", "per_page=100"],
+        ] {
+            assert_eq!(command_limits(&args).operation, Operation::Read);
+        }
+    }
+
+    #[test]
+    fn timed_out_or_oversized_mutations_remain_uncertain_and_are_never_retried() {
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::InvalidData] {
+            let fake = FakeGh::one(Err(io::Error::new(kind, "incomplete process response")));
+            let calls = fake.calls_handle();
+            let error = GhCliClient::with_process(fake)
+                .post_conversation_comment(&loc(), "body")
+                .unwrap_err();
+            assert!(error.mutation_is_uncertain());
+            assert!(!matches!(
+                error,
+                ClientError::Rejected(_) | ClientError::NoCredentialSource
+            ));
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn enterprise_locators_and_cwd_remotes_are_rejected_without_remapping() {
+        for input in [
+            "https://enterprise.example/o/r/pull/1",
+            "enterprise.example/o/r#1",
+            "https://enterprise.example/o/r#1",
+        ] {
+            let fake = FakeGh::many(vec![]);
+            let calls = fake.calls_handle();
+            assert!(matches!(
+                GhCliClient::with_process(fake).resolve_pr(input),
+                Err(ClientError::Invalid(_))
+            ));
+            assert!(calls.lock().unwrap().is_empty());
+        }
+        let fake = FakeGh::one(ok(Some(0), "https://enterprise.example/o/r\n", ""));
+        assert!(matches!(
+            GhCliClient::with_process(fake).resolve_pr("1"),
+            Err(ClientError::Invalid(_))
+        ));
     }
 
     const VIEWED_PAGE1: &str = include_str!("../fixtures/gh_graphql_viewed_files_page1.json");
@@ -6026,7 +6224,7 @@ mod tests {
 
     #[test]
     fn resolve_pr_resolves_a_bare_number_through_the_cwd_repo() {
-        let fake = FakeGh::one(ok(Some(0), "octocat/Hello-World\n", ""));
+        let fake = FakeGh::one(ok(Some(0), "https://github.com/octocat/Hello-World\n", ""));
         let calls = fake.calls_handle();
         assert_eq!(
             GhCliClient::with_process(fake).resolve_pr("#123").unwrap(),
@@ -6038,10 +6236,7 @@ mod tests {
         );
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].join(" "),
-            "repo view --json nameWithOwner --jq .nameWithOwner"
-        );
+        assert_eq!(calls[0].join(" "), "repo view --json url --jq .url");
     }
 
     #[test]

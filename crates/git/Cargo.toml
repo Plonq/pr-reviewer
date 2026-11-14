@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 diff-core = { path = "../diff-core" }

@@ -2164,6 +2164,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "diff-core",
+ "libc",
  "tempfile",
 ]
 
@@ -2172,6 +2173,7 @@ name = "github"
 version = "0.1.0"
 dependencies = [
  "diff-core",
+ "git",
  "serde",
  "serde_json",
  "sha2 0.10.9",
