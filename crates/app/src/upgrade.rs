@@ -791,6 +791,7 @@ mod tests {
         fn submit_review(
             &self,
             _: &github::PrLocator,
+            _commit_id: &str,
             _: github::ReviewVerdict,
             _: &str,
         ) -> Result<(), github::ClientError> {

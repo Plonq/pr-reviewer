@@ -927,6 +927,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             node_id: String,
             state: String,
             body: Option<String>,
+            commit_id: Option<String>,
             user: crate::Author,
         }
         let pages: Vec<Vec<Review>> = decode_value(value)?;
@@ -939,6 +940,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         Ok(Some(PendingReview {
             id: review.id,
             node_id: review.node_id,
+            commit_id: review.commit_id,
             body: review.body.unwrap_or_default(),
             comments,
         }))
@@ -957,6 +959,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         Ok(PendingReview {
             id: decode_value(value["id"].clone())?,
             node_id: decode_value(value["node_id"].clone())?,
+            commit_id: value["commit_id"].as_str().map(str::to_owned),
             body: value["body"].as_str().unwrap_or_default().into(),
             comments: Vec::new(),
         })
@@ -1630,32 +1633,41 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
     fn submit_review(
         &self,
         loc: &PrLocator,
+        commit_id: &str,
         verdict: ReviewVerdict,
         body: &str,
     ) -> Result<(), ClientError> {
-        let number = loc.number.to_string();
-        let slug = loc.repo_slug();
-        let flag = match verdict {
-            ReviewVerdict::Approve => "--approve",
-            ReviewVerdict::RequestChanges => "--request-changes",
-            ReviewVerdict::Comment => "--comment",
-        };
-        let mut args = vec![
-            "pr".to_string(),
-            "review".to_string(),
-            number,
-            "--repo".to_string(),
-            slug,
-            flag.to_string(),
-        ];
-        if !body.is_empty() {
-            args.push("--body".to_string());
-            args.push(body.to_string());
+        if commit_id.is_empty() {
+            return Err(ClientError::Invalid("missing reviewed head commit".into()));
         }
-        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self.process.run(&argv).map_err(spawn_failure)?;
-        if out.code != Some(0) {
-            return Err(classify_failure(&out));
+        let (event, state) = match verdict {
+            ReviewVerdict::Approve => ("APPROVE", "APPROVED"),
+            ReviewVerdict::RequestChanges => ("REQUEST_CHANGES", "CHANGES_REQUESTED"),
+            ReviewVerdict::Comment => ("COMMENT", "COMMENTED"),
+        };
+        let value = self.creation_api(&[
+            "api".into(),
+            "-X".into(),
+            "POST".into(),
+            format!("repos/{}/pulls/{}/reviews", loc.repo_slug(), loc.number),
+            "-f".into(),
+            format!("commit_id={commit_id}"),
+            "-f".into(),
+            format!("event={event}"),
+            "-f".into(),
+            format!("body={body}"),
+        ])?;
+        if value["id"].as_u64().filter(|id| *id > 0).is_none()
+            || value["node_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .is_none()
+            || value["commit_id"].as_str() != Some(commit_id)
+            || value["state"].as_str() != Some(state)
+        {
+            return Err(ClientError::Failed(
+                "GitHub returned no matching submitted review".into(),
+            ));
         }
         Ok(())
     }
@@ -3702,7 +3714,7 @@ mod tests {
     }
 
     // Scripted API payloads for the pending lifecycle (not live mutations).
-    const PENDING: &str = r#"[[{"id":91,"node_id":"PRR_pending","state":"PENDING","body":"web summary","user":{"login":"octocat"}}]]"#;
+    const PENDING: &str = r#"[[{"id":91,"node_id":"PRR_pending","state":"PENDING","commit_id":"head","body":"web summary","user":{"login":"octocat"}}]]"#;
     const DRAFT: &str = r#"{"id":12,"node_id":"PRRC_draft","path":"a.rs","side":"RIGHT","line":7,"start_line":5,"body":"draft"}"#;
     const EMPTY_THREADS: &str = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#;
 
@@ -3934,6 +3946,7 @@ mod tests {
                 let pending = PendingReview {
                     id: 91,
                     node_id: "pending".into(),
+                    commit_id: Some("head".into()),
                     body: "untouched".into(),
                     comments: vec![],
                 };
@@ -4038,6 +4051,7 @@ mod tests {
                 pending: Some(PendingReview {
                     id: 91,
                     node_id: "pending".into(),
+                    commit_id: Some("head".into()),
                     body: "untouched draft".into(),
                     comments: vec![],
                 }),
@@ -4201,6 +4215,7 @@ mod tests {
             pending: Some(PendingReview {
                 id: 91,
                 node_id: "stale".into(),
+                commit_id: Some("head".into()),
                 body: String::new(),
                 comments: vec![],
             }),
@@ -4315,6 +4330,7 @@ mod tests {
                 let review = PendingReview {
                     id: 91,
                     node_id: "PRR_pending".into(),
+                    commit_id: Some("head".into()),
                     body: String::new(),
                     comments: vec![],
                 };
@@ -4492,6 +4508,7 @@ mod tests {
                         pending: Some(PendingReview {
                             id: 91,
                             node_id: "PRR_pending".into(),
+                            commit_id: Some("head".into()),
                             body: "keep me".into(),
                             comments: vec![serde_json::from_str(DRAFT).unwrap()],
                         }),
@@ -4540,7 +4557,7 @@ mod tests {
         let (client, calls) = session_script(&[
             SUCCESS,
             "[[]]",
-            r#"{"id":91,"node_id":"PRR_pending","body":""}"#,
+            r#"{"id":91,"node_id":"PRR_pending","commit_id":"head","body":""}"#,
             SUCCESS,
             PENDING,
             EMPTY_THREADS,
@@ -4570,6 +4587,10 @@ mod tests {
             .unwrap();
         assert_eq!(session.count(), 0);
         assert_eq!(session.pending.as_ref().unwrap().id, 91);
+        assert_eq!(
+            session.pending.as_ref().unwrap().commit_id.as_deref(),
+            Some("head")
+        );
         session
             .execute(
                 &client,
@@ -4605,6 +4626,7 @@ mod tests {
                 &client,
                 &loc(),
                 Command::Submit {
+                    commit_id: "head".into(),
                     verdict: ReviewVerdict::Approve,
                     body: String::new(),
                 },
@@ -4906,6 +4928,7 @@ mod tests {
                         &client,
                         &loc(),
                         Command::Submit {
+                            commit_id: "head".into(),
                             verdict,
                             body: body.into(),
                         },
@@ -4949,6 +4972,7 @@ mod tests {
                 &client,
                 &loc(),
                 Command::Submit {
+                    commit_id: "head".into(),
                     verdict: ReviewVerdict::Approve,
                     body: String::new()
                 }
@@ -5001,6 +5025,7 @@ mod tests {
         let review = PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("head".into()),
             body: String::new(),
             comments: vec![],
         };
@@ -5041,6 +5066,7 @@ mod tests {
             let review = PendingReview {
                 id: 91,
                 node_id: "pending".into(),
+                commit_id: Some("head".into()),
                 body: String::new(),
                 comments: vec![],
             };
@@ -5079,6 +5105,7 @@ mod tests {
                     &client,
                     &loc(),
                     Command::Submit {
+                        commit_id: "head".into(),
                         verdict: ReviewVerdict::Approve,
                         body: String::new()
                     }
@@ -6710,36 +6737,146 @@ mod tests {
     }
 
     #[test]
-    fn submit_review_invokes_gh_pr_review_verbatim() {
-        // Approvals may be bodyless; the other two verdicts carry --body —
-        // exactly the flags the caller's own emptiness rule assumes.
-        let (client, calls) = rich_client(
-            ok(Some(0), "", ""),
-            vec![ok(Some(0), "", ""), ok(Some(0), "", "")],
-        );
-        client
-            .submit_review(&loc(), ReviewVerdict::Approve, "")
-            .unwrap();
-        client
-            .submit_review(&loc(), ReviewVerdict::RequestChanges, "please no")
-            .unwrap();
-        client
-            .submit_review(&loc(), ReviewVerdict::Comment, "fyi")
-            .unwrap();
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(
-            calls[0].join(" "),
-            "pr review 4781 --repo octocat/Hello-World --approve"
-        );
-        assert_eq!(
-            calls[1].join(" "),
-            "pr review 4781 --repo octocat/Hello-World --request-changes --body please no"
-        );
-        assert_eq!(
-            calls[2].join(" "),
-            "pr review 4781 --repo octocat/Hello-World --comment --body fyi"
-        );
+    fn submit_review_pins_each_verdict_to_the_displayed_commit() {
+        use crate::review_session::{Command, ReviewSession};
+        for (verdict, event, state, body) in [
+            (ReviewVerdict::Approve, "APPROVE", "APPROVED", ""),
+            (
+                ReviewVerdict::RequestChanges,
+                "REQUEST_CHANGES",
+                "CHANGES_REQUESTED",
+                "please no",
+            ),
+            (
+                ReviewVerdict::Comment,
+                "COMMENT",
+                "COMMENTED",
+                "summary \"quoted\"\nnext line",
+            ),
+        ] {
+            let response = serde_json::json!({"id":92,"node_id":"PRR_created",
+                "commit_id":"displayed-A","state":state})
+            .to_string();
+            // The PR may already have advanced to B: no mutable head lookup is
+            // needed or allowed to choose the commit for this submission.
+            let (client, calls) = session_script(&[SUCCESS, "[[]]", &response]);
+            let mut session = ReviewSession::default();
+            session
+                .execute(
+                    &client,
+                    &loc(),
+                    Command::Submit {
+                        commit_id: "displayed-A".into(),
+                        verdict,
+                        body: body.into(),
+                    },
+                )
+                .unwrap();
+            assert!(session.pending.is_none());
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 3);
+            assert_eq!(
+                calls[2],
+                vec![
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/octocat/Hello-World/pulls/4781/reviews",
+                    "-f",
+                    "commit_id=displayed-A",
+                    "-f",
+                    &format!("event={event}"),
+                    "-f",
+                    &format!("body={body}")
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn pending_submission_requires_a_known_matching_review_commit() {
+        use crate::review_session::{Command, ReviewSession};
+        for commit in [Some("displayed-A"), Some("current-B"), Some(""), None] {
+            let mut draft: serde_json::Value = serde_json::from_str(PENDING).unwrap();
+            if let Some(commit) = commit {
+                draft[0][0]["commit_id"] = serde_json::json!(commit);
+            } else {
+                draft[0][0].as_object_mut().unwrap().remove("commit_id");
+            }
+            let draft = draft.to_string();
+            let (client, calls) = session_script(&[
+                SUCCESS,
+                &draft,
+                EMPTY_THREADS,
+                r#"{"data":{"submitPullRequestReview":{"pullRequestReview":{"id":"PRR_pending","state":"APPROVED"}}}}"#,
+            ]);
+            let mut session = ReviewSession::default();
+            let result = session.execute(
+                &client,
+                &loc(),
+                Command::Submit {
+                    commit_id: "displayed-A".into(),
+                    verdict: ReviewVerdict::Approve,
+                    body: "keep my summary".into(),
+                },
+            );
+            if commit == Some("displayed-A") {
+                result.unwrap();
+                assert!(session.pending.is_none());
+                assert_eq!(calls.lock().unwrap().len(), 4);
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(error, ClientError::Invalid(_)));
+                assert!(error.to_string().contains(if commit == Some("current-B") {
+                    "different commit"
+                } else {
+                    "unknown"
+                }));
+                let pending = session.pending.unwrap();
+                assert_eq!(pending.commit_id.as_deref(), commit);
+                assert_eq!(pending.body, "web summary");
+                assert_eq!(calls.lock().unwrap().len(), 3, "blocked drafts only read");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_review_requires_a_matching_success_response_without_retrying() {
+        let (client, calls) = session_script(&[]);
+        assert!(matches!(
+            client.submit_review(&loc(), "", ReviewVerdict::Approve, ""),
+            Err(ClientError::Invalid(_))
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+        let receipt = serde_json::json!({"id":92,"node_id":"PRR_created",
+            "commit_id":"displayed-A","state":"APPROVED"});
+        for (field, value) in [
+            ("id", serde_json::json!(null)),
+            ("id", serde_json::json!(0)),
+            ("node_id", serde_json::json!("")),
+            ("commit_id", serde_json::json!("current-B")),
+            ("state", serde_json::json!("PENDING")),
+        ] {
+            let mut malformed = receipt.clone();
+            malformed[field] = value;
+            let (client, calls) = session_script(&[&malformed.to_string()]);
+            let error = client
+                .submit_review(&loc(), "displayed-A", ReviewVerdict::Approve, "")
+                .unwrap_err();
+            assert!(error.mutation_is_uncertain());
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
+        for (code, message, uncertain) in [
+            (1, "network unavailable", true),
+            (1, "Unprocessable Entity (HTTP 422)", false),
+        ] {
+            let (client, calls) = rich_client(ok(Some(code), "", message), vec![]);
+            let error = client
+                .submit_review(&loc(), "displayed-A", ReviewVerdict::Approve, "")
+                .unwrap_err();
+            assert_eq!(error.mutation_is_uncertain(), uncertain);
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
     }
 
     // --- file_at and its cache -----------------------------------------------

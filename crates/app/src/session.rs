@@ -90,6 +90,8 @@ struct SavedItem {
     pane: ItemPane,
     view: Option<SavedView>,
     summary: Option<String>,
+    #[serde(default)]
+    summary_commit_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -166,6 +168,12 @@ impl ReviewApp {
                                 .as_ref()
                                 .map(|r| r.input.read(cx).value().to_string())
                         }),
+                    summary_commit_id: self
+                        .review
+                        .as_ref()
+                        .filter(|r| r.item_id == item.id)
+                        .map(|r| r.commit_id.clone())
+                        .or_else(|| item.review_draft.as_ref().map(|r| r.commit_id.clone())),
                     view: match &item.state {
                         ItemState::Ready(data) if data.diff_loaded => Some(SavedView {
                             position: data
@@ -323,7 +331,11 @@ impl ReviewApp {
                     Source::Pr(loc) => Some(comment_media::Uploads::new(loc.clone(), &input, cx)),
                     _ => None,
                 };
-                item.review_draft = Some(ReviewDraft { input, uploads });
+                item.review_draft = Some(ReviewDraft {
+                    commit_id: saved.summary_commit_id.unwrap_or_default(),
+                    input,
+                    uploads,
+                });
             }
         }
         self.active = session.active.min(self.items.len().saturating_sub(1));

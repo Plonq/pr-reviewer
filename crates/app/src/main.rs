@@ -1911,14 +1911,16 @@ impl Composer {
 }
 
 struct ReviewDraft {
+    commit_id: String,
     input: gpui::Entity<gpui::component::input::EditorState>,
     uploads: Option<gpui::Entity<comment_media::Uploads>>,
 }
 
 /// The "submit review" modal: a verdict (approve / request changes /
-/// comment) plus an optional body, targeting the item it was opened on.
+/// comment) plus an optional body, targeting the item and displayed head it opened on.
 struct ReviewDialog {
     item_id: u64,
+    commit_id: String,
     verdict: github::ReviewVerdict,
     input: gpui::Entity<gpui::component::input::EditorState>,
     uploads: Option<gpui::Entity<comment_media::Uploads>>,
@@ -4851,11 +4853,23 @@ impl ReviewApp {
         let Source::Pr(_) = item.source else {
             return;
         };
-        let ItemState::Ready(_) = item.state else {
+        let ItemState::Ready(data) = &item.state else {
             return;
         };
+        if !data.diff_loaded {
+            return;
+        }
+        let commit_id = data
+            .pr_meta
+            .as_ref()
+            .map(|meta| meta.head_ref_oid.clone())
+            .unwrap_or_default();
         let item_id = item.id;
         let draft = self.items[self.active].review_draft.take();
+        // Restored text belongs to the same reviewed revision, even after refresh.
+        let commit_id = draft
+            .as_ref()
+            .map_or(commit_id, |draft| draft.commit_id.clone());
         self.review_gen += 1;
         let input = if let Some(draft) = &draft {
             draft.input.clone()
@@ -4901,6 +4915,7 @@ impl ReviewApp {
         };
         self.review = Some(ReviewDialog {
             item_id,
+            commit_id,
             verdict: github::ReviewVerdict::Approve,
             input,
             uploads,
@@ -4960,8 +4975,16 @@ impl ReviewApp {
         let Some(review) = self.review.take() else {
             return false;
         };
+        // An empty dismissed editor has no review to keep pinned. Uploads may
+        // still finish into this editor; completed attachments live in its text.
+        let keep_draft = !review.input.read(cx).value().trim().is_empty()
+            || review
+                .uploads
+                .as_ref()
+                .is_some_and(|uploads| uploads.read(cx).pending() > 0);
         if let Some(item) = self.items.iter_mut().find(|item| item.id == review.item_id) {
-            item.review_draft = Some(ReviewDraft {
+            item.review_draft = keep_draft.then(|| ReviewDraft {
+                commit_id: review.commit_id,
                 input: review.input,
                 uploads: review.uploads,
             });
@@ -4992,6 +5015,7 @@ impl ReviewApp {
         }
         let body = review.input.read(cx).value().trim().to_string();
         let verdict = review.verdict;
+        let commit_id = review.commit_id.clone();
         let item_id = review.item_id;
         if self.comment_write_blocked(item_id) {
             return;
@@ -5010,7 +5034,11 @@ impl ReviewApp {
         }
         self.run_session(
             item_id,
-            SessionCommand::Submit { verdict, body },
+            SessionCommand::Submit {
+                commit_id,
+                verdict,
+                body,
+            },
             SessionCompletion::Review(gen),
             window,
             cx,
@@ -8693,6 +8721,7 @@ mod tests {
         let pending = github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: String::new(),
             comments: vec![github::PendingComment {
                 id: 9,
@@ -11785,6 +11814,7 @@ mod tests {
         fn submit_review(
             &self,
             _loc: &github::PrLocator,
+            _commit_id: &str,
             _verdict: github::ReviewVerdict,
             _body: &str,
         ) -> Result<(), github::ClientError> {
@@ -12767,6 +12797,7 @@ mod tests {
         fn submit_review(
             &self,
             _loc: &github::PrLocator,
+            _commit_id: &str,
             _verdict: github::ReviewVerdict,
             _body: &str,
         ) -> Result<(), github::ClientError> {
@@ -14842,6 +14873,8 @@ mod tests {
         comments: std::sync::Mutex<Vec<github::ReviewComment>>,
         conversation: std::sync::Mutex<Vec<github::DiscussionComment>>,
         posted: std::sync::Mutex<Vec<Post>>,
+        review_commits: std::sync::Mutex<Vec<String>>,
+        head: std::sync::Mutex<Option<String>>,
         /// While set, posting a new comment fails — the inline-error path.
         fail: std::sync::atomic::AtomicBool,
         stale_discussion: std::sync::atomic::AtomicBool,
@@ -15280,11 +15313,12 @@ mod tests {
         fn start_review(
             &self,
             _loc: &github::PrLocator,
-            _commit: &str,
+            commit: &str,
         ) -> Result<github::PendingReview, github::ClientError> {
             let review = github::PendingReview {
                 id: 91,
                 node_id: "pending".into(),
+                commit_id: Some(commit.into()),
                 body: String::new(),
                 comments: vec![],
             };
@@ -15438,10 +15472,14 @@ mod tests {
         fn submit_pending_review(
             &self,
             _loc: &github::PrLocator,
-            _review: &github::PendingReview,
+            review: &github::PendingReview,
             verdict: github::ReviewVerdict,
             body: &str,
         ) -> Result<(), github::ClientError> {
+            self.review_commits
+                .lock()
+                .unwrap()
+                .push(review.commit_id.clone().unwrap());
             self.pending.lock().unwrap().take().unwrap();
             self.posted.lock().unwrap().push(Post::Review {
                 verdict,
@@ -15478,7 +15516,11 @@ mod tests {
         }
 
         fn pr_meta(&self, _loc: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
-            Ok(loop_pr_meta())
+            let mut meta = loop_pr_meta();
+            if let Some(head) = self.head.lock().unwrap().as_ref() {
+                meta.head_ref_oid = head.clone();
+            }
+            Ok(meta)
         }
 
         fn merge_base(
@@ -15489,7 +15531,7 @@ mod tests {
         ) -> Result<String, github::ClientError> {
             assert_eq!(loc.repo_slug(), loop_loc().repo_slug());
             assert_eq!(base, "ba5ec0de");
-            assert_eq!(head, "dead10cc");
+            assert_eq!(head, self.pr_meta(loc)?.head_ref_oid);
             if self.fail_merge_base {
                 return Err(github::ClientError::Failed("merge base unavailable".into()));
             }
@@ -15687,9 +15729,11 @@ mod tests {
         fn submit_review(
             &self,
             _loc: &github::PrLocator,
+            commit_id: &str,
             verdict: github::ReviewVerdict,
             body: &str,
         ) -> Result<(), github::ClientError> {
+            self.review_commits.lock().unwrap().push(commit_id.into());
             self.posted.lock().unwrap().push(Post::Review {
                 verdict,
                 body: body.to_string(),
@@ -16863,6 +16907,7 @@ mod tests {
         *fake.pending.lock().unwrap() = Some(github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: String::new(),
             comments: vec![github::PendingComment {
                 id: 13,
@@ -17630,6 +17675,7 @@ mod tests {
         *fake.pending.lock().unwrap() = Some(github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: "web summary".into(),
             comments: vec![],
         });
@@ -18064,6 +18110,7 @@ mod tests {
             *fake.pending.lock().unwrap() = Some(github::PendingReview {
                 id: 91,
                 node_id: "pending".into(),
+                commit_id: Some("dead10cc".into()),
                 body: "web summary".into(),
                 comments: vec![],
             });
@@ -18286,6 +18333,7 @@ mod tests {
         *fake.pending.lock().unwrap() = Some(github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: String::new(),
             comments: [
                 (12, "a.rs", CommentSide::Right),
@@ -18662,6 +18710,7 @@ mod tests {
         *fake.pending.lock().unwrap() = Some(github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: "web review".into(),
             comments: vec![],
         });
@@ -18853,6 +18902,234 @@ mod tests {
     }
 
     #[gpui::test]
+    fn review_dialog_blank_cancel_captures_the_refreshed_head_when_reopened(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, loop_pr_item(vec![]), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_review(window, cx);
+                assert_eq!(app.review.as_ref().unwrap().commit_id, "dead10cc");
+                app.close_review(window, cx);
+                assert!(app.items[0].review_draft.is_none());
+                *fake.head.lock().unwrap() = Some("new-head-B".into());
+                app.refresh(cx);
+            })
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_review(window, cx);
+                assert_eq!(app.review.as_ref().unwrap().commit_id, "new-head-B");
+                app.submit_review(window, cx);
+            })
+        });
+        vcx.run_until_parked();
+        assert_eq!(*fake.review_commits.lock().unwrap(), vec!["new-head-B"]);
+    }
+
+    #[gpui::test]
+    fn review_dialog_keeps_empty_drafts_only_while_uploads_are_pending(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, loop_pr_item(vec![]), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_review(window, cx);
+                let review = app.review.as_ref().unwrap();
+                let input = review.input.clone();
+                let uploads = review.uploads.clone();
+                // Unsupported files fail locally, so this never uploads to GitHub.
+                comment_media::start(
+                    uploads.as_ref().unwrap(),
+                    &input,
+                    vec![comment_media::Source::File("not-media.txt".into())],
+                    window,
+                    cx,
+                );
+                input.update(cx, |input, cx| input.set_value("", window, cx));
+                assert_eq!(uploads.as_ref().unwrap().read(cx).pending(), 1);
+                app.close_review(window, cx);
+                assert_eq!(app.items[0].review_draft.as_ref().unwrap().input, input);
+                app.open_review(window, cx);
+                let review = app.review.as_ref().unwrap();
+                assert_eq!(review.input, input);
+                assert_eq!(review.uploads, uploads);
+                assert_eq!(review.commit_id, "dead10cc");
+            })
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let review = app.review.as_ref().unwrap();
+                assert_eq!(review.uploads.as_ref().unwrap().read(cx).pending(), 0);
+                assert!(review.input.read(cx).value().is_empty());
+                app.close_review(window, cx);
+                assert!(app.items[0].review_draft.is_none());
+            })
+        });
+        assert!(fake.posts().is_empty());
+    }
+
+    #[gpui::test]
+    fn review_dialog_waits_for_the_diff_before_capturing_a_head(cx: &mut gpui::TestAppContext) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        let mut item = loop_pr_item(vec![]);
+        if let ItemState::Ready(data) = &mut item.state {
+            data.diff_loaded = false;
+        }
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_review(window, cx);
+                assert!(app.review.is_none());
+            })
+        });
+        assert!(fake.posts().is_empty());
+    }
+
+    #[gpui::test]
+    fn review_dialog_submits_displayed_head_when_github_has_advanced(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, loop_pr_item(vec![]), cx);
+        *fake.head.lock().unwrap() = Some("new-head-B".into());
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_review(window, cx);
+                app.submit_review(window, cx);
+            })
+        });
+        vcx.run_until_parked();
+        assert_eq!(*fake.review_commits.lock().unwrap(), vec!["dead10cc"]);
+    }
+
+    #[gpui::test]
+    fn review_dialog_and_saved_summary_keep_their_commit_across_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = FakePr::with_threads(vec![]);
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, loop_pr_item(vec![]), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_review(window, cx);
+                app.review
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .update(cx, |input, cx| input.set_value("Approval of A", window, cx));
+                *fake.head.lock().unwrap() = Some("new-head-B".into());
+                app.refresh(cx);
+            })
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                assert_eq!(
+                    app.active_data()
+                        .unwrap()
+                        .pr_meta
+                        .as_ref()
+                        .unwrap()
+                        .head_ref_oid,
+                    "new-head-B"
+                );
+                assert_eq!(app.review.as_ref().unwrap().commit_id, "dead10cc");
+                // Dismissal and reopening must not attach saved text to the new head either.
+                app.close_review(window, cx);
+                app.open_review(window, cx);
+                let review = app.review.as_ref().unwrap();
+                assert_eq!(review.commit_id, "dead10cc");
+                assert_eq!(review.input.read(cx).value().as_str(), "Approval of A");
+                app.submit_review(window, cx);
+            })
+        });
+        vcx.run_until_parked();
+        assert_eq!(*fake.review_commits.lock().unwrap(), vec!["dead10cc"]);
+        assert_eq!(
+            fake.posts(),
+            vec![Post::Review {
+                verdict: github::ReviewVerdict::Approve,
+                body: "Approval of A".into(),
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn review_dialog_blocks_unknown_or_mismatched_drafts_and_retains_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for commit in [None, Some("new-head-B")] {
+            let fake = FakePr::with_threads(vec![]);
+            let (window, app) = queue_window(cx, fake.clone());
+            install_item(&app, loop_pr_item(vec![]), cx);
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            let body = "  Keep my approval text\n";
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.open_review(window, cx);
+                    app.review
+                        .as_ref()
+                        .unwrap()
+                        .input
+                        .update(cx, |input, cx| input.set_value(body, window, cx));
+                    // A web draft can appear after the dialog was opened.
+                    *fake.pending.lock().unwrap() = Some(github::PendingReview {
+                        id: 91,
+                        node_id: "pending".into(),
+                        commit_id: commit.map(str::to_owned),
+                        body: "web summary".into(),
+                        comments: vec![],
+                    });
+                    app.submit_review(window, cx);
+                })
+            });
+            vcx.run_until_parked();
+            vcx.update(|_, cx| {
+                let app = app.read(cx);
+                let review = app.review.as_ref().expect("blocked review remains open");
+                assert!(!review.in_flight);
+                assert!(review
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains(if commit.is_none() {
+                        "unknown"
+                    } else {
+                        "different commit"
+                    }));
+                assert_eq!(review.input.read(cx).value().as_str(), body);
+                assert_eq!(
+                    app.sessions[&0]
+                        .state
+                        .pending
+                        .as_ref()
+                        .unwrap()
+                        .commit_id
+                        .as_deref(),
+                    commit
+                );
+            });
+            assert!(fake.posts().is_empty());
+            assert!(fake.review_commits.lock().unwrap().is_empty());
+            assert!(fake.pending.lock().unwrap().is_some());
+        }
+    }
+
+    #[gpui::test]
     fn review_dialog_preserves_summary_after_cancel_and_escape(cx: &mut gpui::TestAppContext) {
         let fake = FakePr::with_threads(vec![]);
         let (window, app) = queue_window(cx, fake.clone());
@@ -18898,13 +19175,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn review_dialog_local_draft_overrides_pending_summary_even_when_empty(
+    fn review_dialog_keeps_nonempty_local_drafts_and_reloads_pending_summary_after_clearing(
         cx: &mut gpui::TestAppContext,
     ) {
         let fake = FakePr::with_threads(vec![]);
         *fake.pending.lock().unwrap() = Some(github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: "Summary from GitHub".into(),
             comments: vec![],
         });
@@ -18920,7 +19198,10 @@ mod tests {
                     app.review.as_ref().unwrap().input.read(cx).value().as_str(),
                     "Summary from GitHub"
                 );
-                for body in ["Edited locally", ""] {
+                for (body, reopened) in [
+                    ("Edited locally", "Edited locally"),
+                    ("", "Summary from GitHub"),
+                ] {
                     app.review
                         .as_ref()
                         .unwrap()
@@ -18930,7 +19211,7 @@ mod tests {
                     app.open_review(window, cx);
                     assert_eq!(
                         app.review.as_ref().unwrap().input.read(cx).value().as_str(),
-                        body
+                        reopened
                     );
                 }
             });
@@ -19381,6 +19662,7 @@ mod tests {
         *fake.pending.lock().unwrap() = Some(github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: String::new(),
             comments: vec![github::PendingComment {
                 id: 13,
@@ -19496,6 +19778,7 @@ mod tests {
         *fake.pending.lock().unwrap() = Some(github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: String::new(),
             comments: vec![
                 github::PendingComment {
@@ -19587,6 +19870,7 @@ mod tests {
         *fake.pending.lock().unwrap() = Some(github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: String::new(),
             comments: vec![github::PendingComment {
                 id: 12,
@@ -19970,6 +20254,7 @@ mod tests {
         *fake.pending.lock().unwrap() = Some(github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: "keep my draft".into(),
             comments: vec![],
         });
@@ -20139,6 +20424,7 @@ mod tests {
         *fake.pending.lock().unwrap() = Some(github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: "from web".into(),
             comments: vec![github::PendingComment {
                 id: 13,

@@ -578,6 +578,7 @@ mod tests {
         let pending = github::PendingReview {
             id: 91,
             node_id: "PRR_pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: "summary".into(),
             comments: vec![github::PendingComment {
                 in_reply_to_id: None,

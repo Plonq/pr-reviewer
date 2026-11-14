@@ -39,6 +39,7 @@ fn fake_mutations(pending: bool) -> Arc<FakePr> {
         *fake.pending.lock().unwrap() = Some(github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: String::new(),
             comments: [11, 12]
                 .into_iter()
@@ -385,6 +386,7 @@ fn uncertain_edits_deletes_reconcile_by_target_or_remain_blocked_without_retries
                             app.run_session(
                                 0,
                                 SessionCommand::Submit {
+                                    commit_id: "dead10cc".into(),
                                     verdict: github::ReviewVerdict::Comment,
                                     body: "review".into(),
                                 },

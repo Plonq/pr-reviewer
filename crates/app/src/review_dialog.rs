@@ -59,6 +59,20 @@ impl ReviewApp {
             }))
             .child(
                 div()
+                    .debug_selector(|| "review-commit".into())
+                    .text_sm()
+                    .text_color(theme::subtext(cx))
+                    .child(if review.commit_id.is_empty() {
+                        "Reviewed commit unavailable".to_owned()
+                    } else {
+                        format!(
+                            "Reviewing commit {}",
+                            review.commit_id.chars().take(7).collect::<String>()
+                        )
+                    }),
+            )
+            .child(
+                div()
                     .flex()
                     .flex_wrap()
                     .gap_2()
