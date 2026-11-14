@@ -28,7 +28,10 @@ mod position;
 mod settings;
 mod snapshot;
 
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -84,14 +87,39 @@ impl Store {
     /// Open (creating if needed) the database at `path`, running any
     /// pending migrations.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_on_disk(path, false)
+    }
+
+    fn open_on_disk(path: &Path, private_directory: bool) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
+            create_store_directory(parent, private_directory).with_context(|| {
                 format!("couldn't create the store directory {}", parent.display())
             })?;
         }
-        let conn = Connection::open(path)
+        // Create the actual database privately before SQLite can read it or
+        // derive the permissions of a new WAL/journal from its mode.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(path)
+            .with_context(|| format!("couldn't create the store at {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        drop(file);
+        let actual_path = std::fs::canonicalize(path)?;
+        tighten_sidecars(&actual_path)?;
+        let conn = Connection::open(&actual_path)
             .with_context(|| format!("couldn't open the store at {}", path.display()))?;
         Self::prepare(&conn)?;
+        tighten_sidecars(&actual_path)?;
         Ok(Self {
             conn,
             path: Some(path.to_path_buf()),
@@ -103,8 +131,11 @@ impl Store {
     /// unwritable directory) — the app then runs without persistence
     /// rather than refusing to start.
     pub fn open_default() -> Result<Self> {
+        let private_directory = std::env::var_os("GANDER_DB_PATH")
+            .filter(|path| !path.is_empty())
+            .is_none();
         match default_database_path() {
-            Some(path) => Self::open(&path),
+            Some(path) => Self::open_on_disk(&path, private_directory),
             None => Self::open_in_memory(),
         }
     }
@@ -160,6 +191,45 @@ impl Store {
     pub fn positions(&self) -> PositionStore<'_> {
         PositionStore::new(&self.conn)
     }
+}
+
+fn create_store_directory(path: &Path, private: bool) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    Ok(())
+}
+
+fn tighten_sidecars(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            match std::fs::set_permissions(Path::new(&name), std::fs::Permissions::from_mode(0o600))
+            {
+                Ok(()) => (),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => (),
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// Bring a database's schema up to [`SCHEMA_VERSION`].
@@ -304,6 +374,108 @@ fn reconcile_queue_cache(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_store_directories_database_and_live_sidecars_are_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_mode(tmp.path(), 0o755);
+        let app_dir = tmp.path().join("Gander");
+        let path = app_dir.join("store.db");
+        let store = Store::open_on_disk(&path, true).unwrap();
+        store
+            .settings()
+            .set("private", serde_json::json!("draft"))
+            .unwrap();
+        assert_eq!(mode(tmp.path()), 0o755);
+        assert_eq!(mode(&app_dir), 0o700);
+        for name in ["store.db", "store.db-wal", "store.db-shm"] {
+            assert_eq!(mode(&app_dir.join(name)), 0o600, "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_application_directory_database_and_sidecars_are_tightened() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_mode(tmp.path(), 0o755);
+        let app_dir = tmp.path().join("Gander");
+        let path = app_dir.join("store.db");
+        // Keep the first connection alive so real SQLite WAL/SHM files exist.
+        let first = Store::open(&path).unwrap();
+        first
+            .settings()
+            .set("kept", serde_json::json!("draft"))
+            .unwrap();
+        set_mode(&app_dir, 0o777);
+        for name in ["store.db", "store.db-wal", "store.db-shm"] {
+            set_mode(&app_dir.join(name), 0o666);
+        }
+        let journal = app_dir.join("store.db-journal");
+        std::fs::write(&journal, []).unwrap();
+        set_mode(&journal, 0o666);
+        let store = Store::open_on_disk(&path, true).unwrap();
+        assert_eq!(
+            store.settings().get("kept").unwrap(),
+            Some(serde_json::json!("draft"))
+        );
+        assert_eq!(mode(tmp.path()), 0o755);
+        assert_eq!(mode(&app_dir), 0o700);
+        for name in [
+            "store.db",
+            "store.db-wal",
+            "store.db-shm",
+            "store.db-journal",
+        ] {
+            assert_eq!(mode(&app_dir.join(name)), 0o600, "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_database_parent_permissions_are_preserved_and_actual_sidecars_tightened() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let actual = tmp.path().join("actual");
+        let path = actual.join("store.db");
+        let first = Store::open(&path).unwrap();
+        first
+            .settings()
+            .set("kept", serde_json::json!(true))
+            .unwrap();
+        set_mode(&actual, 0o755);
+        let custom = tmp.path().join("custom");
+        std::fs::create_dir(&custom).unwrap();
+        set_mode(&custom, 0o775);
+        let alias = custom.join("alias.db");
+        symlink(&path, &alias).unwrap();
+        for name in ["store.db", "store.db-wal", "store.db-shm"] {
+            set_mode(&actual.join(name), 0o666);
+        }
+        let store = Store::open(&alias).unwrap();
+        assert_eq!(store.path(), Some(alias.as_path()));
+        assert_eq!(
+            store.settings().get("kept").unwrap(),
+            Some(serde_json::json!(true))
+        );
+        assert_eq!(mode(&custom), 0o775);
+        assert_eq!(mode(&actual), 0o755);
+        for name in ["store.db", "store.db-wal", "store.db-shm"] {
+            assert_eq!(mode(&actual.join(name)), 0o600, "{name}");
+        }
+    }
 
     /// The schema a fresh database gets: the version stamped, and every
     /// table this store reads present.

@@ -9,8 +9,8 @@
 //! reality drifts).
 
 use std::collections::{HashMap, HashSet};
-use std::io;
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
@@ -71,6 +71,7 @@ impl GhProcess for GhSubprocess {
 #[derive(Debug)]
 pub struct GhCliClient<P: GhProcess = GhSubprocess> {
     process: P,
+    blob_cache_root: Option<PathBuf>,
 }
 
 impl GhCliClient<GhSubprocess> {
@@ -267,7 +268,11 @@ impl<P: GhProcess> GhCliClient<P> {
     /// Run against a specific process boundary — how tests replay recorded
     /// `gh` output.
     pub fn with_process(process: P) -> Self {
-        Self { process }
+        Self {
+            process,
+            blob_cache_root: std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cache").join("gander")),
+        }
     }
 
     /// The authenticated user via `gh api user`: one subprocess answers both
@@ -1528,13 +1533,13 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         commit_oid: &str,
         path: &str,
     ) -> Result<Option<String>, ClientError> {
-        let cache = cache_path(&loc.repo_slug(), commit_oid, path);
+        let cache = self
+            .blob_cache_root
+            .as_deref()
+            .and_then(|root| cache_path(root, &loc.repo_slug(), commit_oid, path));
         if let Some(cache) = &cache {
-            if cache.with_extension("absent").exists() {
-                return Ok(None);
-            }
-            if let Ok(bytes) = std::fs::read(cache) {
-                return Ok(String::from_utf8(bytes).ok());
+            if let Some(text) = read_cached_blob(cache) {
+                return Ok(Some(text));
             }
         }
 
@@ -1556,21 +1561,20 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             .map_err(spawn_failure)?;
         if out.code != Some(0) {
             if out.stderr.contains("404") {
-                mark_absent(cache);
+                // GitHub also returns 404 for inaccessible private files.
+                // Never persist a miss that credentials could later resolve.
                 return Ok(None);
             }
             return Err(classify_failure(&out));
         }
         if out.stdout.len() > MAX_BLOB_BYTES {
-            mark_absent(cache);
             return Ok(None);
         }
         let Ok(text) = String::from_utf8(out.stdout) else {
-            mark_absent(cache);
             return Ok(None);
         };
         if let Some(cache) = cache {
-            let _ = std::fs::write(cache, &text);
+            let _ = write_cached_blob(&cache, &text);
         }
         Ok(Some(text))
     }
@@ -2569,23 +2573,65 @@ const MAX_MENTIONABLE: usize = 500;
 /// contents API happily serves up to 100 MB.
 const MAX_BLOB_BYTES: usize = 1024 * 1024;
 
-/// Mark a negative cache entry (absent / binary / oversize) with an
-/// `.absent` sidecar, so the miss is remembered too.
-fn mark_absent(cache: Option<PathBuf>) {
-    if let Some(cache) = cache {
-        let _ = std::fs::write(cache.with_extension("absent"), b"");
+fn read_cached_blob(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .ok()?;
     }
+    if file.metadata().ok()?.len() > MAX_BLOB_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BLOB_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_BLOB_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
-/// `~/.cache/gander/blobs/<key>`, creating the directory; None when HOME is
-/// unset or the directory can't be created (cache disabled, fetch still
-/// works).
-fn cache_path(repo: &str, oid: &str, path: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("HOME")?)
-        .join(".cache")
-        .join("gander")
-        .join("blobs");
-    std::fs::create_dir_all(&dir).ok()?;
+fn write_cached_blob(path: &Path, text: &str) -> io::Result<()> {
+    if text.len() > MAX_BLOB_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "blob exceeds cache limit",
+        ));
+    }
+    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    file.write_all(text.as_bytes())?;
+    file.persist(path)?;
+    Ok(())
+}
+
+/// Only application-owned directories are tightened; shared ancestors such
+/// as `~/.cache` retain their existing permissions.
+fn private_cache_directory(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// A new namespace excludes legacy direct writes (possibly partial UTF-8)
+/// and ambiguous `.absent` markers. Cache failures still allow fetching.
+fn cache_path(root: &Path, repo: &str, oid: &str, path: &str) -> Option<PathBuf> {
+    private_cache_directory(root).ok()?;
+    let dir = root.join("blobs-v2");
+    private_cache_directory(&dir).ok()?;
     Some(dir.join(cache_key(repo, oid, path)))
 }
 
@@ -6728,85 +6774,185 @@ mod tests {
         );
     }
 
-    #[test]
-    fn file_at_absent_binary_oversize_and_cached_answers_replay_the_contract() {
-        // The blob cache lives under $HOME, and only this test reads or
-        // writes it: swap HOME for a tempdir under a lock, and nothing
-        // else in this suite notices.
-        static HOME: Mutex<()> = Mutex::new(());
-        let _guard = HOME.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+    fn blob_client(process: FakeGh, root: &Path) -> GhCliClient<FakeGh> {
+        GhCliClient {
+            process,
+            blob_cache_root: Some(root.to_path_buf()),
+        }
+    }
 
-        const OID: &str = "f16ea0a8cfd0fbb0328b8348972356d532b921d0";
+    #[test]
+    fn file_at_recovers_after_a_hidden_private_file_and_reuses_positive_disk_cache() {
+        let tmp = tempfile::tempdir().unwrap();
         let fake = FakeGh::many(vec![
-            // gone.rs: absent at that commit (404).
             ok(Some(1), "", "gh: Not Found (HTTP 404)"),
-            // main.rs: present, plain text.
             ok(Some(0), "fn main() {}\n", ""),
-            // blob.bin: binary bytes.
-            raw(Some(0), &[0u8, 159, 146, 150], ""),
-            // huge.txt: over the blob cap.
-            raw(Some(0), &vec![b'x'; MAX_BLOB_BYTES + 1], ""),
-            // denied.txt: a real failure, not an absence — twice, because
-            // failures are never cached.
-            ok(Some(1), "", "gh: Forbidden (HTTP 403)"),
-            ok(Some(1), "", "gh: Forbidden (HTTP 403)"),
         ]);
         let calls = fake.calls_handle();
-        let client = GhCliClient::with_process(fake);
-
-        // Absent: Ok(None), and the invocation carries the raw-contents
-        // Accept header with the path percent-encoded per segment.
-        assert_eq!(client.file_at(&loc(), OID, "gone.rs").unwrap(), None);
-        {
-            let calls = calls.lock().unwrap();
-            assert_eq!(
-                calls[0].join(" "),
-                format!(
-                    "api -H Accept: application/vnd.github.raw+json \
-                     repos/octocat/Hello-World/contents/gone.rs?ref={OID}"
-                )
-            );
-        }
-        // The negative answer is cached: no second subprocess.
-        assert_eq!(client.file_at(&loc(), OID, "gone.rs").unwrap(), None);
-
-        // Present: the text, cached on disk…
+        let client = blob_client(fake, tmp.path());
+        assert_eq!(client.file_at(&loc(), "oid", "gone.rs").unwrap(), None);
         assert_eq!(
-            client.file_at(&loc(), OID, "main.rs").unwrap().as_deref(),
+            calls.lock().unwrap()[0].join(" "),
+            "api -H Accept: application/vnd.github.raw+json repos/octocat/Hello-World/contents/gone.rs?ref=oid"
+        );
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("blobs-v2"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            client.file_at(&loc(), "oid", "gone.rs").unwrap().as_deref(),
             Some("fn main() {}\n")
         );
-        // …so a second call never leaves the process.
+        // A new client also reuses the positive entry, without another gh call.
+        let client = blob_client(FakeGh::many(vec![]), tmp.path());
         assert_eq!(
-            client.file_at(&loc(), OID, "main.rs").unwrap().as_deref(),
+            client.file_at(&loc(), "oid", "gone.rs").unwrap().as_deref(),
             Some("fn main() {}\n")
         );
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
 
-        // Binary and oversize are absences too — the file stays
-        // patch-derived rather than upgrading garbage.
-        assert_eq!(client.file_at(&loc(), OID, "blob.bin").unwrap(), None);
-        assert_eq!(client.file_at(&loc(), OID, "huge.txt").unwrap(), None);
-
-        // Any other failure is an error, and never cached.
-        let err = client.file_at(&loc(), OID, "denied.txt").unwrap_err();
-        assert_eq!(err, ClientError::Failed("Forbidden (HTTP 403)".to_string()));
+    #[test]
+    fn file_at_ignores_legacy_partial_blobs_and_ambiguous_absent_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = cache_key(&loc().repo_slug(), "oid", "main.rs");
+        let legacy = tmp.path().join("blobs");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join(&key), b"valid UTF-8 but truncated").unwrap();
+        std::fs::write(legacy.join(&key).with_extension("absent"), b"").unwrap();
+        let path = cache_path(tmp.path(), &loc().repo_slug(), "oid", "main.rs").unwrap();
+        std::fs::write(path.with_extension("absent"), b"").unwrap();
+        let client = blob_client(FakeGh::one(ok(Some(0), "complete\n", "")), tmp.path());
         assert_eq!(
-            client.file_at(&loc(), OID, "denied.txt").unwrap_err(),
+            client.file_at(&loc(), "oid", "main.rs").unwrap().as_deref(),
+            Some("complete\n")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "complete\n");
+    }
+
+    #[test]
+    fn file_at_errors_binary_and_oversize_responses_do_not_poison_later_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = FakeGh::many(vec![
+            ok(Some(1), "", "gh: Forbidden (HTTP 403)"),
+            ok(Some(0), "accessible now", ""),
+            raw(Some(0), &[0u8, 159, 146, 150], ""),
+            raw(Some(0), &[0u8, 159, 146, 150], ""),
+            raw(Some(0), &vec![b'x'; MAX_BLOB_BYTES + 1], ""),
+            raw(Some(0), &vec![b'x'; MAX_BLOB_BYTES + 1], ""),
+        ]);
+        let calls = fake.calls_handle();
+        let client = blob_client(fake, tmp.path());
+        assert_eq!(
+            client.file_at(&loc(), "oid", "denied.txt").unwrap_err(),
             ClientError::Failed("Forbidden (HTTP 403)".to_string())
         );
-
-        let calls = calls.lock().unwrap();
         assert_eq!(
-            calls.len(),
-            6,
-            "cache hits and negative cache never spawn gh"
+            client
+                .file_at(&loc(), "oid", "denied.txt")
+                .unwrap()
+                .as_deref(),
+            Some("accessible now")
         );
-
-        match old_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
+        for path in ["blob.bin", "blob.bin", "huge.txt", "huge.txt"] {
+            assert_eq!(client.file_at(&loc(), "oid", path).unwrap(), None);
         }
+        assert_eq!(calls.lock().unwrap().len(), 6);
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("blobs-v2"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn file_at_rejects_oversize_cache_entries_and_accepts_the_exact_byte_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = cache_path(tmp.path(), &loc().repo_slug(), "oid", "main.rs").unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_BLOB_BYTES as u64) * 64).unwrap();
+        assert_eq!(read_cached_blob(&path), None);
+        let text = "x".repeat(MAX_BLOB_BYTES);
+        let client = blob_client(FakeGh::one(ok(Some(0), &text, "")), tmp.path());
+        assert_eq!(
+            client.file_at(&loc(), "oid", "main.rs").unwrap().as_deref(),
+            Some(text.as_str())
+        );
+        assert_eq!(read_cached_blob(&path).as_deref(), Some(text.as_str()));
+        assert!(write_cached_blob(&path, &(text + "x")).is_err());
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            MAX_BLOB_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn concurrent_blob_publication_only_exposes_complete_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = cache_path(tmp.path(), "o/r", "oid", "file.rs").unwrap();
+        let first = "a".repeat(MAX_BLOB_BYTES / 4);
+        let second = "b".repeat(MAX_BLOB_BYTES / 4);
+        write_cached_blob(&path, &first).unwrap();
+        let start = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            for text in [&first, &second, &first, &second] {
+                let path = &path;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..16 {
+                        write_cached_blob(path, text).unwrap();
+                    }
+                });
+            }
+            start.wait();
+            for _ in 0..64 {
+                let text =
+                    read_cached_blob(&path).expect("atomic replacement always leaves an entry");
+                assert!(
+                    text == first || text == second,
+                    "a reader observed a partial blob"
+                );
+            }
+        });
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_cache_creates_private_paths_and_tightens_existing_paths_before_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join(".cache");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = shared.join("gander");
+        let client = blob_client(FakeGh::one(ok(Some(0), "cached", "")), &root);
+        client.file_at(&loc(), "oid", "main.rs").unwrap();
+        let path = root
+            .join("blobs-v2")
+            .join(cache_key(&loc().repo_slug(), "oid", "main.rs"));
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        for dir in [&root, path.parent().unwrap()] {
+            assert_eq!(mode(dir), 0o700);
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        }
+        assert_eq!(mode(&path), 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let client = blob_client(FakeGh::many(vec![]), &root);
+        assert_eq!(
+            client.file_at(&loc(), "oid", "main.rs").unwrap().as_deref(),
+            Some("cached")
+        );
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&shared), 0o755);
     }
 }
