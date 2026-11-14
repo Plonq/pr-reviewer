@@ -276,6 +276,8 @@ impl ImagePlugin {
         let target = image.target.clone();
         let activate = target.clone();
         let selector = format!("{}-image-{offset}", self.host);
+        let fallback_selector = format!("{selector}-fallback");
+        let block = self.block;
         img(crate::svg_image::remote_source(&target.url))
             .id(offset)
             .object_fit(gpui::ObjectFit::Contain)
@@ -293,10 +295,23 @@ impl ImagePlugin {
                             .into_any_element()
                     })
             })
-            .with_fallback(|| {
+            .with_fallback(move || {
                 div()
                     .text_sm()
-                    .child("Image unavailable — click to inspect")
+                    .debug_selector(|| fallback_selector.clone())
+                    .when(!block, |element| {
+                        element
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .line_height(relative(1.))
+                    })
+                    .child(if block {
+                        "Image unavailable — click to inspect"
+                    } else {
+                        "×"
+                    })
                     .into_any_element()
             })
             .cursor_pointer()
@@ -505,7 +520,11 @@ impl MarkdownPlugin for ImagePlugin {
                 (height * ratio, height)
             }
         };
-        Some(InlineElement::new(self.image(image).w(width).h(height)))
+        // Replacements are ordinary children of Img: their natural text height
+        // can exceed this reserved slot. Contain both fallback and loading paint.
+        Some(InlineElement::new(
+            self.image(image).w(width).h(height).overflow_hidden(),
+        ))
     }
 }
 

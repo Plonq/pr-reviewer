@@ -17,6 +17,8 @@ line-break documentation](https://docs.github.com/en/get-started/writing-on-gith
 - Images, including full/collapsed/shortcut reference images and GitHub's pasted
   image HTML, use the app's image loader and viewer. Only HTTP(S) Markdown image
   targets are loaded; resolving a reference must not grant filesystem access.
+  Failed mixed-paragraph images show a small × inside their reserved inline
+  bounds and remain clickable for inspection; block images retain error text.
 - Mermaid and video attachments use the existing native extension hooks.
 - Conversation documents retain both their original input and their TextView
   state. Preprocessing runs again only when the body or repository context

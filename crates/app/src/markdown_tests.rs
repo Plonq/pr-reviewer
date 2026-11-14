@@ -17,10 +17,13 @@ pub(super) fn image_client(cx: &mut gpui::TestAppContext) -> Arc<std::sync::Mute
     cx.update(|cx| cx.set_http_client(http_client::FakeHttpClient::create(move |req| {
         let url = req.uri().to_string();
         seen.lock().unwrap().push(url.clone());
-        let bytes = if url.ends_with("diagram") {
+        let bytes = if url.ends_with("undecodable-badge.svg") {
+            b"not an image".to_vec()
+        } else if url.ends_with("diagram") {
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80"><rect width="200" height="80"/></svg>"#.to_vec()
         } else if url.ends_with("animation") { gif.clone() } else { png.clone() };
-        async move { Ok(http_client::http::Response::builder().status(200)
+        let status = if url.ends_with("missing-badge.svg") { 404 } else { 200 };
+        async move { Ok(http_client::http::Response::builder().status(status)
             // Deliberately uninformative MIME and extension: decoding is byte-based.
             .header("content-type", "application/octet-stream")
             .body(http_client::AsyncBody::from(bytes)).unwrap()) }
@@ -32,6 +35,120 @@ pub(super) fn draw_settled(cx: &mut gpui::VisualTestContext) {
     for _ in 0..8 {
         cx.update(|window, cx| { window.draw(cx).clear(cx); });
         cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn failed_inline_badges_stay_inside_their_reserved_bounds(cx: &mut gpui::TestAppContext) {
+    image_client(cx);
+    for asset in ["undecodable-badge.svg", "missing-badge.svg"] {
+        let url = format!("https://example.test/{asset}");
+        let source = format!(
+            "[![Rust]({url})](https://example.test/language) 🦀\n\n\
+             # Remove the doc comment on `POLL_INTERVAL`\n\n\
+             > *TL;DR*: **one thing only** — this removes a comment.\n\n\
+             > Following prose should remain readable.\n\n\
+             | Aspect | Before | After |\n| :--- | :---: | :---: |\n\
+             | Doc comment | prose | *removed* |\n\n```rust\nconst VALUE: u32 = 1;\n```"
+        );
+        let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+        let mut item = loop_pr_item(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            &source,
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        let ItemState::Ready(data) = &mut item.state else {
+            unreachable!()
+        };
+        data.pr_meta.as_mut().unwrap().body = source;
+        data.discussion = Some(github::PrDiscussion::default());
+        install_item(&app, item, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.simulate_resize(size(px(1500.), px(1800.)));
+        for (mode, image_selector, fallback_selector, content_selector) in [
+            (
+                Some(ViewMode::Unified),
+                "inline-text-0-11-0-image-1",
+                "inline-text-0-11-0-image-1-fallback",
+                "inline-text-0-11-0-content",
+            ),
+            (
+                Some(ViewMode::Split),
+                "inline-text-0-11-0-image-1",
+                "inline-text-0-11-0-image-1-fallback",
+                "inline-text-0-11-0-content",
+            ),
+            (
+                None,
+                "conversation-0-image-1",
+                "conversation-0-image-1-fallback",
+                "conversation-0-text",
+            ),
+        ] {
+            if let Some(mode) = mode {
+                cx.update(|cx| {
+                    app.update(cx, |app, cx| {
+                        let data = app.active_data_mut().unwrap();
+                        data.mode = mode;
+                        data.rebuild_rows_anchored();
+                        data.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+                        data.scroll
+                            .0
+                            .borrow()
+                            .base_handle
+                            .set_offset(point(px(0.), px(0.)));
+                        cx.notify();
+                    })
+                });
+            } else {
+                vcx.dispatch_action(ShowConversation);
+            }
+            draw_settled(&mut vcx);
+            let image = vcx.debug_bounds(image_selector).unwrap();
+            let fallback = vcx.debug_bounds(fallback_selector).unwrap();
+            let content = vcx.debug_bounds(content_selector).unwrap();
+            assert!(image.size.width > px(0.) && image.size.height > px(0.));
+            // The linked fallback inherits link underlines. Inspect their actual
+            // clipped paint bounds, since unchanged document height hid this bug.
+            vcx.update(|window, _| {
+                let image = image.scale(window.scale_factor());
+                let content = content.scale(window.scale_factor());
+                for underline in window.painted_underlines() {
+                    let painted = underline.bounds.intersect(&underline.content_mask.bounds);
+                    if painted.intersects(&content) && painted.right() > image.left()
+                        && painted.left() < image.right() && painted.top() >= image.top()
+                    {
+                        assert!(painted.bottom() <= image.bottom(),
+                            "{asset} {image_selector}: fallback painted beyond inline image: {painted:?} in {image:?}");
+                    }
+                }
+            });
+            assert_eq!(image.intersect(&fallback), fallback,
+                "{asset} {image_selector}: fallback must fit the reserved slot: {fallback:?} in {image:?}");
+            vcx.simulate_click(image.center(), Default::default());
+            draw_settled(&mut vcx);
+            cx.update(|cx| {
+                let viewer = app.read(cx).image_viewer.as_ref().unwrap();
+                assert_eq!(viewer.target.url.as_ref(), url);
+                assert_eq!(viewer.target.alt.as_ref(), "Rust");
+                assert_eq!(
+                    viewer.target.link.as_deref(),
+                    Some("https://example.test/language")
+                );
+            });
+            assert!(
+                cx.opened_url().is_none(),
+                "image activation must not follow the parent link"
+            );
+            assert!(vcx.debug_bounds("viewer-error").is_some());
+            vcx.simulate_keystrokes("escape");
+            draw_settled(&mut vcx);
+        }
     }
 }
 
