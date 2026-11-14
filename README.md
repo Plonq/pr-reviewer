@@ -24,7 +24,7 @@ Requires **Apple Silicon** and **macOS 15 or later**. GitHub reviews use your [G
 
 ### Install
 
-1. Download [Gander.dmg](https://github.com/Plonq/gander/releases/download/latest/Gander.dmg) from the [latest build](https://github.com/Plonq/gander/releases/tag/latest).
+1. Download [Gander.dmg](https://github.com/Plonq/gander/releases/download/latest/Gander.dmg) from the [latest release downloads](https://github.com/Plonq/gander/releases/tag/latest).
 2. Open the disk image and drag **Gander** into **Applications**.
 3. Install the GitHub CLI if needed, then sign in:
 
@@ -40,6 +40,8 @@ Installed builds check for updates on launch and hourly in the background;
 installs a ready update and restores your review session. Updates can also install
 on normal quit. Publishing requires no paid Apple Developer account; see
 [release workflow and one-time update-key setup](docs/releases.md).
+Releases are explicit: run `./scripts/release.sh` after merging your changes to
+`main`. It suggests a version and creates the tag; CI publishes the DMG and update.
 
 ### Review your first PR
 

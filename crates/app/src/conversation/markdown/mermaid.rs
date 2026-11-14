@@ -507,9 +507,9 @@ fn without_quoted_labels(source: &str) -> String {
                 .iter()
                 .position(|b| matches!(b, b'"' | b'\n' | b'\r'))
                 .map(|end| offset + 1 + end);
-            if let Some(end) = end.filter(|&end| {
-                bytes[end] == b'"' && bytes.get(end + 1) == Some(&close)
-            }) {
+            if let Some(end) =
+                end.filter(|&end| bytes[end] == b'"' && bytes.get(end + 1) == Some(&close))
+            {
                 syntax[offset + 1..end].fill(b' ');
                 offset = end + 1;
             }

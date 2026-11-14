@@ -252,7 +252,10 @@ impl ImagePlugin {
         cx: &mut App,
     ) -> gpui::AnyElement {
         let intrinsic = window
-            .use_asset::<crate::svg_image::ImageLoader>(&Resource::Uri(image.target.url.clone()), cx)
+            .use_asset::<crate::svg_image::ImageLoader>(
+                &Resource::Uri(image.target.url.clone()),
+                cx,
+            )
             .and_then(Result::ok)
             .map(|image| image.size(0));
         let Some(size) = intrinsic else {

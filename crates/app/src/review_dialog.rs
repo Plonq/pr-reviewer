@@ -113,12 +113,7 @@ impl ReviewApp {
                     cx,
                 )
             } else {
-                comment_editor::field_with_media(
-                    &review.input,
-                    review.uploads.as_ref(),
-                    busy,
-                    cx,
-                )
+                comment_editor::field_with_media(&review.input, review.uploads.as_ref(), busy, cx)
             })
             .when_some(review.error.clone(), |body, error| {
                 body.child(div().text_color(theme::red(cx)).child(error))

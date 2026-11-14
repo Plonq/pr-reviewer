@@ -336,7 +336,9 @@ mod tests {
             rows: vec![
                 body(1, 0, Some(crate::CommentSide::Left)),
                 body(1, 1, Some(crate::CommentSide::Left)),
-                Row::CommentSpacer { half: Some(crate::CommentSide::Left) },
+                Row::CommentSpacer {
+                    half: Some(crate::CommentSide::Left),
+                },
                 body(3, 0, Some(crate::CommentSide::Right)),
                 Row::Binary,
             ],
@@ -352,10 +354,15 @@ mod tests {
                 half: Some(crate::CommentSide::Left)
             }
         ));
-        assert!(matches!(
-            built.rows[3],
-            Row::CommentSpacer { half: Some(crate::CommentSide::Left) }
-        ), "spacing belongs after the reactions, not between body and reactions");
+        assert!(
+            matches!(
+                built.rows[3],
+                Row::CommentSpacer {
+                    half: Some(crate::CommentSide::Left)
+                }
+            ),
+            "spacing belongs after the reactions, not between body and reactions"
+        );
         assert!(matches!(
             built.rows[5],
             Row::CommentReactions {
@@ -373,7 +380,13 @@ mod tests {
             comment.reactions.clear();
         }
         let mut built = BuiltRows {
-            rows: vec![body(1, 0, None), Row::CommentEditor { half: None, top: false }],
+            rows: vec![
+                body(1, 0, None),
+                Row::CommentEditor {
+                    half: None,
+                    top: false,
+                },
+            ],
             file_rows: vec![0],
             hunk_rows: vec![],
         };

@@ -121,7 +121,10 @@ fn matches_project_across_unequal_soft_wraps_and_repeated_occurrences() {
 fn multiline_matches_follow_source_streams_but_not_folds_or_hunk_gaps() {
     let rows = vec![
         line(1, LineKind::Context, "foo"),
-        Row::CommentEditor { half: None, top: false },
+        Row::CommentEditor {
+            half: None,
+            top: false,
+        },
         line(2, LineKind::Context, "bar"),
         line(3, LineKind::Removed, "foo"),
         line(4, LineKind::Removed, "bar"),
@@ -160,10 +163,7 @@ fn multiline_matches_follow_source_streams_but_not_folds_or_hunk_gaps() {
 #[test]
 fn selecting_the_only_occurrence_leaves_no_highlights_or_minimap_marks() {
     let rows = vec![line(1, LineKind::Context, "unique")];
-    let matches = SelectionMatches::find(
-        &rows,
-        Some(selection(SelSide::Unified, (0, 6), (0, 0))),
-    );
+    let matches = SelectionMatches::find(&rows, Some(selection(SelSide::Unified, (0, 6), (0, 0))));
     assert!(matches.ranges(0, SelSide::Unified).is_empty());
     assert!(matches.marks.is_empty());
 }

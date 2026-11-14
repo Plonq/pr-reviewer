@@ -342,16 +342,11 @@ mod tests {
         let read = snapshots.read("acme/widgets", 4781).unwrap();
         assert_eq!(read, Some(snapshot.clone()));
         assert_eq!(
-            snapshots
-                .head_sha("acme/widgets", 4781)
-                .unwrap()
-                .as_deref(),
+            snapshots.head_sha("acme/widgets", 4781).unwrap().as_deref(),
             Some("abc123")
         );
         assert_eq!(
-            snapshots
-                .fetched_at_ms("acme/widgets", 4781)
-                .unwrap(),
+            snapshots.fetched_at_ms("acme/widgets", 4781).unwrap(),
             Some(1_700_000_000_000)
         );
     }
@@ -391,10 +386,7 @@ mod tests {
         let snapshots = store.snapshots();
         assert_eq!(snapshots.read("acme/widgets", 1).unwrap(), None);
         assert_eq!(snapshots.head_sha("acme/widgets", 1).unwrap(), None);
-        assert_eq!(
-            snapshots.fetched_at_ms("acme/widgets", 1).unwrap(),
-            None
-        );
+        assert_eq!(snapshots.fetched_at_ms("acme/widgets", 1).unwrap(), None);
     }
 
     /// Writing a second snapshot replaces the first: the store holds the
@@ -408,10 +400,7 @@ mod tests {
         second.head_sha = "def456".into();
         second.title = "Renamed".into();
         snapshots.write(&second).unwrap();
-        let read = snapshots
-            .read("acme/widgets", 4781)
-            .unwrap()
-            .unwrap();
+        let read = snapshots.read("acme/widgets", 4781).unwrap().unwrap();
         assert_eq!(read.head_sha, "def456");
         assert_eq!(read.title, "Renamed");
     }
@@ -464,10 +453,7 @@ mod tests {
         snapshots
             .mark_thread_seen("acme/widgets", 1, &thread)
             .unwrap();
-        assert!(snapshots
-            .thread_seen("acme/widgets", 2)
-            .unwrap()
-            .is_empty());
+        assert!(snapshots.thread_seen("acme/widgets", 2).unwrap().is_empty());
         assert!(snapshots.thread_seen("other/repo", 1).unwrap().is_empty());
     }
 

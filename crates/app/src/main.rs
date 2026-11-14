@@ -4360,9 +4360,7 @@ impl ReviewApp {
         // Match the empty inline card before it can paint: p_3 top/bottom
         // (1.5rem), two gap_2 gaps (1rem), and h_6 mode/action buttons (3rem).
         // Include the same 8px breathing room as the measured reservation.
-        let initial_height = comment_editor::minimum_height(cx)
-            + window.rem_size() * 5.5
-            + px(8.);
+        let initial_height = comment_editor::minimum_height(cx) + window.rem_size() * 5.5 + px(8.);
         self.composers.push(Composer {
             id: self.composer_gen,
             item_id,
@@ -4394,7 +4392,8 @@ impl ReviewApp {
                 if let Some(id) = reply_to {
                     data.replying_comments.insert(id, height);
                 } else {
-                    data.new_comments.insert(path, NewCommentEditor { side, line, height });
+                    data.new_comments
+                        .insert(path, NewCommentEditor { side, line, height });
                 }
                 data.rebuild_rows_anchored();
             }
@@ -5219,9 +5218,11 @@ impl ReviewApp {
             .absolute()
             // Stay inside the thread's existing outline, including at the
             // bottom where the reserved rows draw its rounded cap.
-            .max_w(diff_media::comment_card_max_width(
-                self.char_width.unwrap_or(px(text_size() * 0.6)),
-            ) - px(3.))
+            .max_w(
+                diff_media::comment_card_max_width(
+                    self.char_width.unwrap_or(px(text_size() * 0.6)),
+                ) - px(3.),
+            )
             .left(inline_left + px(2.))
             .top(px(row_y + row_height()))
             .w((if data.mode == ViewMode::Split {
@@ -5398,7 +5399,9 @@ impl ReviewApp {
                 |app: &mut Self, preview, window, cx| {
                     if let Some(composer) = app.composer_mut() {
                         composer.preview = preview;
-                        composer.input.update(cx, |input, cx| input.focus(window, cx));
+                        composer
+                            .input
+                            .update(cx, |input, cx| input.focus(window, cx));
                         cx.notify();
                     }
                 },
@@ -9640,7 +9643,9 @@ mod tests {
         let mut vcx = gpui::VisualTestContext::from_window(window, cx);
         for changes in [
             github::ReviewChanges::NotReviewed,
-            github::ReviewChanges::Unavailable("History rewritten by a rebase or force-push".into()),
+            github::ReviewChanges::Unavailable(
+                "History rewritten by a rebase or force-push".into(),
+            ),
             github::ReviewChanges::default(),
             github::ReviewChanges::Available(github::ReviewBaseline {
                 commit: "abcdef0".into(),
@@ -9681,7 +9686,10 @@ mod tests {
             let text = vcx
                 .debug_bounds("review-scope-tooltip-text")
                 .expect("tooltip text is visible");
-            assert!(text.size.width <= px(440.), "tooltip text must stay bounded");
+            assert!(
+                text.size.width <= px(440.),
+                "tooltip text must stay bounded"
+            );
             if active {
                 assert!(text.size.height > px(60.), "long guidance must wrap");
             }
@@ -17796,7 +17804,12 @@ mod tests {
             assert!(vcx.debug_bounds("composer-start-review").is_none());
             assert!(fake.posts().is_empty());
             cx.update(|cx| {
-                assert!(app.read(cx).store.review_session(&loop_loc()).pending.is_none());
+                assert!(app
+                    .read(cx)
+                    .store
+                    .review_session(&loop_loc())
+                    .pending
+                    .is_none());
             });
             vcx.simulate_keystrokes("cmd-enter");
             cx.run_until_parked();
@@ -17990,7 +18003,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn shift_cmd_enter_cannot_start_review_with_conversation_comment(cx: &mut gpui::TestAppContext) {
+    fn shift_cmd_enter_cannot_start_review_with_conversation_comment(
+        cx: &mut gpui::TestAppContext,
+    ) {
         composer_enter(
             cx,
             ComposerPlacement::ConversationMain,
@@ -18015,7 +18030,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn cmd_enter_publishes_conversation_comment_without_changing_review(cx: &mut gpui::TestAppContext) {
+    fn cmd_enter_publishes_conversation_comment_without_changing_review(
+        cx: &mut gpui::TestAppContext,
+    ) {
         composer_enter(cx, ComposerPlacement::ConversationMain, "cmd-enter", true);
     }
 
@@ -18157,7 +18174,12 @@ mod tests {
         assert_eq!(fake.posts(), vec![expected]);
         if existing_review {
             cx.update(|cx| {
-                let review = app.read(cx).store.review_session(&loop_loc()).pending.unwrap();
+                let review = app
+                    .read(cx)
+                    .store
+                    .review_session(&loop_loc())
+                    .pending
+                    .unwrap();
                 assert_eq!(review.id, 91);
                 assert_eq!(review.body, "web summary");
                 assert!(review.comments.is_empty());

@@ -502,9 +502,13 @@ mod tests {
                     3,
                 );
                 // Comment cards are selectable-through but contribute no text.
-                built
-                    .rows
-                    .insert(built.hunk_rows[0] + 1, Row::CommentEditor { half: None, top: false });
+                built.rows.insert(
+                    built.hunk_rows[0] + 1,
+                    Row::CommentEditor {
+                        half: None,
+                        top: false,
+                    },
+                );
                 let selection = hunk_selection(
                     &built.rows,
                     &diff.files[0].hunks[0],
