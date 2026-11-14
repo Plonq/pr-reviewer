@@ -187,20 +187,6 @@ fn anchor_range(thread: &github::ReviewThread) -> String {
     }
 }
 
-pub(crate) fn anchor(thread: &github::ReviewThread) -> String {
-    format!(
-        "{}{} · {}{}",
-        thread.path,
-        anchor_range(thread),
-        if thread.side == "LEFT" { "old" } else { "new" },
-        if thread.is_outdated {
-            " · outdated"
-        } else {
-            ""
-        }
-    )
-}
-
 use crate::{
     text_size, theme, CommentSide, ComposerPlacement, ItemData, ItemState, ReviewApp, ReviewItem,
     Source,
@@ -1627,10 +1613,6 @@ pub(crate) mod tests {
             matches!(&entries[1], Entry::Thread(t) if t.comments.len() == 2 && matches!(t.comments[1], Comment::Published(c) if c.id == 3))
         );
         assert!(matches!(entries[2], Entry::Comment(Comment::Published(c)) if c.id == 1));
-        assert_eq!(
-            anchor(&discussion.threads[0]),
-            "src/main.rs:10–12 · old · outdated"
-        );
     }
 
     #[test]

@@ -282,17 +282,6 @@ impl LocalStore {
             .flatten()
     }
 
-    /// Record that a review thread was seen, and when.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn mark_thread_seen(&self, repository: &str, number: u64, thread: &store::ThreadSeen) {
-        let Ok(store) = self.inner.lock() else {
-            return;
-        };
-        let _ = store
-            .snapshots()
-            .mark_thread_seen(repository, number, thread);
-    }
-
     /// The threads the app has seen on a PR, with the moment it saw each.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn threads_seen(&self, repository: &str, number: u64) -> Vec<store::ThreadSeen> {

@@ -71,6 +71,16 @@ cargo run --release --locked
 
 The repository pins the Rust toolchain and targets Apple Silicon. If the build reports a missing Metal toolchain, run `xcodebuild -downloadComponent MetalToolchain`.
 
+To keep development settings, sessions, drafts and cached reviews separate from
+the installed app, set `GANDER_DB_PATH`:
+
+```sh
+GANDER_DB_PATH="$PWD/target/dev-store.db" cargo run --locked
+```
+
+The database and its parent directories are created automatically. Without the
+override, Gander uses `~/Library/Application Support/Gander/store.db`.
+
 ## Tech Stack
 
 Built in [Rust](https://www.rust-lang.org/) with [GPUI](https://www.gpui.rs/) for the native UI.
