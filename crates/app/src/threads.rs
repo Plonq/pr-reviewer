@@ -17,7 +17,7 @@ pub(crate) fn author_avatar(
         .name(author.to_owned())
         .xsmall()
         .when_some(author_avatar_url(author, account), |avatar, url| {
-            avatar.src(url)
+            avatar.src(crate::svg_image::remote_source(&url.into()))
         })
 }
 

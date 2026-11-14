@@ -262,6 +262,7 @@ pub(crate) fn card(
             SharedString::from(format!("{}-attachment-link", origin.key)),
             source,
         )
+        .image_source(crate::svg_image::markdown_source)
         .w_auto()
         .h_auto()
         .scrollable(false)

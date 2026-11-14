@@ -1,11 +1,10 @@
 //! Window-filling media inspection, deliberately separate from review input.
-//! Images retain the existing GPUI loader; video moves its live session here.
+//! Images share the restricted conversation decoder; video moves its live session here.
 use crate::{ReviewApp, APP_HEADER_HEIGHT};
 use gpui::component::{button::Button, Sizable, WindowExt};
 use gpui::{
-    div, img, point, prelude::*, px, size, Context, FocusHandle, ImgResourceLoader, KeyDownEvent,
-    MouseButton, MouseMoveEvent, Pixels, Point, Resource, SharedString, SharedUri, Size,
-    StyledImage, Window,
+    div, img, point, prelude::*, px, size, Context, FocusHandle, KeyDownEvent, MouseButton,
+    MouseMoveEvent, Pixels, Point, Resource, SharedString, SharedUri, Size, StyledImage, Window,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -230,7 +229,7 @@ impl ReviewApp {
         let loaded = if is_video {
             None
         } else {
-            window.use_asset::<ImgResourceLoader>(&resource, cx)
+            window.use_asset::<crate::svg_image::ImageLoader>(&resource, cx)
         };
         let session = self.video_hub.read(cx).session.clone();
         let viewport = window.viewport_size();
@@ -265,8 +264,7 @@ impl ReviewApp {
         } else {
             match loaded {
                 Some(Ok(image)) => {
-                    // Let GPUI resolve logical dimensions, including its SVG
-                    // rasterization scale; RenderImage::size is in device pixels.
+                    // Let GPUI resolve logical dimensions from decoded pixels.
                     let natural = img(image.clone()).into_any_element().layout_as_root(
                         gpui::AvailableSpace::min_size(),
                         window,
@@ -326,8 +324,9 @@ impl ReviewApp {
                                 Button::new("viewer-retry").label("Retry").small().on_click(
                                     cx.listener(|app, _, _, cx| {
                                         if let Some(viewer) = &app.image_viewer {
-                                            gpui::ImageSource::from(viewer.target.url.clone())
-                                                .remove_asset(cx);
+                                            cx.remove_asset::<crate::svg_image::ImageLoader>(
+                                                &Resource::Uri(viewer.target.url.clone()),
+                                            );
                                             cx.notify();
                                         }
                                     }),

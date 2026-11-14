@@ -644,7 +644,7 @@ fn animated_markdown_images_keep_frames_and_share_the_inline_asset(cx: &mut gpui
     );
     vcx.update(|window, cx| {
         let image = window
-            .get_asset::<gpui::ImgResourceLoader>(
+            .get_asset::<svg_image::ImageLoader>(
                 &gpui::Resource::Uri("https://github.com/user-attachments/assets/animation".into()),
                 cx,
             )

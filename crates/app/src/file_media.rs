@@ -1,5 +1,5 @@
 //! File media comparisons, separate from Markdown attachments and video playback.
-//! Raster images use GPUI's loader; SVG rasterization tracks display size.
+//! Images use the app's restricted decoder; SVG rasterization tracks display size.
 //! Everything else is a link.
 use std::{collections::HashMap, io::Write, path::Path};
 
@@ -11,7 +11,7 @@ use gpui::{
     },
     div, img,
     prelude::*,
-    px, Context, ImageSource, ObjectFit, Resource, StyledImage, Window,
+    px, Context, ObjectFit, Resource, StyledImage, Window,
 };
 
 use crate::{review_target::LoadedMeta, theme, ItemData, ReviewApp, Source};
@@ -315,7 +315,7 @@ fn render_side(
                     if path.is_some_and(is_svg) {
                         return crate::svg_image::svg_image(source, label);
                     }
-                    img(ImageSource::Resource(source))
+                    img(crate::svg_image::image_source(source))
                         .id("image")
                         .size_full()
                         .object_fit(ObjectFit::Contain)

@@ -6251,7 +6251,11 @@ impl ReviewApp {
                 .items_center()
                 .gap_1()
                 .pr_3()
-                .child(Avatar::new().src(viewer.avatar_url.clone()).xsmall())
+                .child(
+                    Avatar::new()
+                        .src(svg_image::remote_source(&viewer.avatar_url.clone().into()))
+                        .xsmall(),
+                )
                 .child(
                     div()
                         .text_size(px(12.))

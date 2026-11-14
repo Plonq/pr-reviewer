@@ -11,8 +11,8 @@ use gpui::component::text::{
     MarkdownPlugin, TextView, TextViewState,
 };
 use gpui::{
-    div, img, prelude::*, px, relative, App, Context, ImgResourceLoader, MouseButton, Resource,
-    SharedString, StyledImage, WeakEntity, Window,
+    div, img, prelude::*, px, relative, App, Context, MouseButton, Resource, SharedString,
+    StyledImage, WeakEntity, Window,
 };
 use markdown::mdast::Node;
 use std::{
@@ -252,7 +252,7 @@ impl ImagePlugin {
         cx: &mut App,
     ) -> gpui::AnyElement {
         let intrinsic = window
-            .use_asset::<ImgResourceLoader>(&Resource::Uri(image.target.url.clone()), cx)
+            .use_asset::<crate::svg_image::ImageLoader>(&Resource::Uri(image.target.url.clone()), cx)
             .and_then(Result::ok)
             .map(|image| image.size(0));
         let Some(size) = intrinsic else {
@@ -276,7 +276,7 @@ impl ImagePlugin {
         let target = image.target.clone();
         let activate = target.clone();
         let selector = format!("{}-image-{offset}", self.host);
-        img(target.url)
+        img(crate::svg_image::remote_source(&target.url))
             .id(offset)
             .object_fit(gpui::ObjectFit::Contain)
             .max_w(relative(1.))
@@ -292,12 +292,12 @@ impl ImagePlugin {
                             .child("Loading image…")
                             .into_any_element()
                     })
-                    .with_fallback(|| {
-                        div()
-                            .text_sm()
-                            .child("Image unavailable — click to inspect")
-                            .into_any_element()
-                    })
+            })
+            .with_fallback(|| {
+                div()
+                    .text_sm()
+                    .child("Image unavailable — click to inspect")
+                    .into_any_element()
             })
             .cursor_pointer()
             .debug_selector(move || selector.clone())
@@ -437,6 +437,7 @@ impl MarkdownPlugin for ImagePlugin {
                         SharedString::from(format!("{}-captioned-{offset}", self.host)),
                         captioned.html.clone(),
                     )
+                    .image_source(crate::svg_image::markdown_source)
                     .w_full()
                     .h_auto()
                     .scrollable(false)
@@ -486,7 +487,7 @@ impl MarkdownPlugin for ImagePlugin {
         // The same GPUI asset and secure HTTP client supply both measurement
         // and drawing, including asynchronously resolved intrinsic sizing.
         let intrinsic = window
-            .use_asset::<ImgResourceLoader>(&Resource::Uri(target.url.clone()), cx)
+            .use_asset::<crate::svg_image::ImageLoader>(&Resource::Uri(target.url.clone()), cx)
             .and_then(Result::ok)
             .map(|image| image.size(0));
         let ratio = intrinsic.map_or(1., |size| {
@@ -614,7 +615,8 @@ pub(crate) fn render_view(
             move || format!("{id}-text")
         })
         .child(
-            view.markdown_extensions(extensions)
+            view.image_source(crate::svg_image::markdown_source)
+                .markdown_extensions(extensions)
                 .w_full()
                 .h_auto()
                 .scrollable(false)
