@@ -1,6 +1,339 @@
 use super::*;
 
 #[gpui::test]
+fn close_reopen_cannot_replace_a_delayed_mutation_lock(cx: &mut gpui::TestAppContext) {
+    for pending in [false, true] {
+        for fail in [false, true] {
+            let fake = Arc::new(FakePr::default());
+            fake.fail.store(fail, Ordering::SeqCst);
+            fake.fail_pending_create.store(fail, Ordering::SeqCst);
+            let (window, app) = queue_window(cx, fake.clone());
+            install_item(&app, commenting_item(&fake), cx);
+            let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.open_composer(None, "a.rs".into(), CommentSide::Right, 1, 0, window, cx);
+                    app.composer_mut().unwrap().pending = pending;
+                    app.composer().unwrap().input.update(cx, |input, cx| {
+                        input.set_value("keep this write", window, cx)
+                    });
+                    app.submit_composer(window, cx);
+                    assert!(app.sessions[&0].busy);
+                    assert!(app.items[0].comment_sync.is_writing());
+                    // GPUI's deterministic executor holds the fake write until
+                    // run_until_parked, so close/reopen races need no sleeps.
+                    assert!(fake.posts().is_empty());
+                    assert_eq!(fake.pending_create_calls.load(Ordering::SeqCst), 0);
+
+                    app.open_composer(None, "a.rs".into(), CommentSide::Right, 1, 0, window, cx);
+                    let editor = app.composer().unwrap().id;
+                    app.composer()
+                        .unwrap()
+                        .input
+                        .update(cx, |input, cx| input.set_value("newer editor", window, cx));
+                    app.close_item(0, cx);
+                    assert_eq!(app.items.len(), 1);
+                    assert_eq!(app.composer().unwrap().id, editor);
+                    assert!(app.sessions[&0]
+                        .error
+                        .as_ref()
+                        .unwrap()
+                        .contains("before closing"));
+                    app.open_item(Source::Pr(loop_loc()), cx);
+                    assert_eq!(app.items.len(), 1);
+                    assert_eq!(app.items[0].id, 0, "reopen must keep the original lock");
+                    assert_eq!(app.next_id, 1);
+                    app.run_session(
+                        0,
+                        SessionCommand::Conversation {
+                            body: "second write".into(),
+                        },
+                        SessionCompletion::None,
+                        window,
+                        cx,
+                    );
+
+                    // Only the writing PR is held open.
+                    let mut other = loop_pr_item(vec![]);
+                    other.id = 1;
+                    if let Source::Pr(loc) = &mut other.source {
+                        loc.number += 1;
+                    }
+                    app.items.push(other);
+                    app.close_item(1, cx);
+                    assert_eq!(app.items.len(), 1);
+                })
+            });
+            cx.run_until_parked();
+            assert_eq!(fake.posts().len(), usize::from(!pending));
+            assert_eq!(
+                fake.pending_create_calls.load(Ordering::SeqCst),
+                usize::from(pending)
+            );
+            vcx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    assert!(!app.sessions[&0].busy);
+                    assert!(!app.items[0].comment_sync.is_writing());
+                    assert_eq!(app.sessions[&0].error.is_some(), fail);
+                    assert_eq!(
+                        app.composer().unwrap().input.read(cx).value(),
+                        "newer editor"
+                    );
+                    if fail {
+                        let recovery = &app.active_data().unwrap().posts.failed[0];
+                        assert_eq!(recovery.body, "keep this write");
+                        if pending {
+                            assert_eq!(app.sessions[&0].state.pending.as_ref().unwrap().id, 91);
+                            assert_eq!(app.store.review_session(&loop_loc()).count(), 0);
+                        }
+                        // The rejected close must not lose the failed write's
+                        // recovery action or overwrite a newer editor.
+                        let token = recovery.token;
+                        app.close_composer(window, cx);
+                        app.restore_comment_draft(0, token, window, cx);
+                        assert_eq!(
+                            app.composer().unwrap().input.read(cx).value(),
+                            "keep this write"
+                        );
+                    }
+                    app.close_item(0, cx);
+                    assert!(
+                        app.items.is_empty(),
+                        "success and failure both release the close guard"
+                    );
+                    assert!(app.composers.is_empty());
+                    assert!(app.show_queue);
+                })
+            });
+        }
+    }
+}
+
+#[gpui::test]
+fn all_session_mutations_hold_the_tab_until_completion(cx: &mut gpui::TestAppContext) {
+    let anchor = github::CommentAnchor {
+        commit_id: "dead10cc".into(),
+        path: "a.rs".into(),
+        side: CommentSide::Right,
+        line: 1,
+        start_line: None,
+        position: None,
+    };
+    let target = github::CommentTarget::ReviewComment("node-11".into());
+    let commands = [
+        (
+            false,
+            SessionCommand::Start {
+                commit_id: "dead10cc".into(),
+            },
+        ),
+        (
+            false,
+            SessionCommand::Add {
+                anchor: anchor.clone(),
+                body: "draft".into(),
+            },
+        ),
+        (
+            false,
+            SessionCommand::Reply {
+                comment_id: 11,
+                body: "reply".into(),
+            },
+        ),
+        (
+            true,
+            SessionCommand::Reply {
+                comment_id: 11,
+                body: "draft reply".into(),
+            },
+        ),
+        (
+            false,
+            SessionCommand::ConversationReply {
+                comment_id: 11,
+                commit_id: "dead10cc".into(),
+                body: "reply".into(),
+                pending: false,
+            },
+        ),
+        (
+            false,
+            SessionCommand::ConversationReply {
+                comment_id: 11,
+                commit_id: "dead10cc".into(),
+                body: "draft reply".into(),
+                pending: true,
+            },
+        ),
+        (
+            false,
+            SessionCommand::Conversation {
+                body: "comment".into(),
+            },
+        ),
+        (
+            true,
+            SessionCommand::Edit {
+                id: 13,
+                body: "edited draft".into(),
+            },
+        ),
+        (true, SessionCommand::Delete { id: 13 }),
+        (
+            false,
+            SessionCommand::EditPublished {
+                target: target.clone(),
+                body: "edited".into(),
+            },
+        ),
+        (
+            false,
+            SessionCommand::DeletePublished {
+                target: target.clone(),
+            },
+        ),
+        (
+            false,
+            SessionCommand::SetReaction {
+                target,
+                content: "HEART".into(),
+                reacted: true,
+            },
+        ),
+        (
+            false,
+            SessionCommand::SetThreadResolved {
+                thread_id: "11".into(),
+                resolved: true,
+            },
+        ),
+        (
+            false,
+            SessionCommand::Submit {
+                commit_id: "dead10cc".into(),
+                verdict: github::ReviewVerdict::Approve,
+                body: String::new(),
+            },
+        ),
+        (
+            true,
+            SessionCommand::Submit {
+                commit_id: "dead10cc".into(),
+                verdict: github::ReviewVerdict::Approve,
+                body: String::new(),
+            },
+        ),
+        (
+            false,
+            SessionCommand::Immediate {
+                anchor,
+                body: "inline".into(),
+            },
+        ),
+    ];
+    for (pending, command) in commands {
+        let fake = FakePr::with_threads(vec![rc(
+            11,
+            "a.rs",
+            Some("RIGHT"),
+            Some(1),
+            "root",
+            "alice",
+            "",
+            None,
+        )]);
+        fake.comment_permissions
+            .lock()
+            .unwrap()
+            .insert(11, permitted_comment("node-11", true, true));
+        if pending {
+            *fake.pending.lock().unwrap() = Some(github::PendingReview {
+                id: 91,
+                node_id: "pending".into(),
+                commit_id: Some("dead10cc".into()),
+                body: String::new(),
+                comments: vec![github::PendingComment {
+                    id: 13,
+                    node_id: "draft".into(),
+                    path: "a.rs".into(),
+                    side: CommentSide::Right,
+                    line: Some(1),
+                    start_line: None,
+                    body: "draft".into(),
+                    in_reply_to_id: None,
+                }],
+            });
+        }
+        let (window, app) = queue_window(cx, fake.clone());
+        install_item(&app, commenting_item(&fake), cx);
+        let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+        vcx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.run_session(0, command.clone(), SessionCompletion::None, window, cx);
+                app.close_item(0, cx);
+                assert_eq!(app.items.len(), 1, "{command:?}");
+                assert!(app.items[0].comment_sync.is_writing(), "{command:?}");
+                assert!(
+                    app.session_job(
+                        0,
+                        SessionCommand::Conversation {
+                            body: "second write".into()
+                        },
+                        cx
+                    )
+                    .is_none(),
+                    "{command:?}"
+                );
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                assert!(!app.sessions[&0].busy, "{command:?}");
+                assert!(
+                    app.sessions[&0].error.is_none(),
+                    "{command:?}: {:?}",
+                    app.sessions[&0].error
+                );
+                assert!(!app.items[0].comment_sync.is_writing(), "{command:?}");
+                app.close_item(0, cx);
+                assert!(app.items.is_empty(), "{command:?}");
+            })
+        });
+    }
+}
+
+#[gpui::test]
+fn read_only_resume_can_close_and_cleans_up_its_old_session(cx: &mut gpui::TestAppContext) {
+    let fake = Arc::new(FakePr::default());
+    let (_, app) = queue_window(cx, fake.clone());
+    install_item(&app, commenting_item(&fake), cx);
+    cx.update(|cx| {
+        app.update(cx, |app, cx| {
+            app.resume_session(0, cx);
+            assert!(app.sessions[&0].busy);
+            assert!(!app.items[0].comment_sync.is_writing());
+            app.close_item(0, cx);
+            assert!(app.items.is_empty());
+            app.open_item(Source::Pr(loop_loc()), cx);
+            assert_eq!(app.items[0].id, 1);
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(
+            !app.sessions.contains_key(&0),
+            "a late read removes only its old session"
+        );
+        assert!(!app.sessions[&1].busy);
+        assert!(!app.items[0].comment_sync.is_writing());
+    });
+    assert!(fake.posts().is_empty());
+}
+
+#[gpui::test]
 fn immediate_inline_projects_and_closes_editor_before_response(cx: &mut gpui::TestAppContext) {
     let fake = Arc::new(FakePr::default());
     let (window, app) = queue_window(cx, fake.clone());

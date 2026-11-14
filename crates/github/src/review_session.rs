@@ -108,6 +108,9 @@ fn deserialize_side<'de, D: serde::Deserializer<'de>>(
 pub struct PendingReview {
     pub id: u64,
     pub node_id: String,
+    /// Captured from GitHub; old cache entries and incomplete responses are unknown.
+    #[serde(default)]
+    pub commit_id: Option<String>,
     pub body: String,
     pub comments: Vec<PendingComment>,
 }
@@ -168,6 +171,8 @@ pub enum Command {
         resolved: bool,
     },
     Submit {
+        /// The head displayed when the review dialog was opened.
+        commit_id: String,
         verdict: ReviewVerdict,
         body: String,
     },
@@ -375,13 +380,29 @@ impl ReviewSession {
                     .comments
                     .retain(|comment| comment.id != id);
             }
-            Command::Submit { verdict, body } => {
+            Command::Submit {
+                commit_id,
+                verdict,
+                body,
+            } => {
+                if commit_id.is_empty() {
+                    return Err(ClientError::Invalid("missing reviewed head commit".into()));
+                }
                 validate_submission(verdict, &body, self.count())?;
                 match &self.pending {
                     Some(review) => {
+                        match review.commit_id.as_deref().filter(|commit| !commit.is_empty()) {
+                            Some(commit) if commit == commit_id => {}
+                            Some(_) => return Err(ClientError::Invalid(
+                                "Your pending review targets a different commit than this review; resolve the draft on GitHub before submitting. Your summary has been kept.".into(),
+                            )),
+                            None => return Err(ClientError::Invalid(
+                                "The commit for your pending review is unknown; resolve the draft on GitHub before submitting. Your summary has been kept.".into(),
+                            )),
+                        }
                         client.submit_pending_review(loc, review, verdict, body.trim())?
                     }
-                    None => client.submit_review(loc, verdict, body.trim())?,
+                    None => client.submit_review(loc, &commit_id, verdict, body.trim())?,
                 }
                 self.pending = None;
             }

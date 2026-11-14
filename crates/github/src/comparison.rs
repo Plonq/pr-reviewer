@@ -5,7 +5,8 @@
 //! in the user's repository.
 
 use crate::{ClientError, PrLocator};
-use diff_core::{diff_texts, parse_patch, DiffRow};
+use diff_core::{diff_texts, try_parse_patch, DiffRow};
+use git::process::{self, Limits};
 use std::{collections::HashMap, path::Path, process::Command};
 
 #[derive(Debug, Clone)]
@@ -144,7 +145,7 @@ fn compare_trees(
         ],
     )?;
     let mut base_files = HashMap::new();
-    for file in parse_patch(&patch).files {
+    for file in try_parse_patch(&patch).map_err(failed)?.files {
         let Some(path) = file.old_path else { continue };
         let Some(text) = text_blob(repo, tree, &path)? else {
             continue;
@@ -187,18 +188,12 @@ fn reviewed_lines(original: &str, virtual_text: &str) -> Vec<Option<u32>> {
 fn text_blob(repo: &Path, revision: &str, path: &str) -> Result<Option<String>, ClientError> {
     let object = format!("{revision}:{path}");
     // Gitlinks point at commits, not blobs. They stay patch-derived.
-    let kind = command(repo)
-        .args(["cat-file", "-t", &object])
-        .output()
-        .map_err(failed)?;
+    let kind = output(repo, &["cat-file", "-t", &object])?;
     if kind.status.success() && kind.stdout != b"blob\n" {
         return Ok(None);
     }
     // Don't materialize monster/binary files for full-content upgrades.
-    let size = command(repo)
-        .args(["cat-file", "-s", &object])
-        .output()
-        .map_err(failed)?;
+    let size = output(repo, &["cat-file", "-s", &object])?;
     if !size.status.success() {
         // Distinguish a missing path from an object-fetch/authentication error.
         git(repo, &["cat-file", "-e", revision])?;
@@ -225,10 +220,7 @@ fn text_blob(repo: &Path, revision: &str, path: &str) -> Result<Option<String>, 
     if size > 1024 * 1024 {
         return Ok(None);
     }
-    let out = command(repo)
-        .args(["cat-file", "blob", &object])
-        .output()
-        .map_err(failed)?;
+    let out = output(repo, &["cat-file", "blob", &object])?;
     if !out.status.success() {
         return Err(failed(String::from_utf8_lossy(&out.stderr)));
     }
@@ -240,6 +232,8 @@ fn text_blob(repo: &Path, revision: &str, path: &str) -> Result<Option<String>, 
 fn command(repo: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(repo)
+        .env("GH_HOST", "github.com")
+        .env_remove("GH_REPO")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -264,7 +258,7 @@ fn command(repo: &Path) -> Command {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, ClientError> {
-    let out = command(repo).args(args).output().map_err(failed)?;
+    let out = output(repo, args)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(failed(if stderr.trim().is_empty() {
@@ -279,6 +273,18 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, ClientError> {
     String::from_utf8(out.stdout).map_err(failed)
 }
 
+fn output(repo: &Path, args: &[&str]) -> Result<std::process::Output, ClientError> {
+    let mut limits = Limits::read(if args.first() == Some(&"diff") {
+        process::PATCH_BYTES
+    } else {
+        process::TEXT_BYTES
+    });
+    if args.first() == Some(&"fetch") {
+        limits.timeout = std::time::Duration::from_secs(90);
+    }
+    process::run(command(repo).args(args), limits).map_err(failed)
+}
+
 fn failed(error: impl std::fmt::Display) -> ClientError {
     ClientError::Failed(format!(
         "upstream-aware comparison (requires Git 2.43+): {error}"
@@ -288,6 +294,7 @@ fn failed(error: impl std::fmt::Display) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diff_core::parse_patch;
 
     fn commit(repo: &Path, files: &[(&str, &str)]) -> String {
         for (path, text) in files {
@@ -434,6 +441,44 @@ mod tests {
         assert_eq!(files["deleted"].text, "deleted reviewed\n");
         assert!(!files.contains_key("binary"));
         assert!(text_blob(repo, &head, "absent").unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unsupported_patch_path_returns_a_visible_comparison_error() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q"]).unwrap();
+        let base = commit(repo, &[("valid", "text\n")]);
+        let blob = git(repo, &["rev-parse", &format!("{base}:valid")]).unwrap();
+        // macOS cannot create this filename in the filesystem, but Git trees
+        // can contain it and an external comparison can therefore encounter it.
+        let output = command(repo)
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                blob.trim(),
+            ])
+            .arg(OsStr::from_bytes(b"invalid-\xff"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let head = git(repo, &["write-tree"]).unwrap();
+
+        let error = compare_trees(repo, &base, head.trim(), &base, &base).unwrap_err();
+        assert!(matches!(error, ClientError::Failed(_)), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("upstream-aware comparison"), "{message}");
+        assert!(
+            message.contains("Unsupported non-UTF-8 Git path"),
+            "{message}"
+        );
+        assert!(message.contains(r"invalid-\\377"), "{message}");
     }
 
     #[test]

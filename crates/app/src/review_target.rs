@@ -56,6 +56,7 @@ pub(crate) struct LoadedConversation {
 pub(crate) struct Loaded {
     pub(crate) meta: LoadedMeta,
     pub(crate) diff: PrDiff,
+    pub(crate) omitted_untracked: usize,
     /// Original patch coordinates, before re-diffing full file contents.
     pub(crate) anchor_hunks: Vec<Vec<diff_core::Hunk>>,
     pub(crate) upgrades: HashMap<usize, FileUpgrade>,
@@ -91,9 +92,9 @@ pub(crate) fn fetch_item(
 }
 
 /// Blocking fetch, parse, and row building on the background executor. PR
-/// metadata, patch, discussion, commits, and viewed state fetch concurrently;
-/// the review baseline is then validated against the captured metadata head.
-/// Optional comparison failures keep the complete PR diff usable.
+/// metadata, discussion, commits, and viewed state fetch concurrently. Resolve
+/// the requested range against the captured metadata before fetching its patch;
+/// optional comparison failures fall back to the complete PR at the same OIDs.
 ///
 /// The local snapshot records last-seen bookkeeping, independently of the
 /// submitted GitHub review that determines the incremental diff's baseline.
@@ -144,6 +145,7 @@ pub(crate) fn fetch_item_with_restart(
     let mut pr_base = None;
     let mut review_base = None;
     let mut review_base_files = None;
+    let mut omitted_untracked = 0;
     let (meta, patch, comments, discussion, commits, viewed, snapshot) = match source {
         Source::Pr(loc) => {
             let meta_client = github.clone();
@@ -160,9 +162,6 @@ pub(crate) fn fetch_item_with_restart(
             let viewed_client = github.clone();
             let viewed_loc = loc.clone();
             let viewed_thread = std::thread::spawn(move || viewed_client.viewed_files(&viewed_loc));
-            let patch_client = github.clone();
-            let patch_loc = loc.clone();
-            let patch_thread = std::thread::spawn(move || patch_client.pr_patch(&patch_loc));
             let meta = meta_thread
                 .join()
                 .map_err(|_| anyhow!("GitHub metadata fetch panicked"))??;
@@ -177,9 +176,6 @@ pub(crate) fn fetch_item_with_restart(
                     discussion: discussion.clone(),
                 });
             }
-            let patch = patch_thread
-                .join()
-                .map_err(|_| anyhow!("GitHub patch fetch panicked"))??;
             // Both the timeline and inline index derive from this discussion;
             // never fetch a second, potentially inconsistent comment collection.
             let comments = crate::comments::Projection::new(
@@ -200,7 +196,7 @@ pub(crate) fn fetch_item_with_restart(
                     "Couldn't verify changes since your last review: {error}. View all changes instead."
                 ))
             });
-            let mut patch = patch;
+            let mut patch = None;
             if since_review || restart_base.is_some() {
                 if let Some(base) = restart_base.or_else(|| {
                     review_changes
@@ -210,7 +206,7 @@ pub(crate) fn fetch_item_with_restart(
                     match github.comparison_patch(loc, base, &meta.head_ref_oid, &meta.base_ref_oid) {
                         Ok(comparison) => {
                             review_base = Some(base.to_owned());
-                            patch = comparison.patch;
+                            patch = Some(comparison.patch);
                             review_base_files = comparison.base_files.map(Arc::new);
                         }
                         Err(error) => review_changes = github::ReviewChanges::Unavailable(format!(
@@ -219,6 +215,10 @@ pub(crate) fn fetch_item_with_restart(
                     }
                 }
             }
+            let patch = match patch {
+                Some(patch) => patch,
+                None => github.pr_patch(loc, &meta.base_ref_oid, &meta.head_ref_oid)?,
+            };
             if review_base.is_none() {
                 pr_base = match github.merge_base(loc, &meta.base_ref_oid, &meta.head_ref_oid) {
                     Ok(oid) => Some(oid),
@@ -242,7 +242,16 @@ pub(crate) fn fetch_item_with_restart(
         Source::Local(src) => {
             let src = git::resolve_local_with_base(&src.repo_root, src.base_ref.as_deref())?;
             let patch = git::diff_patch(&src)?;
-            (LoadedMeta::Local(src), patch, None, None, None, None, None)
+            omitted_untracked = patch.omitted_untracked;
+            (
+                LoadedMeta::Local(src),
+                patch.patch,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         }
     };
     let mut comments = comments;
@@ -251,7 +260,7 @@ pub(crate) fn fetch_item_with_restart(
             index.hide_left_anchors();
         }
     }
-    let mut diff = diff_core::parse_patch(&patch);
+    let mut diff = diff_core::try_parse_patch(&patch)?;
     let anchor_hunks = diff.files.iter().map(|file| file.hunks.clone()).collect();
     let jobs: Vec<_> = diff
         .files
@@ -316,6 +325,7 @@ pub(crate) fn fetch_item_with_restart(
     Ok(Loaded {
         meta,
         diff,
+        omitted_untracked,
         anchor_hunks,
         upgrades,
         file_media,

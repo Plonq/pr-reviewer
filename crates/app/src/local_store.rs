@@ -411,7 +411,7 @@ mod tests {
             title: "Add deactivation filters".into(),
             author: "octocat".into(),
             author_avatar_url: Some("https://avatars.githubusercontent.com/u/583231".into()),
-            repository: "octocat/Hello-World".into(),
+            repository: "acme/widgets".into(),
             is_draft: true,
             review_state: ReviewState::ChangesRequested,
             ci: CiState::Pass,
@@ -578,6 +578,7 @@ mod tests {
         let pending = github::PendingReview {
             id: 91,
             node_id: "PRR_pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: "summary".into(),
             comments: vec![github::PendingComment {
                 in_reply_to_id: None,

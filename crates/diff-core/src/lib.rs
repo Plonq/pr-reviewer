@@ -71,7 +71,26 @@ pub enum DiffRow {
     },
 }
 
+/// Parse a patch whose paths are known to be supported. Call
+/// [`try_parse_patch`] for external input so path errors can be shown to users.
 pub fn parse_patch(patch: &str) -> PrDiff {
+    try_parse_patch(patch).expect("invalid or unsupported Git patch path")
+}
+
+#[derive(Debug)]
+pub struct PatchPathError(String);
+
+impl std::fmt::Display for PatchPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PatchPathError {}
+
+/// Decode Git's quoted path bytes exactly once, rejecting paths the UTF-8
+/// file model cannot represent rather than substituting a different filename.
+pub fn try_parse_patch(patch: &str) -> Result<PrDiff, PatchPathError> {
     let mut files = Vec::new();
     let mut lines = patch.lines().peekable();
 
@@ -79,7 +98,7 @@ pub fn parse_patch(patch: &str) -> PrDiff {
         let Some(rest) = line.strip_prefix("diff --git ") else {
             continue;
         };
-        let (old_guess, new_guess) = parse_git_paths(rest);
+        let (old_guess, new_guess) = parse_git_paths(rest)?;
         let mut file = FileDiff {
             old_path: old_guess,
             new_path: new_guess,
@@ -105,19 +124,19 @@ pub fn parse_patch(patch: &str) -> PrDiff {
                 file.status = FileStatus::Deleted;
                 is_deleted = true;
             } else if let Some(p) = next.strip_prefix("rename from ") {
-                file.old_path = Some(p.to_string());
+                file.old_path = Some(decode_path(p)?);
                 is_rename = true;
             } else if let Some(p) = next.strip_prefix("rename to ") {
-                file.new_path = Some(p.to_string());
+                file.new_path = Some(decode_path(p)?);
                 is_rename = true;
             } else if next.starts_with("Binary files ") || next == "GIT binary patch" {
                 file.status = FileStatus::Binary;
             } else if let Some(p) = next.strip_prefix("--- ") {
-                if let Some(p) = parse_marker_path(p) {
+                if let Some(p) = parse_marker_path(p)? {
                     file.old_path = Some(p);
                 }
             } else if let Some(p) = next.strip_prefix("+++ ") {
-                if let Some(p) = parse_marker_path(p) {
+                if let Some(p) = parse_marker_path(p)? {
                     file.new_path = Some(p);
                 }
             }
@@ -185,7 +204,7 @@ pub fn parse_patch(patch: &str) -> PrDiff {
         files.push(file);
     }
 
-    PrDiff { files }
+    Ok(PrDiff { files })
 }
 
 /// Authoritative diff of two complete file contents into hunks with `context`
@@ -381,31 +400,33 @@ pub fn without_whitespace(hunks: &[Hunk]) -> Vec<Hunk> {
 
 /// `a/old b/new`, possibly with `"`-quoted paths. Best-effort: the definitive
 /// paths come from `---`/`+++`/`rename` lines when present.
-fn parse_git_paths(rest: &str) -> (Option<String>, Option<String>) {
+fn parse_git_paths(rest: &str) -> Result<(Option<String>, Option<String>), PatchPathError> {
     if rest.starts_with('"') {
-        let mut parts = Vec::new();
-        let mut chars = rest.char_indices();
-        while let Some((start, ch)) = chars.next() {
-            if ch != '"' {
-                continue;
-            }
-            for (end, ch) in chars.by_ref() {
-                if ch == '"' {
-                    parts.push(&rest[start + 1..end]);
-                    break;
-                }
-            }
-        }
-        if parts.len() == 2 {
-            return (strip_side(parts[0]), strip_side(parts[1]));
+        let (old, rest) = decode_quoted_path(rest)?;
+        let new = decode_path(rest.strip_prefix(' ').ok_or_else(|| invalid_path(rest))?)?;
+        return Ok((strip_side(&old), strip_side(&new)));
+    }
+    // Either side may be quoted independently (e.g. a renamed empty file).
+    if let Some((old, new)) = rest.split_once(" \"") {
+        return Ok((
+            strip_side(old),
+            strip_side(&decode_path(&format!("\"{new}"))?),
+        ));
+    }
+    // Spaces, including " b/", are legal unquoted filename bytes. Prefer the
+    // split where both names agree, which also handles header-only empty and
+    // binary files. Rename headers/markers supply authoritative differing names.
+    for (pos, _) in rest.match_indices(" b/") {
+        if rest[..pos].strip_prefix("a/") == rest[pos + 1..].strip_prefix("b/") {
+            return Ok((strip_side(&rest[..pos]), strip_side(&rest[pos + 1..])));
         }
     }
     if let Some(pos) = rest.find(" b/") {
         let old = strip_side(&rest[..pos]);
         let new = strip_side(&rest[pos + 1..]);
-        return (old, new);
+        return Ok((old, new));
     }
-    (None, None)
+    Ok((None, None))
 }
 
 fn strip_side(path: &str) -> Option<String> {
@@ -415,14 +436,74 @@ fn strip_side(path: &str) -> Option<String> {
 }
 
 /// Path from a `---`/`+++` marker: `a/path`, `b/path`, `/dev/null`, maybe quoted.
-fn parse_marker_path(p: &str) -> Option<String> {
-    let p = p.trim_end();
-    let p = p.strip_prefix('"').unwrap_or(p);
-    let p = p.strip_suffix('"').unwrap_or(p);
+fn parse_marker_path(p: &str) -> Result<Option<String>, PatchPathError> {
+    // Git adds a tab terminator to unquoted marker paths containing spaces.
+    // Literal filename tabs are quoted; do not trim meaningful spaces.
+    let p = decode_path(p.split_once('\t').map_or(p, |(path, _)| path))?;
     if p == "/dev/null" {
-        return None;
+        return Ok(None);
     }
-    strip_side(p).or_else(|| Some(p.to_string()))
+    Ok(strip_side(&p).or(Some(p)))
+}
+
+fn invalid_path(path: &str) -> PatchPathError {
+    PatchPathError(format!("Invalid Git patch path: {path:?}"))
+}
+
+fn decode_path(path: &str) -> Result<String, PatchPathError> {
+    if !path.starts_with('"') {
+        return Ok(path.to_string());
+    }
+    let (decoded, rest) = decode_quoted_path(path)?;
+    if !rest.is_empty() {
+        return Err(invalid_path(path));
+    }
+    Ok(decoded)
+}
+
+fn decode_quoted_path(path: &str) -> Result<(String, &str), PatchPathError> {
+    let input = path.as_bytes();
+    let mut bytes = Vec::new();
+    let mut ix = 1; // opening quote
+    while let Some(&byte) = input.get(ix) {
+        ix += 1;
+        match byte {
+            b'"' => {
+                let decoded = String::from_utf8(bytes).map_err(|_| {
+                    PatchPathError(format!("Unsupported non-UTF-8 Git path: {path:?}"))
+                })?;
+                if decoded.contains('\0') {
+                    return Err(invalid_path(path));
+                }
+                return Ok((decoded, &path[ix..]));
+            }
+            b'\\' => {
+                let escaped = *input.get(ix).ok_or_else(|| invalid_path(path))?;
+                ix += 1;
+                bytes.push(match escaped {
+                    b'a' => 7,
+                    b'b' => 8,
+                    b't' => b'\t',
+                    b'n' => b'\n',
+                    b'v' => 11,
+                    b'f' => 12,
+                    b'r' => b'\r',
+                    b'"' | b'\\' => escaped,
+                    b'0'..=b'3' => {
+                        let digits = input.get(ix..ix + 2).ok_or_else(|| invalid_path(path))?;
+                        if !digits.iter().all(|d| matches!(d, b'0'..=b'7')) {
+                            return Err(invalid_path(path));
+                        }
+                        ix += 2;
+                        (escaped - b'0') * 64 + (digits[0] - b'0') * 8 + (digits[1] - b'0')
+                    }
+                    _ => return Err(invalid_path(path)),
+                });
+            }
+            _ => bytes.push(byte),
+        }
+    }
+    Err(invalid_path(path))
 }
 
 /// `@@ -old_start[,old_count] +new_start[,new_count] @@[ section]`
@@ -629,6 +710,72 @@ fn merge_whitespace_gaps(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_quoted_paths_decode_bytes_once_for_markers_and_renames() {
+        let encoded = r#"\303\251\t\n\"\\literal\\n "#;
+        let decoded = "é\t\n\"\\literal\\n ";
+        let patch = format!(
+            "diff --git \"a/{encoded}\" \"b/new-{encoded}\"\nsimilarity index 90%\nrename from \"{encoded}\"\nrename to \"new-{encoded}\"\n--- \"a/{encoded}\"\n+++ \"b/new-{encoded}\"\n@@ -1 +1 @@\n-old\n+new\n"
+        );
+        let diff = try_parse_patch(&patch).unwrap();
+        let file = &diff.files[0];
+        assert_eq!(file.old_path.as_deref(), Some(decoded));
+        assert_eq!(
+            file.new_path.as_deref(),
+            Some(format!("new-{decoded}").as_str())
+        );
+        assert_eq!(file.status, FileStatus::Renamed);
+
+        // A pure rename has no marker paths to repair its extended headers.
+        let patch = format!(
+            "diff --git a/plain \"b/{encoded}\"\nsimilarity index 100%\nrename from plain\nrename to \"{encoded}\"\n"
+        );
+        let diff = try_parse_patch(&patch).unwrap();
+        assert_eq!(diff.files[0].old_path.as_deref(), Some("plain"));
+        assert_eq!(diff.files[0].new_path.as_deref(), Some(decoded));
+
+        let diff = try_parse_patch("diff --git \"a/has\\ttab\" b/plain\nsimilarity index 100%\nrename from \"has\\ttab\"\nrename to plain\n").unwrap();
+        assert_eq!(diff.files[0].old_path.as_deref(), Some("has\ttab"));
+        assert_eq!(diff.files[0].new_path.as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn unquoted_paths_preserve_unicode_and_spaces_including_header_only_files() {
+        for path in ["é世界", " name  ", "has b/inside "] {
+            for suffix in [
+                "new file mode 100644\nindex 0000000..e69de29\n".to_string(),
+                format!(
+                    "new file mode 100644\n--- /dev/null\n+++ b/{path}\t\n@@ -0,0 +1 @@\n+text\n"
+                ),
+            ] {
+                let diff =
+                    try_parse_patch(&format!("diff --git a/{path} b/{path}\n{suffix}")).unwrap();
+                assert_eq!(diff.files[0].old_path, None);
+                assert_eq!(diff.files[0].new_path.as_deref(), Some(path));
+            }
+        }
+        let diff = try_parse_patch(
+            "diff --git a/old  b/new  \nsimilarity index 100%\nrename from old \nrename to new  \n",
+        )
+        .unwrap();
+        assert_eq!(diff.files[0].old_path.as_deref(), Some("old "));
+        assert_eq!(diff.files[0].new_path.as_deref(), Some("new  "));
+    }
+
+    #[test]
+    fn unsupported_or_invalid_quoted_paths_are_errors() {
+        for patch in [
+            "diff --git \"a/\\377\" \"b/\\377\"\n",
+            "diff --git a/old b/new\nrename to \"\\377\"\n",
+            "diff --git a/old b/new\n+++ \"b/\\377\"\n",
+            "diff --git \"a/unterminated b/new\n",
+            "diff --git a/old b/new\nrename from \"bad\\q\"\n",
+            "diff --git a/old b/new\nrename from \"bad\\000\"\n",
+        ] {
+            assert!(try_parse_patch(patch).is_err(), "{patch:?}");
+        }
+    }
 
     #[test]
     fn binary_additions_and_deletions_keep_the_absent_side_absent() {

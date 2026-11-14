@@ -156,3 +156,114 @@ fn svg_toggle_uses_full_code_diff_in_both_modes_and_remembers_each_file(cx: &mut
     draw_settled(&mut vcx);
     assert!(vcx.debug_bounds("code-diff-pane").is_some(), "refresh preserves the choice");
 }
+
+#[gpui::test]
+fn svg_safety_covers_named_and_raster_disguised_local_files(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("harmless.png");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255])).save(&fixture).unwrap();
+    let unsafe_svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><image href="{}" width="20" height="10"/></svg>"#, fixture.display());
+    for name in ["blocked.svg", "disguised.png"] {
+        std::fs::write(dir.path().join(name), &unsafe_svg).unwrap();
+    }
+    let local = git::LocalSource {
+        repo_root: dir.path().to_owned(), branch: "main".into(), base_ref: None,
+        base_label: "HEAD".into(), base_oid: None,
+    };
+    let (window, app) = queue_window(cx, Arc::new(FakePr::default()));
+    let mut item = loop_pr_item(Vec::new());
+    item.pane = ItemPane::Changes;
+    item.source = Source::Local(local.clone());
+    let ItemState::Ready(data) = &mut item.state else { unreachable!() };
+    data.pr_meta = None;
+    data.diff = diff_core::parse_patch(concat!(
+        "diff --git a/blocked.svg b/blocked.svg\nnew file mode 100644\n--- /dev/null\n+++ b/blocked.svg\n@@ -0,0 +1 @@\n+svg\n",
+        "diff --git a/disguised.png b/disguised.png\nnew file mode 100644\nBinary files /dev/null and b/disguised.png differ\n",
+        "diff --git a/harmless.png b/harmless.png\nnew file mode 100644\nBinary files /dev/null and b/harmless.png differ\n",
+    ));
+    data.file_media = file_media::prepare(&data.diff, &item.source, &LoadedMeta::Local(local), None, None);
+    data.rebuild_tree();
+    data.set_rows(data.row_build());
+    install_item(&app, item, cx);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    for (ix, name) in ["blocked.svg", "disguised.png", "harmless.png"].into_iter().enumerate() {
+        cx.update(|cx| app.update(cx, |app, cx| {
+            let data = app.active_data_mut().unwrap();
+            data.file_ix = ix;
+            data.set_rows(data.row_build());
+            cx.notify();
+        }));
+        draw_settled(&mut vcx);
+        assert_eq!(vcx.debug_bounds("file-media-After-error").is_some(), ix < 2, "{name}");
+        assert!(vcx.debug_bounds("file-media-After-link").is_some());
+        vcx.update(|window, cx| {
+            let resource = gpui::Resource::from(dir.path().join(name));
+            assert!(!cx.has_asset::<gpui::ImgResourceLoader>(&resource), "default decoder used for {name}");
+            if ix > 0 {
+                let image = window.get_asset::<svg_image::ImageLoader>(&resource, cx).unwrap();
+                assert_eq!(image.is_ok(), ix == 2, "{name}");
+            }
+        });
+    }
+}
+
+#[gpui::test]
+fn svg_safety_covers_markdown_stock_html_captions_measurement_and_viewer_retry(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("harmless.png");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255])).save(&fixture).unwrap();
+    let unsafe_svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><image href="{}" width="20" height="10"/></svg>"#, fixture.display());
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let payload = unsafe_svg.into_bytes();
+    cx.update(|cx| cx.set_http_client(http_client::FakeHttpClient::create(move |req| {
+        seen.lock().unwrap().push(req.uri().to_string());
+        let bytes = payload.clone();
+        async move { Ok(http_client::http::Response::builder().status(200)
+            .header("content-type", "image/png")
+            .body(http_client::AsyncBody::from(bytes)).unwrap()) }
+    })));
+    let body = concat!(
+        "![block](https://example.com/block.png)\n\n",
+        "before ![inline](https://example.com/inline.png) after\n\n",
+        "![reference][ref]\n\n[ref]: https://example.com/reference.png\n\n",
+        "<div><img src='https://example.com/nested.png'></div>\n\n",
+        "<video src='https://example.com/video.mp4'><img src='https://example.com/video-fallback.png'></video>\n\n",
+        "<img src='https://github.com/user-attachments/assets/caption.png'>\nCaption\n\n",
+        // These stay with Kit's stock parser, whose image hook must fail closed.
+        "<div><img src='file:///tmp/harmless.png'><img src='data:image/svg+xml;base64,PHN2Zy8+'></div>\n",
+    );
+    let (window, _) = viewer_conversation(cx, body);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.simulate_resize(size(px(1400.), px(2400.)));
+    draw_settled(&mut vcx);
+    let urls = [
+        "https://example.com/block.png",
+        "https://example.com/inline.png",
+        "https://example.com/reference.png",
+        "https://example.com/nested.png",
+        "https://example.com/video-fallback.png",
+        "https://github.com/user-attachments/assets/caption.png",
+    ];
+    vcx.update(|window, cx| {
+        for url in urls {
+            let resource = gpui::Resource::Uri(url.into());
+            assert!(window.get_asset::<svg_image::ImageLoader>(&resource, cx).unwrap_or_else(|| panic!("not loaded: {url}")).is_err(), "{url}");
+            assert!(!cx.has_asset::<gpui::ImgResourceLoader>(&resource), "default decoder used for {url}");
+        }
+        for url in ["file:///tmp/harmless.png", "data:image/svg+xml;base64,PHN2Zy8+"] {
+            assert!(!cx.has_asset::<gpui::ImgResourceLoader>(&gpui::Resource::Uri(url.into())));
+            let gpui::ImageSource::Custom(load) = svg_image::remote_source(&url.into()) else { panic!("expected restricted source") };
+            assert!(load(window, cx).unwrap().is_err());
+            assert!(matches!(svg_image::markdown_source(&url.into()), gpui::ImageSource::Custom(_)));
+        }
+    });
+    assert!(requests.lock().unwrap().iter().all(|url| url.starts_with("https://")));
+    click_selector(&mut vcx, "conversation-0-image-0");
+    assert!(vcx.debug_bounds("viewer-error").is_some());
+    let before_retry = requests.lock().unwrap().iter().filter(|url| url.ends_with("block.png")).count();
+    click_selector(&mut vcx, "viewer-retry");
+    assert!(vcx.debug_bounds("viewer-error").is_some());
+    assert_eq!(requests.lock().unwrap().iter().filter(|url| url.ends_with("block.png")).count(), before_retry + 1);
+    vcx.update(|_, cx| assert!(!cx.has_asset::<gpui::ImgResourceLoader>(&gpui::Resource::Uri(urls[0].into()))));
+}

@@ -9,10 +9,11 @@
 //! reality drifts).
 
 use std::collections::{HashMap, HashSet};
-use std::io;
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use git::process::{self, Limits, Operation};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -57,7 +58,7 @@ pub struct GhSubprocess;
 
 impl GhProcess for GhSubprocess {
     fn run(&self, args: &[&str]) -> io::Result<GhOutput> {
-        let out = Command::new("gh").args(args).output()?;
+        let out = process::run(&mut github_command(args), command_limits(args))?;
         Ok(GhOutput {
             code: out.status.code(),
             stdout: out.stdout,
@@ -66,11 +67,70 @@ impl GhProcess for GhSubprocess {
     }
 }
 
+/// This backend supports github.com only. Scope overrides to the child so
+/// credentials, proxies and the user's environment retain their normal behavior.
+fn github_command(args: &[&str]) -> Command {
+    let mut command = Command::new("gh");
+    command.env("GH_HOST", "github.com").env_remove("GH_REPO");
+    if args.first() == Some(&"api") && !args.contains(&"--hostname") {
+        command.args(["api", "--hostname", "github.com"]);
+        command.args(&args[1..]);
+    } else {
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 && args[i - 1] == "--repo" && !arg.starts_with("github.com/") {
+                command.arg(format!("github.com/{arg}"));
+            } else {
+                command.arg(arg);
+            }
+        }
+    }
+    command
+}
+
+fn command_limits(args: &[&str]) -> Limits {
+    let patch = args.starts_with(&["pr", "diff"])
+        || args
+            .iter()
+            .any(|arg| *arg == "Accept: application/vnd.github.diff");
+    let raw = args
+        .iter()
+        .any(|arg| *arg == "Accept: application/vnd.github.raw+json");
+    let mut limits = Limits::read(if patch {
+        process::PATCH_BYTES
+    } else if raw {
+        process::TEXT_BYTES
+    } else if args.starts_with(&["auth", "token"]) {
+        16 * 1024
+    } else {
+        process::JSON_BYTES
+    });
+    let graphql = args.first() == Some(&"api") && args.contains(&"graphql");
+    let mutation = if graphql {
+        args.iter().any(|arg| {
+            arg.strip_prefix("query=")
+                .is_some_and(|q| q.trim_start().starts_with("mutation"))
+        })
+    } else {
+        args.windows(2)
+            .any(|pair| matches!(pair[0], "-X" | "--method") && !matches!(pair[1], "GET" | "HEAD"))
+            || (args.first() == Some(&"api")
+                && !args.iter().any(|arg| matches!(*arg, "-X" | "--method"))
+                && args
+                    .iter()
+                    .any(|arg| matches!(*arg, "-f" | "-F" | "--field" | "--raw-field")))
+    };
+    if mutation {
+        limits.operation = Operation::Mutation;
+    }
+    limits
+}
+
 /// The v0.1 backend: each facade operation becomes one or more `gh`
 /// invocations.
 #[derive(Debug)]
 pub struct GhCliClient<P: GhProcess = GhSubprocess> {
     process: P,
+    blob_cache_root: Option<PathBuf>,
 }
 
 impl GhCliClient<GhSubprocess> {
@@ -267,7 +327,37 @@ impl<P: GhProcess> GhCliClient<P> {
     /// Run against a specific process boundary — how tests replay recorded
     /// `gh` output.
     pub fn with_process(process: P) -> Self {
-        Self { process }
+        Self {
+            process,
+            blob_cache_root: std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cache").join("gander")),
+        }
+    }
+
+    fn compare_diff(&self, loc: &PrLocator, base: &str, head: &str) -> Result<String, ClientError> {
+        if ![base, head]
+            .into_iter()
+            .all(crate::review_changes::valid_oid)
+        {
+            return Err(ClientError::Invalid("invalid comparison revision".into()));
+        }
+        // Raw diff avoids the compare JSON's capped file list. OIDs also work
+        // for historical/deleted refs and commits in the repository's forks;
+        // an unavailable pair must fail rather than fetch a mutable PR diff.
+        let endpoint = format!("repos/{}/compare/{base}...{head}", loc.repo_slug());
+        let out = self
+            .process
+            .run(&[
+                "api",
+                &endpoint,
+                "-H",
+                "Accept: application/vnd.github.diff",
+            ])
+            .map_err(spawn_failure)?;
+        if out.code != Some(0) {
+            return Err(classify_failure(&out));
+        }
+        Ok(out.text()?.to_string())
     }
 
     /// The authenticated user via `gh api user`: one subprocess answers both
@@ -489,14 +579,7 @@ impl<P: GhProcess> GhCliClient<P> {
     fn locator_in_cwd_repo(&self, number: u64) -> Result<PrLocator, ClientError> {
         let out = self
             .process
-            .run(&[
-                "repo",
-                "view",
-                "--json",
-                "nameWithOwner",
-                "--jq",
-                ".nameWithOwner",
-            ])
+            .run(&["repo", "view", "--json", "url", "--jq", ".url"])
             .map_err(spawn_failure)?;
         if out.code != Some(0) {
             let mut err = classify_failure(&out);
@@ -509,9 +592,15 @@ impl<P: GhProcess> GhCliClient<P> {
             return Err(err);
         }
         let stdout = out.text()?;
-        stdout
+        let slug = stdout
             .trim()
-            .split_once('/')
+            .strip_prefix("https://github.com/")
+            .ok_or_else(|| {
+                ClientError::Invalid(
+                    "Only github.com repositories are supported; use owner/repo#123".into(),
+                )
+            })?;
+        slug.split_once('/')
             .map(|(owner, repo)| PrLocator {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
@@ -922,6 +1011,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             node_id: String,
             state: String,
             body: Option<String>,
+            commit_id: Option<String>,
             user: crate::Author,
         }
         let pages: Vec<Vec<Review>> = decode_value(value)?;
@@ -934,6 +1024,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         Ok(Some(PendingReview {
             id: review.id,
             node_id: review.node_id,
+            commit_id: review.commit_id,
             body: review.body.unwrap_or_default(),
             comments,
         }))
@@ -952,6 +1043,7 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         Ok(PendingReview {
             id: decode_value(value["id"].clone())?,
             node_id: decode_value(value["node_id"].clone())?,
+            commit_id: value["commit_id"].as_str().map(str::to_owned),
             body: value["body"].as_str().unwrap_or_default().into(),
             comments: Vec::new(),
         })
@@ -1240,6 +1332,12 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             let (owner, repo) = repo_part.split_once('/').ok_or_else(|| {
                 ClientError::Invalid(format!("expected owner/repo before '#' in {arg}"))
             })?;
+            if owner.is_empty() || repo.is_empty() || repo.contains('/') || repo_part.contains(':')
+            {
+                return Err(ClientError::Invalid(
+                    "expected owner/repo#123 on github.com".into(),
+                ));
+            }
             return Ok(PrLocator {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
@@ -1371,33 +1469,11 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 &new_upstream,
             );
         }
-        let endpoint = format!("repos/{}/compare/{base}...{head}", loc.repo_slug());
-        let out = self
-            .process
-            .run(&[
-                "api",
-                &endpoint,
-                "-H",
-                "Accept: application/vnd.github.diff",
-            ])
-            .map_err(spawn_failure)?;
-        if out.code != Some(0) {
-            return Err(classify_failure(&out));
-        }
-        Ok(out.text()?.to_string().into())
+        self.compare_diff(loc, base, head).map(Into::into)
     }
 
-    fn pr_patch(&self, loc: &PrLocator) -> Result<String, ClientError> {
-        let number = loc.number.to_string();
-        let slug = loc.repo_slug();
-        let out = self
-            .process
-            .run(&["pr", "diff", &number, "--repo", &slug])
-            .map_err(spawn_failure)?;
-        if out.code != Some(0) {
-            return Err(classify_failure(&out));
-        }
-        Ok(out.text()?.to_string())
+    fn pr_patch(&self, loc: &PrLocator, base: &str, head: &str) -> Result<String, ClientError> {
+        self.compare_diff(loc, base, head)
     }
 
     fn review_comments(&self, loc: &PrLocator) -> Result<Vec<ReviewComment>, ClientError> {
@@ -1528,13 +1604,13 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
         commit_oid: &str,
         path: &str,
     ) -> Result<Option<String>, ClientError> {
-        let cache = cache_path(&loc.repo_slug(), commit_oid, path);
+        let cache = self
+            .blob_cache_root
+            .as_deref()
+            .and_then(|root| cache_path(root, &loc.repo_slug(), commit_oid, path));
         if let Some(cache) = &cache {
-            if cache.with_extension("absent").exists() {
-                return Ok(None);
-            }
-            if let Ok(bytes) = std::fs::read(cache) {
-                return Ok(String::from_utf8(bytes).ok());
+            if let Some(text) = read_cached_blob(cache) {
+                return Ok(Some(text));
             }
         }
 
@@ -1556,21 +1632,20 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
             .map_err(spawn_failure)?;
         if out.code != Some(0) {
             if out.stderr.contains("404") {
-                mark_absent(cache);
+                // GitHub also returns 404 for inaccessible private files.
+                // Never persist a miss that credentials could later resolve.
                 return Ok(None);
             }
             return Err(classify_failure(&out));
         }
         if out.stdout.len() > MAX_BLOB_BYTES {
-            mark_absent(cache);
             return Ok(None);
         }
         let Ok(text) = String::from_utf8(out.stdout) else {
-            mark_absent(cache);
             return Ok(None);
         };
         if let Some(cache) = cache {
-            let _ = std::fs::write(cache, &text);
+            let _ = write_cached_blob(&cache, &text);
         }
         Ok(Some(text))
     }
@@ -1626,32 +1701,41 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
     fn submit_review(
         &self,
         loc: &PrLocator,
+        commit_id: &str,
         verdict: ReviewVerdict,
         body: &str,
     ) -> Result<(), ClientError> {
-        let number = loc.number.to_string();
-        let slug = loc.repo_slug();
-        let flag = match verdict {
-            ReviewVerdict::Approve => "--approve",
-            ReviewVerdict::RequestChanges => "--request-changes",
-            ReviewVerdict::Comment => "--comment",
-        };
-        let mut args = vec![
-            "pr".to_string(),
-            "review".to_string(),
-            number,
-            "--repo".to_string(),
-            slug,
-            flag.to_string(),
-        ];
-        if !body.is_empty() {
-            args.push("--body".to_string());
-            args.push(body.to_string());
+        if commit_id.is_empty() {
+            return Err(ClientError::Invalid("missing reviewed head commit".into()));
         }
-        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self.process.run(&argv).map_err(spawn_failure)?;
-        if out.code != Some(0) {
-            return Err(classify_failure(&out));
+        let (event, state) = match verdict {
+            ReviewVerdict::Approve => ("APPROVE", "APPROVED"),
+            ReviewVerdict::RequestChanges => ("REQUEST_CHANGES", "CHANGES_REQUESTED"),
+            ReviewVerdict::Comment => ("COMMENT", "COMMENTED"),
+        };
+        let value = self.creation_api(&[
+            "api".into(),
+            "-X".into(),
+            "POST".into(),
+            format!("repos/{}/pulls/{}/reviews", loc.repo_slug(), loc.number),
+            "-f".into(),
+            format!("commit_id={commit_id}"),
+            "-f".into(),
+            format!("event={event}"),
+            "-f".into(),
+            format!("body={body}"),
+        ])?;
+        if value["id"].as_u64().filter(|id| *id > 0).is_none()
+            || value["node_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .is_none()
+            || value["commit_id"].as_str() != Some(commit_id)
+            || value["state"].as_str() != Some(state)
+        {
+            return Err(ClientError::Failed(
+                "GitHub returned no matching submitted review".into(),
+            ));
         }
         Ok(())
     }
@@ -2569,23 +2653,65 @@ const MAX_MENTIONABLE: usize = 500;
 /// contents API happily serves up to 100 MB.
 const MAX_BLOB_BYTES: usize = 1024 * 1024;
 
-/// Mark a negative cache entry (absent / binary / oversize) with an
-/// `.absent` sidecar, so the miss is remembered too.
-fn mark_absent(cache: Option<PathBuf>) {
-    if let Some(cache) = cache {
-        let _ = std::fs::write(cache.with_extension("absent"), b"");
+fn read_cached_blob(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .ok()?;
     }
+    if file.metadata().ok()?.len() > MAX_BLOB_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BLOB_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_BLOB_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
-/// `~/.cache/gander/blobs/<key>`, creating the directory; None when HOME is
-/// unset or the directory can't be created (cache disabled, fetch still
-/// works).
-fn cache_path(repo: &str, oid: &str, path: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("HOME")?)
-        .join(".cache")
-        .join("gander")
-        .join("blobs");
-    std::fs::create_dir_all(&dir).ok()?;
+fn write_cached_blob(path: &Path, text: &str) -> io::Result<()> {
+    if text.len() > MAX_BLOB_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "blob exceeds cache limit",
+        ));
+    }
+    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    file.write_all(text.as_bytes())?;
+    file.persist(path)?;
+    Ok(())
+}
+
+/// Only application-owned directories are tightened; shared ancestors such
+/// as `~/.cache` retain their existing permissions.
+fn private_cache_directory(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// A new namespace excludes legacy direct writes (possibly partial UTF-8)
+/// and ambiguous `.absent` markers. Cache failures still allow fetching.
+fn cache_path(root: &Path, repo: &str, oid: &str, path: &str) -> Option<PathBuf> {
+    private_cache_directory(root).ok()?;
+    let dir = root.join("blobs-v2");
+    private_cache_directory(&dir).ok()?;
     Some(dir.join(cache_key(repo, oid, path)))
 }
 
@@ -3174,7 +3300,9 @@ mod tests {
                 ok(Some(0), empty, ""),
                 response,
             ]);
-            assert!(GhCliClient::with_process(fake).pr_discussion(&loc()).is_err());
+            assert!(GhCliClient::with_process(fake)
+                .pr_discussion(&loc())
+                .is_err());
         }
     }
 
@@ -3379,38 +3507,6 @@ mod tests {
         }
     }
 
-    /// Compare an authenticated web view's exported per-file counts against
-    /// the production path. Inputs stay external (including private PR data).
-    #[test]
-    #[ignore = "requires gh authentication, network, and GANDER_COMPARE_* inputs"]
-    fn real_upstream_aware_comparison_matches_web_file_counts() {
-        let input = |name: &str| std::env::var(format!("GANDER_COMPARE_{name}")).expect(name);
-        let client = GhCliClient::new();
-        let loc = client.resolve_pr(&input("PR")).unwrap();
-        let comparison = client
-            .comparison_patch(&loc, &input("REVIEWED"), &input("HEAD"), &input("UPSTREAM"))
-            .unwrap();
-        let expected: std::collections::BTreeMap<String, (u32, u32)> =
-            serde_json::from_slice(&std::fs::read(input("EXPECTED")).unwrap()).unwrap();
-        let actual: std::collections::BTreeMap<_, _> = diff_core::parse_patch(&comparison.patch)
-            .files
-            .into_iter()
-            .map(|file| {
-                (
-                    file.display_path().to_owned(),
-                    (file.additions, file.deletions),
-                )
-            })
-            .collect();
-        assert_eq!(actual, expected);
-        let files = comparison
-            .base_files
-            .expect("exercise an upstream-adjusted baseline");
-        for base in files.values() {
-            assert_eq!(base.text.lines().count(), base.reviewed_lines.len());
-        }
-    }
-
     /// Each invocation pops the next recorded outcome and records argv;
     /// an invocation beyond the script fails the test.
     struct FakeGh {
@@ -3487,10 +3583,142 @@ mod tests {
     /// The PR every PR-shaped fixture below addresses.
     fn loc() -> PrLocator {
         PrLocator {
-            owner: "octocat".into(),
-            repo: "Hello-World".into(),
+            owner: "acme".into(),
+            repo: "widgets".into(),
             number: 4781,
         }
+    }
+
+    #[test]
+    fn subprocess_commands_pin_github_com_without_overriding_credentials_or_proxies() {
+        use std::ffi::OsStr;
+        for (args, expected) in [
+            (
+                vec!["api", "user"],
+                vec!["api", "--hostname", "github.com", "user"],
+            ),
+            (
+                vec!["api", "--hostname", "github.com", "repos/o/r"],
+                vec!["api", "--hostname", "github.com", "repos/o/r"],
+            ),
+            (
+                vec!["pr", "diff", "1", "--repo", "o/r"],
+                vec!["pr", "diff", "1", "--repo", "github.com/o/r"],
+            ),
+            (vec!["search", "prs"], vec!["search", "prs"]),
+            (
+                vec!["auth", "token", "--hostname", "github.com"],
+                vec!["auth", "token", "--hostname", "github.com"],
+            ),
+        ] {
+            let command = github_command(&args);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                expected.iter().map(OsStr::new).collect::<Vec<_>>()
+            );
+            let env: HashMap<_, _> = command.get_envs().collect();
+            assert_eq!(
+                env.get(OsStr::new("GH_HOST")),
+                Some(&Some(OsStr::new("github.com")))
+            );
+            assert_eq!(env.get(OsStr::new("GH_REPO")), Some(&None));
+            assert_eq!(
+                env.len(),
+                2,
+                "credential and proxy variables must remain inherited"
+            );
+        }
+    }
+
+    #[test]
+    fn command_classes_keep_blob_patch_and_write_limits_distinct() {
+        assert_eq!(
+            command_limits(&["pr", "diff", "1"]).stdout,
+            process::PATCH_BYTES
+        );
+        assert_eq!(
+            command_limits(&["auth", "token", "--hostname", "github.com"]).stdout,
+            16 * 1024
+        );
+        assert_eq!(
+            command_limits(&[
+                "api",
+                "compare",
+                "-H",
+                "Accept: application/vnd.github.diff"
+            ])
+            .stdout,
+            process::PATCH_BYTES
+        );
+        assert_eq!(
+            command_limits(&[
+                "api",
+                "contents",
+                "-H",
+                "Accept: application/vnd.github.raw+json"
+            ])
+            .stdout,
+            process::TEXT_BYTES
+        );
+        for args in [
+            vec![
+                "api",
+                "graphql",
+                "-f",
+                "query=mutation { submitPullRequestReview {} }",
+            ],
+            vec!["api", "-X", "POST", "comments"],
+            vec!["api", "--method", "DELETE", "comments/1"],
+            vec!["api", "comments", "-f", "body=comment"],
+        ] {
+            assert_eq!(command_limits(&args).operation, Operation::Mutation);
+        }
+        for args in [
+            vec!["api", "graphql", "-f", "query=query { viewer { login } }"],
+            vec!["api", "user"],
+            vec!["api", "--method", "GET", "comments", "-f", "per_page=100"],
+        ] {
+            assert_eq!(command_limits(&args).operation, Operation::Read);
+        }
+    }
+
+    #[test]
+    fn timed_out_or_oversized_mutations_remain_uncertain_and_are_never_retried() {
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::InvalidData] {
+            let fake = FakeGh::one(Err(io::Error::new(kind, "incomplete process response")));
+            let calls = fake.calls_handle();
+            let error = GhCliClient::with_process(fake)
+                .post_conversation_comment(&loc(), "body")
+                .unwrap_err();
+            assert!(error.mutation_is_uncertain());
+            assert!(!matches!(
+                error,
+                ClientError::Rejected(_) | ClientError::NoCredentialSource
+            ));
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn enterprise_locators_and_cwd_remotes_are_rejected_without_remapping() {
+        for input in [
+            "https://enterprise.example/o/r/pull/1",
+            "enterprise.example/o/r#1",
+            "https://enterprise.example/o/r#1",
+        ] {
+            let fake = FakeGh::many(vec![]);
+            let calls = fake.calls_handle();
+            assert!(matches!(
+                GhCliClient::with_process(fake).resolve_pr(input),
+                Err(ClientError::Invalid(_))
+            ));
+            assert!(calls.lock().unwrap().is_empty());
+        }
+        let fake = FakeGh::one(ok(Some(0), "https://enterprise.example/o/r\n", ""));
+        assert!(matches!(
+            GhCliClient::with_process(fake).resolve_pr("1"),
+            Err(ClientError::Invalid(_))
+        ));
     }
 
     const VIEWED_PAGE1: &str = include_str!("../fixtures/gh_graphql_viewed_files_page1.json");
@@ -3518,7 +3746,7 @@ mod tests {
         );
         let calls = calls.lock().unwrap();
         assert_eq!(&calls[0][..3], ["api", "graphql", "-f"]);
-        assert_eq!(calls[0][3], "query=query { repository(owner:\"octocat\",name:\"Hello-World\") { pullRequest(number:4781) { id files(first:100) { nodes { path viewerViewedState } pageInfo { hasNextPage endCursor } } } } }");
+        assert_eq!(calls[0][3], "query=query { repository(owner:\"acme\",name:\"widgets\") { pullRequest(number:4781) { id files(first:100) { nodes { path viewerViewedState } pageInfo { hasNextPage endCursor } } } } }");
         assert!(calls[1][3].contains("files(first:100,after:\"files-next\")"));
         assert!(calls.iter().all(|call| !call[3].contains("mutation")));
     }
@@ -3656,7 +3884,7 @@ mod tests {
     }
 
     // Scripted API payloads for the pending lifecycle (not live mutations).
-    const PENDING: &str = r#"[[{"id":91,"node_id":"PRR_pending","state":"PENDING","body":"web summary","user":{"login":"octocat"}}]]"#;
+    const PENDING: &str = r#"[[{"id":91,"node_id":"PRR_pending","state":"PENDING","commit_id":"head","body":"web summary","user":{"login":"octocat"}}]]"#;
     const DRAFT: &str = r#"{"id":12,"node_id":"PRRC_draft","path":"a.rs","side":"RIGHT","line":7,"start_line":5,"body":"draft"}"#;
     const EMPTY_THREADS: &str = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#;
 
@@ -3711,7 +3939,7 @@ mod tests {
 
     fn actions_suite(ix: usize) -> serde_json::Value {
         serde_json::json!({"workflowRun": {
-            "url":format!("https://github.com/octocat/Hello-World/actions/runs/{ix}"),
+            "url":format!("https://github.com/acme/widgets/actions/runs/{ix}"),
             "workflow":{"name":format!("Workflow {ix}")}
         }})
     }
@@ -3765,7 +3993,7 @@ mod tests {
         );
         assert_eq!(
             result.commits[0].actions[100].url,
-            "https://github.com/octocat/Hello-World/actions/runs/100"
+            "https://github.com/acme/widgets/actions/runs/100"
         );
         assert_eq!(
             result.commits[1].actions.len(),
@@ -3827,33 +4055,6 @@ mod tests {
         assert!(client.pr_commits(&loc()).is_err());
     }
 
-    #[test]
-    #[ignore = "requires authenticated gh and network; read-only public PR"]
-    fn real_pr_commits_use_available_graphql_fields_and_direct_actions_urls() {
-        let loc = PrLocator {
-            owner: "zed-industries".into(),
-            repo: "zed".into(),
-            number: 66062,
-        };
-        let commits = GhCliClient::new().pr_commits(&loc).unwrap();
-        assert!(!commits.commits.is_empty());
-        assert!(
-            commits
-                .commits
-                .iter()
-                .any(|commit| !commit.actions.is_empty()),
-            "use a recent PR with retained Actions runs for this live smoke test"
-        );
-        for commit in &commits.commits {
-            assert_eq!(commit.sha.len(), 40);
-            for run in &commit.actions {
-                assert!(run
-                    .url
-                    .starts_with("https://github.com/zed-industries/zed/actions/runs/"));
-            }
-        }
-    }
-
     fn range_anchor() -> CommentAnchor {
         CommentAnchor {
             path: "a.rs".into(),
@@ -3888,6 +4089,7 @@ mod tests {
                 let pending = PendingReview {
                     id: 91,
                     node_id: "pending".into(),
+                    commit_id: Some("head".into()),
                     body: "untouched".into(),
                     comments: vec![],
                 };
@@ -3992,6 +4194,7 @@ mod tests {
                 pending: Some(PendingReview {
                     id: 91,
                     node_id: "pending".into(),
+                    commit_id: Some("head".into()),
                     body: "untouched draft".into(),
                     comments: vec![],
                 }),
@@ -4155,6 +4358,7 @@ mod tests {
             pending: Some(PendingReview {
                 id: 91,
                 node_id: "stale".into(),
+                commit_id: Some("head".into()),
                 body: String::new(),
                 comments: vec![],
             }),
@@ -4269,6 +4473,7 @@ mod tests {
                 let review = PendingReview {
                     id: 91,
                     node_id: "PRR_pending".into(),
+                    commit_id: Some("head".into()),
                     body: String::new(),
                     comments: vec![],
                 };
@@ -4446,6 +4651,7 @@ mod tests {
                         pending: Some(PendingReview {
                             id: 91,
                             node_id: "PRR_pending".into(),
+                            commit_id: Some("head".into()),
                             body: "keep me".into(),
                             comments: vec![serde_json::from_str(DRAFT).unwrap()],
                         }),
@@ -4494,7 +4700,7 @@ mod tests {
         let (client, calls) = session_script(&[
             SUCCESS,
             "[[]]",
-            r#"{"id":91,"node_id":"PRR_pending","body":""}"#,
+            r#"{"id":91,"node_id":"PRR_pending","commit_id":"head","body":""}"#,
             SUCCESS,
             PENDING,
             EMPTY_THREADS,
@@ -4524,6 +4730,10 @@ mod tests {
             .unwrap();
         assert_eq!(session.count(), 0);
         assert_eq!(session.pending.as_ref().unwrap().id, 91);
+        assert_eq!(
+            session.pending.as_ref().unwrap().commit_id.as_deref(),
+            Some("head")
+        );
         session
             .execute(
                 &client,
@@ -4559,6 +4769,7 @@ mod tests {
                 &client,
                 &loc(),
                 Command::Submit {
+                    commit_id: "head".into(),
                     verdict: ReviewVerdict::Approve,
                     body: String::new(),
                 },
@@ -4568,7 +4779,7 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(
             calls[2].join(" "),
-            "api -X POST repos/octocat/Hello-World/pulls/4781/reviews -f commit_id=head"
+            "api -X POST repos/acme/widgets/pulls/4781/reviews -f commit_id=head"
         );
         assert!(calls[6][3].contains("pullRequestReviewId:\"PRR_pending\""));
         assert!(calls[6][3].contains("side:RIGHT,line:7"));
@@ -4740,31 +4951,6 @@ mod tests {
         assert!(calls.lock().unwrap().is_empty());
     }
 
-    /// Read-only: GANDER_TEST_PR=owner/repo#123 cargo test -p github pending_review_live_read_only -- --ignored --nocapture
-    #[test]
-    #[ignore = "requires gh authentication and a PR with a pending review"]
-    fn pending_review_live_read_only() {
-        let pr = std::env::var("GANDER_TEST_PR").expect("set GANDER_TEST_PR");
-        let client = GhCliClient::new();
-        let loc = client.resolve_pr(&pr).unwrap();
-        let review = client
-            .pending_review(&loc)
-            .unwrap()
-            .expect("a pending review");
-        for comment in &review.comments {
-            assert!(!comment.node_id.is_empty());
-            println!(
-                "draft {}: {} {} {:?}–{:?}",
-                comment.id,
-                comment.path,
-                comment.side.api_str(),
-                comment.start_line,
-                comment.line
-            );
-        }
-        assert!(!review.comments.is_empty());
-    }
-
     #[test]
     fn immediate_comments_do_not_resume_start_or_submit_the_pending_review() {
         use crate::review_session::{Command, ReviewSession};
@@ -4799,7 +4985,7 @@ mod tests {
         assert_eq!(session.pending, pending);
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 5);
-        assert_eq!(calls[3].join(" "), "api -X POST repos/octocat/Hello-World/pulls/4781/comments -f body=now -f commit_id=head -f path=a.rs -f side=LEFT -F line=7 -F start_line=5 -f start_side=LEFT");
+        assert_eq!(calls[3].join(" "), "api -X POST repos/acme/widgets/pulls/4781/comments -f body=now -f commit_id=head -f path=a.rs -f side=LEFT -F line=7 -F start_line=5 -f start_side=LEFT");
         assert!(!calls[4].iter().any(|arg| arg.starts_with("start_")));
     }
 
@@ -4860,6 +5046,7 @@ mod tests {
                         &client,
                         &loc(),
                         Command::Submit {
+                            commit_id: "head".into(),
                             verdict,
                             body: body.into(),
                         },
@@ -4903,6 +5090,7 @@ mod tests {
                 &client,
                 &loc(),
                 Command::Submit {
+                    commit_id: "head".into(),
                     verdict: ReviewVerdict::Approve,
                     body: String::new()
                 }
@@ -4955,6 +5143,7 @@ mod tests {
         let review = PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("head".into()),
             body: String::new(),
             comments: vec![],
         };
@@ -4995,6 +5184,7 @@ mod tests {
             let review = PendingReview {
                 id: 91,
                 node_id: "pending".into(),
+                commit_id: Some("head".into()),
                 body: String::new(),
                 comments: vec![],
             };
@@ -5033,6 +5223,7 @@ mod tests {
                     &client,
                     &loc(),
                     Command::Submit {
+                        commit_id: "head".into(),
                         verdict: ReviewVerdict::Approve,
                         body: String::new()
                     }
@@ -5216,25 +5407,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires authenticated gh and network; read-only review history"]
-    fn real_past_reviews_load() {
-        let start = std::time::Instant::now();
-        let items = GhCliClient::new()
-            .search_prs(&QueueSearch::review_requested().with_past_reviews(true))
-            .unwrap();
-        assert!(items.len() <= 10);
-        assert!(items.iter().all(|item| item.reviewed_at.is_some()));
-        assert!(items
-            .windows(2)
-            .all(|pair| pair[0].reviewed_at >= pair[1].reviewed_at));
-        eprintln!(
-            "Loaded {} past reviews in {:?}",
-            items.len(),
-            start.elapsed()
-        );
-    }
-
-    #[test]
     fn past_reviews_empty_and_failed_searches_finish_without_more_requests() {
         for response in [
             ok(Some(0), &past_search_page(Vec::new(), None), ""),
@@ -5333,7 +5505,7 @@ mod tests {
             "Add deactivation filters to the users manage list"
         );
         assert_eq!(first.author, "octocat");
-        assert_eq!(first.repository, "octocat/Hello-World");
+        assert_eq!(first.repository, "acme/widgets");
         assert!(first.is_draft);
         assert_eq!(first.created_at, "2026-10-15T10:00:00Z");
         assert_eq!(first.updated_at, "2026-10-20T08:07:08Z");
@@ -5343,7 +5515,7 @@ mod tests {
         assert_eq!(first.labels[0].name, "api");
         assert_eq!(first.labels[0].color, "1D76DB");
         let second = &queue[0];
-        assert_eq!(second.repository, "octocat/Spoon-Knife");
+        assert_eq!(second.repository, "acme/gadgets");
         assert!(!second.is_draft);
         assert_eq!(second.created_at, "2026-10-10T09:00:00Z");
         assert_eq!(second.comments, 1);
@@ -5506,12 +5678,12 @@ mod tests {
         assert_eq!(
             calls[1].join(" "),
              "api graphql -f query=query { viewer { login } \
-             r0: repository(owner: \"octocat\", name: \"Hello-World\") { \
+             r0: repository(owner: \"acme\", name: \"widgets\") { \
              p4781: pullRequest(number: 4781) { additions deletions reviewDecision \
              statusCheckRollup { state } author { avatarUrl(size: 64) } \
              reviewRequests(first:100) { nodes { requestedReviewer { __typename ... on User { login } } } pageInfo { hasNextPage endCursor } } \
              timelineItems(last:100,itemTypes:[REVIEW_REQUESTED_EVENT]) { nodes { ... on ReviewRequestedEvent { createdAt requestedReviewer { __typename ... on User { login } } } } pageInfo { hasPreviousPage startCursor } } } } \
-             r1: repository(owner: \"octocat\", name: \"Spoon-Knife\") { \
+             r1: repository(owner: \"acme\", name: \"gadgets\") { \
              p4761: pullRequest(number: 4761) { additions deletions reviewDecision \
              statusCheckRollup { state } author { avatarUrl(size: 64) } \
              reviewRequests(first:100) { nodes { requestedReviewer { __typename ... on User { login } } } pageInfo { hasNextPage endCursor } } \
@@ -5739,9 +5911,9 @@ mod tests {
         let hits: Vec<String> = (0..count as u64)
             .map(|number| {
                 let repo = if number % 2 == 0 {
-                    "octocat/Hello-World"
+                    "acme/widgets"
                 } else {
-                    "octocat/Spoon-Knife"
+                    "acme/gadgets"
                 };
                 format!(
                     "{{\"author\":{{\"login\":\"octocat\"}},\"isDraft\":false,\
@@ -5795,9 +5967,9 @@ mod tests {
                 author: String::new(),
                 author_avatar_url: None,
                 repository: if number % 2 == 0 {
-                    "octocat/Hello-World".to_string()
+                    "acme/widgets".to_string()
                 } else {
-                    "octocat/Spoon-Knife".to_string()
+                    "acme/gadgets".to_string()
                 },
                 is_draft: false,
                 review_state: ReviewState::Awaiting,
@@ -5820,8 +5992,8 @@ mod tests {
         let first = &plans[0];
         assert_eq!(first.repos.len(), 2);
         assert_eq!(first.repos[0].alias, "r0");
-        assert_eq!(first.repos[0].owner, "octocat");
-        assert_eq!(first.repos[0].name, "Hello-World");
+        assert_eq!(first.repos[0].owner, "acme");
+        assert_eq!(first.repos[0].name, "widgets");
         assert_eq!(first.repos[1].alias, "r1");
         // Each batch re-aliases its repos from r0 — aliases never leak
         // across batches.
@@ -5840,73 +6012,6 @@ mod tests {
         assert!(enrich_plans(std::slice::from_ref(&malformed)).is_empty());
     }
 
-    /// Live smoke check against the real `gh` on this machine — not part of
-    /// the recorded set. Run explicitly with `cargo test -p github --
-    /// --ignored` whenever the CLI contract is in question.
-    #[test]
-    #[ignore = "needs gh installed, authenticated, and network"]
-    fn the_real_backend_sees_the_signed_in_user() {
-        let viewer = GhCliClient::new()
-            .viewer()
-            .expect("gh on this machine is installed and signed in");
-        assert!(!viewer.login.is_empty());
-        assert!(viewer.avatar_url.starts_with("https://"));
-    }
-
-    /// Live smoke check of the queue search against the real `gh` on this
-    /// machine — not part of the recorded set. Run explicitly with
-    /// `cargo test -p github -- --ignored` whenever the search contract is
-    /// in question.
-    #[test]
-    #[ignore = "needs gh installed, authenticated, and network"]
-    fn the_real_backend_runs_the_real_queue_search() {
-        let queue = GhCliClient::new()
-            .search_prs(&QueueSearch::review_requested())
-            .expect("gh on this machine is installed and signed in");
-        let mut sorted = queue.clone();
-        QueueSearch::review_requested().sort_items(&mut sorted);
-        assert_eq!(
-            queue, sorted,
-            "the queue must come back oldest request first"
-        );
-        // The live enrichment answered: a non-empty queue comes back with
-        // its check-sized fields on at least one row (all-null answers are
-        // the degrade path, and would mean the live contract broke).
-        if !queue.is_empty() {
-            assert!(
-                queue.iter().any(|pr| pr.additions.is_some()),
-                "with PRs queued, at least one must carry its diff size"
-            );
-        }
-    }
-
-    /// Live smoke check that chips narrow on real data — not part of the
-    /// recorded set. Run explicitly with `cargo test -p github --
-    /// --ignored` whenever the search contract is in question.
-    #[test]
-    #[ignore = "needs gh installed, authenticated, and network"]
-    fn the_real_backend_narrows_by_repo() {
-        let client = GhCliClient::new();
-        let full = client
-            .search_prs(&QueueSearch::review_requested())
-            .expect("gh on this machine is installed and signed in");
-        if full.len() < 2 {
-            return; // nothing to narrow on this account today
-        }
-        let repository = full[0].repository.clone();
-        let narrowed = client
-            .search_prs(
-                &QueueSearch::review_requested().filtered_by(QueueFilter::repo(repository.clone())),
-            )
-            .expect("the narrowed search must succeed like the full one");
-        assert!(narrowed.iter().all(|pr| pr.repository == repository));
-        assert!(!narrowed.is_empty());
-        // Narrowing means fewer rows whenever the repository isn't the whole queue.
-        if full.iter().any(|pr| pr.repository != repository) {
-            assert!(narrowed.len() < full.len());
-        }
-    }
-
     // --- resolve_pr --------------------------------------------------------
 
     #[test]
@@ -5915,10 +6020,10 @@ mod tests {
         // stray subprocess would fail the fake below.
         let client = GhCliClient::with_process(FakeGh::many(vec![]));
         assert_eq!(
-            client.resolve_pr("zed-industries/zed#12345").unwrap(),
+            client.resolve_pr("acme/widgets#12345").unwrap(),
             PrLocator {
-                owner: "zed-industries".into(),
-                repo: "zed".into(),
+                owner: "acme".into(),
+                repo: "widgets".into(),
                 number: 12345,
             }
         );
@@ -5928,10 +6033,10 @@ mod tests {
     fn resolve_pr_parses_the_url_form() {
         let client = GhCliClient::with_process(FakeGh::many(vec![]));
         let loc = client
-            .resolve_pr("https://github.com/rust-lang/rust/pull/99999/files")
+            .resolve_pr("https://github.com/acme/widgets/pull/99999/files")
             .unwrap();
-        assert_eq!(loc.owner, "rust-lang");
-        assert_eq!(loc.repo, "rust");
+        assert_eq!(loc.owner, "acme");
+        assert_eq!(loc.repo, "widgets");
         assert_eq!(loc.number, 99999);
     }
 
@@ -5949,22 +6054,19 @@ mod tests {
 
     #[test]
     fn resolve_pr_resolves_a_bare_number_through_the_cwd_repo() {
-        let fake = FakeGh::one(ok(Some(0), "octocat/Hello-World\n", ""));
+        let fake = FakeGh::one(ok(Some(0), "https://github.com/acme/widgets\n", ""));
         let calls = fake.calls_handle();
         assert_eq!(
             GhCliClient::with_process(fake).resolve_pr("#123").unwrap(),
             PrLocator {
-                owner: "octocat".into(),
-                repo: "Hello-World".into(),
+                owner: "acme".into(),
+                repo: "widgets".into(),
                 number: 123,
             }
         );
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].join(" "),
-            "repo view --json nameWithOwner --jq .nameWithOwner"
-        );
+        assert_eq!(calls[0].join(" "), "repo view --json url --jq .url");
     }
 
     #[test]
@@ -5992,7 +6094,7 @@ mod tests {
         );
         assert_eq!(meta.author.login, "octocat");
         assert_eq!(meta.state, "OPEN");
-        assert_eq!(meta.url, "https://github.com/octocat/Hello-World/pull/4781");
+        assert_eq!(meta.url, "https://github.com/acme/widgets/pull/4781");
         assert_eq!(meta.body, "Adds the filters discussed in #4778.");
         assert_eq!(meta.base_ref_name, "main");
         assert_eq!(meta.head_ref_name, "deactivation-filters");
@@ -6036,7 +6138,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].join(" "),
-            "pr view 4781 --repo octocat/Hello-World --json \
+            "pr view 4781 --repo acme/widgets --json \
              number,title,author,state,url,body,baseRefName,headRefName,baseRefOid,headRefOid,\
              additions,deletions,changedFiles,reviewDecision"
         );
@@ -6057,22 +6159,69 @@ mod tests {
     #[test]
     fn pr_patch_returns_the_recorded_diff() {
         let patch = client(ok(Some(0), "diff --git a/a.rs b/a.rs\n", ""))
-            .pr_patch(&loc())
+            .pr_patch(&loc(), &"a".repeat(40), &"b".repeat(40))
             .unwrap();
         assert!(patch.starts_with("diff --git"));
     }
 
     #[test]
-    fn pr_patch_invokes_gh_pr_diff_verbatim() {
+    fn pr_patch_invokes_raw_three_dot_compare_for_the_captured_pair() {
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
         let fake = FakeGh::one(ok(Some(0), "", ""));
         let calls = fake.calls_handle();
-        GhCliClient::with_process(fake).pr_patch(&loc()).unwrap();
+        GhCliClient::with_process(fake)
+            .pr_patch(&loc(), &base, &head)
+            .unwrap();
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0].join(" "),
-            "pr diff 4781 --repo octocat/Hello-World"
+            calls[0],
+            vec![
+                "api".to_string(),
+                format!("repos/acme/widgets/compare/{base}...{head}"),
+                "-H".into(),
+                "Accept: application/vnd.github.diff".into(),
+            ]
         );
+    }
+
+    #[test]
+    fn pr_patch_rejects_mutable_or_invalid_revisions_without_running_gh() {
+        let oid = "a".repeat(40);
+        for invalid in ["main", "", "--repo", "a...b", &"a".repeat(39)] {
+            let (client, calls) = session_script(&[]);
+            for (base, head) in [(invalid, oid.as_str()), (oid.as_str(), invalid)] {
+                assert!(matches!(
+                    client.pr_patch(&loc(), base, head),
+                    Err(ClientError::Invalid(_))
+                ));
+            }
+            assert!(calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn pr_patch_unavailable_pair_never_falls_back_to_the_mutable_pr_diff() {
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
+        for message in [
+            "gh: Not Found (HTTP 404)",
+            "gh: No common ancestor (HTTP 422)",
+            "error connecting to api.github.com",
+        ] {
+            let fake = FakeGh::one(ok(Some(1), "", message));
+            let calls = fake.calls_handle();
+            let client = GhCliClient::with_process(fake);
+            assert!(client.pr_patch(&loc(), &base, &head).is_err());
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0][0], "api");
+            assert_eq!(
+                calls[0][1],
+                format!("repos/acme/widgets/compare/{base}...{head}")
+            );
+        }
     }
 
     #[test]
@@ -6111,7 +6260,7 @@ mod tests {
         assert_eq!(
             calls[0].join(" "),
             "api --paginate --slurp \
-             repos/octocat/Hello-World/pulls/4781/comments?per_page=100"
+             repos/acme/widgets/pulls/4781/comments?per_page=100"
         );
     }
 
@@ -6141,8 +6290,8 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "one gh api graphql per page");
         assert!(calls[0][3].starts_with("query=query($owner:String!"));
-        assert_eq!(calls[0][5], "owner=octocat");
-        assert_eq!(calls[0][7], "repo=Hello-World");
+        assert_eq!(calls[0][5], "owner=acme");
+        assert_eq!(calls[0][7], "repo=widgets");
         assert_eq!(calls[1][9], "after=c1");
     }
 
@@ -6546,7 +6695,7 @@ mod tests {
                 "api",
                 "-X",
                 "POST",
-                "repos/octocat/Hello-World/issues/4781/comments",
+                "repos/acme/widgets/issues/4781/comments",
                 "-f",
                 "body=hello\n@octocat"
             ]
@@ -6580,7 +6729,7 @@ mod tests {
                 "api",
                 "-X",
                 "POST",
-                "repos/octocat/Hello-World/pulls/4781/comments/11/replies",
+                "repos/acme/widgets/pulls/4781/comments/11/replies",
                 "-f",
                 "body=reply"
             ]
@@ -6624,7 +6773,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].join(" "),
-            "api -X POST repos/octocat/Hello-World/pulls/4781/comments \
+            "api -X POST repos/acme/widgets/pulls/4781/comments \
              -f body=nice -f commit_id=a66406e -f path=src/main.rs -f side=RIGHT -F line=42"
         );
     }
@@ -6658,42 +6807,152 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].join(" "),
-            "api -X POST repos/octocat/Hello-World/pulls/4781/comments/100/replies \
+            "api -X POST repos/acme/widgets/pulls/4781/comments/100/replies \
              -f body=+1"
         );
     }
 
     #[test]
-    fn submit_review_invokes_gh_pr_review_verbatim() {
-        // Approvals may be bodyless; the other two verdicts carry --body —
-        // exactly the flags the caller's own emptiness rule assumes.
-        let (client, calls) = rich_client(
-            ok(Some(0), "", ""),
-            vec![ok(Some(0), "", ""), ok(Some(0), "", "")],
-        );
-        client
-            .submit_review(&loc(), ReviewVerdict::Approve, "")
-            .unwrap();
-        client
-            .submit_review(&loc(), ReviewVerdict::RequestChanges, "please no")
-            .unwrap();
-        client
-            .submit_review(&loc(), ReviewVerdict::Comment, "fyi")
-            .unwrap();
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
-        assert_eq!(
-            calls[0].join(" "),
-            "pr review 4781 --repo octocat/Hello-World --approve"
-        );
-        assert_eq!(
-            calls[1].join(" "),
-            "pr review 4781 --repo octocat/Hello-World --request-changes --body please no"
-        );
-        assert_eq!(
-            calls[2].join(" "),
-            "pr review 4781 --repo octocat/Hello-World --comment --body fyi"
-        );
+    fn submit_review_pins_each_verdict_to_the_displayed_commit() {
+        use crate::review_session::{Command, ReviewSession};
+        for (verdict, event, state, body) in [
+            (ReviewVerdict::Approve, "APPROVE", "APPROVED", ""),
+            (
+                ReviewVerdict::RequestChanges,
+                "REQUEST_CHANGES",
+                "CHANGES_REQUESTED",
+                "please no",
+            ),
+            (
+                ReviewVerdict::Comment,
+                "COMMENT",
+                "COMMENTED",
+                "summary \"quoted\"\nnext line",
+            ),
+        ] {
+            let response = serde_json::json!({"id":92,"node_id":"PRR_created",
+                "commit_id":"displayed-A","state":state})
+            .to_string();
+            // The PR may already have advanced to B: no mutable head lookup is
+            // needed or allowed to choose the commit for this submission.
+            let (client, calls) = session_script(&[SUCCESS, "[[]]", &response]);
+            let mut session = ReviewSession::default();
+            session
+                .execute(
+                    &client,
+                    &loc(),
+                    Command::Submit {
+                        commit_id: "displayed-A".into(),
+                        verdict,
+                        body: body.into(),
+                    },
+                )
+                .unwrap();
+            assert!(session.pending.is_none());
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 3);
+            assert_eq!(
+                calls[2],
+                vec![
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/acme/widgets/pulls/4781/reviews",
+                    "-f",
+                    "commit_id=displayed-A",
+                    "-f",
+                    &format!("event={event}"),
+                    "-f",
+                    &format!("body={body}")
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn pending_submission_requires_a_known_matching_review_commit() {
+        use crate::review_session::{Command, ReviewSession};
+        for commit in [Some("displayed-A"), Some("current-B"), Some(""), None] {
+            let mut draft: serde_json::Value = serde_json::from_str(PENDING).unwrap();
+            if let Some(commit) = commit {
+                draft[0][0]["commit_id"] = serde_json::json!(commit);
+            } else {
+                draft[0][0].as_object_mut().unwrap().remove("commit_id");
+            }
+            let draft = draft.to_string();
+            let (client, calls) = session_script(&[
+                SUCCESS,
+                &draft,
+                EMPTY_THREADS,
+                r#"{"data":{"submitPullRequestReview":{"pullRequestReview":{"id":"PRR_pending","state":"APPROVED"}}}}"#,
+            ]);
+            let mut session = ReviewSession::default();
+            let result = session.execute(
+                &client,
+                &loc(),
+                Command::Submit {
+                    commit_id: "displayed-A".into(),
+                    verdict: ReviewVerdict::Approve,
+                    body: "keep my summary".into(),
+                },
+            );
+            if commit == Some("displayed-A") {
+                result.unwrap();
+                assert!(session.pending.is_none());
+                assert_eq!(calls.lock().unwrap().len(), 4);
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(error, ClientError::Invalid(_)));
+                assert!(error.to_string().contains(if commit == Some("current-B") {
+                    "different commit"
+                } else {
+                    "unknown"
+                }));
+                let pending = session.pending.unwrap();
+                assert_eq!(pending.commit_id.as_deref(), commit);
+                assert_eq!(pending.body, "web summary");
+                assert_eq!(calls.lock().unwrap().len(), 3, "blocked drafts only read");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_review_requires_a_matching_success_response_without_retrying() {
+        let (client, calls) = session_script(&[]);
+        assert!(matches!(
+            client.submit_review(&loc(), "", ReviewVerdict::Approve, ""),
+            Err(ClientError::Invalid(_))
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+        let receipt = serde_json::json!({"id":92,"node_id":"PRR_created",
+            "commit_id":"displayed-A","state":"APPROVED"});
+        for (field, value) in [
+            ("id", serde_json::json!(null)),
+            ("id", serde_json::json!(0)),
+            ("node_id", serde_json::json!("")),
+            ("commit_id", serde_json::json!("current-B")),
+            ("state", serde_json::json!("PENDING")),
+        ] {
+            let mut malformed = receipt.clone();
+            malformed[field] = value;
+            let (client, calls) = session_script(&[&malformed.to_string()]);
+            let error = client
+                .submit_review(&loc(), "displayed-A", ReviewVerdict::Approve, "")
+                .unwrap_err();
+            assert!(error.mutation_is_uncertain());
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
+        for (code, message, uncertain) in [
+            (1, "network unavailable", true),
+            (1, "Unprocessable Entity (HTTP 422)", false),
+        ] {
+            let (client, calls) = rich_client(ok(Some(code), "", message), vec![]);
+            let error = client
+                .submit_review(&loc(), "displayed-A", ReviewVerdict::Approve, "")
+                .unwrap_err();
+            assert_eq!(error.mutation_is_uncertain(), uncertain);
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
     }
 
     // --- file_at and its cache -----------------------------------------------
@@ -6728,85 +6987,185 @@ mod tests {
         );
     }
 
-    #[test]
-    fn file_at_absent_binary_oversize_and_cached_answers_replay_the_contract() {
-        // The blob cache lives under $HOME, and only this test reads or
-        // writes it: swap HOME for a tempdir under a lock, and nothing
-        // else in this suite notices.
-        static HOME: Mutex<()> = Mutex::new(());
-        let _guard = HOME.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+    fn blob_client(process: FakeGh, root: &Path) -> GhCliClient<FakeGh> {
+        GhCliClient {
+            process,
+            blob_cache_root: Some(root.to_path_buf()),
+        }
+    }
 
-        const OID: &str = "f16ea0a8cfd0fbb0328b8348972356d532b921d0";
+    #[test]
+    fn file_at_recovers_after_a_hidden_private_file_and_reuses_positive_disk_cache() {
+        let tmp = tempfile::tempdir().unwrap();
         let fake = FakeGh::many(vec![
-            // gone.rs: absent at that commit (404).
             ok(Some(1), "", "gh: Not Found (HTTP 404)"),
-            // main.rs: present, plain text.
             ok(Some(0), "fn main() {}\n", ""),
-            // blob.bin: binary bytes.
-            raw(Some(0), &[0u8, 159, 146, 150], ""),
-            // huge.txt: over the blob cap.
-            raw(Some(0), &vec![b'x'; MAX_BLOB_BYTES + 1], ""),
-            // denied.txt: a real failure, not an absence — twice, because
-            // failures are never cached.
-            ok(Some(1), "", "gh: Forbidden (HTTP 403)"),
-            ok(Some(1), "", "gh: Forbidden (HTTP 403)"),
         ]);
         let calls = fake.calls_handle();
-        let client = GhCliClient::with_process(fake);
-
-        // Absent: Ok(None), and the invocation carries the raw-contents
-        // Accept header with the path percent-encoded per segment.
-        assert_eq!(client.file_at(&loc(), OID, "gone.rs").unwrap(), None);
-        {
-            let calls = calls.lock().unwrap();
-            assert_eq!(
-                calls[0].join(" "),
-                format!(
-                    "api -H Accept: application/vnd.github.raw+json \
-                     repos/octocat/Hello-World/contents/gone.rs?ref={OID}"
-                )
-            );
-        }
-        // The negative answer is cached: no second subprocess.
-        assert_eq!(client.file_at(&loc(), OID, "gone.rs").unwrap(), None);
-
-        // Present: the text, cached on disk…
+        let client = blob_client(fake, tmp.path());
+        assert_eq!(client.file_at(&loc(), "oid", "gone.rs").unwrap(), None);
         assert_eq!(
-            client.file_at(&loc(), OID, "main.rs").unwrap().as_deref(),
+            calls.lock().unwrap()[0].join(" "),
+            "api -H Accept: application/vnd.github.raw+json repos/acme/widgets/contents/gone.rs?ref=oid"
+        );
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("blobs-v2"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            client.file_at(&loc(), "oid", "gone.rs").unwrap().as_deref(),
             Some("fn main() {}\n")
         );
-        // …so a second call never leaves the process.
+        // A new client also reuses the positive entry, without another gh call.
+        let client = blob_client(FakeGh::many(vec![]), tmp.path());
         assert_eq!(
-            client.file_at(&loc(), OID, "main.rs").unwrap().as_deref(),
+            client.file_at(&loc(), "oid", "gone.rs").unwrap().as_deref(),
             Some("fn main() {}\n")
         );
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
 
-        // Binary and oversize are absences too — the file stays
-        // patch-derived rather than upgrading garbage.
-        assert_eq!(client.file_at(&loc(), OID, "blob.bin").unwrap(), None);
-        assert_eq!(client.file_at(&loc(), OID, "huge.txt").unwrap(), None);
-
-        // Any other failure is an error, and never cached.
-        let err = client.file_at(&loc(), OID, "denied.txt").unwrap_err();
-        assert_eq!(err, ClientError::Failed("Forbidden (HTTP 403)".to_string()));
+    #[test]
+    fn file_at_ignores_legacy_partial_blobs_and_ambiguous_absent_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = cache_key(&loc().repo_slug(), "oid", "main.rs");
+        let legacy = tmp.path().join("blobs");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join(&key), b"valid UTF-8 but truncated").unwrap();
+        std::fs::write(legacy.join(&key).with_extension("absent"), b"").unwrap();
+        let path = cache_path(tmp.path(), &loc().repo_slug(), "oid", "main.rs").unwrap();
+        std::fs::write(path.with_extension("absent"), b"").unwrap();
+        let client = blob_client(FakeGh::one(ok(Some(0), "complete\n", "")), tmp.path());
         assert_eq!(
-            client.file_at(&loc(), OID, "denied.txt").unwrap_err(),
+            client.file_at(&loc(), "oid", "main.rs").unwrap().as_deref(),
+            Some("complete\n")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "complete\n");
+    }
+
+    #[test]
+    fn file_at_errors_binary_and_oversize_responses_do_not_poison_later_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = FakeGh::many(vec![
+            ok(Some(1), "", "gh: Forbidden (HTTP 403)"),
+            ok(Some(0), "accessible now", ""),
+            raw(Some(0), &[0u8, 159, 146, 150], ""),
+            raw(Some(0), &[0u8, 159, 146, 150], ""),
+            raw(Some(0), &vec![b'x'; MAX_BLOB_BYTES + 1], ""),
+            raw(Some(0), &vec![b'x'; MAX_BLOB_BYTES + 1], ""),
+        ]);
+        let calls = fake.calls_handle();
+        let client = blob_client(fake, tmp.path());
+        assert_eq!(
+            client.file_at(&loc(), "oid", "denied.txt").unwrap_err(),
             ClientError::Failed("Forbidden (HTTP 403)".to_string())
         );
-
-        let calls = calls.lock().unwrap();
         assert_eq!(
-            calls.len(),
-            6,
-            "cache hits and negative cache never spawn gh"
+            client
+                .file_at(&loc(), "oid", "denied.txt")
+                .unwrap()
+                .as_deref(),
+            Some("accessible now")
         );
-
-        match old_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
+        for path in ["blob.bin", "blob.bin", "huge.txt", "huge.txt"] {
+            assert_eq!(client.file_at(&loc(), "oid", path).unwrap(), None);
         }
+        assert_eq!(calls.lock().unwrap().len(), 6);
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("blobs-v2"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn file_at_rejects_oversize_cache_entries_and_accepts_the_exact_byte_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = cache_path(tmp.path(), &loc().repo_slug(), "oid", "main.rs").unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_BLOB_BYTES as u64) * 64).unwrap();
+        assert_eq!(read_cached_blob(&path), None);
+        let text = "x".repeat(MAX_BLOB_BYTES);
+        let client = blob_client(FakeGh::one(ok(Some(0), &text, "")), tmp.path());
+        assert_eq!(
+            client.file_at(&loc(), "oid", "main.rs").unwrap().as_deref(),
+            Some(text.as_str())
+        );
+        assert_eq!(read_cached_blob(&path).as_deref(), Some(text.as_str()));
+        assert!(write_cached_blob(&path, &(text + "x")).is_err());
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            MAX_BLOB_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn concurrent_blob_publication_only_exposes_complete_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = cache_path(tmp.path(), "o/r", "oid", "file.rs").unwrap();
+        let first = "a".repeat(MAX_BLOB_BYTES / 4);
+        let second = "b".repeat(MAX_BLOB_BYTES / 4);
+        write_cached_blob(&path, &first).unwrap();
+        let start = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            for text in [&first, &second, &first, &second] {
+                let path = &path;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..16 {
+                        write_cached_blob(path, text).unwrap();
+                    }
+                });
+            }
+            start.wait();
+            for _ in 0..64 {
+                let text =
+                    read_cached_blob(&path).expect("atomic replacement always leaves an entry");
+                assert!(
+                    text == first || text == second,
+                    "a reader observed a partial blob"
+                );
+            }
+        });
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_cache_creates_private_paths_and_tightens_existing_paths_before_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join(".cache");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = shared.join("gander");
+        let client = blob_client(FakeGh::one(ok(Some(0), "cached", "")), &root);
+        client.file_at(&loc(), "oid", "main.rs").unwrap();
+        let path = root
+            .join("blobs-v2")
+            .join(cache_key(&loc().repo_slug(), "oid", "main.rs"));
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        for dir in [&root, path.parent().unwrap()] {
+            assert_eq!(mode(dir), 0o700);
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        }
+        assert_eq!(mode(&path), 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let client = blob_client(FakeGh::many(vec![]), &root);
+        assert_eq!(
+            client.file_at(&loc(), "oid", "main.rs").unwrap().as_deref(),
+            Some("cached")
+        );
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&shared), 0o755);
     }
 }

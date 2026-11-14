@@ -86,11 +86,17 @@ fn session_restores_reviews_editors_and_view_on_every_launch(cx: &mut gpui::Test
             app.review.as_ref().unwrap().input.update(cx, |input, cx| {
                 input.set_value("unfinished summary", window, cx);
             });
+            app.save_session(cx).unwrap();
+            assert_eq!(
+                store.setting(session::KEY).unwrap()["items"][0]["summary_commit_id"],
+                "dead10cc"
+            );
             app.close_review(window, cx);
             app.save_session(cx).unwrap();
             assert!(session::read(&store).is_some());
         });
     });
+    *fake.head.lock().unwrap() = Some("new-head-B".into());
     let (_, restored) = queue_window_with_store(cx, fake.clone(), store.clone());
     cx.update(|cx| {
         let app = restored.read(cx);
@@ -109,6 +115,10 @@ fn session_restores_reviews_editors_and_view_on_every_launch(cx: &mut gpui::Test
         assert_eq!(composer.line, 1);
         assert!(!composer.in_flight);
         assert_eq!(
+            app.items[0].review_draft.as_ref().unwrap().commit_id,
+            "dead10cc"
+        );
+        assert_eq!(
             app.items[0]
                 .review_draft
                 .as_ref()
@@ -126,6 +136,65 @@ fn session_restores_reviews_editors_and_view_on_every_launch(cx: &mut gpui::Test
         assert_eq!(again.read(cx).items.len(), 1);
         assert_eq!(again.read(cx).composers.len(), 1);
     });
+}
+
+#[gpui::test]
+fn legacy_summary_requires_clearing_and_reopening_to_capture_a_reviewed_commit(
+    cx: &mut gpui::TestAppContext,
+) {
+    let store = seed_saved_session(cx);
+    let mut saved = store.setting(session::KEY).unwrap();
+    saved["items"][0]["summary"] = serde_json::json!("legacy summary");
+    saved["items"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("summary_commit_id");
+    store.set_setting(session::KEY, saved);
+    let fake = Arc::new(FakePr::default());
+    let (window, app) = queue_window_with_store(cx, fake.clone(), store);
+    let mut vcx = gpui::VisualTestContext::from_window(window, cx);
+    vcx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_review(window, cx);
+            app.submit_review(window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let review = app.read(cx).review.as_ref().unwrap();
+        assert!(review
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("missing reviewed head commit"));
+        assert_eq!(review.input.read(cx).value().as_str(), "legacy summary");
+    });
+    assert!(fake.posts().is_empty());
+    vcx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.review
+                .as_ref()
+                .unwrap()
+                .input
+                .update(cx, |input, cx| input.set_value("  \n", window, cx));
+            app.close_review(window, cx);
+            assert!(app.items[0].review_draft.is_none());
+            app.open_review(window, cx);
+            let review = app.review.as_ref().unwrap();
+            assert_eq!(review.commit_id, "dead10cc");
+            assert!(review.input.read(cx).value().is_empty());
+            app.submit_review(window, cx);
+        })
+    });
+    vcx.run_until_parked();
+    assert_eq!(*fake.review_commits.lock().unwrap(), vec!["dead10cc"]);
+    assert_eq!(
+        fake.posts(),
+        vec![Post::Review {
+            verdict: github::ReviewVerdict::Approve,
+            body: String::new(),
+        }]
+    );
 }
 
 #[gpui::test]

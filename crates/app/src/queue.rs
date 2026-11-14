@@ -528,7 +528,8 @@ pub(crate) fn queue_row(
                         .child(
                             div().flex_shrink_0().child(
                                 match &pr.author_avatar_url {
-                                    Some(url) => Avatar::new().src(url.clone()),
+                                    Some(url) => Avatar::new()
+                                        .src(crate::svg_image::remote_source(&url.clone().into())),
                                     None => Avatar::new(),
                                 }
                                 .name(pr.author.clone())

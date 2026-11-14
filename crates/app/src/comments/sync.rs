@@ -20,6 +20,10 @@ pub(crate) struct SyncState {
 }
 
 impl SyncState {
+    pub fn is_writing(&self) -> bool {
+        self.writing
+    }
+
     /// Shared ordering for comments-only reads and full refreshes.
     pub fn begin_read(&mut self) -> ReadTicket {
         self.request += 1;

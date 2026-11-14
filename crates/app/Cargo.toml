@@ -39,6 +39,7 @@ merman = { version = "=0.10.0-alpha.2", default-features = false, features = ["s
 # Decode/rasterize with host-owned resolvers, never GPUI's default SVG resolver.
 resvg = { version = "=0.47.0", default-features = false, features = ["text"] }
 roxmltree = "0.21"
+data-url = "0.3"
 http_client = { version = "=0.3.10", package = "gpui-pre-http-client" }
 futures = "0.3"
 ureq = "2"
@@ -59,6 +60,7 @@ objc2-core-media = { version = "0.3", default-features = false, features = ["std
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVAsset", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "AVVideoComposition", "block2", "objc2-core-media", "objc2-core-video", "objc2-core-foundation"] }
 
 [dev-dependencies]
+base64 = "0.22"
 # TestAppContext + the #[gpui::test] harness — app-level behavior tests
 # drive the real window/handler chain against a fake facade.
 gpui = { package = "gpui-kit", version = "=0.8.1", features = ["test-support"] }

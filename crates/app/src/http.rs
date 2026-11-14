@@ -14,6 +14,7 @@ pub(crate) mod video;
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::{AsyncReadExt as _, FutureExt as _};
+use github::gh_cli::{GhProcess as _, GhSubprocess};
 use http_client::{http, AsyncBody, HttpClient, RedirectPolicy, Url};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -68,12 +69,10 @@ impl UreqHttpClient {
             follow: agent(10),
             no_follow: agent(0),
             token: Arc::new(|| {
-                let output = std::process::Command::new("gh")
-                    .args(["auth", "token", "--hostname", "github.com"])
-                    .stdin(std::process::Stdio::null())
-                    .output()
+                let output = GhSubprocess
+                    .run(&["auth", "token", "--hostname", "github.com"])
                     .ok()?;
-                if !output.status.success() {
+                if output.code != Some(0) {
                     return None;
                 }
                 let token = String::from_utf8(output.stdout).ok()?.trim().to_owned();

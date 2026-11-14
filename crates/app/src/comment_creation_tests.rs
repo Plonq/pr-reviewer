@@ -5,6 +5,7 @@ fn pending_review() -> github::PendingReview {
     github::PendingReview {
         id: 91,
         node_id: "pending".into(),
+        commit_id: Some("dead10cc".into()),
         body: String::new(),
         comments: vec![],
     }

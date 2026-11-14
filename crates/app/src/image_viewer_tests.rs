@@ -173,7 +173,7 @@ fn image_viewer_zoom_drag_resize_fit_and_all_dismissals(cx: &mut gpui::TestAppCo
 #[gpui::test]
 fn oversized_conversation_images_reserve_only_their_scaled_height(cx: &mut gpui::TestAppContext) {
     image_client(cx);
-    // The dimensions and adjacent image tags match ucroo/portal#4887.
+    // Large screenshots appear as adjacent image tags in the conversation.
     let body = (0..7)
         .map(|i| format!("<img width=\"3024\" height=\"1964\" alt=\"screenshot\" src=\"https://github.com/user-attachments/assets/large-{i}\" />"))
         .collect::<Vec<_>>()
@@ -644,7 +644,7 @@ fn animated_markdown_images_keep_frames_and_share_the_inline_asset(cx: &mut gpui
     );
     vcx.update(|window, cx| {
         let image = window
-            .get_asset::<gpui::ImgResourceLoader>(
+            .get_asset::<svg_image::ImageLoader>(
                 &gpui::Resource::Uri("https://github.com/user-attachments/assets/animation".into()),
                 cx,
             )

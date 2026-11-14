@@ -1,5 +1,5 @@
 //! File media comparisons, separate from Markdown attachments and video playback.
-//! Raster images use GPUI's loader; SVG rasterization tracks display size.
+//! Images use the app's restricted decoder; SVG rasterization tracks display size.
 //! Everything else is a link.
 use std::{collections::HashMap, io::Write, path::Path};
 
@@ -11,7 +11,7 @@ use gpui::{
     },
     div, img,
     prelude::*,
-    px, Context, ImageSource, ObjectFit, Resource, StyledImage, Window,
+    px, Context, ObjectFit, Resource, StyledImage, Window,
 };
 
 use crate::{review_target::LoadedMeta, theme, ItemData, ReviewApp, Source};
@@ -315,7 +315,7 @@ fn render_side(
                     if path.is_some_and(is_svg) {
                         return crate::svg_image::svg_image(source, label);
                     }
-                    img(ImageSource::Resource(source))
+                    img(crate::svg_image::image_source(source))
                         .id("image")
                         .size_full()
                         .object_fit(ObjectFit::Contain)
@@ -431,7 +431,7 @@ mod tests {
         std::fs::write(repo.path().join("a.svg"), "<svg>new</svg>").unwrap();
         std::fs::write(repo.path().join("movie.mp4"), [0, 254, 2]).unwrap();
         std::fs::remove_file(repo.path().join("binary")).unwrap();
-        let diff = diff_core::parse_patch(&git::diff_patch(&src).unwrap());
+        let diff = diff_core::parse_patch(&git::diff_patch(&src).unwrap().patch);
         let media = prepare(
             &diff,
             &Source::Local(src.clone()),

@@ -545,7 +545,7 @@ mod tests {
             time: CommentTime::Draft,
             in_reply_to_id: parent.map(Into::into),
         };
-        // Two outdated roots with four replies, like permissions.py in PR #4805.
+        // Two outdated roots with four replies.
         let mut comments = vec![
             comment(1, None, None),
             comment(2, None, Some(1)),

@@ -2036,7 +2036,9 @@ name = "gander"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "block2 0.6.2",
+ "data-url",
  "diff-core",
  "emojis",
  "futures",
@@ -2164,6 +2166,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "diff-core",
+ "libc",
  "tempfile",
 ]
 
@@ -2172,6 +2175,7 @@ name = "github"
 version = "0.1.0"
 dependencies = [
  "diff-core",
+ "git",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -7133,6 +7137,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

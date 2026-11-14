@@ -809,8 +809,10 @@ pub trait GitHubClient: Send + Sync {
     /// One PR's metadata (see [`PrMeta`]).
     fn pr_meta(&self, loc: &PrLocator) -> Result<PrMeta, ClientError>;
 
-    /// The PR's unified diff patch, for the diff engine to parse.
-    fn pr_patch(&self, loc: &PrLocator) -> Result<String, ClientError>;
+    /// The PR's three-dot unified diff at the captured base and head OIDs.
+    /// Compare their merge base with `head`, matching full-file reconstruction;
+    /// never substitute mutable branch names or the PR's latest diff.
+    fn pr_patch(&self, loc: &PrLocator, base: &str, head: &str) -> Result<String, ClientError>;
 
     /// Every review comment on the PR, flat; the app groups them into
     /// threads. Pagination (gh ≥ 2.66's `--paginate --slurp`) is the
@@ -856,13 +858,14 @@ pub trait GitHubClient: Send + Sync {
         body: &str,
     ) -> Result<PublishedComment, ClientError>;
 
-    /// Submit a top-level review with `verdict`. GitHub requires a
-    /// non-empty body for request-changes and comment reviews — the
+    /// Submit a top-level review pinned to the captured displayed `commit_id`.
+    /// GitHub requires a non-empty body for request-changes and comment reviews — the
     /// caller enforces this so the error surfaces before a round trip;
     /// approvals may be bodyless.
     fn submit_review(
         &self,
         loc: &PrLocator,
+        commit_id: &str,
         verdict: ReviewVerdict,
         body: &str,
     ) -> Result<(), ClientError>;

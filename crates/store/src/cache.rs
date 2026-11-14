@@ -201,7 +201,7 @@ mod tests {
                 title: "Add deactivation filters".into(),
                 author: "octocat".into(),
                 author_avatar_url: Some("https://avatars.githubusercontent.com/u/583231".into()),
-                repository: "octocat/Hello-World".into(),
+                repository: "acme/widgets".into(),
                 is_draft: true,
                 review_state: "awaiting".into(),
                 ci: "pass".into(),

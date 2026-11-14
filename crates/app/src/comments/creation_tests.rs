@@ -278,6 +278,7 @@ fn pending_roots_and_replies_project_without_fabricating_a_review_and_keep_their
         let review = PendingReview {
             id: 42,
             node_id: "real-review".into(),
+            commit_id: Some("dead10cc".into()),
             body: "".into(),
             comments: vec![comment],
         };

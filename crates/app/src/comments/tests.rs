@@ -35,6 +35,7 @@ fn pending(comments: Vec<PendingComment>) -> PendingReview {
     PendingReview {
         id: 100,
         node_id: "review-100".into(),
+        commit_id: Some("dead10cc".into()),
         body: String::new(),
         comments,
     }

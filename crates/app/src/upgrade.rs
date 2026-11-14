@@ -9,8 +9,9 @@ use gpui::SharedString;
 const MAX_UPGRADE_FILES: usize = 400;
 /// Per-side byte cap, checked on fetched text before line-ending normalization.
 const MAX_UPGRADE_BLOB_BYTES: usize = 1024 * 1024;
-/// gh/git are one subprocess per call, so a small worker pool is plenty.
-const UPGRADE_WORKERS: usize = 4;
+/// Each batch has a small pool; the shared runner also limits gh/git reads
+/// across all concurrent batches, tabs and other background requests.
+const UPGRADE_WORKERS: usize = git::process::MAX_READ_PROCESSES;
 
 /// Where to fetch full file contents from, snapshotted when an item loads.
 pub(crate) enum UpgradeSource {
@@ -121,7 +122,16 @@ impl ContentSource for LocalContent<'_> {
         match side {
             Side::Old => git::file_at_base(self.source, path),
             Side::New => {
-                String::from_utf8(std::fs::read(self.source.repo_root.join(path)).ok()?).ok()
+                use std::io::Read as _;
+                let file = std::fs::File::open(self.source.repo_root.join(path)).ok()?;
+                let mut bytes = Vec::new();
+                file.take(MAX_UPGRADE_BLOB_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                if bytes.len() > MAX_UPGRADE_BLOB_BYTES {
+                    return None;
+                }
+                String::from_utf8(bytes).ok()
             }
         }
     }
@@ -155,8 +165,8 @@ fn run_with_source(source: &dyn ContentSource, mut jobs: Vec<UpgradeJob>) -> Vec
     done
 }
 
-/// Apply the common byte cap before normalization. Fetching still loads the
-/// complete side; this is not a streaming memory bound.
+/// Apply the common byte cap before normalization, including fake sources.
+/// Production gh/git pipes and local working-tree reads also enforce this cap.
 fn fetch_side(source: &dyn ContentSource, path: &str, side: Side) -> Option<String> {
     let text = source.fetch(path, side)?;
     (text.len() <= MAX_UPGRADE_BLOB_BYTES).then_some(text)
@@ -754,7 +764,12 @@ mod tests {
         fn pr_meta(&self, _: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
             unreachable!()
         }
-        fn pr_patch(&self, _: &github::PrLocator) -> Result<String, github::ClientError> {
+        fn pr_patch(
+            &self,
+            _: &github::PrLocator,
+            _: &str,
+            _: &str,
+        ) -> Result<String, github::ClientError> {
             unreachable!()
         }
         fn review_comments(
@@ -791,6 +806,7 @@ mod tests {
         fn submit_review(
             &self,
             _: &github::PrLocator,
+            _commit_id: &str,
             _: github::ReviewVerdict,
             _: &str,
         ) -> Result<(), github::ClientError> {
@@ -973,6 +989,33 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(lines(&results[0]), ["fn working_tree() {}"]);
         assert!(client.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_adapter_enforces_the_text_byte_limit_on_both_sides() {
+        let repo = TempRepo::new();
+        let exact = "x".repeat(MAX_UPGRADE_BLOB_BYTES);
+        let path = repo.0.join("large.txt");
+        std::fs::write(&path, &exact).unwrap();
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "exact limit"]);
+        let source = git::resolve_local_with_base(&repo.0, Some("HEAD")).unwrap();
+        let adapter = LocalContent { source: &source };
+        for side in [Side::Old, Side::New] {
+            assert_eq!(
+                adapter.fetch("large.txt", side).as_deref(),
+                Some(exact.as_str())
+            );
+        }
+        std::fs::write(&path, exact + "x").unwrap();
+        assert_eq!(adapter.fetch("large.txt", Side::New), None);
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "over limit"]);
+        let source = git::resolve_local_with_base(&repo.0, Some("HEAD")).unwrap();
+        assert_eq!(
+            LocalContent { source: &source }.fetch("large.txt", Side::Old),
+            None
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub(crate) fn author_avatar(
         .name(author.to_owned())
         .xsmall()
         .when_some(author_avatar_url(author, account), |avatar, url| {
-            avatar.src(url)
+            avatar.src(crate::svg_image::remote_source(&url.into()))
         })
 }
 
@@ -323,6 +323,7 @@ mod tests {
         let mut review = github::PendingReview {
             id: 91,
             node_id: "pending".into(),
+            commit_id: Some("dead10cc".into()),
             body: String::new(),
             comments: vec![
                 github::PendingComment {

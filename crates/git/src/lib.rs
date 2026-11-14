@@ -3,8 +3,11 @@
 //! + untracked), as one unified patch for diff-core to parse.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+pub mod process;
 
 /// How many untracked files to inline into the patch before giving up.
 const MAX_UNTRACKED_FILES: usize = 200;
@@ -32,11 +35,10 @@ pub fn resolve_local(path: &Path) -> Result<LocalSource> {
 
 /// Resolve a path inside a git repo using a specific base ref when provided.
 pub fn resolve_local_with_base(path: &Path, base_ref: Option<&str>) -> Result<LocalSource> {
-    let repo_root = PathBuf::from(
-        git(path, &["rev-parse", "--show-toplevel"])
-            .with_context(|| format!("{} is not inside a git repository", path.display()))?
-            .trim(),
-    );
+    let root = git_bytes(path, &["rev-parse", "--show-toplevel"])
+        .with_context(|| format!("{} is not inside a git repository", path.display()))?;
+    let root = String::from_utf8(root).context("Unsupported non-UTF-8 repository path")?;
+    let repo_root = PathBuf::from(root.strip_suffix('\n').unwrap_or(&root));
     let branch = git(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
         .trim()
         .to_string();
@@ -132,12 +134,14 @@ fn push_remote_head(repo_root: &Path, remote: &str, candidates: &mut Vec<String>
 /// caller keeps that file's patch-derived view.
 pub fn file_at_base(src: &LocalSource, path: &str) -> Option<String> {
     let oid = src.base_oid.as_deref()?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&src.repo_root)
-        .args(["show", &format!("{oid}:{path}")])
-        .output()
-        .ok()?;
+    let output = process::run(
+        Command::new("git")
+            .arg("-C")
+            .arg(&src.repo_root)
+            .args(["show", &format!("{oid}:{path}")]),
+        process::Limits::read(process::TEXT_BYTES),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -155,12 +159,14 @@ pub fn copy_file_at_base(
         .base_oid
         .as_deref()
         .ok_or_else(|| anyhow!("No base commit"))?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&src.repo_root)
-        .args(["show", &format!("{oid}:{path}")])
-        .stdout(destination.try_clone()?)
-        .output()?;
+    let output = process::run_to_file(
+        Command::new("git")
+            .arg("-C")
+            .arg(&src.repo_root)
+            .args(["show", &format!("{oid}:{path}")]),
+        process::Limits::read(process::BINARY_BYTES),
+        destination,
+    )?;
     if !output.status.success() {
         bail!(
             "Could not load base file: {}",
@@ -173,55 +179,115 @@ pub fn copy_file_at_base(
 /// Unified patch of everything that would go into a PR opened from here:
 /// merge-base(HEAD, base)..working-tree (two-dot, so committed + staged +
 /// unstaged), plus untracked files appended as added-file diffs.
-pub fn diff_patch(src: &LocalSource) -> Result<String> {
+#[derive(Debug)]
+pub struct LocalPatch {
+    pub patch: String,
+    pub omitted_untracked: usize,
+}
+
+pub fn diff_patch(src: &LocalSource) -> Result<LocalPatch> {
     // The oid captured at resolve time; "HEAD" only in a zero-commit repo,
     // where the committed-diff half is empty anyway.
     let base = src.base_oid.clone().unwrap_or_else(|| "HEAD".to_string());
     let mut patch = git(
         &src.repo_root,
-        &["diff", "-M", "--no-color", "--no-ext-diff", &base],
+        &[
+            "-c",
+            "core.quotePath=true",
+            "diff",
+            "-M",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            &base,
+        ],
     )?;
 
-    let untracked = git(
+    let untracked = git_bytes(
         &src.repo_root,
-        &["ls-files", "--others", "--exclude-standard"],
+        &["ls-files", "-z", "--others", "--exclude-standard"],
     )?;
-    for file in untracked.lines().take(MAX_UNTRACKED_FILES) {
-        // `--no-index` against /dev/null renders an untracked file as an
-        // added-file diff; it exits 1 when the sides differ, which is success
-        // here (0 would mean an empty file — also fine, git emits a header).
-        let output = Command::new("git")
+    let paths: Vec<_> = untracked
+        .split(|&byte| byte == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    for path in paths.iter().take(MAX_UNTRACKED_FILES) {
+        // Enumeration is raw NUL-delimited bytes, never Git-quoted text.
+        // Validate before constructing the OS argument: our file model is UTF-8.
+        let added = untracked_patch(&src.repo_root, untracked_path(path)?)?;
+        if added.len() > process::PATCH_BYTES.saturating_sub(patch.len()) {
+            bail!(
+                "Local patch exceeded its {} byte limit",
+                process::PATCH_BYTES
+            );
+        }
+        patch.push_str(&added);
+    }
+    Ok(LocalPatch {
+        patch,
+        omitted_untracked: paths.len().saturating_sub(MAX_UNTRACKED_FILES),
+    })
+}
+
+fn untracked_path(path: &[u8]) -> Result<&OsStr> {
+    let path = std::str::from_utf8(path)
+        .with_context(|| format!("Unsupported non-UTF-8 untracked Git path: {path:?}"))?;
+    Ok(OsStr::new(path))
+}
+
+fn untracked_patch(repo_root: &Path, file: &OsStr) -> Result<String> {
+    // Different sides exit 1, including creation of an empty file (which has
+    // a header but no hunks). Access errors can ALSO exit 1, with no patch.
+    let output = process::run(
+        Command::new("git")
             .arg("-C")
-            .arg(&src.repo_root)
+            .arg(repo_root)
             .args([
+                "-c",
+                "core.quotePath=true",
                 "diff",
                 "--no-color",
                 "--no-ext-diff",
+                "--no-textconv",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
                 "--no-index",
                 "--",
                 "/dev/null",
             ])
-            .arg(file)
-            .output()
-            .map_err(|err| anyhow!("failed to run git: {err}"))?;
-        if !matches!(output.status.code(), Some(0) | Some(1)) {
-            bail!(
-                "git diff --no-index /dev/null {file} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        patch.push_str(&String::from_utf8_lossy(&output.stdout));
+            .arg(file),
+        process::Limits::read(process::PATCH_BYTES),
+    )
+    .map_err(|err| anyhow!("failed to run git: {err}"))?;
+    if !matches!(output.status.code(), Some(0) | Some(1))
+        || !output.stdout.starts_with(b"diff --git ")
+    {
+        bail!(
+            "git diff --no-index /dev/null {file:?} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    Ok(patch)
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|err| anyhow!("failed to run git (is git installed?): {err}"))?;
+    Ok(String::from_utf8_lossy(&git_bytes(dir, args)?).into_owned())
+}
+
+fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let cap = if args.contains(&"diff") {
+        process::PATCH_BYTES
+    } else {
+        process::TEXT_BYTES
+    };
+    let output = process::run(
+        Command::new("git").arg("-C").arg(dir).args(args),
+        process::Limits::read(cap),
+    )
+    .map_err(|err| anyhow!("failed to run git (is git installed?): {err}"))?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
@@ -229,7 +295,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -258,6 +324,242 @@ mod tests {
         run(dir, &["git", "config", "commit.gpgsign", "false"]);
     }
 
+    fn empty_repo(dir: &Path) -> LocalSource {
+        init_repo(dir);
+        run(dir, &["git", "commit", "--allow-empty", "-m", "init"]);
+        resolve_local_with_base(dir, Some("HEAD")).unwrap()
+    }
+
+    fn write_path(dir: &Path, path: &str, text: &str) {
+        let path = dir.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn unusual_paths_round_trip_through_real_tracked_untracked_and_rename_patches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        // Exercise both caller configurations; local patch generation chooses
+        // quoting explicitly so unsupported byte paths cannot be replaced.
+        run(dir, &["git", "config", "core.quotePath", "false"]);
+        let names = [
+            "café-世界.txt",
+            "tab\tname.txt",
+            "line\nname.txt",
+            "quote\"name.txt",
+            "back\\slash.txt",
+            "literal\\n\\303.txt",
+            " leading and trailing ",
+            "has b/inside ",
+        ];
+        for (ix, name) in names.iter().enumerate() {
+            write_path(dir, &format!("tracked/{name}"), &format!("tracked {ix}\n"));
+            write_path(dir, &format!("before/{name}"), &format!("rename {ix}\n"));
+        }
+        run(dir, &["git", "add", "."]);
+        run(dir, &["git", "commit", "-m", "unusual paths"]);
+        for name in names {
+            write_path(dir, &format!("tracked/{name}"), "changed\n");
+            write_path(dir, &format!("untracked/{name}"), "new\n");
+            let new = format!("after/{name}");
+            fs::create_dir_all(dir.join(&new).parent().unwrap()).unwrap();
+            run(dir, &["git", "mv", "--", &format!("before/{name}"), &new]);
+        }
+        // Empty creations rely solely on diff --git paths, without +++ markers.
+        write_path(dir, "empty has b/inside ", "");
+        let src = resolve_local_with_base(dir, Some("HEAD")).unwrap();
+        let patch = diff_patch(&src).unwrap();
+        assert_eq!(patch.omitted_untracked, 0);
+        let diff = diff_core::try_parse_patch(&patch.patch).unwrap();
+        assert_eq!(diff.files.len(), 3 * names.len() + 1);
+        for (ix, name) in names.iter().enumerate() {
+            for (prefix, status) in [
+                ("tracked", FileStatus::Modified),
+                ("untracked", FileStatus::Added),
+                ("after", FileStatus::Renamed),
+            ] {
+                let expected = format!("{prefix}/{name}");
+                let file = diff
+                    .files
+                    .iter()
+                    .find(|f| f.display_path() == expected)
+                    .unwrap_or_else(|| panic!("missing {expected:?}: {diff:?}"));
+                assert_eq!(file.status, status);
+                if prefix == "after" {
+                    assert_eq!(
+                        file.old_path.as_deref(),
+                        Some(format!("before/{name}").as_str())
+                    );
+                    assert_eq!(
+                        file_at_base(&src, file.old_path.as_deref().unwrap()),
+                        Some(format!("rename {ix}\n"))
+                    );
+                }
+            }
+        }
+        let empty = diff
+            .files
+            .iter()
+            .find(|f| f.display_path() == "empty has b/inside ")
+            .unwrap();
+        assert_eq!(empty.status, FileStatus::Added);
+        assert!(empty.hunks.is_empty());
+    }
+
+    #[test]
+    fn no_index_empty_creation_is_valid_but_failed_empty_output_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        empty_repo(tmp.path());
+        fs::write(tmp.path().join("empty "), "").unwrap();
+        let patch = untracked_patch(tmp.path(), OsStr::new("empty ")).unwrap();
+        let diff = diff_core::try_parse_patch(&patch).unwrap();
+        assert_eq!(diff.files[0].new_path.as_deref(), Some("empty "));
+        assert_eq!(diff.files[0].status, FileStatus::Added);
+        assert!(diff.files[0].hunks.is_empty());
+        for path in ["missing", "empty /cannot-access"] {
+            let error = untracked_patch(tmp.path(), OsStr::new(path))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("failed"), "{error}");
+            assert!(error.contains(path), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_untracked_file_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = empty_repo(tmp.path());
+        let path = tmp.path().join("unreadable");
+        fs::write(&path, "secret\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        // Privileged test runners can read mode-000 files; the missing/ENOTDIR
+        // fixture above still exercises a deterministic Git access failure.
+        if fs::File::open(&path).is_err() {
+            let error = diff_patch(&src).unwrap_err().to_string();
+            assert!(
+                error.contains("unreadable") && error.contains("failed"),
+                "{error}"
+            );
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn non_utf8_untracked_bytes_are_rejected_before_constructing_an_argument() {
+        let error = untracked_path(b"invalid-\xff").unwrap_err().to_string();
+        assert!(error.contains("non-UTF-8 untracked Git path"), "{error}");
+    }
+
+    // macOS filesystems reject creating non-UTF-8 names; Linux can exercise
+    // the complete untracked enumeration path as well as byte validation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_untracked_and_tracked_paths_are_rejected() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = empty_repo(tmp.path());
+        let path = tmp.path().join(OsStr::from_bytes(b"invalid-\xff"));
+        fs::write(&path, "old\n").unwrap();
+        let error = diff_patch(&src).unwrap_err().to_string();
+        assert!(error.contains("non-UTF-8 untracked Git path"), "{error}");
+        run(tmp.path(), &["git", "add", "."]);
+        run(tmp.path(), &["git", "commit", "-m", "byte path"]);
+        fs::write(path, "new\n").unwrap();
+        run(tmp.path(), &["git", "config", "core.quotePath", "false"]);
+        let src = resolve_local_with_base(tmp.path(), Some("HEAD")).unwrap();
+        let patch = diff_patch(&src).unwrap();
+        let error = diff_core::try_parse_patch(&patch.patch)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-UTF-8 Git path"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_non_utf8_path_in_git_index_is_rejected_even_without_a_worktree_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        empty_repo(dir);
+        fs::write(dir.join("blob"), "text\n").unwrap();
+        let oid = git(dir, &["hash-object", "-w", "blob"]).unwrap();
+        fs::remove_file(dir.join("blob")).unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["update-index", "--add", "--cacheinfo", "100644", oid.trim()])
+            .arg(OsStr::from_bytes(b"invalid-\xff"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        run(dir, &["git", "commit", "-m", "byte path in index"]);
+        run(dir, &["git", "config", "core.quotePath", "false"]);
+        let src = resolve_local_with_base(dir, Some("HEAD")).unwrap();
+        let patch = diff_patch(&src).unwrap();
+        let error = diff_core::try_parse_patch(&patch.patch)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-UTF-8 Git path"), "{error}");
+    }
+
+    #[test]
+    fn untracked_cap_reports_omitted_files_and_keeps_empty_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = empty_repo(tmp.path());
+        for ix in 0..MAX_UNTRACKED_FILES + 2 {
+            fs::write(tmp.path().join(format!("{ix:03}.txt")), "").unwrap();
+        }
+        let patch = diff_patch(&src).unwrap();
+        assert_eq!(patch.omitted_untracked, 2);
+        let diff = diff_core::try_parse_patch(&patch.patch).unwrap();
+        assert_eq!(diff.files.len(), MAX_UNTRACKED_FILES);
+        assert_eq!(diff.files.last().unwrap().display_path(), "199.txt");
+        assert!(diff.files.iter().all(|f| f.status == FileStatus::Added));
+    }
+
+    #[test]
+    fn local_diffs_do_not_run_configured_textconv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        fs::write(dir.join(".gitattributes"), "*.txt diff=fixture\n").unwrap();
+        fs::write(dir.join("tracked.txt"), "old\n").unwrap();
+        run(dir, &["git", "add", "."]);
+        run(dir, &["git", "commit", "-m", "base"]);
+        // If invoked, this converter fails the diff instead of touching state.
+        run(dir, &["git", "config", "diff.fixture.textconv", "false"]);
+        fs::write(dir.join("tracked.txt"), "changed\n").unwrap();
+        fs::write(dir.join("untracked.txt"), "new\n").unwrap();
+        let patch = diff_patch(&resolve_local(dir).unwrap()).unwrap();
+        let diff = diff_core::try_parse_patch(&patch.patch).unwrap();
+        assert_eq!(diff.files.len(), 2);
+        assert!(diff.files.iter().all(|f| f.additions == 1));
+    }
+
+    #[test]
+    fn repository_root_preserves_trailing_spaces_and_newlines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repository \n ");
+        fs::create_dir(&dir).unwrap();
+        let src = empty_repo(&dir);
+        assert_eq!(
+            src.repo_root.canonicalize().unwrap(),
+            dir.canonicalize().unwrap()
+        );
+        fs::write(dir.join("new"), "new\n").unwrap();
+        assert_eq!(
+            diff_core::try_parse_patch(&diff_patch(&src).unwrap().patch)
+                .unwrap()
+                .files
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn no_remote_main_branch_diffs_working_tree_against_head() {
         let tmp = tempfile::tempdir().unwrap();
@@ -281,7 +583,7 @@ mod tests {
         assert_eq!(src.base_label, "HEAD");
 
         let patch = diff_patch(&src).unwrap();
-        let diff = diff_core::parse_patch(&patch);
+        let diff = diff_core::parse_patch(&patch.patch);
         let by_path: Vec<(&str, FileStatus)> = diff
             .files
             .iter()
@@ -318,7 +620,7 @@ mod tests {
         assert_eq!(src.base_label, "main");
 
         let patch = diff_patch(&src).unwrap();
-        let diff = diff_core::parse_patch(&patch);
+        let diff = diff_core::parse_patch(&patch.patch);
         assert_eq!(diff.files.len(), 1);
         assert_eq!(diff.files[0].display_path(), "lib.rs");
         assert_eq!((diff.files[0].additions, diff.files[0].deletions), (1, 0));
@@ -391,7 +693,7 @@ mod tests {
         assert_eq!(src.base_label, "origin/main");
 
         let patch = diff_patch(&src).unwrap();
-        let diff = diff_core::parse_patch(&patch);
+        let diff = diff_core::parse_patch(&patch.patch);
         assert_eq!(diff.files.len(), 1);
         let file = &diff.files[0];
         assert_eq!(file.display_path(), "lib.rs");
