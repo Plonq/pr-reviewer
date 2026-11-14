@@ -754,7 +754,12 @@ mod tests {
         fn pr_meta(&self, _: &github::PrLocator) -> Result<github::PrMeta, github::ClientError> {
             unreachable!()
         }
-        fn pr_patch(&self, _: &github::PrLocator) -> Result<String, github::ClientError> {
+        fn pr_patch(
+            &self,
+            _: &github::PrLocator,
+            _: &str,
+            _: &str,
+        ) -> Result<String, github::ClientError> {
             unreachable!()
         }
         fn review_comments(

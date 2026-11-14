@@ -8339,7 +8339,12 @@ mod tests {
         let loc = client
             .resolve_pr(&std::env::var("GANDER_DIFF_PR").unwrap())
             .unwrap();
-        let patch = diff_core::parse_patch(&client.pr_patch(&loc).unwrap());
+        let meta = client.pr_meta(&loc).unwrap();
+        let patch = diff_core::parse_patch(
+            &client
+                .pr_patch(&loc, &meta.base_ref_oid, &meta.head_ref_oid)
+                .unwrap(),
+        );
         let loaded = fetch_item(client, &Source::Pr(loc), ViewMode::Split, 0).unwrap();
         assert!(loaded.pr_base.is_some());
         assert!(!loaded.upgrades.is_empty());
@@ -8521,6 +8526,117 @@ mod tests {
     }
 
     #[test]
+    fn pr_fetch_keeps_captured_revisions_when_both_refs_move() {
+        for range in ["full", "incremental", "fallback"] {
+            let mut fake = since_review_fake();
+            let client = Arc::get_mut(&mut fake).unwrap();
+            client.pr_merge_base = Some("merge-base".into());
+            client
+                .file_contents
+                .insert(("merge-base".into(), "a.rs".into()), "old\n".into());
+            *client.refs_after_meta.lock().unwrap() = Some(("new-base".into(), "new-head".into()));
+            if range == "fallback" {
+                *client.comparison_patch.lock().unwrap() = None;
+            }
+            let loaded = review_target::fetch_item_scoped(
+                fake.clone(),
+                &Source::Pr(loop_loc()),
+                ViewMode::Split,
+                0,
+                range != "full",
+            )
+            .unwrap();
+            let LoadedMeta::Pr(meta) = &loaded.meta else {
+                panic!()
+            };
+            assert_eq!(meta.base_ref_oid, "ba5ec0de");
+            assert_eq!(meta.head_ref_oid, "dead10cc");
+            assert_eq!(fake.base.lock().unwrap().as_deref(), Some("new-base"));
+            assert_eq!(fake.head.lock().unwrap().as_deref(), Some("new-head"));
+            let pair = ("ba5ec0de".into(), "dead10cc".into());
+            let incremental = range == "incremental";
+            let full_requests = if incremental { vec![] } else { vec![pair] };
+            assert_eq!(*fake.patch_requests.lock().unwrap(), full_requests);
+            assert_eq!(*fake.merge_base_requests.lock().unwrap(), full_requests);
+            let comparison_requests = if range == "full" {
+                vec![]
+            } else {
+                vec![("reviewed-sha".into(), "dead10cc".into(), "ba5ec0de".into())]
+            };
+            assert_eq!(
+                *fake.comparison_requests.lock().unwrap(),
+                comparison_requests
+            );
+            assert_eq!(
+                loaded.review_base.as_deref(),
+                incremental.then_some("reviewed-sha")
+            );
+            assert_eq!(
+                loaded.pr_base.as_deref(),
+                (!incremental).then_some("merge-base")
+            );
+            assert!(
+                loaded.upgrades.contains_key(&0),
+                "use captured full-file context"
+            );
+            let old = if incremental { "reviewed" } else { "old" };
+            assert!(loaded.diff.files[0]
+                .hunks
+                .iter()
+                .flat_map(|h| &h.rows)
+                .any(|row| matches!(row, diff_core::DiffRow::Removed { text, .. } if text == old)));
+            assert_eq!(loaded.anchor_hunks.len(), if incremental { 1 } else { 2 });
+            let anchor = &loaded.anchor_hunks[0][0];
+            assert_eq!(
+                (
+                    anchor.old_start,
+                    anchor.old_count,
+                    anchor.new_start,
+                    anchor.new_count
+                ),
+                (1, 1, 1, 1)
+            );
+            assert!(anchor
+                .rows
+                .iter()
+                .any(|row| matches!(row, diff_core::DiffRow::Removed { text, .. } if text == old)));
+        }
+    }
+
+    #[test]
+    fn successful_incremental_ranges_skip_the_full_patch_even_when_it_would_fail() {
+        for empty in [false, true] {
+            for restart in [false, true] {
+                let fake = since_review_fake();
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send(Err(github::ClientError::Failed(
+                    "full patch unavailable".into(),
+                )))
+                .unwrap();
+                *fake.patch_gate.lock().unwrap() = Some(rx);
+                if empty {
+                    *fake.comparison_patch.lock().unwrap() = Some(String::new().into());
+                }
+                let loaded = review_target::fetch_item_with_restart(
+                    fake.clone(),
+                    &Source::Pr(loop_loc()),
+                    ViewMode::Split,
+                    0,
+                    !restart,
+                    None,
+                    restart.then_some("reviewed-sha"),
+                )
+                .unwrap();
+                assert_eq!(loaded.review_base.as_deref(), Some("reviewed-sha"));
+                assert_eq!(loaded.diff.files.is_empty(), empty);
+                assert!(fake.patch_requests.lock().unwrap().is_empty());
+                assert!(fake.merge_base_requests.lock().unwrap().is_empty());
+                assert_eq!(fake.comparison_requests.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn since_review_is_a_real_range_and_upgrades_and_comments_use_that_range() {
         let fake = since_review_fake();
         let mut item = loop_pr_item(Vec::new());
@@ -8678,6 +8794,10 @@ mod tests {
             .unwrap();
             assert_eq!(loaded.diff.files.len(), 2);
             assert!(loaded.review_base.is_none());
+            assert_eq!(
+                *fake.patch_requests.lock().unwrap(),
+                [("ba5ec0de".into(), "dead10cc".into())]
+            );
             let github::ReviewChanges::Unavailable(reason) = loaded.review_changes else {
                 panic!()
             };
@@ -11768,7 +11888,12 @@ mod tests {
             ))
         }
 
-        fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
+        fn pr_patch(
+            &self,
+            _loc: &github::PrLocator,
+            _base: &str,
+            _head: &str,
+        ) -> Result<String, github::ClientError> {
             Err(github::ClientError::Failed(
                 "queue tests never fetch a patch".into(),
             ))
@@ -12755,7 +12880,12 @@ mod tests {
             unimplemented!("queue tests never read PR meta")
         }
 
-        fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
+        fn pr_patch(
+            &self,
+            _loc: &github::PrLocator,
+            _base: &str,
+            _head: &str,
+        ) -> Result<String, github::ClientError> {
             unimplemented!("queue tests never fetch a patch")
         }
 
@@ -14884,6 +15014,9 @@ mod tests {
         posted: std::sync::Mutex<Vec<Post>>,
         review_commits: std::sync::Mutex<Vec<String>>,
         head: std::sync::Mutex<Option<String>>,
+        base: std::sync::Mutex<Option<String>>,
+        /// Advance both refs immediately after returning one captured snapshot.
+        refs_after_meta: std::sync::Mutex<Option<(String, String)>>,
         /// While set, posting a new comment fails — the inline-error path.
         fail: std::sync::atomic::AtomicBool,
         stale_discussion: std::sync::atomic::AtomicBool,
@@ -14903,6 +15036,8 @@ mod tests {
         review_changes: std::sync::Mutex<github::ReviewChanges>,
         comparison_patch: std::sync::Mutex<Option<github::ReviewComparison>>,
         comparison_requests: std::sync::Mutex<Vec<(String, String, String)>>,
+        patch_requests: std::sync::Mutex<Vec<(String, String)>>,
+        merge_base_requests: std::sync::Mutex<Vec<(String, String)>>,
         fail_review_history: std::sync::atomic::AtomicBool,
         pr_merge_base: Option<String>,
         fail_merge_base: bool,
@@ -15529,6 +15664,13 @@ mod tests {
             if let Some(head) = self.head.lock().unwrap().as_ref() {
                 meta.head_ref_oid = head.clone();
             }
+            if let Some(base) = self.base.lock().unwrap().as_ref() {
+                meta.base_ref_oid = base.clone();
+            }
+            if let Some((base, head)) = self.refs_after_meta.lock().unwrap().take() {
+                *self.base.lock().unwrap() = Some(base);
+                *self.head.lock().unwrap() = Some(head);
+            }
             Ok(meta)
         }
 
@@ -15539,15 +15681,26 @@ mod tests {
             head: &str,
         ) -> Result<String, github::ClientError> {
             assert_eq!(loc.repo_slug(), loop_loc().repo_slug());
-            assert_eq!(base, "ba5ec0de");
-            assert_eq!(head, self.pr_meta(loc)?.head_ref_oid);
+            self.merge_base_requests
+                .lock()
+                .unwrap()
+                .push((base.into(), head.into()));
             if self.fail_merge_base {
                 return Err(github::ClientError::Failed("merge base unavailable".into()));
             }
             Ok(self.pr_merge_base.clone().unwrap_or_else(|| base.into()))
         }
 
-        fn pr_patch(&self, _loc: &github::PrLocator) -> Result<String, github::ClientError> {
+        fn pr_patch(
+            &self,
+            _loc: &github::PrLocator,
+            base: &str,
+            head: &str,
+        ) -> Result<String, github::ClientError> {
+            self.patch_requests
+                .lock()
+                .unwrap()
+                .push((base.into(), head.into()));
             if let Some(gate) = self.patch_gate.lock().unwrap().take() {
                 return gate
                     .recv_timeout(std::time::Duration::from_secs(5))

@@ -809,8 +809,10 @@ pub trait GitHubClient: Send + Sync {
     /// One PR's metadata (see [`PrMeta`]).
     fn pr_meta(&self, loc: &PrLocator) -> Result<PrMeta, ClientError>;
 
-    /// The PR's unified diff patch, for the diff engine to parse.
-    fn pr_patch(&self, loc: &PrLocator) -> Result<String, ClientError>;
+    /// The PR's three-dot unified diff at the captured base and head OIDs.
+    /// Compare their merge base with `head`, matching full-file reconstruction;
+    /// never substitute mutable branch names or the PR's latest diff.
+    fn pr_patch(&self, loc: &PrLocator, base: &str, head: &str) -> Result<String, ClientError>;
 
     /// Every review comment on the PR, flat; the app groups them into
     /// threads. Pagination (gh ≥ 2.66's `--paginate --slurp`) is the

@@ -275,6 +275,32 @@ impl<P: GhProcess> GhCliClient<P> {
         }
     }
 
+    fn compare_diff(&self, loc: &PrLocator, base: &str, head: &str) -> Result<String, ClientError> {
+        if ![base, head]
+            .into_iter()
+            .all(crate::review_changes::valid_oid)
+        {
+            return Err(ClientError::Invalid("invalid comparison revision".into()));
+        }
+        // Raw diff avoids the compare JSON's capped file list. OIDs also work
+        // for historical/deleted refs and commits in the repository's forks;
+        // an unavailable pair must fail rather than fetch a mutable PR diff.
+        let endpoint = format!("repos/{}/compare/{base}...{head}", loc.repo_slug());
+        let out = self
+            .process
+            .run(&[
+                "api",
+                &endpoint,
+                "-H",
+                "Accept: application/vnd.github.diff",
+            ])
+            .map_err(spawn_failure)?;
+        if out.code != Some(0) {
+            return Err(classify_failure(&out));
+        }
+        Ok(out.text()?.to_string())
+    }
+
     /// The authenticated user via `gh api user`: one subprocess answers both
     /// halves of the facade's auth check — whether GitHub is usable, and as
     /// whom. A signed-out `gh` fails this with its documented auth exit code
@@ -1379,33 +1405,11 @@ impl<P: GhProcess> GitHubClient for GhCliClient<P> {
                 &new_upstream,
             );
         }
-        let endpoint = format!("repos/{}/compare/{base}...{head}", loc.repo_slug());
-        let out = self
-            .process
-            .run(&[
-                "api",
-                &endpoint,
-                "-H",
-                "Accept: application/vnd.github.diff",
-            ])
-            .map_err(spawn_failure)?;
-        if out.code != Some(0) {
-            return Err(classify_failure(&out));
-        }
-        Ok(out.text()?.to_string().into())
+        self.compare_diff(loc, base, head).map(Into::into)
     }
 
-    fn pr_patch(&self, loc: &PrLocator) -> Result<String, ClientError> {
-        let number = loc.number.to_string();
-        let slug = loc.repo_slug();
-        let out = self
-            .process
-            .run(&["pr", "diff", &number, "--repo", &slug])
-            .map_err(spawn_failure)?;
-        if out.code != Some(0) {
-            return Err(classify_failure(&out));
-        }
-        Ok(out.text()?.to_string())
+    fn pr_patch(&self, loc: &PrLocator, base: &str, head: &str) -> Result<String, ClientError> {
+        self.compare_diff(loc, base, head)
     }
 
     fn review_comments(&self, loc: &PrLocator) -> Result<Vec<ReviewComment>, ClientError> {
@@ -6130,22 +6134,69 @@ mod tests {
     #[test]
     fn pr_patch_returns_the_recorded_diff() {
         let patch = client(ok(Some(0), "diff --git a/a.rs b/a.rs\n", ""))
-            .pr_patch(&loc())
+            .pr_patch(&loc(), &"a".repeat(40), &"b".repeat(40))
             .unwrap();
         assert!(patch.starts_with("diff --git"));
     }
 
     #[test]
-    fn pr_patch_invokes_gh_pr_diff_verbatim() {
+    fn pr_patch_invokes_raw_three_dot_compare_for_the_captured_pair() {
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
         let fake = FakeGh::one(ok(Some(0), "", ""));
         let calls = fake.calls_handle();
-        GhCliClient::with_process(fake).pr_patch(&loc()).unwrap();
+        GhCliClient::with_process(fake)
+            .pr_patch(&loc(), &base, &head)
+            .unwrap();
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0].join(" "),
-            "pr diff 4781 --repo octocat/Hello-World"
+            calls[0],
+            vec![
+                "api".to_string(),
+                format!("repos/octocat/Hello-World/compare/{base}...{head}"),
+                "-H".into(),
+                "Accept: application/vnd.github.diff".into(),
+            ]
         );
+    }
+
+    #[test]
+    fn pr_patch_rejects_mutable_or_invalid_revisions_without_running_gh() {
+        let oid = "a".repeat(40);
+        for invalid in ["main", "", "--repo", "a...b", &"a".repeat(39)] {
+            let (client, calls) = session_script(&[]);
+            for (base, head) in [(invalid, oid.as_str()), (oid.as_str(), invalid)] {
+                assert!(matches!(
+                    client.pr_patch(&loc(), base, head),
+                    Err(ClientError::Invalid(_))
+                ));
+            }
+            assert!(calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn pr_patch_unavailable_pair_never_falls_back_to_the_mutable_pr_diff() {
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
+        for message in [
+            "gh: Not Found (HTTP 404)",
+            "gh: No common ancestor (HTTP 422)",
+            "error connecting to api.github.com",
+        ] {
+            let fake = FakeGh::one(ok(Some(1), "", message));
+            let calls = fake.calls_handle();
+            let client = GhCliClient::with_process(fake);
+            assert!(client.pr_patch(&loc(), &base, &head).is_err());
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0][0], "api");
+            assert_eq!(
+                calls[0][1],
+                format!("repos/octocat/Hello-World/compare/{base}...{head}")
+            );
+        }
     }
 
     #[test]
