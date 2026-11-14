@@ -3093,7 +3093,16 @@ impl ReviewApp {
     }
 
     fn close_item(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix >= self.items.len() {
+        let Some(item) = self.items.get(ix) else {
+            return;
+        };
+        // Reopening a removed item would create a fresh SessionUi lock while
+        // its detached mutation is still running. Keep the item (and recovery
+        // state) until that write finishes; read-only resume jobs can close.
+        if item.comment_sync.is_writing() {
+            self.sessions.entry(item.id).or_default().error =
+                Some("Wait for the PR update to finish before closing this tab.".into());
+            cx.notify();
             return;
         }
         self.persist_positions();
