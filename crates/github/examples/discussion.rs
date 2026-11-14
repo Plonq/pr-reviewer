@@ -1,5 +1,5 @@
-//! Read-only discussion export for checking a busy real PR:
-//! cargo run -p github --example discussion -- zed-industries/zed#13433
+//! Export a PR discussion (read-only):
+//! cargo run -p github --example discussion -- acme/widgets#123
 use github::{gh_cli::GhCliClient, GitHubClient};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

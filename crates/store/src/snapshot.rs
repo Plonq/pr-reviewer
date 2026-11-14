@@ -311,7 +311,7 @@ mod tests {
     /// A snapshot, as a detail fetch would produce it.
     fn sample() -> PrSnapshot {
         PrSnapshot {
-            repository: "octocat/Hello-World".into(),
+            repository: "acme/widgets".into(),
             number: 4781,
             title: "Add deactivation filters".into(),
             body: "Some **markdown**.".into(),
@@ -339,18 +339,18 @@ mod tests {
         let snapshots = store.snapshots();
         let snapshot = sample();
         snapshots.write(&snapshot).unwrap();
-        let read = snapshots.read("octocat/Hello-World", 4781).unwrap();
+        let read = snapshots.read("acme/widgets", 4781).unwrap();
         assert_eq!(read, Some(snapshot.clone()));
         assert_eq!(
             snapshots
-                .head_sha("octocat/Hello-World", 4781)
+                .head_sha("acme/widgets", 4781)
                 .unwrap()
                 .as_deref(),
             Some("abc123")
         );
         assert_eq!(
             snapshots
-                .fetched_at_ms("octocat/Hello-World", 4781)
+                .fetched_at_ms("acme/widgets", 4781)
                 .unwrap(),
             Some(1_700_000_000_000)
         );
@@ -389,10 +389,10 @@ mod tests {
     fn an_unseen_pr_has_no_snapshot() {
         let store = crate::Store::open_in_memory().unwrap();
         let snapshots = store.snapshots();
-        assert_eq!(snapshots.read("octocat/Hello-World", 1).unwrap(), None);
-        assert_eq!(snapshots.head_sha("octocat/Hello-World", 1).unwrap(), None);
+        assert_eq!(snapshots.read("acme/widgets", 1).unwrap(), None);
+        assert_eq!(snapshots.head_sha("acme/widgets", 1).unwrap(), None);
         assert_eq!(
-            snapshots.fetched_at_ms("octocat/Hello-World", 1).unwrap(),
+            snapshots.fetched_at_ms("acme/widgets", 1).unwrap(),
             None
         );
     }
@@ -409,7 +409,7 @@ mod tests {
         second.title = "Renamed".into();
         snapshots.write(&second).unwrap();
         let read = snapshots
-            .read("octocat/Hello-World", 4781)
+            .read("acme/widgets", 4781)
             .unwrap()
             .unwrap();
         assert_eq!(read.head_sha, "def456");
@@ -424,7 +424,7 @@ mod tests {
         let store = crate::Store::open_in_memory().unwrap();
         let snapshots = store.snapshots();
         assert!(snapshots
-            .thread_seen("octocat/Hello-World", 4781)
+            .thread_seen("acme/widgets", 4781)
             .unwrap()
             .is_empty());
         let thread = ThreadSeen {
@@ -433,9 +433,9 @@ mod tests {
             resolved: false,
         };
         snapshots
-            .mark_thread_seen("octocat/Hello-World", 4781, &thread)
+            .mark_thread_seen("acme/widgets", 4781, &thread)
             .unwrap();
-        let seen = snapshots.thread_seen("octocat/Hello-World", 4781).unwrap();
+        let seen = snapshots.thread_seen("acme/widgets", 4781).unwrap();
         assert_eq!(seen, vec![thread.clone()]);
         // Marking it again with a later timestamp updates it in place.
         let later = ThreadSeen {
@@ -444,9 +444,9 @@ mod tests {
             resolved: true,
         };
         snapshots
-            .mark_thread_seen("octocat/Hello-World", 4781, &later)
+            .mark_thread_seen("acme/widgets", 4781, &later)
             .unwrap();
-        let seen = snapshots.thread_seen("octocat/Hello-World", 4781).unwrap();
+        let seen = snapshots.thread_seen("acme/widgets", 4781).unwrap();
         assert_eq!(seen, vec![later]);
     }
 
@@ -462,10 +462,10 @@ mod tests {
             resolved: false,
         };
         snapshots
-            .mark_thread_seen("octocat/Hello-World", 1, &thread)
+            .mark_thread_seen("acme/widgets", 1, &thread)
             .unwrap();
         assert!(snapshots
-            .thread_seen("octocat/Hello-World", 2)
+            .thread_seen("acme/widgets", 2)
             .unwrap()
             .is_empty());
         assert!(snapshots.thread_seen("other/repo", 1).unwrap().is_empty());
@@ -479,7 +479,7 @@ mod tests {
         snapshots.write(&sample()).unwrap();
         snapshots
             .mark_thread_seen(
-                "octocat/Hello-World",
+                "acme/widgets",
                 4781,
                 &ThreadSeen {
                     id: "T_1".into(),
@@ -488,10 +488,10 @@ mod tests {
                 },
             )
             .unwrap();
-        snapshots.forget("octocat/Hello-World", 4781).unwrap();
-        assert_eq!(snapshots.read("octocat/Hello-World", 4781).unwrap(), None);
+        snapshots.forget("acme/widgets", 4781).unwrap();
+        assert_eq!(snapshots.read("acme/widgets", 4781).unwrap(), None);
         assert!(snapshots
-            .thread_seen("octocat/Hello-World", 4781)
+            .thread_seen("acme/widgets", 4781)
             .unwrap()
             .is_empty());
     }

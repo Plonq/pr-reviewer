@@ -683,7 +683,7 @@ mod tests {
                 queue.prs.push(CachedQueueRow {
                     number,
                     title: format!("PR {number}"),
-                    repository: "octocat/Hello-World".into(),
+                    repository: "acme/widgets".into(),
                     updated_at: "2026-10-20T08:07:08Z".into(),
                     ..Default::default()
                 });

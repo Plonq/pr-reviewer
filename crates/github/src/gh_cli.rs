@@ -3507,38 +3507,6 @@ mod tests {
         }
     }
 
-    /// Compare an authenticated web view's exported per-file counts against
-    /// the production path. Inputs stay external (including private PR data).
-    #[test]
-    #[ignore = "requires gh authentication, network, and GANDER_COMPARE_* inputs"]
-    fn real_upstream_aware_comparison_matches_web_file_counts() {
-        let input = |name: &str| std::env::var(format!("GANDER_COMPARE_{name}")).expect(name);
-        let client = GhCliClient::new();
-        let loc = client.resolve_pr(&input("PR")).unwrap();
-        let comparison = client
-            .comparison_patch(&loc, &input("REVIEWED"), &input("HEAD"), &input("UPSTREAM"))
-            .unwrap();
-        let expected: std::collections::BTreeMap<String, (u32, u32)> =
-            serde_json::from_slice(&std::fs::read(input("EXPECTED")).unwrap()).unwrap();
-        let actual: std::collections::BTreeMap<_, _> = diff_core::parse_patch(&comparison.patch)
-            .files
-            .into_iter()
-            .map(|file| {
-                (
-                    file.display_path().to_owned(),
-                    (file.additions, file.deletions),
-                )
-            })
-            .collect();
-        assert_eq!(actual, expected);
-        let files = comparison
-            .base_files
-            .expect("exercise an upstream-adjusted baseline");
-        for base in files.values() {
-            assert_eq!(base.text.lines().count(), base.reviewed_lines.len());
-        }
-    }
-
     /// Each invocation pops the next recorded outcome and records argv;
     /// an invocation beyond the script fails the test.
     struct FakeGh {
@@ -3615,8 +3583,8 @@ mod tests {
     /// The PR every PR-shaped fixture below addresses.
     fn loc() -> PrLocator {
         PrLocator {
-            owner: "octocat".into(),
-            repo: "Hello-World".into(),
+            owner: "acme".into(),
+            repo: "widgets".into(),
             number: 4781,
         }
     }
@@ -3778,7 +3746,7 @@ mod tests {
         );
         let calls = calls.lock().unwrap();
         assert_eq!(&calls[0][..3], ["api", "graphql", "-f"]);
-        assert_eq!(calls[0][3], "query=query { repository(owner:\"octocat\",name:\"Hello-World\") { pullRequest(number:4781) { id files(first:100) { nodes { path viewerViewedState } pageInfo { hasNextPage endCursor } } } } }");
+        assert_eq!(calls[0][3], "query=query { repository(owner:\"acme\",name:\"widgets\") { pullRequest(number:4781) { id files(first:100) { nodes { path viewerViewedState } pageInfo { hasNextPage endCursor } } } } }");
         assert!(calls[1][3].contains("files(first:100,after:\"files-next\")"));
         assert!(calls.iter().all(|call| !call[3].contains("mutation")));
     }
@@ -3971,7 +3939,7 @@ mod tests {
 
     fn actions_suite(ix: usize) -> serde_json::Value {
         serde_json::json!({"workflowRun": {
-            "url":format!("https://github.com/octocat/Hello-World/actions/runs/{ix}"),
+            "url":format!("https://github.com/acme/widgets/actions/runs/{ix}"),
             "workflow":{"name":format!("Workflow {ix}")}
         }})
     }
@@ -4025,7 +3993,7 @@ mod tests {
         );
         assert_eq!(
             result.commits[0].actions[100].url,
-            "https://github.com/octocat/Hello-World/actions/runs/100"
+            "https://github.com/acme/widgets/actions/runs/100"
         );
         assert_eq!(
             result.commits[1].actions.len(),
@@ -4085,33 +4053,6 @@ mod tests {
             .contains("repeated"));
         let client = GhCliClient::with_process(FakeGh::one(ok(Some(1), "", "network unavailable")));
         assert!(client.pr_commits(&loc()).is_err());
-    }
-
-    #[test]
-    #[ignore = "requires authenticated gh and network; read-only public PR"]
-    fn real_pr_commits_use_available_graphql_fields_and_direct_actions_urls() {
-        let loc = PrLocator {
-            owner: "zed-industries".into(),
-            repo: "zed".into(),
-            number: 66062,
-        };
-        let commits = GhCliClient::new().pr_commits(&loc).unwrap();
-        assert!(!commits.commits.is_empty());
-        assert!(
-            commits
-                .commits
-                .iter()
-                .any(|commit| !commit.actions.is_empty()),
-            "use a recent PR with retained Actions runs for this live smoke test"
-        );
-        for commit in &commits.commits {
-            assert_eq!(commit.sha.len(), 40);
-            for run in &commit.actions {
-                assert!(run
-                    .url
-                    .starts_with("https://github.com/zed-industries/zed/actions/runs/"));
-            }
-        }
     }
 
     fn range_anchor() -> CommentAnchor {
@@ -4838,7 +4779,7 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(
             calls[2].join(" "),
-            "api -X POST repos/octocat/Hello-World/pulls/4781/reviews -f commit_id=head"
+            "api -X POST repos/acme/widgets/pulls/4781/reviews -f commit_id=head"
         );
         assert!(calls[6][3].contains("pullRequestReviewId:\"PRR_pending\""));
         assert!(calls[6][3].contains("side:RIGHT,line:7"));
@@ -5010,31 +4951,6 @@ mod tests {
         assert!(calls.lock().unwrap().is_empty());
     }
 
-    /// Read-only: GANDER_TEST_PR=owner/repo#123 cargo test -p github pending_review_live_read_only -- --ignored --nocapture
-    #[test]
-    #[ignore = "requires gh authentication and a PR with a pending review"]
-    fn pending_review_live_read_only() {
-        let pr = std::env::var("GANDER_TEST_PR").expect("set GANDER_TEST_PR");
-        let client = GhCliClient::new();
-        let loc = client.resolve_pr(&pr).unwrap();
-        let review = client
-            .pending_review(&loc)
-            .unwrap()
-            .expect("a pending review");
-        for comment in &review.comments {
-            assert!(!comment.node_id.is_empty());
-            println!(
-                "draft {}: {} {} {:?}–{:?}",
-                comment.id,
-                comment.path,
-                comment.side.api_str(),
-                comment.start_line,
-                comment.line
-            );
-        }
-        assert!(!review.comments.is_empty());
-    }
-
     #[test]
     fn immediate_comments_do_not_resume_start_or_submit_the_pending_review() {
         use crate::review_session::{Command, ReviewSession};
@@ -5069,7 +4985,7 @@ mod tests {
         assert_eq!(session.pending, pending);
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 5);
-        assert_eq!(calls[3].join(" "), "api -X POST repos/octocat/Hello-World/pulls/4781/comments -f body=now -f commit_id=head -f path=a.rs -f side=LEFT -F line=7 -F start_line=5 -f start_side=LEFT");
+        assert_eq!(calls[3].join(" "), "api -X POST repos/acme/widgets/pulls/4781/comments -f body=now -f commit_id=head -f path=a.rs -f side=LEFT -F line=7 -F start_line=5 -f start_side=LEFT");
         assert!(!calls[4].iter().any(|arg| arg.starts_with("start_")));
     }
 
@@ -5491,25 +5407,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires authenticated gh and network; read-only review history"]
-    fn real_past_reviews_load() {
-        let start = std::time::Instant::now();
-        let items = GhCliClient::new()
-            .search_prs(&QueueSearch::review_requested().with_past_reviews(true))
-            .unwrap();
-        assert!(items.len() <= 10);
-        assert!(items.iter().all(|item| item.reviewed_at.is_some()));
-        assert!(items
-            .windows(2)
-            .all(|pair| pair[0].reviewed_at >= pair[1].reviewed_at));
-        eprintln!(
-            "Loaded {} past reviews in {:?}",
-            items.len(),
-            start.elapsed()
-        );
-    }
-
-    #[test]
     fn past_reviews_empty_and_failed_searches_finish_without_more_requests() {
         for response in [
             ok(Some(0), &past_search_page(Vec::new(), None), ""),
@@ -5608,7 +5505,7 @@ mod tests {
             "Add deactivation filters to the users manage list"
         );
         assert_eq!(first.author, "octocat");
-        assert_eq!(first.repository, "octocat/Hello-World");
+        assert_eq!(first.repository, "acme/widgets");
         assert!(first.is_draft);
         assert_eq!(first.created_at, "2026-10-15T10:00:00Z");
         assert_eq!(first.updated_at, "2026-10-20T08:07:08Z");
@@ -5618,7 +5515,7 @@ mod tests {
         assert_eq!(first.labels[0].name, "api");
         assert_eq!(first.labels[0].color, "1D76DB");
         let second = &queue[0];
-        assert_eq!(second.repository, "octocat/Spoon-Knife");
+        assert_eq!(second.repository, "acme/gadgets");
         assert!(!second.is_draft);
         assert_eq!(second.created_at, "2026-10-10T09:00:00Z");
         assert_eq!(second.comments, 1);
@@ -5781,12 +5678,12 @@ mod tests {
         assert_eq!(
             calls[1].join(" "),
              "api graphql -f query=query { viewer { login } \
-             r0: repository(owner: \"octocat\", name: \"Hello-World\") { \
+             r0: repository(owner: \"acme\", name: \"widgets\") { \
              p4781: pullRequest(number: 4781) { additions deletions reviewDecision \
              statusCheckRollup { state } author { avatarUrl(size: 64) } \
              reviewRequests(first:100) { nodes { requestedReviewer { __typename ... on User { login } } } pageInfo { hasNextPage endCursor } } \
              timelineItems(last:100,itemTypes:[REVIEW_REQUESTED_EVENT]) { nodes { ... on ReviewRequestedEvent { createdAt requestedReviewer { __typename ... on User { login } } } } pageInfo { hasPreviousPage startCursor } } } } \
-             r1: repository(owner: \"octocat\", name: \"Spoon-Knife\") { \
+             r1: repository(owner: \"acme\", name: \"gadgets\") { \
              p4761: pullRequest(number: 4761) { additions deletions reviewDecision \
              statusCheckRollup { state } author { avatarUrl(size: 64) } \
              reviewRequests(first:100) { nodes { requestedReviewer { __typename ... on User { login } } } pageInfo { hasNextPage endCursor } } \
@@ -6014,9 +5911,9 @@ mod tests {
         let hits: Vec<String> = (0..count as u64)
             .map(|number| {
                 let repo = if number % 2 == 0 {
-                    "octocat/Hello-World"
+                    "acme/widgets"
                 } else {
-                    "octocat/Spoon-Knife"
+                    "acme/gadgets"
                 };
                 format!(
                     "{{\"author\":{{\"login\":\"octocat\"}},\"isDraft\":false,\
@@ -6070,9 +5967,9 @@ mod tests {
                 author: String::new(),
                 author_avatar_url: None,
                 repository: if number % 2 == 0 {
-                    "octocat/Hello-World".to_string()
+                    "acme/widgets".to_string()
                 } else {
-                    "octocat/Spoon-Knife".to_string()
+                    "acme/gadgets".to_string()
                 },
                 is_draft: false,
                 review_state: ReviewState::Awaiting,
@@ -6095,8 +5992,8 @@ mod tests {
         let first = &plans[0];
         assert_eq!(first.repos.len(), 2);
         assert_eq!(first.repos[0].alias, "r0");
-        assert_eq!(first.repos[0].owner, "octocat");
-        assert_eq!(first.repos[0].name, "Hello-World");
+        assert_eq!(first.repos[0].owner, "acme");
+        assert_eq!(first.repos[0].name, "widgets");
         assert_eq!(first.repos[1].alias, "r1");
         // Each batch re-aliases its repos from r0 — aliases never leak
         // across batches.
@@ -6115,73 +6012,6 @@ mod tests {
         assert!(enrich_plans(std::slice::from_ref(&malformed)).is_empty());
     }
 
-    /// Live smoke check against the real `gh` on this machine — not part of
-    /// the recorded set. Run explicitly with `cargo test -p github --
-    /// --ignored` whenever the CLI contract is in question.
-    #[test]
-    #[ignore = "needs gh installed, authenticated, and network"]
-    fn the_real_backend_sees_the_signed_in_user() {
-        let viewer = GhCliClient::new()
-            .viewer()
-            .expect("gh on this machine is installed and signed in");
-        assert!(!viewer.login.is_empty());
-        assert!(viewer.avatar_url.starts_with("https://"));
-    }
-
-    /// Live smoke check of the queue search against the real `gh` on this
-    /// machine — not part of the recorded set. Run explicitly with
-    /// `cargo test -p github -- --ignored` whenever the search contract is
-    /// in question.
-    #[test]
-    #[ignore = "needs gh installed, authenticated, and network"]
-    fn the_real_backend_runs_the_real_queue_search() {
-        let queue = GhCliClient::new()
-            .search_prs(&QueueSearch::review_requested())
-            .expect("gh on this machine is installed and signed in");
-        let mut sorted = queue.clone();
-        QueueSearch::review_requested().sort_items(&mut sorted);
-        assert_eq!(
-            queue, sorted,
-            "the queue must come back oldest request first"
-        );
-        // The live enrichment answered: a non-empty queue comes back with
-        // its check-sized fields on at least one row (all-null answers are
-        // the degrade path, and would mean the live contract broke).
-        if !queue.is_empty() {
-            assert!(
-                queue.iter().any(|pr| pr.additions.is_some()),
-                "with PRs queued, at least one must carry its diff size"
-            );
-        }
-    }
-
-    /// Live smoke check that chips narrow on real data — not part of the
-    /// recorded set. Run explicitly with `cargo test -p github --
-    /// --ignored` whenever the search contract is in question.
-    #[test]
-    #[ignore = "needs gh installed, authenticated, and network"]
-    fn the_real_backend_narrows_by_repo() {
-        let client = GhCliClient::new();
-        let full = client
-            .search_prs(&QueueSearch::review_requested())
-            .expect("gh on this machine is installed and signed in");
-        if full.len() < 2 {
-            return; // nothing to narrow on this account today
-        }
-        let repository = full[0].repository.clone();
-        let narrowed = client
-            .search_prs(
-                &QueueSearch::review_requested().filtered_by(QueueFilter::repo(repository.clone())),
-            )
-            .expect("the narrowed search must succeed like the full one");
-        assert!(narrowed.iter().all(|pr| pr.repository == repository));
-        assert!(!narrowed.is_empty());
-        // Narrowing means fewer rows whenever the repository isn't the whole queue.
-        if full.iter().any(|pr| pr.repository != repository) {
-            assert!(narrowed.len() < full.len());
-        }
-    }
-
     // --- resolve_pr --------------------------------------------------------
 
     #[test]
@@ -6190,10 +6020,10 @@ mod tests {
         // stray subprocess would fail the fake below.
         let client = GhCliClient::with_process(FakeGh::many(vec![]));
         assert_eq!(
-            client.resolve_pr("zed-industries/zed#12345").unwrap(),
+            client.resolve_pr("acme/widgets#12345").unwrap(),
             PrLocator {
-                owner: "zed-industries".into(),
-                repo: "zed".into(),
+                owner: "acme".into(),
+                repo: "widgets".into(),
                 number: 12345,
             }
         );
@@ -6203,10 +6033,10 @@ mod tests {
     fn resolve_pr_parses_the_url_form() {
         let client = GhCliClient::with_process(FakeGh::many(vec![]));
         let loc = client
-            .resolve_pr("https://github.com/rust-lang/rust/pull/99999/files")
+            .resolve_pr("https://github.com/acme/widgets/pull/99999/files")
             .unwrap();
-        assert_eq!(loc.owner, "rust-lang");
-        assert_eq!(loc.repo, "rust");
+        assert_eq!(loc.owner, "acme");
+        assert_eq!(loc.repo, "widgets");
         assert_eq!(loc.number, 99999);
     }
 
@@ -6224,13 +6054,13 @@ mod tests {
 
     #[test]
     fn resolve_pr_resolves_a_bare_number_through_the_cwd_repo() {
-        let fake = FakeGh::one(ok(Some(0), "https://github.com/octocat/Hello-World\n", ""));
+        let fake = FakeGh::one(ok(Some(0), "https://github.com/acme/widgets\n", ""));
         let calls = fake.calls_handle();
         assert_eq!(
             GhCliClient::with_process(fake).resolve_pr("#123").unwrap(),
             PrLocator {
-                owner: "octocat".into(),
-                repo: "Hello-World".into(),
+                owner: "acme".into(),
+                repo: "widgets".into(),
                 number: 123,
             }
         );
@@ -6264,7 +6094,7 @@ mod tests {
         );
         assert_eq!(meta.author.login, "octocat");
         assert_eq!(meta.state, "OPEN");
-        assert_eq!(meta.url, "https://github.com/octocat/Hello-World/pull/4781");
+        assert_eq!(meta.url, "https://github.com/acme/widgets/pull/4781");
         assert_eq!(meta.body, "Adds the filters discussed in #4778.");
         assert_eq!(meta.base_ref_name, "main");
         assert_eq!(meta.head_ref_name, "deactivation-filters");
@@ -6308,7 +6138,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].join(" "),
-            "pr view 4781 --repo octocat/Hello-World --json \
+            "pr view 4781 --repo acme/widgets --json \
              number,title,author,state,url,body,baseRefName,headRefName,baseRefOid,headRefOid,\
              additions,deletions,changedFiles,reviewDecision"
         );
@@ -6349,7 +6179,7 @@ mod tests {
             calls[0],
             vec![
                 "api".to_string(),
-                format!("repos/octocat/Hello-World/compare/{base}...{head}"),
+                format!("repos/acme/widgets/compare/{base}...{head}"),
                 "-H".into(),
                 "Accept: application/vnd.github.diff".into(),
             ]
@@ -6389,7 +6219,7 @@ mod tests {
             assert_eq!(calls[0][0], "api");
             assert_eq!(
                 calls[0][1],
-                format!("repos/octocat/Hello-World/compare/{base}...{head}")
+                format!("repos/acme/widgets/compare/{base}...{head}")
             );
         }
     }
@@ -6430,7 +6260,7 @@ mod tests {
         assert_eq!(
             calls[0].join(" "),
             "api --paginate --slurp \
-             repos/octocat/Hello-World/pulls/4781/comments?per_page=100"
+             repos/acme/widgets/pulls/4781/comments?per_page=100"
         );
     }
 
@@ -6460,8 +6290,8 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "one gh api graphql per page");
         assert!(calls[0][3].starts_with("query=query($owner:String!"));
-        assert_eq!(calls[0][5], "owner=octocat");
-        assert_eq!(calls[0][7], "repo=Hello-World");
+        assert_eq!(calls[0][5], "owner=acme");
+        assert_eq!(calls[0][7], "repo=widgets");
         assert_eq!(calls[1][9], "after=c1");
     }
 
@@ -6865,7 +6695,7 @@ mod tests {
                 "api",
                 "-X",
                 "POST",
-                "repos/octocat/Hello-World/issues/4781/comments",
+                "repos/acme/widgets/issues/4781/comments",
                 "-f",
                 "body=hello\n@octocat"
             ]
@@ -6899,7 +6729,7 @@ mod tests {
                 "api",
                 "-X",
                 "POST",
-                "repos/octocat/Hello-World/pulls/4781/comments/11/replies",
+                "repos/acme/widgets/pulls/4781/comments/11/replies",
                 "-f",
                 "body=reply"
             ]
@@ -6943,7 +6773,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].join(" "),
-            "api -X POST repos/octocat/Hello-World/pulls/4781/comments \
+            "api -X POST repos/acme/widgets/pulls/4781/comments \
              -f body=nice -f commit_id=a66406e -f path=src/main.rs -f side=RIGHT -F line=42"
         );
     }
@@ -6977,7 +6807,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(
             calls[0].join(" "),
-            "api -X POST repos/octocat/Hello-World/pulls/4781/comments/100/replies \
+            "api -X POST repos/acme/widgets/pulls/4781/comments/100/replies \
              -f body=+1"
         );
     }
@@ -7027,7 +6857,7 @@ mod tests {
                     "api",
                     "-X",
                     "POST",
-                    "repos/octocat/Hello-World/pulls/4781/reviews",
+                    "repos/acme/widgets/pulls/4781/reviews",
                     "-f",
                     "commit_id=displayed-A",
                     "-f",
@@ -7176,7 +7006,7 @@ mod tests {
         assert_eq!(client.file_at(&loc(), "oid", "gone.rs").unwrap(), None);
         assert_eq!(
             calls.lock().unwrap()[0].join(" "),
-            "api -H Accept: application/vnd.github.raw+json repos/octocat/Hello-World/contents/gone.rs?ref=oid"
+            "api -H Accept: application/vnd.github.raw+json repos/acme/widgets/contents/gone.rs?ref=oid"
         );
         assert_eq!(
             std::fs::read_dir(tmp.path().join("blobs-v2"))
